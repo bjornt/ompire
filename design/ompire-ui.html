@@ -1,0 +1,1554 @@
+<title>ompire — UI design</title>
+
+<style>
+/* ============ tokens ============ */
+:root {
+  --bg: #eef1f4;
+  --surface: #ffffff;
+  --surface2: #f3f6f8;
+  --line: #d6dee4;
+  --line-soft: #e3e9ee;
+  --text: #1f2b34;
+  --muted: #5d6d7a;
+  --faint: #8b98a3;
+  --accent: #147c6b;
+  --on-hue: #ffffff;
+  --red: #c8382e;
+  --amber: #a06a08;
+  --cyan: #146f9e;
+  --violet: #6d4fd3;
+  --green: #2c8642;
+  --shadow: 0 1px 2px rgba(24,39,50,.06), 0 2px 8px rgba(24,39,50,.05);
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1418;
+    --surface: #151c22;
+    --surface2: #1a232b;
+    --line: #27333d;
+    --line-soft: #1f2a33;
+    --text: #d5dee6;
+    --muted: #8797a6;
+    --faint: #5b6a77;
+    --accent: #4fb3a1;
+    --on-hue: #10161b;
+    --red: #f16a5f;
+    --amber: #e6a23c;
+    --cyan: #56b9e4;
+    --violet: #a78bfa;
+    --green: #63bd75;
+    --shadow: none;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #eef1f4; --surface: #ffffff; --surface2: #f3f6f8; --line: #d6dee4;
+  --line-soft: #e3e9ee; --text: #1f2b34; --muted: #5d6d7a; --faint: #8b98a3;
+  --accent: #147c6b; --on-hue: #ffffff;
+  --red: #c8382e; --amber: #a06a08; --cyan: #146f9e; --violet: #6d4fd3; --green: #2c8642;
+  --shadow: 0 1px 2px rgba(24,39,50,.06), 0 2px 8px rgba(24,39,50,.05);
+}
+:root[data-theme="dark"] {
+  --bg: #0f1418; --surface: #151c22; --surface2: #1a232b; --line: #27333d;
+  --line-soft: #1f2a33; --text: #d5dee6; --muted: #8797a6; --faint: #5b6a77;
+  --accent: #4fb3a1; --on-hue: #10161b;
+  --red: #f16a5f; --amber: #e6a23c; --cyan: #56b9e4; --violet: #a78bfa; --green: #63bd75;
+  --shadow: none;
+}
+
+* { box-sizing: border-box; }
+html { background: var(--bg); }
+body {
+  margin: 0;
+  font: 13px/1.5 var(--sans);
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+button { font: inherit; color: inherit; cursor: pointer; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 3px; }
+code, .mono { font-family: var(--mono); }
+
+/* ============ chrome ============ */
+.chrome {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: center; gap: 16px;
+  padding: 0 20px; height: 46px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+.logo {
+  font-family: var(--mono); font-weight: 700; font-size: 14px;
+  letter-spacing: .04em; display: flex; align-items: center; gap: 8px;
+  white-space: nowrap;
+}
+.logo .glyph {
+  width: 18px; height: 18px; border-radius: 4px;
+  background: var(--accent); color: var(--on-hue);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700;
+}
+.nav { display: flex; gap: 2px; flex: 1; min-width: 0; overflow-x: auto; }
+.nav button {
+  background: none; border: none; border-radius: 6px;
+  padding: 5px 11px; color: var(--muted); font-size: 12.5px;
+  white-space: nowrap;
+}
+.nav button:hover { color: var(--text); background: var(--surface2); }
+.nav button.active { color: var(--text); background: var(--surface2); font-weight: 600; }
+.chrome-right { display: flex; align-items: center; gap: 10px; }
+
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 11px;
+  padding: 3px 9px; border-radius: 20px;
+  border: 1px solid var(--line); color: var(--muted);
+  white-space: nowrap; background: var(--surface);
+}
+.chip .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.chip-attn {
+  border-color: color-mix(in srgb, var(--red) 45%, transparent);
+  background: color-mix(in srgb, var(--red) 12%, var(--surface));
+  color: var(--red); font-weight: 700;
+}
+.chip-ok .dot { background: var(--green); }
+.chip-gpg-locked {
+  border-color: color-mix(in srgb, var(--amber) 50%, transparent);
+  background: color-mix(in srgb, var(--amber) 12%, var(--surface));
+  color: var(--amber); font-weight: 600;
+}
+.chip-gpg-locked .dot { background: var(--amber); }
+.chip-gpg-cached .dot { background: var(--green); }
+body:not(.gpg-locked) .only-locked { display: none !important; }
+body.gpg-locked .only-cached { display: none !important; }
+
+/* ============ layout ============ */
+main { max-width: 1240px; margin: 0 auto; padding: 20px 20px 80px; }
+.view { display: none; }
+.view.active { display: block; }
+.view-head { display: flex; align-items: baseline; gap: 14px; margin: 6px 0 18px; flex-wrap: wrap; }
+.view-head h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+.view-head .sub { color: var(--muted); font-size: 12.5px; }
+.view-head .spacer { flex: 1; }
+
+.eyebrow {
+  font-family: var(--mono); font-size: 10.5px; font-weight: 700;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--faint);
+  display: flex; align-items: center; gap: 10px; margin: 26px 0 10px;
+}
+.eyebrow:first-of-type { margin-top: 0; }
+.eyebrow .rule { flex: 1; height: 1px; background: var(--line-soft); }
+.eyebrow .count { color: var(--muted); }
+.eyebrow.hot { color: var(--red); }
+.eyebrow.hot .count { color: var(--red); }
+
+/* ============ buttons ============ */
+.btn {
+  border: 1px solid var(--line); background: var(--surface2);
+  border-radius: 6px; padding: 4px 11px; font-size: 12px;
+  color: var(--text); line-height: 1.5; white-space: nowrap;
+}
+.btn:hover { border-color: var(--faint); }
+.btn-primary {
+  background: var(--accent); border-color: var(--accent);
+  color: var(--on-hue); font-weight: 600;
+}
+.btn-primary:hover { filter: brightness(1.08); border-color: var(--accent); }
+.btn-quiet { background: none; border-color: transparent; color: var(--muted); }
+.btn-quiet:hover { color: var(--text); border-color: var(--line); }
+.btn-sm { padding: 2px 8px; font-size: 11.5px; }
+.btn[disabled] { opacity: .45; cursor: not-allowed; pointer-events: none; }
+.btn-danger-quiet { color: var(--red); }
+.btn-hue { font-weight: 600; }
+
+/* ============ state pills — the tier grammar ============ */
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 10.5px; font-weight: 700;
+  letter-spacing: .05em; padding: 2px 8px; border-radius: 4px;
+  white-space: nowrap; line-height: 1.6;
+}
+.pill .d { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+/* tier 1 — interrupt: solid fill, pulsing dot */
+.pill.t-interrupt { background: var(--hue); color: var(--on-hue); }
+.pill.t-interrupt .d { background: var(--on-hue); animation: pulse 1.1s ease-in-out infinite; }
+/* tier 2 — notify: outlined in hue, steady dot */
+.pill.t-notify {
+  color: var(--hue);
+  border: 1px solid color-mix(in srgb, var(--hue) 55%, transparent);
+  background: color-mix(in srgb, var(--hue) 9%, transparent);
+}
+/* tier 3 — badge: neutral chip, hollow dot */
+.pill.t-badge { color: var(--muted); background: var(--surface2); border: 1px solid var(--line); }
+.pill.t-badge .d { background: none; border: 1.5px solid currentColor; width: 5px; height: 5px; }
+/* tier 4 — silent: text only, dim */
+.pill.t-silent { color: var(--faint); background: none; padding-left: 0; }
+.pill.t-silent .d { background: currentColor; opacity: .7; }
+.pill.t-silent.anim .d { animation: breathe 2.4s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+@keyframes breathe { 0%,100% { opacity: .8; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) {
+  .pill .d { animation: none !important; }
+  .shimmer::after { animation: none !important; }
+}
+
+.hue-red    { --hue: var(--red); }
+.hue-amber  { --hue: var(--amber); }
+.hue-cyan   { --hue: var(--cyan); }
+.hue-violet { --hue: var(--violet); }
+.hue-green  { --hue: var(--green); }
+
+/* ============ workflow (Decision 8) ============ */
+/* step prefix inside a state pill: "fix: waiting-input" */
+.pill .step { font-weight: 600; opacity: .85; }
+
+/* card-level workflow trail */
+.wf-trail {
+  font-family: var(--mono); font-size: 10.5px; color: var(--faint);
+  display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap;
+}
+.wf-trail .wf-name { color: var(--muted); font-weight: 700; }
+.wf-trail .ws.done { color: var(--green); }
+.wf-trail .ws.cur { color: var(--text); font-weight: 700; }
+.wf-trail .ws.fail { color: var(--red); font-weight: 700; }
+
+/* task-detail workflow strip */
+.wf-strip {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: var(--shadow); margin-bottom: 14px; overflow: hidden;
+}
+.wf-steps { display: flex; align-items: stretch; overflow-x: auto; }
+.wf-step {
+  display: flex; align-items: center; gap: 8px; padding: 8px 14px;
+  border: none; border-right: 1px solid var(--line-soft); background: none;
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
+  white-space: nowrap; cursor: default;
+}
+.wf-step .mark {
+  width: 15px; height: 15px; border-radius: 50%; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 9px; font-weight: 700; border: 1.5px solid var(--line); color: var(--faint);
+}
+.wf-step.done .mark { background: var(--green); border-color: var(--green); color: var(--on-hue); }
+.wf-step.cur {
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--text); font-weight: 700; box-shadow: inset 0 -2px 0 var(--accent);
+}
+.wf-step.cur .mark { border-color: var(--accent); color: var(--accent); }
+.wf-step .kind { font-size: 9px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+.wf-step .sess {
+  font-size: 9.5px; color: var(--violet); border-radius: 3px; padding: 0 4px;
+  border: 1px solid color-mix(in srgb, var(--violet) 35%, transparent);
+}
+.wf-step .caret { font-size: 8px; color: var(--faint); }
+.wf-step.done { cursor: pointer; }
+.wf-step.done:hover { background: var(--surface2); }
+.wf-loop {
+  font-family: var(--mono); font-size: 10px; color: var(--faint);
+  align-self: center; padding: 0 12px; border-right: 1px solid var(--line-soft); white-space: nowrap;
+}
+.wf-outcome {
+  display: none; border-top: 1px solid var(--line-soft);
+  padding: 9px 14px; font-family: var(--mono); font-size: 11px; line-height: 1.7;
+  color: var(--muted); background: var(--surface2); white-space: pre; overflow-x: auto;
+}
+.wf-strip.open .wf-outcome { display: block; }
+.wf-outcome .key { color: var(--cyan); }
+.wf-outcome .str { color: var(--green); }
+.wf-outcome .ohead { color: var(--faint); }
+
+/* per-session transcript tabs */
+.session-tabs { display: flex; align-items: center; gap: 2px; margin-bottom: -1px; position: relative; z-index: 1; padding: 0 10px; }
+.session-tab {
+  font-family: var(--mono); font-size: 11px; padding: 5px 12px;
+  border: 1px solid transparent; border-bottom: none; border-radius: 7px 7px 0 0;
+  background: none; color: var(--muted);
+}
+.session-tab.on { background: var(--surface); border-color: var(--line); color: var(--text); font-weight: 700; }
+.session-tab .sd { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--cyan); margin-right: 6px; vertical-align: 1px; }
+.session-tab.s-idle .sd { background: var(--faint); }
+.session-tabs .st-note { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--faint); }
+
+/* ============ task cards ============ */
+.card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; }
+.card {
+  position: relative;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px 10px 17px;
+  box-shadow: var(--shadow);
+  display: flex; flex-direction: column; gap: 7px;
+  overflow: hidden;
+}
+.card .spine { position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
+/* tier 1: spine + tinted surface + stronger border */
+.card.t1 {
+  background: color-mix(in srgb, var(--hue) 6%, var(--surface));
+  border-color: color-mix(in srgb, var(--hue) 38%, var(--line));
+}
+.card.t1 .spine { background: var(--hue); }
+/* tier 2: spine only */
+.card.t2 { border-color: color-mix(in srgb, var(--hue) 22%, var(--line)); }
+.card.t2 .spine { background: color-mix(in srgb, var(--hue) 75%, transparent); }
+/* tier 3: plain */
+/* tier 4: recessed */
+.card.t4 { background: color-mix(in srgb, var(--surface) 55%, var(--bg)); }
+.card.t4 .proj, .card.t4 .slug { color: var(--muted); }
+
+.card-top { display: flex; align-items: center; gap: 8px; }
+.proj { font-size: 11.5px; color: var(--muted); font-weight: 600; }
+.card-top .spacer { flex: 1; }
+.slug { font-family: var(--mono); font-size: 13.5px; font-weight: 600; letter-spacing: -.01em; overflow-wrap: anywhere; }
+.reason { font-size: 12px; color: var(--muted); }
+.reason strong { color: var(--text); font-weight: 600; }
+.card.t1 .reason, .card.t2 .reason { color: var(--text); }
+.reason .why { color: var(--faint); font-family: var(--mono); font-size: 11px; }
+
+.stderr {
+  font-family: var(--mono); font-size: 11px; line-height: 1.55;
+  background: color-mix(in srgb, var(--red) 7%, var(--surface2));
+  border: 1px solid color-mix(in srgb, var(--red) 20%, var(--line));
+  color: var(--muted);
+  border-radius: 5px; padding: 6px 9px;
+  white-space: pre; overflow-x: auto;
+}
+.stderr b { color: var(--red); font-weight: 600; }
+
+.activity {
+  font-family: var(--mono); font-size: 11px; color: var(--faint);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.shimmer { position: relative; height: 2px; background: var(--line-soft); border-radius: 1px; overflow: hidden; margin-top: 2px; }
+.shimmer::after {
+  content: ""; position: absolute; inset: 0; width: 35%;
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
+  animation: slide 1.8s ease-in-out infinite;
+}
+@keyframes slide { 0% { left: -35%; } 100% { left: 100%; } }
+
+.card-meta {
+  display: flex; align-items: center; gap: 12px;
+  font-family: var(--mono); font-size: 11px; color: var(--faint);
+  border-top: 1px solid var(--line-soft); padding-top: 8px; margin-top: auto;
+  flex-wrap: wrap;
+}
+.card-meta .m { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.card-meta .spacer { flex: 1; }
+.card-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* context ring */
+.ring { width: 16px; height: 16px; flex: none; }
+.ring circle { fill: none; stroke-width: 3; }
+.ring .track { stroke: var(--line); }
+.ring .arc { stroke: var(--accent); stroke-linecap: round; transform: rotate(-90deg); transform-origin: center; }
+.ring.warn .arc { stroke: var(--amber); }
+.m.ctx-warn { color: var(--amber); }
+
+/* quick answer */
+.quick-answer {
+  border: 1px solid color-mix(in srgb, var(--cyan) 30%, var(--line));
+  background: color-mix(in srgb, var(--cyan) 5%, var(--surface));
+  border-radius: 6px; padding: 9px 11px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.quick-answer .q { font-size: 12.5px; }
+.qa-opts { display: flex; gap: 6px; flex-wrap: wrap; }
+.qa-opt {
+  border: 1px solid var(--line); background: var(--surface);
+  border-radius: 5px; padding: 3px 10px; font-size: 12px;
+}
+.qa-opt:hover { border-color: var(--cyan); }
+.qa-opt.rec {
+  border-color: color-mix(in srgb, var(--cyan) 60%, transparent);
+  background: color-mix(in srgb, var(--cyan) 12%, var(--surface));
+  font-weight: 600;
+}
+.qa-opt.rec::after { content: " ·rec"; font-family: var(--mono); font-size: 10px; color: var(--cyan); }
+
+.decoration {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px; color: var(--muted); font-style: italic;
+}
+.decoration::before { content: "?"; font-style: normal; font-family: var(--mono); font-weight: 700;
+  width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--faint);
+  display: inline-flex; align-items: center; justify-content: center; font-size: 9.5px; flex: none; }
+
+.archived-strip {
+  display: flex; align-items: center; gap: 14px;
+  background: color-mix(in srgb, var(--surface) 55%, var(--bg));
+  border: 1px dashed var(--line); border-radius: 8px;
+  padding: 9px 15px; color: var(--muted); font-size: 12px; flex-wrap: wrap;
+}
+.archived-strip .slug { font-size: 12px; }
+.pr-link { font-family: var(--mono); font-size: 11.5px; }
+
+/* ============ spawn ============ */
+.spawn-grid { display: grid; grid-template-columns: minmax(380px, 1fr) minmax(340px, 460px); gap: 20px; align-items: start; }
+@media (max-width: 900px) { .spawn-grid { grid-template-columns: 1fr; } .detail-grid { grid-template-columns: 1fr !important; } }
+.panel {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 8px; padding: 16px; box-shadow: var(--shadow);
+}
+.panel h2 {
+  margin: 0 0 14px; font-size: 11px; font-family: var(--mono);
+  letter-spacing: .12em; text-transform: uppercase; color: var(--faint); font-weight: 700;
+}
+.field { margin-bottom: 14px; }
+.field label { display: block; font-size: 11.5px; font-weight: 600; color: var(--muted); margin-bottom: 4px; }
+.field .hint { font-size: 11px; color: var(--faint); margin-top: 4px; }
+.field .hint code { font-size: 10.5px; }
+input[type="text"], select, textarea {
+  width: 100%; background: var(--surface2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 6px 9px; font: 12.5px/1.5 var(--sans);
+}
+textarea.mono, input.mono { font-family: var(--mono); font-size: 12px; }
+textarea { resize: vertical; }
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.field-row { display: flex; gap: 12px; }
+.field-row .field { flex: 1; }
+
+.branch-preview {
+  font-family: var(--mono); font-size: 11.5px; color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-radius: 4px; padding: 2px 7px; display: inline-block; margin-top: 5px;
+}
+
+.pipeline { display: flex; flex-direction: column; }
+.pstep { display: flex; gap: 12px; position: relative; padding-bottom: 18px; }
+.pstep:last-child { padding-bottom: 0; }
+.pstep::before {
+  content: ""; position: absolute; left: 9px; top: 22px; bottom: 2px;
+  width: 2px; background: var(--line-soft);
+}
+.pstep:last-child::before { display: none; }
+.pstep .marker {
+  width: 20px; height: 20px; border-radius: 50%; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--mono); font-size: 10px; font-weight: 700;
+  border: 2px solid var(--line); color: var(--faint); background: var(--surface);
+  position: relative; z-index: 1;
+}
+.pstep.done .marker { background: var(--green); border-color: var(--green); color: var(--on-hue); }
+.pstep.active .marker { border-color: var(--accent); color: var(--accent); }
+.pstep.active .marker::after {
+  content: ""; position: absolute; inset: -6px; border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+.pstep.failed .marker { background: var(--red); border-color: var(--red); color: var(--on-hue); }
+.pstep .pbody { flex: 1; min-width: 0; padding-top: 1px; }
+.pstep .ptitle { font-weight: 600; font-size: 12.5px; display: flex; gap: 8px; align-items: baseline; }
+.pstep .ptime { font-family: var(--mono); font-size: 10.5px; color: var(--faint); font-weight: 400; }
+.pstep.active .ptime { color: var(--accent); }
+.pstep .pdetail { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.pstep.pending .ptitle { color: var(--faint); font-weight: 500; }
+.log-tail {
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.6; color: var(--faint);
+  background: var(--surface2); border: 1px solid var(--line-soft);
+  border-radius: 5px; padding: 6px 9px; margin-top: 7px;
+  white-space: pre; overflow-x: auto;
+}
+.log-tail .cur { color: var(--text); }
+
+/* ============ task detail ============ */
+.detail-grid { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 16px; align-items: start; }
+.status-strip {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  padding: 9px 14px; margin-bottom: 14px; box-shadow: var(--shadow);
+  font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+}
+.status-strip .sep { width: 1px; align-self: stretch; background: var(--line-soft); }
+.status-strip .m { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.status-strip .reason-txt { color: var(--faint); font-size: 11px; }
+.advisory {
+  display: inline-flex; align-items: center; gap: 6px;
+  color: var(--amber); font-size: 11px;
+}
+.advisory .btn { border-color: color-mix(in srgb, var(--amber) 45%, var(--line)); color: var(--amber); background: none; }
+
+.transcript {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  padding: 4px 0; box-shadow: var(--shadow);
+}
+.t-entry { padding: 10px 16px; border-bottom: 1px solid var(--line-soft); }
+.t-entry:last-child { border-bottom: none; }
+.t-role {
+  font-family: var(--mono); font-size: 10px; font-weight: 700;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--faint);
+  margin-bottom: 5px; display: flex; align-items: center; gap: 8px;
+}
+.t-role .t-time { font-weight: 400; letter-spacing: 0; text-transform: none; }
+.t-user { background: color-mix(in srgb, var(--accent) 4%, transparent); }
+.t-user .t-role { color: var(--accent); }
+.t-text { font-size: 13px; max-width: 70ch; }
+.t-text p { margin: 0 0 8px; } .t-text p:last-child { margin-bottom: 0; }
+.t-text code { font-size: 11.5px; background: var(--surface2); padding: 1px 4px; border-radius: 3px; }
+
+.tool-card {
+  border: 1px solid var(--line); border-radius: 6px;
+  background: var(--surface2); margin: 6px 0;
+  font-size: 12px; overflow: hidden;
+}
+.tool-head {
+  display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+  font-family: var(--mono); font-size: 11.5px; cursor: pointer; color: var(--muted);
+}
+.tool-head:hover { color: var(--text); }
+.tool-head .tw { color: var(--faint); transition: transform .12s; font-size: 9px; }
+.tool-card.open .tw { transform: rotate(90deg); }
+.tool-head .tname { color: var(--violet); font-weight: 700; }
+.tool-head .targ { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.tool-head .tstat { font-size: 10px; color: var(--green); }
+.tool-head .tstat.err { color: var(--red); }
+.tool-body {
+  display: none; border-top: 1px solid var(--line-soft);
+  padding: 8px 12px; font-family: var(--mono); font-size: 11px; line-height: 1.6;
+  color: var(--muted); white-space: pre; overflow-x: auto;
+}
+.tool-card.open .tool-body { display: block; }
+.tool-body .add { color: var(--green); } .tool-body .del { color: var(--red); }
+
+.thinking {
+  border-left: 2px solid var(--line); padding: 2px 0 2px 12px; margin: 6px 0;
+  color: var(--faint); font-size: 12px; font-style: italic; max-width: 68ch;
+}
+.thinking .t-label { font-family: var(--mono); font-size: 9.5px; font-style: normal; letter-spacing: .12em; text-transform: uppercase; font-weight: 700; display: block; margin-bottom: 2px; }
+
+.subagent {
+  border: 1px dashed var(--line); border-radius: 6px; margin: 6px 0 6px 18px;
+  background: color-mix(in srgb, var(--surface2) 50%, transparent);
+}
+.subagent .tool-head .tname { color: var(--cyan); }
+
+/* ask card */
+.ask-card {
+  border: 1px solid color-mix(in srgb, var(--cyan) 45%, var(--line));
+  background: color-mix(in srgb, var(--cyan) 6%, var(--surface));
+  border-radius: 8px; padding: 13px 15px; margin: 8px 0 2px;
+}
+.ask-card .ask-head {
+  font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--cyan); display: flex; gap: 8px; align-items: center; margin-bottom: 8px;
+}
+.ask-card .ask-head .d { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.ask-q { font-size: 13px; font-weight: 600; margin-bottom: 10px; max-width: 70ch; }
+.ask-opts { display: flex; flex-direction: column; gap: 6px; }
+.ask-opt {
+  display: flex; gap: 10px; align-items: baseline; text-align: left;
+  border: 1px solid var(--line); background: var(--surface);
+  border-radius: 6px; padding: 8px 12px; width: 100%;
+}
+.ask-opt:hover { border-color: var(--cyan); }
+.ask-opt .k {
+  font-family: var(--mono); font-size: 10.5px; font-weight: 700; color: var(--faint);
+  border: 1px solid var(--line); border-radius: 3px; padding: 0 5px; flex: none;
+}
+.ask-opt .lab { font-weight: 600; font-size: 12.5px; }
+.ask-opt .desc { color: var(--muted); font-size: 11.5px; display: block; font-weight: 400; }
+.ask-opt.rec { border-color: color-mix(in srgb, var(--cyan) 55%, transparent); background: color-mix(in srgb, var(--cyan) 9%, var(--surface)); }
+.ask-opt.rec .lab::after { content: "recommended"; font-family: var(--mono); font-size: 9.5px; color: var(--cyan); margin-left: 8px; font-weight: 700; letter-spacing: .06em; }
+.ask-other { display: flex; gap: 8px; margin-top: 8px; }
+.ask-other input { flex: 1; }
+
+/* composer */
+.composer {
+  margin-top: 14px; background: var(--surface); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px 12px; box-shadow: var(--shadow);
+}
+.composer textarea { border: none; background: none; padding: 2px 2px 8px; min-height: 40px; }
+.composer textarea:focus { outline: none; }
+.composer-bar { display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--line-soft); padding-top: 9px; }
+.mode-seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.mode-seg button { border: none; background: none; padding: 3px 10px; font-size: 11.5px; font-family: var(--mono); color: var(--muted); }
+.mode-seg button + button { border-left: 1px solid var(--line); }
+.mode-seg button.on { background: var(--surface2); color: var(--text); font-weight: 700; }
+.mode-seg button[disabled] { opacity: .4; cursor: not-allowed; }
+.composer-bar .note { font-size: 11px; color: var(--faint); flex: 1; }
+
+/* metadata panel */
+.meta-panel { display: flex; flex-direction: column; gap: 14px; position: sticky; top: 62px; }
+.kv { display: grid; grid-template-columns: 86px 1fr; gap: 5px 10px; font-size: 11.5px; }
+.kv dt { color: var(--faint); margin: 0; }
+.kv dd { margin: 0; font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
+.kv .ok { color: var(--green); }
+.escape {
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.7;
+  background: var(--surface2); border: 1px solid var(--line-soft); border-radius: 5px;
+  padding: 8px 10px; white-space: pre; overflow-x: auto; color: var(--muted);
+}
+.escape .p { color: var(--accent); user-select: none; }
+.todo-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.todo-list li { display: flex; gap: 8px; align-items: baseline; }
+.todo-list .tk { font-family: var(--mono); font-size: 10px; width: 14px; flex: none; text-align: center; }
+.todo-list .done { color: var(--faint); text-decoration: line-through; }
+.todo-list .done .tk { color: var(--green); text-decoration: none; }
+.todo-list .act { font-weight: 600; }
+.todo-list .act .tk { color: var(--accent); }
+.todo-list .pend .tk { color: var(--faint); }
+
+/* ============ ship flow ============ */
+.ship-wrap { max-width: 860px; }
+.stepper { display: flex; flex-direction: column; gap: 10px; }
+.sstep {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: var(--shadow); overflow: hidden;
+}
+.sstep-head { display: flex; align-items: center; gap: 12px; padding: 11px 16px; }
+.sstep .snum {
+  width: 22px; height: 22px; border-radius: 50%; flex: none;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--mono); font-size: 10.5px; font-weight: 700;
+  border: 2px solid var(--line); color: var(--faint);
+}
+.sstep.done .snum { background: var(--green); border-color: var(--green); color: var(--on-hue); }
+.sstep.current .snum { border-color: var(--accent); color: var(--accent); }
+.sstep.blocked .snum { border-color: var(--amber); color: var(--amber); }
+.sstep .stitle { font-weight: 650; font-size: 13px; }
+.sstep .ssub { color: var(--muted); font-size: 11.5px; font-family: var(--mono); }
+.sstep-head .spacer { flex: 1; }
+.sstep.pending { opacity: .6; }
+.sstep-body { border-top: 1px solid var(--line-soft); padding: 14px 16px 16px 50px; }
+@media (max-width: 700px) { .sstep-body { padding-left: 16px; } }
+
+.iteration { display: flex; gap: 10px; align-items: baseline; font-size: 12px; padding: 4px 0; }
+.iteration .it-n { font-family: var(--mono); font-size: 10.5px; color: var(--faint); width: 38px; flex: none; }
+.iteration .it-out { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.iteration .ok { color: var(--green); font-weight: 600; }
+
+.radio-row { display: flex; gap: 16px; margin-bottom: 12px; flex-wrap: wrap; }
+.radio-row label { display: flex; gap: 7px; align-items: baseline; font-size: 12.5px; cursor: pointer; }
+.radio-row input { accent-color: var(--accent); }
+.radio-row .rdesc { color: var(--faint); font-size: 11.5px; }
+
+.gpg-banner {
+  display: flex; gap: 12px; align-items: flex-start;
+  border: 1px solid color-mix(in srgb, var(--amber) 45%, var(--line));
+  background: color-mix(in srgb, var(--amber) 8%, var(--surface));
+  border-radius: 7px; padding: 11px 14px; margin-bottom: 14px;
+}
+.gpg-banner .icon {
+  font-family: var(--mono); font-weight: 700; color: var(--amber);
+  border: 1.5px solid var(--amber); border-radius: 4px; width: 20px; height: 20px;
+  display: flex; align-items: center; justify-content: center; flex: none; font-size: 11px;
+}
+.gpg-banner .gb-title { font-weight: 650; color: var(--amber); font-size: 12.5px; margin-bottom: 2px; }
+.gpg-banner .gb-text { font-size: 12px; color: var(--text); }
+.gpg-banner code {
+  display: block; font-size: 11px; background: var(--surface2);
+  border: 1px solid var(--line-soft); border-radius: 4px; padding: 5px 8px; margin-top: 6px;
+  overflow-x: auto; white-space: pre;
+}
+body:not(.gpg-locked) .gpg-banner { display: none; }
+body.gpg-locked .commit-actions .btn-primary { opacity: .45; pointer-events: none; }
+
+.mock-toggle {
+  border: 1px dashed var(--faint); background: none; color: var(--muted);
+  border-radius: 6px; padding: 3px 10px; font-size: 11px; font-family: var(--mono);
+}
+.mock-toggle:hover { color: var(--text); }
+
+/* ============ templates & settings ============ */
+.settings-grid { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 900px) { .settings-grid { grid-template-columns: 1fr; } }
+.tpl-row {
+  display: flex; align-items: center; gap: 12px; padding: 9px 12px;
+  border: 1px solid var(--line); border-radius: 7px; margin-bottom: 8px;
+  background: var(--surface2); font-size: 12.5px;
+}
+.tpl-row .tname { font-family: var(--mono); font-weight: 700; }
+.tpl-row .tmeta { color: var(--faint); font-family: var(--mono); font-size: 11px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tpl-row.editing { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 5%, var(--surface2)); }
+
+.tier-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.tier-table th {
+  font-family: var(--mono); font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--faint); text-align: left; padding: 4px 8px; font-weight: 700;
+  border-bottom: 1px solid var(--line);
+}
+.tier-table th:not(:first-child), .tier-table td:not(:first-child) { text-align: center; }
+.tier-table td { padding: 7px 8px; border-bottom: 1px solid var(--line-soft); }
+.tier-table input[type="checkbox"] { accent-color: var(--accent); width: auto; }
+.tier-table .states { display: block; color: var(--faint); font-family: var(--mono); font-size: 10px; margin-top: 1px; }
+.token-row { display: flex; gap: 8px; align-items: center; }
+.token-row input { flex: 1; }
+</style>
+
+<!-- ==================== chrome ==================== -->
+<header class="chrome">
+  <div class="logo"><span class="glyph">»</span>ompire</div>
+  <nav class="nav" id="nav">
+    <button data-view="dashboard" class="active">Fleet</button>
+    <button data-view="spawn">Spawn task</button>
+    <button data-view="detail">Task detail</button>
+    <button data-view="ship">Ship flow</button>
+    <button data-view="settings">Templates &amp; settings</button>
+  </nav>
+  <div class="chrome-right">
+    <span class="chip chip-attn" title="waiting-approval 1 · waiting-input 1 · gate 1 · reviewing 1 · stalled 1 · failed 1">6 need you</span>
+    <span class="chip chip-ok" title="WebSocket connected — snapshot + live deltas"><span class="dot"></span>daemon</span>
+    <span class="chip chip-gpg-cached only-cached" title="Signing key cached in gpg-agent"><span class="dot"></span>gpg 2h58m</span>
+    <span class="chip chip-gpg-locked only-locked" title="Signing key locked — run the terminal helper to warm the cache"><span class="dot"></span>gpg locked</span>
+  </div>
+</header>
+
+<main>
+
+<!-- ==================== 1. fleet dashboard ==================== -->
+<section class="view active" id="view-dashboard">
+  <div class="view-head">
+    <h1>Fleet</h1>
+    <span class="sub">10 tasks · 3 projects · attention first, then recency</span>
+    <span class="spacer"></span>
+    <button class="btn btn-quiet btn-sm">Archived (12)</button>
+    <button class="btn btn-primary" data-goto="spawn">Spawn task</button>
+  </div>
+
+  <div class="eyebrow hot"><span>Needs you</span><span class="count">6</span><span class="rule"></span></div>
+  <div class="card-grid">
+
+    <!-- failed · interrupt -->
+    <article class="card t1 hue-red">
+      <div class="spine"></div>
+      <div class="card-top">
+        <span class="proj">llmvet</span>
+        <span class="spacer"></span>
+        <span class="pill t-interrupt hue-red"><span class="d"></span>failed</span>
+      </div>
+      <div class="slug">bjornt/range-mode</div>
+      <div class="reason"><strong>Process exited 1</strong> — retries exhausted (3/3) <span class="why">reason: fatal stderr</span></div>
+      <div class="stderr"><b>error:</b> pi-auth-gateway 127.0.0.1:4000: connection refused
+    at fetchModel (sdk/client.ts:214)</div>
+      <div class="card-meta">
+        <span class="m"><svg class="ring" viewBox="0 0 20 20"><circle class="track" cx="10" cy="10" r="8"/><circle class="arc" cx="10" cy="10" r="8" data-pct="34"/></svg>34%</span>
+        <span class="m">612k · $1.87</span>
+        <span class="m">47m</span>
+        <span class="m">exit 9m ago</span>
+        <span class="spacer"></span>
+        <span class="card-actions">
+          <button class="btn btn-sm">Open</button>
+          <button class="btn btn-sm">Respawn</button>
+          <button class="btn btn-sm btn-quiet btn-danger-quiet">Clean up</button>
+        </span>
+      </div>
+    </article>
+
+    <!-- waiting-approval · interrupt -->
+    <article class="card t1 hue-amber">
+      <div class="spine"></div>
+      <div class="card-top">
+        <span class="proj">maas-code-reviewer</span>
+        <span class="spacer"></span>
+        <span class="pill t-interrupt hue-amber"><span class="d"></span>waiting-approval</span>
+      </div>
+      <div class="slug">bjornt/reviewer-eval-harness</div>
+      <div class="reason"><strong>Approve:</strong> <code>bash — sudo systemctl restart postgresql</code> <span class="why">tools.approval: prompt (sudo) · waiting 4m</span></div>
+      <div class="card-meta">
+        <span class="m"><svg class="ring" viewBox="0 0 20 20"><circle class="track" cx="10" cy="10" r="8"/><circle class="arc" cx="10" cy="10" r="8" data-pct="46"/></svg>46%</span>
+        <span class="m">812k · $2.10</span>
+        <span class="m">38m</span>
+        <span class="spacer"></span>
+        <span class="card-actions">
+          <button class="btn btn-sm btn-primary">Approve</button>
+          <button class="btn btn-sm">Deny</button>
+          <button class="btn btn-sm btn-quiet">Open</button>
+        </span>
+      </div>
+    </article>
+
+    <!-- waiting-input · notify, with quick answer -->
+    <article class="card t2 hue-cyan">
+      <div class="spine"></div>
+      <div class="card-top">
+        <span class="proj">maas</span>
+        <span class="spacer"></span>
+        <span class="pill t-notify hue-cyan"><span class="d"></span><span class="step">fix:</span>waiting-input</span>
+      </div>
+      <div class="slug">bjornt/fix-dhcp-races</div>
+      <div class="wf-trail"><span class="wf-name">bugfix</span><span class="ws done">reproduce ✓</span>→<span class="ws cur">fix</span>→<span class="ws">validate</span>→<span class="ws">ship</span></div>
+      <div class="reason">1 question pending <span class="why">ask in flight · 2m</span></div>
+      <div class="quick-answer">
+        <div class="q">Apply the same lock ordering to the dhcpd6 loop, even though the reproducer only covers v4?</div>
+        <div class="qa-opts">
+          <button class="qa-opt rec">Yes, both loops</button>
+          <button class="qa-opt">v4 only</button>
+          <button class="qa-opt" data-goto="detail">Open for details…</button>
+        </div>
+      </div>
+      <div class="card-meta">
+        <span class="m ctx-warn"><svg class="ring warn" viewBox="0 0 20 20"><circle class="track" cx="10" cy="10" r="8"/><circle class="arc" cx="10" cy="10" r="8" data-pct="83"/></svg>83%</span>
+        <span class="m">2.1M · $6.40</span>
+        <span class="m">1h 12m</span>
+        <span class="spacer"></span>
+        <span class="card-actions"><button class="btn btn-sm" data-goto="detail">Open</button></span>
+      </div>
+    </article>
+
+    <!-- reviewing · notify -->
+    <article class="card t2 hue-violet">
+      <div class="spine"></div>
+      <div class="card-top">
+        <span class="proj">maas-code-reviewer</span>
+        <span class="spacer"></span>
+        <span class="pill t-notify hue-violet"><span class="d"></span>reviewing</span>
+      </div>
+      <div class="slug">bjornt/prompt-tuning</div>
+      <div class="reason">llmvet session open 6m — <a href="#" class="mono" onclick="return false">127.0.0.1:7181</a> <span class="why">iteration 2 · 14 files</span></div>
+      <div class="card-meta">
+        <span class="m"><svg class="ring" viewBox="0 0 20 20"><circle class="track" cx="10" cy="10" r="8"/><circle class="arc" cx="10" cy="10" r="8" data-pct="58"/></svg>58%</span>
+        <span class="m">1.4M · $4.83</span>
+        <span class="m">2h 03m</span>
+        <span class="spacer"></span>
+        <span class="card-actions">
+          <button class="btn btn-sm btn-primary">Open review</button>
+          <button class="btn btn-sm btn-quiet" data-goto="ship">Ship flow</button>
+        </span>
+      </div>
+    </article>
+
+    <!-- stalled · notify -->
+    <article class="card t2 hue-amber">
+      <div class="spine"></div>
+      <div class="card-top">
+        <span class="proj">maas</span>
+        <span class="spacer"></span>
+        <span class="pill t-notify hue-amber"><span class="d"></span>stalled</span>
+      </div>
+      <div class="slug">bjornt/pci-passthrough-docs</div>
+      <div class="reason">Working, but <strong>no frames for 14m</strong> <span class="why">watchdog · last tool: bash (pytest -x src/tests/)</span></div>
+      <div class="card-meta">
+        <span class="m"><svg class="ring" viewBox="0 0 20 20"><circle class="track" cx="10" cy="10" r="8"/><circle class="arc" cx="10" cy="10" r="8" data-pct="41"/></svg>41%</span>
+        <span class="m">920k · $2.75</span>
+        <span class="m">52m</span>
+        <span class="spacer"></span>
+        <span class="card-actions">
+          <button class="btn btn-sm">Open</button>
+          <button class="btn btn-sm">Interrupt</button>
+        </span>
+      </div>
+    </article>
+
+    <!-- gate · notify — workflow escalated to the operator -->
+    <article class="card t2 hue-cyan">
+      <div class="spine"></div>
+      <div class="card-top">
+        <span class="proj">maas</span>
+        <span class="spacer"></span>
+        <span class="pill t-notify hue-cyan"><span class="d"></span>gate</span>
+      </div>
+      <div class="slug">bjornt/subnet-dup-detect</div>
+      <div class="wf-trail"><span class="wf-name">bugfix</span><span class="ws done">reproduce ✓</span>→<span class="ws done">fix ✓</span>→<span class="ws fail">validate ✗ ×3</span>→<span class="ws cur">gate</span></div>
+      <div class="reason"><strong>Fix ↔ validate loop exhausted</strong> — repro still fails 4/200 after 3 iterations <span class="why">loop bound 3 · escalated 8m ago</span></div>
+      <div class="card-meta">
+        <span class="m"><svg class="ring" viewBox="0 0 20 20"><circle class="track" cx="10" cy="10" r="8"/><circle class="arc" cx="10" cy="10" r="8" data-pct="71"/></svg>71%</span>
+        <span class="m">1.8M · $5.62</span>
+        <span class="m">1h 44m</span>
+        <span class="spacer"></span>
+        <span class="card-actions">
+          <button class="btn btn-sm btn-primary">Open</button>
+          <button class="btn btn-sm">Retry loop</button>
+          <button class="btn btn-sm btn-quiet btn-danger-quiet">Kill</button>
+        </span>
+      </div>
+    </article>
+  </div>
+
+  <div class="eyebrow"><span>Running</span><span class="count">3</span><span class="rule"></span></div>
+  <div class="card-grid">
+
+    <!-- working · silent -->
+    <article class="card t4">
+      <div class="card-top">
+        <span class="proj">maas</span>
+        <span class="spacer"></span>
+        <span class="pill t-silent anim"><span class="d"></span>working</span>
+      </div>
+      <div class="slug">bjornt/rack-controller-tests</div>
+      <div class="activity">bash: pytest src/maasserver/tests/test_racks.py -x</div>
+      <div class="shimmer"></div>
+      <div class="card-meta">
+        <span class="m"><svg class="ring" viewBox="0 0 20 20"><circle class="track" cx="10" cy="10" r="8"/><circle class="arc" cx="10" cy="10" r="8" data-pct="54"/></svg>54%</span>
+        <span class="m">1.1M · $3.20</span>
+        <span class="m">44m</span>
+        <span class="m">todos 2/5</span>
+        <span class="spacer"></span>
+        <span class="card-actions"><button class="btn btn-sm btn-quiet">Open</button></span>
+      </div>
+    </article>
+
+    <!-- starting · silent -->
+    <article class="card t4">
+      <div class="card-top">
+        <span class="proj">llmvet</span>
+        <span class="spacer"></span>
+        <span class="pill t-silent anim"><span class="d"></span>starting</span>
+      </div>
+      <div class="slug">bjornt/exit-code-docs</div>
+      <div class="activity">workshop launch · 22s · installing omp SDK</div>
+      <div class="shimmer"></div>
+      <div class="card-meta">
+        <span class="m">—</span>
+        <span class="m">0 · $0.00</span>
+        <span class="m">22s</span>
+        <span class="spacer"></span>
+        <span class="card-actions"><button class="btn btn-sm btn-quiet" data-goto="spawn">Pipeline</button></span>
+      </div>
+    </article>
+
+    <!-- retrying · badge -->
+    <article class="card">
+      <div class="card-top">
+        <span class="proj">maas</span>
+        <span class="spacer"></span>
+        <span class="pill t-badge"><span class="d"></span>retrying</span>
+      </div>
+      <div class="slug">bjornt/vault-secrets-rotation</div>
+      <div class="reason">Auto-retry 2/5 — HTTP 429 from gateway, next attempt in 40s <span class="why">auto_retry_start</span></div>
+      <div class="card-meta">
+        <span class="m"><svg class="ring" viewBox="0 0 20 20"><circle class="track" cx="10" cy="10" r="8"/><circle class="arc" cx="10" cy="10" r="8" data-pct="27"/></svg>27%</span>
+        <span class="m">380k · $1.12</span>
+        <span class="m">18m</span>
+        <span class="spacer"></span>
+        <span class="card-actions"><button class="btn btn-sm btn-quiet">Open</button></span>
+      </div>
+    </article>
+  </div>
+
+  <div class="eyebrow"><span>Idle</span><span class="count">1</span><span class="rule"></span></div>
+  <div class="card-grid">
+    <!-- idle · badge, with decoration -->
+    <article class="card">
+      <div class="card-top">
+        <span class="proj">llmvet</span>
+        <span class="spacer"></span>
+        <span class="pill t-badge"><span class="d"></span>idle</span>
+      </div>
+      <div class="slug">bjornt/comment-anchors</div>
+      <div class="reason">Turn ended 26m ago — 4/4 todos done <span class="why">agent_end · queue empty</span></div>
+      <span class="decoration">may be waiting for a reply — last message ends with a question</span>
+      <div class="card-meta">
+        <span class="m"><svg class="ring" viewBox="0 0 20 20"><circle class="track" cx="10" cy="10" r="8"/><circle class="arc" cx="10" cy="10" r="8" data-pct="62"/></svg>62%</span>
+        <span class="m">1.6M · $5.05</span>
+        <span class="m">3h 21m</span>
+        <span class="spacer"></span>
+        <span class="card-actions">
+          <button class="btn btn-sm btn-primary" data-goto="ship">Review</button>
+          <button class="btn btn-sm">Open</button>
+          <button class="btn btn-sm btn-quiet btn-danger-quiet">Kill</button>
+        </span>
+      </div>
+    </article>
+  </div>
+
+  <div class="eyebrow"><span>Shipped</span><span class="count">2 recent</span><span class="rule"></span></div>
+  <div class="archived-strip">
+    <span class="pill t-badge hue-green" style="color: var(--green)"><span class="d"></span>shipped</span>
+    <span class="slug">bjornt/hunk-header-parse</span>
+    <a class="pr-link" href="#" onclick="return false">llmvet#82 · merged</a>
+    <span>cleaned up 2d ago</span>
+    <span style="flex:1"></span>
+    <span class="pill t-badge hue-green" style="color: var(--green)"><span class="d"></span>shipped</span>
+    <span class="slug">bjornt/eval-fixtures</span>
+    <a class="pr-link" href="#" onclick="return false">maas-code-reviewer#47 · open</a>
+    <span>awaiting merge · cleanup deferred</span>
+  </div>
+</section>
+
+<!-- ==================== 2. spawn task ==================== -->
+<section class="view" id="view-spawn">
+  <div class="view-head">
+    <h1>Spawn task</h1>
+    <span class="sub">template → clone → workshop → workflow (sessions spawn lazily)</span>
+  </div>
+  <div class="spawn-grid">
+    <div class="panel">
+      <h2>New task</h2>
+      <div class="field">
+        <label for="tpl">Project template</label>
+        <select id="tpl">
+          <option selected>maas — ~/proj/maas · base master · fable-5 · bugfix</option>
+          <option>maas-code-reviewer — ~/proj/maas-code-reviewer · base main · fable-5 · single-step</option>
+          <option>llmvet — ~/proj/llmvet · base main · haiku-4.5 · single-step</option>
+        </select>
+        <div class="hint">Preamble, workshop additions, omp pins and the workflow come from the template. <a href="#" data-goto="settings">Edit templates</a></div>
+      </div>
+      <div class="field">
+        <label>Workflow — from template</label>
+        <div class="wf-trail" style="padding:3px 0"><span class="wf-name">bugfix</span><span class="ws">reproduce</span>→<span class="ws">fix</span>→<span class="ws">validate</span><span>⟲</span>→<span class="ws">gate</span></div>
+        <div class="hint">sessions: <code>reproducer</code>, <code>coder</code> · validate → fix loops at most 3× before escalating to a gate · agent steps finish by writing <code>.ompire/outcome.json</code></div>
+      </div>
+      <div class="field">
+        <label for="slug">Task slug</label>
+        <input type="text" id="slug" class="mono" value="vlan-mtu-validation">
+        <div><span class="branch-preview">branch: bjornt/vlan-mtu-validation · off origin/master</span></div>
+        <div class="hint">clone → <code>~/tasks/maas/vlan-mtu-validation</code></div>
+      </div>
+      <div class="field">
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt" rows="9">Fabric VLANs accept any MTU value, including ones smaller than 68 or
+larger than the fabric's physical links can carry. Add validation:
+
+- reject MTU < 68 or > 9216 at the API layer with a clear error,
+- warn (not reject) when a VLAN MTU exceeds the lowest interface MTU
+  on any rack controller attached to that fabric,
+- regression tests for both paths.
+
+The API handlers live in src/maasserver/api/vlans.py.</textarea>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="model">Model override</label>
+          <select id="model"><option selected>template default (fable-5)</option><option>fable-5</option><option>haiku-4.5</option></select>
+        </div>
+        <div class="field">
+          <label for="think">Thinking</label>
+          <select id="think"><option selected>template default (medium)</option><option>low</option><option>medium</option><option>high</option></select>
+        </div>
+      </div>
+      <button class="btn btn-primary">Spawn agent</button>
+    </div>
+
+    <div class="panel">
+      <h2>Launching · maas/vlan-mtu-validation</h2>
+      <div class="pipeline">
+        <div class="pstep done">
+          <span class="marker">✓</span>
+          <div class="pbody">
+            <div class="ptitle">Fetch + clone <span class="ptime">2.4s</span></div>
+            <div class="pdetail mono" style="font-size:11px">git clone ~/proj/maas ~/tasks/maas/vlan-mtu-validation</div>
+          </div>
+        </div>
+        <div class="pstep active">
+          <span class="marker">2</span>
+          <div class="pbody">
+            <div class="ptitle">Workshop launch <span class="ptime">31s elapsed…</span></div>
+            <div class="pdetail">LXD container from workshop.yaml + my.yaml additions</div>
+            <div class="log-tail">launching container workshop-maas-vlan-mtu…
+mounting omp-home → ~/.omp
+tunnel 127.0.0.1:4000 → pi-auth-gateway
+<span class="cur">installing omp SDK…</span></div>
+          </div>
+        </div>
+        <div class="pstep pending">
+          <span class="marker">3</span>
+          <div class="pbody">
+            <div class="ptitle">Session ready · <span class="mono">reproducer</span></div>
+            <div class="pdetail mono" style="font-size:11px">workshop exec -- omp --mode rpc-ui -s ask.timeout=0</div>
+            <div class="pdetail">sessions spawn lazily — <span class="mono">coder</span> starts when the fix step first needs it</div>
+          </div>
+        </div>
+        <div class="pstep pending">
+          <span class="marker">4</span>
+          <div class="pbody">
+            <div class="ptitle">Step 1 prompted · reproduce</div>
+            <div class="pdetail">template preamble + step prompt (task description + outcome-file contract)</div>
+          </div>
+        </div>
+      </div>
+      <div class="hint" style="font-size:11px; color:var(--faint); margin-top:14px">
+        If a step fails, its stderr expands here and the task lands on the dashboard as <span class="pill t-interrupt hue-red" style="font-size:9.5px"><span class="d" style="animation:none"></span>failed</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== 3. task detail ==================== -->
+<section class="view" id="view-detail">
+  <div class="view-head">
+    <h1 class="mono" style="font-family:var(--mono)">maas / bjornt/fix-dhcp-races</h1>
+    <span class="spacer"></span>
+    <button class="btn btn-sm" data-goto="ship">Review / ship</button>
+    <button class="btn btn-sm btn-quiet">Archive</button>
+    <button class="btn btn-sm btn-quiet btn-danger-quiet">Kill</button>
+  </div>
+
+  <div class="status-strip">
+    <span class="pill t-notify hue-cyan"><span class="d"></span><span class="step">fix:</span>waiting-input</span>
+    <span class="reason-txt">reason: ask in flight — 1 question, 2m · session coder</span>
+    <span class="sep"></span>
+    <span class="m ctx-warn"><svg class="ring warn" viewBox="0 0 20 20"><circle class="track" cx="10" cy="10" r="8"/><circle class="arc" cx="10" cy="10" r="8" data-pct="83"/></svg>ctx 83%</span>
+    <span class="advisory">near limit<button class="btn btn-sm">Compact</button><button class="btn btn-sm">Handoff</button></span>
+    <span class="sep"></span>
+    <span class="m">2.1M tok · $6.40</span>
+    <span class="sep"></span>
+    <span class="m">fable-5 · think:high</span>
+  </div>
+
+  <div class="wf-strip" id="wfStrip">
+    <div class="wf-steps">
+      <button class="wf-step done" onclick="document.getElementById('wfStrip').classList.toggle('open')">
+        <span class="mark">✓</span>reproduce<span class="kind">agent</span><span class="sess">reproducer</span><span class="caret">▾ outcome</span>
+      </button>
+      <button class="wf-step cur"><span class="mark">2</span>fix<span class="kind">agent</span><span class="sess">coder</span></button>
+      <button class="wf-step"><span class="mark">3</span>validate<span class="kind">agent</span><span class="sess">reproducer</span></button>
+      <span class="wf-loop">⟲ fail → fix · max 3</span>
+      <button class="wf-step"><span class="mark">4</span>ship<span class="kind">gate</span></button>
+    </div>
+    <div class="wf-outcome"><span class="ohead">.ompire/outcome.json — written by reproduce · 13:58 · read by the daemon on agent_end</span>
+{ <span class="key">"status"</span>: <span class="str">"reproduced"</span>,
+  <span class="key">"summary"</span>: <span class="str">"lock-order inversion: rack notify path does OMAPI I/O before taking subnet_config_lock"</span>,
+  <span class="key">"repro"</span>: <span class="str">"pytest src/tests/test_dhcp.py -k race -x --count 200"</span>,
+  <span class="key">"expect"</span>: <span class="str">"≥1 failure on unfixed HEAD (observed 12/200)"</span> }</div>
+  </div>
+
+  <div class="detail-grid">
+    <div>
+      <div class="session-tabs">
+        <button class="session-tab on" data-sess="coder"><span class="sd"></span>coder</button>
+        <button class="session-tab s-idle" data-sess="reproducer"><span class="sd"></span>reproducer</button>
+        <span class="st-note">2 sessions · one container · shared clone</span>
+      </div>
+      <div class="transcript" id="tr-coder">
+        <div class="t-entry t-user">
+          <div class="t-role">workflow · step 2 (fix) <span class="t-time">14:02</span></div>
+          <div class="t-text"><p>The dhcpd notification loop races when two rack controllers update the same subnet — see the flaky <code>test_dhcp_notify_concurrent</code>. Find the race, fix it, and add a regression test that fails reliably on the old code.</p><p>Handoff from reproduce: <code>pytest src/tests/test_dhcp.py -k race -x --count 200</code> fails 12/200 on HEAD — lock-order inversion between the rack notify path and <code>configure_dhcp()</code>. Finish by writing <code>.ompire/outcome.json</code>.</p></div>
+        </div>
+
+        <div class="t-entry">
+          <div class="t-role">omp <span class="t-time">14:02</span></div>
+          <div class="thinking"><span class="t-label">thinking</span>The failure is in the notify path, so the race is likely between configure_dhcp() and the OMAPI update — need to see which locks each side takes and in what order.</div>
+
+          <div class="tool-card">
+            <div class="tool-head" onclick="this.parentElement.classList.toggle('open')">
+              <span class="tw">▶</span><span class="tname">grep</span><span class="targ">"omapi" src/maasserver/dhcp.py src/maasserver/rpc/</span><span class="tstat">14 matches</span>
+            </div>
+            <div class="tool-body">src/maasserver/dhcp.py:412:    omapi_key = get_omapi_key(rack)
+src/maasserver/dhcp.py:498:    _update_hosts_via_omapi(server, key, ...)
+src/maasserver/rpc/rackcontrollers.py:87: # omapi updates bypass the config lock</div>
+          </div>
+
+          <div class="tool-card open">
+            <div class="tool-head" onclick="this.parentElement.classList.toggle('open')">
+              <span class="tw">▶</span><span class="tname">edit</span><span class="targ">src/maasserver/dhcp.py</span><span class="tstat">+11 −3</span>
+            </div>
+            <div class="tool-body"><span class="del">-    def _update_hosts_via_omapi(server, key, hosts):</span>
+<span class="add">+    def _update_hosts_via_omapi(server, key, hosts):</span>
+<span class="add">+        # Take the subnet config lock *before* OMAPI I/O so the</span>
+<span class="add">+        # ordering matches configure_dhcp() (config → omapi).</span>
+<span class="add">+        with subnet_config_lock(server.subnet_id):</span></div>
+          </div>
+
+          <div class="subagent tool-card">
+            <div class="tool-head" onclick="this.parentElement.classList.toggle('open')">
+              <span class="tw">▶</span><span class="tname">subagent:Explore</span><span class="targ">locate every acquisition of subnet_config_lock</span><span class="tstat">done · 41s</span>
+            </div>
+            <div class="tool-body">3 call sites: dhcp.py:311 (configure), dhcp.py:501 (omapi, added),
+tests/factory.py:88 (fixture). Ordering consistent: config → omapi.</div>
+          </div>
+
+          <div class="tool-card">
+            <div class="tool-head" onclick="this.parentElement.classList.toggle('open')">
+              <span class="tw">▶</span><span class="tname">bash</span><span class="targ">pytest src/tests/test_dhcp.py -k race -x</span><span class="tstat">exit 0 · 200 runs</span>
+            </div>
+            <div class="tool-body">200 passed in 96.4s (was: 12 failures / 200 before fix)</div>
+          </div>
+
+          <div class="t-text"><p>The race: <code>configure_dhcp()</code> takes the subnet config lock and then talks OMAPI, while the rack-notify path did OMAPI I/O first and locked second — classic lock-order inversion. I now take <code>subnet_config_lock</code> before any OMAPI call in the notify path and added <code>test_dhcp_notify_lock_ordering</code>, which fails in 12/200 runs on the old code and 0/200 after the fix.</p><p>One scope question before I finish up:</p></div>
+
+          <!-- pending ask card -->
+          <div class="ask-card">
+            <div class="ask-head"><span class="d"></span>question — waiting on you · 2m</div>
+            <div class="ask-q">The dhcpd6 notification loop has the same inverted ordering, but the reproducer only covers v4. Apply the same lock ordering to dhcpd6?</div>
+            <div class="ask-opts">
+              <button class="ask-opt rec"><span class="k">1</span><span><span class="lab">Yes, both loops</span><span class="desc">Same two-line change; I'll extend the regression test to parametrize over v4/v6.</span></span></button>
+              <button class="ask-opt"><span class="k">2</span><span><span class="lab">v4 only</span><span class="desc">Keep this branch minimal; file a follow-up note for dhcpd6 in the PR body.</span></span></button>
+            </div>
+            <div class="ask-other">
+              <input type="text" placeholder="Other — free-text answer…">
+              <button class="btn">Send</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="transcript" id="tr-reproducer" style="display:none">
+        <div class="t-entry t-user">
+          <div class="t-role">workflow · step 1 (reproduce) <span class="t-time">13:44</span></div>
+          <div class="t-text"><p>Two rack controllers updating the same subnet make <code>test_dhcp_notify_concurrent</code> flake. Build the smallest reliable reproducer and confirm it fails on HEAD. Finish by writing <code>.ompire/outcome.json</code> with the repro command and the expected failure rate.</p></div>
+        </div>
+        <div class="t-entry">
+          <div class="t-role">omp <span class="t-time">13:58</span></div>
+          <div class="tool-card">
+            <div class="tool-head" onclick="this.parentElement.classList.toggle('open')">
+              <span class="tw">▶</span><span class="tname">bash</span><span class="targ">pytest src/tests/test_dhcp.py -k race -x --count 200</span><span class="tstat err">12 failures</span>
+            </div>
+            <div class="tool-body">12 failed, 188 passed in 94.8s — every failure is the same
+_update_hosts_via_omapi interleaving</div>
+          </div>
+          <div class="tool-card open">
+            <div class="tool-head" onclick="this.parentElement.classList.toggle('open')">
+              <span class="tw">▶</span><span class="tname">write</span><span class="targ">.ompire/outcome.json</span><span class="tstat">ok</span>
+            </div>
+            <div class="tool-body">{ "status": "reproduced",
+  "repro": "pytest src/tests/test_dhcp.py -k race -x --count 200",
+  "expect": "≥1 failure on unfixed HEAD (observed 12/200)" }</div>
+          </div>
+          <div class="t-text"><p>Reproduced reliably enough to gate on: 12/200 failures on HEAD, always the same lock-order interleaving. Outcome written — this session stays warm and picks the work back up at the validate step.</p></div>
+        </div>
+      </div>
+
+      <div class="composer">
+        <textarea rows="2" placeholder="Steer the agent — delivered mid-turn without interrupting…"></textarea>
+        <div class="composer-bar">
+          <div class="mode-seg">
+            <button class="on">steer</button>
+            <button>follow-up</button>
+            <button>interrupt + prompt</button>
+          </div>
+          <span class="note">turn in flight — steer delivers now, follow-up queues for after agent_end</span>
+          <button class="btn btn-primary btn-sm">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <aside class="meta-panel">
+      <div class="panel">
+        <h2>Todos · 2/5 <span style="font-weight:400;letter-spacing:0;text-transform:none">— coder</span></h2>
+        <ul class="todo-list">
+          <li class="done"><span class="tk">✓</span>Find the lock-order inversion</li>
+          <li class="done"><span class="tk">✓</span>Fix ordering in notify path</li>
+          <li class="act"><span class="tk">▸</span>Regression test (v6 pending answer)</li>
+          <li class="pend"><span class="tk">○</span>Run full dhcp suite</li>
+          <li class="pend"><span class="tk">○</span>Write .ompire/outcome.json</li>
+        </ul>
+      </div>
+      <div class="panel">
+        <h2>Task</h2>
+        <dl class="kv">
+          <dt>branch</dt><dd>bjornt/fix-dhcp-races</dd>
+          <dt>base</dt><dd>origin/master</dd>
+          <dt>clone</dt><dd>~/tasks/maas/fix-dhcp-races</dd>
+          <dt>workshop</dt><dd><span class="ok">running</span> · w-8f4b · up 1h 12m</dd>
+          <dt>workflow</dt><dd>bugfix · step 2/4 (fix)</dd>
+          <dt>sessions</dt><dd>coder — …races-coder.jsonl · <span class="ok">streaming</span><br>reproducer — …races-reproducer.jsonl · idle</dd>
+          <dt>spawned</dt><dd>13:43 · template maas</dd>
+        </dl>
+      </div>
+      <div class="panel">
+        <h2>Escape hatch</h2>
+        <div class="escape"><span class="p">$</span> cd ~/tasks/maas/fix-dhcp-races
+<span class="p">$</span> workshop shell
+<span class="p">$</span> omp --resume ~/.omp/sessions/\
+    2026-07-16-dhcp-races-coder.jsonl</div>
+        <div class="hint" style="font-size:11px;color:var(--faint);margin-top:6px">Same session files the daemon supervises — one per named session, pick the one you want to drive.</div>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<!-- ==================== 4. ship flow ==================== -->
+<section class="view" id="view-ship">
+  <div class="view-head">
+    <h1 class="mono" style="font-family:var(--mono)">Ship · llmvet / bjornt/comment-anchors</h1>
+    <span class="sub">the workflow's ship gate: review → commit → push/PR → cleanup</span>
+    <span class="spacer"></span>
+    <button class="mock-toggle" id="gpgToggle">mockup: simulate locked GPG key</button>
+  </div>
+
+  <div class="ship-wrap">
+    <div class="stepper">
+
+      <!-- review step: done -->
+      <div class="sstep done">
+        <div class="sstep-head">
+          <span class="snum">✓</span>
+          <span class="stitle">Review</span>
+          <span class="ssub">llmvet · approved after 2 iterations</span>
+          <span class="spacer"></span>
+          <a class="pr-link" href="#" onclick="return false">reopen 127.0.0.1:7183</a>
+        </div>
+        <div class="sstep-body">
+          <div class="iteration">
+            <span class="it-n">it 1</span>
+            <span>3 comments → sent to agent · agent addressed all, back to idle</span>
+            <span class="it-out">exit 0 · stdout: prompt</span>
+          </div>
+          <div class="iteration">
+            <span class="it-n">it 2</span>
+            <span class="ok">Approved</span>
+            <span class="it-out">exit 0 · stdout empty · full delta via reset dance, git state restored</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- commit step: current, with GPG-locked variant -->
+      <div class="sstep current" id="commitStep">
+        <div class="sstep-head">
+          <span class="snum">2</span>
+          <span class="stitle">Commit</span>
+          <span class="ssub">operator-authored · GPG-signed · agent checkpoints never ship as-is</span>
+        </div>
+        <div class="sstep-body">
+
+          <div class="gpg-banner">
+            <span class="icon">!</span>
+            <div>
+              <div class="gb-title">Signing key locked — commit blocked</div>
+              <div class="gb-text">The daemon has no pinentry surface. Warm the gpg-agent cache from any terminal, then re-check:</div>
+              <code>echo | gpg --clearsign -u 5A2D91C4 &gt;/dev/null</code>
+            </div>
+            <span style="flex:1"></span>
+            <button class="btn btn-sm">Re-check key</button>
+          </div>
+
+          <div class="radio-row">
+            <label><input type="radio" name="cmode" checked><span><strong>Squash</strong> <span class="rdesc">— one final commit for the task (default)</span></span></label>
+            <label><input type="radio" name="cmode"><span><strong>Retain</strong> <span class="rdesc">— keep agent's 6 commits, rewrite range: reset-author + sign each</span></span></label>
+          </div>
+
+          <div class="field">
+            <label for="cmsg">Commit message <span style="font-weight:400;color:var(--faint)">— drafted by the agent, edit freely</span></label>
+            <textarea id="cmsg" class="mono" rows="7">feat(review): anchor comments to diff hunks across rebases
+
+Comments were keyed on absolute file line numbers, so any rebase or
+follow-up commit orphaned them. Key them on (path, hunk header,
+offset-in-hunk) triples instead and re-resolve on render.
+
+Survives the reset dance: verified against a 3-commit rewrite of
+this branch itself.</textarea>
+          </div>
+          <div class="field-row">
+            <div class="field" style="flex:1.2">
+              <label for="prt">PR title</label>
+              <input type="text" id="prt" class="mono" value="Anchor review comments to diff hunks across rebases">
+            </div>
+          </div>
+          <div class="field">
+            <label for="prb">PR body</label>
+            <textarea id="prb" class="mono" rows="4">Fixes #78. Review comments now survive rebases and amended commits.
+
+- keys: (path, hunk header, offset) instead of absolute line
+- re-resolution happens at render time, stale anchors degrade to file-level</textarea>
+          </div>
+          <div class="card-actions commit-actions">
+            <button class="btn btn-primary">Sign &amp; commit</button>
+            <button class="btn btn-quiet">Re-draft via agent</button>
+            <span class="only-locked" style="font-size:11.5px;color:var(--amber);align-self:center">blocked until the key is unlocked</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- push/pr: pending -->
+      <div class="sstep pending">
+        <div class="sstep-head">
+          <span class="snum">3</span>
+          <span class="stitle">Push + PR</span>
+          <span class="ssub">host credentials only — push origin, then gh pr create</span>
+        </div>
+      </div>
+
+      <!-- cleanup: pending -->
+      <div class="sstep pending">
+        <div class="sstep-head">
+          <span class="snum">4</span>
+          <span class="stitle">Cleanup</span>
+          <span class="ssub">on merge: workshop remove + delete clone (confirmation required)</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ==================== 5. templates & settings ==================== -->
+<section class="view" id="view-settings">
+  <div class="view-head">
+    <h1>Templates &amp; settings</h1>
+    <span class="sub">what spawn needs, and how attention reaches you</span>
+  </div>
+
+  <div class="settings-grid">
+    <div>
+      <div class="panel" style="margin-bottom:16px">
+        <h2>Project templates</h2>
+        <div class="tpl-row editing">
+          <span class="tname">maas</span>
+          <span class="tmeta">~/proj/maas · master · bjornt/&lt;slug&gt; · fable-5 · wf:bugfix</span>
+          <button class="btn btn-sm">Editing…</button>
+        </div>
+        <div class="tpl-row">
+          <span class="tname">maas-code-reviewer</span>
+          <span class="tmeta">~/proj/maas-code-reviewer · main · bjornt/&lt;slug&gt; · fable-5 · wf:single-step</span>
+          <button class="btn btn-sm btn-quiet">Edit</button>
+        </div>
+        <div class="tpl-row">
+          <span class="tname">llmvet</span>
+          <span class="tmeta">~/proj/llmvet · main · bjornt/&lt;slug&gt; · haiku-4.5 · wf:single-step</span>
+          <button class="btn btn-sm btn-quiet">Edit</button>
+        </div>
+        <button class="btn btn-sm" style="margin-top:4px">New template</button>
+      </div>
+
+      <div class="panel">
+        <h2>Template · maas</h2>
+        <div class="field-row">
+          <div class="field">
+            <label for="t-path">Main checkout</label>
+            <input type="text" id="t-path" class="mono" value="~/proj/maas">
+          </div>
+          <div class="field">
+            <label for="t-remote">Real remote</label>
+            <input type="text" id="t-remote" class="mono" value="git+ssh://bjornt@git.launchpad.net/maas">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="t-base">Base branch</label>
+            <input type="text" id="t-base" class="mono" value="master">
+          </div>
+          <div class="field">
+            <label for="t-pattern">Branch pattern</label>
+            <input type="text" id="t-pattern" class="mono" value="bjornt/<slug>">
+          </div>
+        </div>
+        <div class="field">
+          <label for="t-wf">Workflow</label>
+          <select id="t-wf">
+            <option selected>bugfix — reproduce → fix → validate ⟲ → gate · sessions: reproducer, coder</option>
+            <option>single-step — one agent session, operator reviews from idle (default)</option>
+            <option>review-only — command steps only, no agent session</option>
+          </select>
+          <div class="hint">Workflows are Python in the daemon — the template only picks one. Agent steps end by writing <code>.ompire/outcome.json</code>; the LLM judge is a fallback when it's missing.</div>
+        </div>
+        <div class="field">
+          <label for="t-ws">Workshop additions</label>
+          <select id="t-ws">
+            <option selected>project workshop.my.yaml</option>
+            <option>global ~/.config/my-workshop/my.yaml</option>
+          </select>
+          <div class="hint">Injects omp SDK, omp-home mount, pi-auth-gateway tunnel.</div>
+        </div>
+        <div class="field">
+          <label for="t-flags">omp flags &amp; pins</label>
+          <input type="text" id="t-flags" class="mono" value="--mode rpc-ui -s ask.timeout=0 --model fable-5 --thinking medium">
+          <div class="hint"><code>ask.timeout=0</code> is pinned by the daemon regardless — unattended agents must never self-answer.</div>
+        </div>
+        <div class="field">
+          <label for="t-pre">Prompt preamble</label>
+          <textarea id="t-pre" class="mono" rows="4">You are working on MAAS (canonical/maas). Run tests with pytest from
+the repo root; never run the full suite unprompted — target the
+affected module. Follow the existing code style; no drive-by
+refactors. Commit checkpoints as you go.</textarea>
+        </div>
+        <div class="card-actions">
+          <button class="btn btn-primary">Save template</button>
+          <button class="btn btn-quiet">Discard changes</button>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel" style="margin-bottom:16px">
+        <h2>Notifications · per attention tier</h2>
+        <table class="tier-table">
+          <thead>
+            <tr><th>Tier</th><th>Desktop</th><th>Sound</th><th>Tab badge</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><span class="pill t-interrupt hue-red" style="font-size:9.5px"><span class="d" style="animation:none"></span>interrupt</span><span class="states">waiting-approval · failed</span></td>
+              <td><input type="checkbox" checked></td><td><input type="checkbox" checked></td><td><input type="checkbox" checked></td>
+            </tr>
+            <tr>
+              <td><span class="pill t-notify hue-cyan" style="font-size:9.5px"><span class="d"></span>notify</span><span class="states">waiting-input · gate · reviewing · stalled</span></td>
+              <td><input type="checkbox" checked></td><td><input type="checkbox"></td><td><input type="checkbox" checked></td>
+            </tr>
+            <tr>
+              <td><span class="pill t-badge" style="font-size:9.5px"><span class="d"></span>badge</span><span class="states">idle · retrying</span></td>
+              <td><input type="checkbox"></td><td><input type="checkbox"></td><td><input type="checkbox" checked></td>
+            </tr>
+            <tr>
+              <td><span class="pill t-silent" style="font-size:9.5px;padding-left:8px"><span class="d"></span>silent</span><span class="states">starting · working</span></td>
+              <td><input type="checkbox"></td><td><input type="checkbox"></td><td><input type="checkbox"></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="field" style="margin:14px 0 0">
+          <label for="renotify">Re-notify unanswered waiting-* states</label>
+          <select id="renotify" style="max-width:200px"><option>every 3 min</option><option selected>every 5 min</option><option>every 10 min</option><option>never</option></select>
+          <div class="hint">Attention ages — it doesn't fire once and scroll away.</div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-bottom:16px">
+        <h2>Watchdogs &amp; thresholds</h2>
+        <div class="field-row">
+          <div class="field">
+            <label for="stall">Stall watchdog</label>
+            <input type="text" id="stall" class="mono" value="10 min">
+            <div class="hint">working + no frames → stalled</div>
+          </div>
+          <div class="field">
+            <label for="ctxth">Context advisory</label>
+            <input type="text" id="ctxth" class="mono" value="80 %">
+            <div class="hint">suggest compact / handoff</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Daemon</h2>
+        <dl class="kv" style="margin-bottom:12px">
+          <dt>bind</dt><dd>127.0.0.1:7420</dd>
+          <dt>version</dt><dd>ompired 0.3.1 · omp 1.42.0</dd>
+          <dt>audit log</dt><dd>~/.local/share/ompire/audit.jsonl</dd>
+        </dl>
+        <div class="field">
+          <label for="tok">Auth token</label>
+          <div class="token-row">
+            <input type="text" id="tok" class="mono" value="ompire_tok_••••••••••••3f2a" readonly>
+            <button class="btn btn-sm">Copy</button>
+            <button class="btn btn-sm">Rotate</button>
+          </div>
+          <div class="hint">Required before any LAN exposure; rotating disconnects open UIs.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<script>
+// view switching
+const nav = document.getElementById('nav');
+function show(view) {
+  document.querySelectorAll('.view').forEach(v => v.classList.toggle('active', v.id === 'view-' + view));
+  nav.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+  window.scrollTo(0, 0);
+}
+nav.addEventListener('click', e => { const b = e.target.closest('button[data-view]'); if (b) show(b.dataset.view); });
+document.addEventListener('click', e => {
+  const g = e.target.closest('[data-goto]');
+  if (g) { e.preventDefault(); show(g.dataset.goto); }
+});
+
+// context rings
+document.querySelectorAll('.ring .arc').forEach(arc => {
+  const pct = parseFloat(arc.dataset.pct) || 0;
+  const c = 2 * Math.PI * 8;
+  arc.setAttribute('stroke-dasharray', (c * pct / 100).toFixed(2) + ' ' + c.toFixed(2));
+});
+
+// GPG lock simulation — flips global chrome chip + blocks the commit step
+document.getElementById('gpgToggle').addEventListener('click', function () {
+  document.body.classList.toggle('gpg-locked');
+  const locked = document.body.classList.contains('gpg-locked');
+  this.textContent = locked ? 'mockup: unlock GPG key' : 'mockup: simulate locked GPG key';
+  document.getElementById('commitStep').classList.toggle('blocked', locked);
+});
+
+// session transcript tabs (task detail)
+document.querySelectorAll('.session-tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.session-tab').forEach(b => b.classList.toggle('on', b === t));
+  document.getElementById('tr-coder').style.display = t.dataset.sess === 'coder' ? '' : 'none';
+  document.getElementById('tr-reproducer').style.display = t.dataset.sess === 'reproducer' ? '' : 'none';
+}));
+
+// attention badge in the tab title, per spec
+document.title = '(6) ompire — UI design';
+</script>
