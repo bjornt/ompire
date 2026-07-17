@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+:root {
+  --bg:#eef1f4; --surface:#ffffff; --surface2:#f3f6f8; --line:#d6dee4; --line-soft:#e3e9ee;
+  --text:#1f2b34; --muted:#5d6d7a; --faint:#8b98a3; --accent:#147c6b; --on-hue:#ffffff;
+  --red:#c8382e; --amber:#a06a08; --cyan:#146f9e; --violet:#6d4fd3; --green:#2c8642;
+  --shadow:0 1px 2px rgba(24,39,50,.06),0 2px 8px rgba(24,39,50,.05);
+  --mono:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,Consolas,monospace;
+  --sans:system-ui,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#0f1418; --surface:#151c22; --surface2:#1a232b; --line:#27333d; --line-soft:#1f2a33;
+    --text:#d5dee6; --muted:#8797a6; --faint:#5b6a77; --accent:#4fb3a1; --on-hue:#10161b;
+    --red:#f16a5f; --amber:#e6a23c; --cyan:#56b9e4; --violet:#a78bfa; --green:#63bd75; --shadow:none; }
+}
+:root[data-theme="light"] { --bg:#eef1f4; --surface:#ffffff; --surface2:#f3f6f8; --line:#d6dee4; --line-soft:#e3e9ee;
+  --text:#1f2b34; --muted:#5d6d7a; --faint:#8b98a3; --accent:#147c6b; --on-hue:#ffffff;
+  --red:#c8382e; --amber:#a06a08; --cyan:#146f9e; --violet:#6d4fd3; --green:#2c8642;
+  --shadow:0 1px 2px rgba(24,39,50,.06),0 2px 8px rgba(24,39,50,.05); }
+:root[data-theme="dark"] { --bg:#0f1418; --surface:#151c22; --surface2:#1a232b; --line:#27333d; --line-soft:#1f2a33;
+  --text:#d5dee6; --muted:#8797a6; --faint:#5b6a77; --accent:#4fb3a1; --on-hue:#10161b;
+  --red:#f16a5f; --amber:#e6a23c; --cyan:#56b9e4; --violet:#a78bfa; --green:#63bd75; --shadow:none; }
+* { box-sizing:border-box; }
+html { background:var(--bg); }
+body { margin:0; font:13px/1.5 var(--sans); color:var(--text); background:var(--bg); -webkit-font-smoothing:antialiased; }
+button { font:inherit; color:inherit; cursor:pointer; }
+a { color:var(--accent); text-decoration:none; }
+a:hover { text-decoration:underline; }
+:focus-visible { outline:2px solid var(--accent); outline-offset:1px; border-radius:3px; }
+input, select, textarea { width:100%; background:var(--surface2); color:var(--text); border:1px solid var(--line); border-radius:6px; padding:6px 9px; font:12.5px/1.5 var(--sans); }
+input:focus, select:focus, textarea:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+textarea { resize:vertical; }
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.25; } }
+@media (prefers-reduced-motion: reduce) { * { animation:none !important; } }
+</style>
+</helmet>
+
+<header data-screen-label="Spawn task" style="position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:16px;padding:0 20px;height:46px;background:var(--surface);border-bottom:1px solid var(--line)">
+  <div style="font-family:var(--mono);font-weight:700;font-size:14px;letter-spacing:.04em;display:flex;align-items:center;gap:8px;white-space:nowrap"><span style="width:18px;height:18px;border-radius:4px;background:var(--accent);color:var(--on-hue);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700">»</span>ompire</div>
+  <nav style="display:flex;gap:2px;flex:1;min-width:0;overflow-x:auto">
+    <a href="Tasks.dc.html" style="padding:5px 11px;color:var(--muted);font-size:12.5px;border-radius:6px;white-space:nowrap" style-hover="color:var(--text);background:var(--surface2);text-decoration:none">Tasks</a>
+    <a href="Projects.dc.html" style="padding:5px 11px;color:var(--muted);font-size:12.5px;border-radius:6px;white-space:nowrap" style-hover="color:var(--text);background:var(--surface2);text-decoration:none">Projects</a>
+    <a href="Spawn Task.dc.html" style="padding:5px 11px;color:var(--text);background:var(--surface2);font-weight:600;font-size:12.5px;border-radius:6px;white-space:nowrap" style-hover="text-decoration:none">Spawn task</a>
+    <a href="Ship Flow.dc.html" style="padding:5px 11px;color:var(--muted);font-size:12.5px;border-radius:6px;white-space:nowrap" style-hover="color:var(--text);background:var(--surface2);text-decoration:none">Ship flow</a>
+    <a href="Settings.dc.html" style="padding:5px 11px;color:var(--muted);font-size:12.5px;border-radius:6px;white-space:nowrap" style-hover="color:var(--text);background:var(--surface2);text-decoration:none">Templates &amp; settings</a>
+  </nav>
+  <div style="display:flex;align-items:center;gap:10px">
+    <span style="display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;padding:3px 9px;border-radius:20px;border:1px solid color-mix(in srgb,var(--red) 45%,transparent);background:color-mix(in srgb,var(--red) 12%,var(--surface));color:var(--red);font-weight:700;white-space:nowrap">6 need you</span>
+    <span style="display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;padding:3px 9px;border-radius:20px;border:1px solid var(--line);color:var(--muted);white-space:nowrap;background:var(--surface)"><span style="width:7px;height:7px;border-radius:50%;flex:none;background:var(--green)"></span>daemon</span>
+    <span style="display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;padding:3px 9px;border-radius:20px;border:1px solid var(--line);color:var(--muted);white-space:nowrap;background:var(--surface)"><span style="width:7px;height:7px;border-radius:50%;flex:none;background:var(--green)"></span>gpg 2h58m</span>
+  </div>
+</header>
+
+<main style="max-width:1240px;margin:0 auto;padding:20px 20px 80px">
+  <div style="display:flex;align-items:baseline;gap:14px;margin:6px 0 18px;flex-wrap:wrap">
+    <h1 style="font-size:17px;margin:0;font-weight:650;letter-spacing:-.01em">Spawn task</h1>
+    <span style="color:var(--muted);font-size:12.5px">template → clone → workshop → workflow (sessions spawn lazily)</span>
+  </div>
+
+  <div style="display:grid;grid-template-columns:minmax(380px,1fr) minmax(340px,460px);gap:20px;align-items:start">
+    <div style="background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px;box-shadow:var(--shadow)">
+      <h2 style="margin:0 0 14px;font-size:11px;font-family:var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--faint);font-weight:700">New task</h2>
+      <div style="margin-bottom:14px">
+        <label style="display:block;font-size:11.5px;font-weight:600;color:var(--muted);margin-bottom:4px">Project template</label>
+        <select>
+          <option selected="selected">maas — ~/proj/maas · base master · fable-5 · bugfix</option>
+          <option>maas-code-reviewer — ~/proj/maas-code-reviewer · base main · fable-5 · single-step</option>
+          <option>llmvet — ~/proj/llmvet · base main · haiku-4.5 · single-step</option>
+        </select>
+        <div style="font-size:11px;color:var(--faint);margin-top:4px">Preamble, workshop additions, omp pins and the workflow come from the template. <a href="Settings.dc.html">Edit templates</a></div>
+      </div>
+      <div style="margin-bottom:14px">
+        <label style="display:block;font-size:11.5px;font-weight:600;color:var(--muted);margin-bottom:4px">Workflow — from template</label>
+        <div style="font-family:var(--mono);font-size:10.5px;color:var(--faint);display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;padding:3px 0"><span style="color:var(--muted);font-weight:700">bugfix</span><span>reproduce</span>→<span>fix</span>→<span>validate</span><span>⟲</span>→<span>gate</span></div>
+        <div style="font-size:11px;color:var(--faint);margin-top:4px">sessions: <code style="font-family:var(--mono);font-size:10.5px">reproducer</code>, <code style="font-family:var(--mono);font-size:10.5px">coder</code> · validate → fix loops at most 3× before escalating to a gate · agent steps finish by writing <code style="font-family:var(--mono);font-size:10.5px">.ompire/outcome.json</code></div>
+      </div>
+      <div style="margin-bottom:14px">
+        <label style="display:block;font-size:11.5px;font-weight:600;color:var(--muted);margin-bottom:4px">Task slug</label>
+        <input type="text" value="vlan-mtu-validation" style="font-family:var(--mono);font-size:12px" />
+        <div><span style="font-family:var(--mono);font-size:11.5px;color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent);border-radius:4px;padding:2px 7px;display:inline-block;margin-top:5px">branch: bjornt/vlan-mtu-validation · off origin/master</span></div>
+        <div style="font-size:11px;color:var(--faint);margin-top:4px">clone → <code style="font-family:var(--mono);font-size:10.5px">~/tasks/maas/vlan-mtu-validation</code></div>
+      </div>
+      <div style="margin-bottom:14px">
+        <label style="display:block;font-size:11.5px;font-weight:600;color:var(--muted);margin-bottom:4px">Prompt</label>
+        <textarea rows="9" style="font-family:var(--mono);font-size:12px" defaultValue="Fabric VLANs accept any MTU value, including ones smaller than 68 or
+larger than the fabric's physical links can carry. Add validation:
+
+- reject MTU < 68 or > 9216 at the API layer with a clear error,
+- warn (not reject) when a VLAN MTU exceeds the lowest interface MTU
+  on any rack controller attached to that fabric,
+- regression tests for both paths.
+
+The API handlers live in src/maasserver/api/vlans.py."></textarea>
+      </div>
+      <div style="display:flex;gap:12px">
+        <div style="margin-bottom:14px;flex:1">
+          <label style="display:block;font-size:11.5px;font-weight:600;color:var(--muted);margin-bottom:4px">Model override</label>
+          <select><option selected="selected">template default (fable-5)</option><option>fable-5</option><option>haiku-4.5</option></select>
+        </div>
+        <div style="margin-bottom:14px;flex:1">
+          <label style="display:block;font-size:11.5px;font-weight:600;color:var(--muted);margin-bottom:4px">Thinking</label>
+          <select><option selected="selected">template default (medium)</option><option>low</option><option>medium</option><option>high</option></select>
+        </div>
+      </div>
+      <button style="border:1px solid var(--accent);background:var(--accent);border-radius:6px;padding:4px 11px;font-size:12px;color:var(--on-hue);font-weight:600;line-height:1.5;white-space:nowrap" style-hover="filter:brightness(1.08)">Spawn agent</button>
+    </div>
+
+    <div style="background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px;box-shadow:var(--shadow)">
+      <h2 style="margin:0 0 14px;font-size:11px;font-family:var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--faint);font-weight:700">Launching · maas/vlan-mtu-validation</h2>
+      <div style="display:flex;flex-direction:column">
+
+        <div style="display:flex;gap:12px;position:relative;padding-bottom:18px">
+          <span style="position:absolute;left:9px;top:22px;bottom:2px;width:2px;background:var(--line-soft)"></span>
+          <span style="width:20px;height:20px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;font-weight:700;border:2px solid var(--green);color:var(--on-hue);background:var(--green);position:relative;z-index:1">✓</span>
+          <div style="flex:1;min-width:0;padding-top:1px">
+            <div style="font-weight:600;font-size:12.5px;display:flex;gap:8px;align-items:baseline">Fetch + clone <span style="font-family:var(--mono);font-size:10.5px;color:var(--faint);font-weight:400">2.4s</span></div>
+            <div style="font-size:11px;color:var(--muted);margin-top:2px;font-family:var(--mono)">git clone ~/proj/maas ~/tasks/maas/vlan-mtu-validation</div>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:12px;position:relative;padding-bottom:18px">
+          <span style="position:absolute;left:9px;top:22px;bottom:2px;width:2px;background:var(--line-soft)"></span>
+          <span style="width:20px;height:20px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;font-weight:700;border:2px solid var(--accent);color:var(--accent);background:var(--surface);position:relative;z-index:1"><span style="position:absolute;inset:-6px;border-radius:50%;border:2px solid color-mix(in srgb,var(--accent) 40%,transparent);animation:pulse 1.4s ease-in-out infinite"></span>2</span>
+          <div style="flex:1;min-width:0;padding-top:1px">
+            <div style="font-weight:600;font-size:12.5px;display:flex;gap:8px;align-items:baseline">Workshop launch <span style="font-family:var(--mono);font-size:10.5px;color:var(--accent);font-weight:400">31s elapsed…</span></div>
+            <div style="font-size:11.5px;color:var(--muted);margin-top:2px">LXD container from workshop.yaml + my.yaml additions</div>
+            <div style="font-family:var(--mono);font-size:10.5px;line-height:1.6;color:var(--faint);background:var(--surface2);border:1px solid var(--line-soft);border-radius:5px;padding:6px 9px;margin-top:7px;white-space:pre;overflow-x:auto">launching container workshop-maas-vlan-mtu…
+mounting omp-home → ~/.omp
+tunnel 127.0.0.1:4000 → pi-auth-gateway
+<span style="color:var(--text)">installing omp SDK…</span></div>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:12px;position:relative;padding-bottom:18px">
+          <span style="position:absolute;left:9px;top:22px;bottom:2px;width:2px;background:var(--line-soft)"></span>
+          <span style="width:20px;height:20px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;font-weight:700;border:2px solid var(--line);color:var(--faint);background:var(--surface);position:relative;z-index:1">3</span>
+          <div style="flex:1;min-width:0;padding-top:1px">
+            <div style="font-weight:500;font-size:12.5px;display:flex;gap:8px;align-items:baseline;color:var(--faint)">Session ready · <span style="font-family:var(--mono)">reproducer</span></div>
+            <div style="font-size:11px;color:var(--muted);margin-top:2px;font-family:var(--mono)">workshop exec -- omp --mode rpc-ui -s ask.timeout=0</div>
+            <div style="font-size:11.5px;color:var(--muted);margin-top:2px">sessions spawn lazily — <span style="font-family:var(--mono)">coder</span> starts when the fix step first needs it</div>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:12px;position:relative">
+          <span style="width:20px;height:20px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-size:10px;font-weight:700;border:2px solid var(--line);color:var(--faint);background:var(--surface);position:relative;z-index:1">4</span>
+          <div style="flex:1;min-width:0;padding-top:1px">
+            <div style="font-weight:500;font-size:12.5px;display:flex;gap:8px;align-items:baseline;color:var(--faint)">Step 1 prompted · reproduce</div>
+            <div style="font-size:11.5px;color:var(--muted);margin-top:2px">template preamble + step prompt (task description + outcome-file contract)</div>
+          </div>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--faint);margin-top:14px">
+        If a step fails, its stderr expands here and the task lands on the dashboard as <span style="display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:9.5px;font-weight:700;letter-spacing:.05em;padding:2px 8px;border-radius:4px;white-space:nowrap;line-height:1.6;background:var(--red);color:var(--on-hue)"><span style="width:6px;height:6px;border-radius:50%;flex:none;background:var(--on-hue)"></span>failed</span>
+      </div>
+    </div>
+  </div>
+</main>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;auto&quot;,&quot;light&quot;,&quot;dark&quot;],&quot;default&quot;:&quot;auto&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Chrome&quot;}}">
+class Component extends DCLogic {
+  applyTheme() {
+    const t = this.props.theme ?? 'auto';
+    if (t === 'auto') delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = t;
+  }
+  componentDidMount() { this.applyTheme(); document.title = '(6) ompire — Spawn task'; }
+  componentDidUpdate() { this.applyTheme(); }
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>
