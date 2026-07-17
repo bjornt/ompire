@@ -1,6 +1,6 @@
 # SPEC: ompire
 
-An agent fleet manager for oh-my-pi (omp + umpire: watches the agents play,
+An agent task manager for oh-my-pi (omp + umpire: watches the agents play,
 doesn't play itself, makes the calls).
 
 Status: draft — decisions are captured as they are made; open questions at the bottom.
@@ -55,9 +55,9 @@ approval (`hasUI` is only set for interactive and `rpc-ui` modes,
 
 The RPC surface (documented in `docs/rpc.md`, types in
 `packages/coding-agent/src/modes/rpc/rpc-types.ts`) covers exactly what the
-fleet manager needs and the alternatives don't:
+task manager needs and the alternatives don't:
 
-- **Fleet status:** `get_state` returns `isStreaming`, `queuedMessageCount`,
+- **Task status:** `get_state` returns `isStreaming`, `queuedMessageCount`,
   todos, context usage, model; `get_session_stats` returns token/message
   counts. Session events (`agent_start`/`agent_end`, tool execution,
   message deltas) stream on stdout.
@@ -87,7 +87,7 @@ Accepted trade-offs:
   permission requests (no raw tool input / file locations). Rendering rich
   diff/approve cards may require parsing or upstream changes.
 - Process-per-agent means the manager owns process supervision
-  (spawn/restart/stdio plumbing) — acceptable, a fleet manager wants that
+  (spawn/restart/stdio plumbing) — acceptable, a task manager wants that
   layer anyway, and it buys crash isolation and per-agent cwd/env.
 
 ### Considered alternatives
@@ -150,7 +150,7 @@ interrupting), and a local relay can be self-hosted.
 - **Pros:** the "render an omp session in a browser" problem is already
   solved here — valuable prior art or embeddable per-session view.
 - **Cons:** it is a guest view onto a TUI-hosted session, not an
-  orchestrator: no spawning, no fleet state, host process still required per
+  orchestrator: no spawning, no aggregate task state, host process still required per
   session.
 - **Verdict:** not the integration mechanism, but study its session
   rendering before building the per-agent view from scratch.
@@ -199,7 +199,7 @@ small tray helper that talks to the daemon.
 ```
 
 - UI is stateless; the daemon is the source of truth. On connect the browser
-  gets a fleet snapshot plus recent events from a per-agent ring buffer,
+  gets a task snapshot plus recent events from a per-agent ring buffer,
   then live deltas over WebSocket. REST for commands (spawn, kill, prompt,
   answer approval), WebSocket for events.
 - Session files are the archive; the daemon persists only registry +
@@ -334,7 +334,7 @@ doesn't fire once and scroll away).
 - Context usage crossing a threshold (~80%): suggest compact/handoff.
 - Cost/token accumulation from throttled stats.
 
-### Fleet event vocabulary (daemon → UI)
+### Task event vocabulary (daemon → UI)
 
 - `status_changed {agent, from, to, reason}`
 - `attention {agent, kind, payload}` / `attention_cleared {agent}`
@@ -426,7 +426,8 @@ refs and objects. The clone instead:
 **Decision:** A per-project template in the daemon's config defines
 everything "spawn" needs:
 
-- main checkout path + real remote URL,
+- the project it runs against (checkout path and push/PR remotes come
+  from the project — Decision 9),
 - base branch and branch naming pattern (e.g. `bjornt/<slug>`),
 - workshop additions source (project `workshop.my.yaml` or the global
   `~/.config/my-workshop/my.yaml`),
@@ -516,7 +517,8 @@ dance.
    Commit message and PR title/body are drafted by asking the agent over
    RPC (it has full task context) and are operator-editable in the
    dashboard before anything is pushed.
-2. **Push + PR:** daemon pushes the branch to the real remote and runs
+2. **Push + PR:** daemon pushes the branch to the project's fork (or upstream when no
+   fork is configured) and runs
    `gh pr create` — host credentials only, per Decision 5's boundary. PR
    URL is stored in the registry and shown on the task card.
 3. **Cleanup:** daemon polls PR state; on merge, `workshop remove` + delete
@@ -642,6 +644,20 @@ mostly `command` steps with no agent session at all.
 
 ---
 
+## Decision 9: Projects are first-class
+
+**Decision:** A **project** is its own registry entity, managed in the UI:
+a short `name` (the id shown on task cards), a human-readable `title`, an
+**upstream git URL** (where PRs land), and an optional **fork URL** (the
+operator's personal repo). Branches push to the fork when one is set and
+PRs are opened against upstream from it; when the operator owns upstream,
+the fork is omitted and branches push straight to upstream. Templates
+(Decision 6) reference a project by name instead of embedding
+checkout/remote details; the main checkout path is derived per project.
+Removing a project is guarded while tasks reference it.
+
+---
+
 ## Web app views
 
 The screen inventory for the browser UI. Global elements first, then one
@@ -657,7 +673,7 @@ entry per view: purpose, key content, key actions.
 - **GPG lock indicator**: signing key cached/locked, with the unlock
   instruction (terminal helper) when locked.
 
-### 1. Fleet dashboard (home)
+### 1. Tasks (home)
 
 The "which agents need me" view — the reason the product exists.
 
@@ -675,7 +691,17 @@ The "which agents need me" view — the reason the product exists.
 - Actions: open task, spawn task, quick-answer an ask question inline if
   it fits (single-select), review/ship an idle task, kill/cleanup a task.
 
-### 2. Spawn task
+### 2. Projects
+
+Manage the repo pairs tasks run against (Decision 9).
+
+- One entry per project: name, title, upstream URL, fork URL (or "you own
+  upstream — no fork"), active-task count linking to a filtered Tasks
+  view.
+- Actions: create project (name, title, upstream, optional fork), edit
+  (name rename guarded — referenced by tasks), remove with confirmation.
+
+### 3. Spawn task
 
 Template-driven task creation; must make launch latency visible.
 
@@ -686,7 +712,7 @@ Template-driven task creation; must make launch latency visible.
   prompt sent) with per-step status, since workshop launch takes tens of
   seconds. Fail states surface stderr.
 
-### 3. Task detail (focused session)
+### 4. Task detail (focused session)
 
 Live view of one task; rendered from the raw omp event passthrough.
 
@@ -710,7 +736,7 @@ Live view of one task; rendered from the raw omp event passthrough.
 - Actions: review/ship, kill, archive; jump to review view when
   `reviewing`.
 
-### 4. Ship flow (review → commit → PR)
+### 5. Ship flow (review → commit → PR)
 
 A stepper attached to a task; llmvet itself opens in its own tab (the
 daemon runs it and links its URL — this view wraps the loop around it).
@@ -726,7 +752,7 @@ daemon runs it and links its URL — this view wraps the loop around it).
 - **Cleanup step**: post-merge status, cleanup action (workshop remove +
   delete clone) with confirmation.
 
-### 5. Templates & settings
+### 6. Templates & settings
 
 - Template CRUD: checkout path, remote, base branch, branch pattern,
   workshop additions source, omp flags/model defaults, prompt preamble.
@@ -735,7 +761,7 @@ daemon runs it and links its URL — this view wraps the loop around it).
 
 ### UI design (2026-07-15)
 
-High-fidelity mockups of all five views:
+High-fidelity mockups of the views:
 <https://claude.ai/code/artifact/bf6a574e-ad7e-410d-8e22-69538f749e8a>
 
 Design language: a terminal-native operations console (dense, monospace
@@ -763,6 +789,10 @@ a `gate` card shows loop-exhaustion escalation; task detail gains the
 workflow strip (expandable step outcomes) and per-session transcript tabs;
 spawn shows the template's workflow and lazy session startup; templates
 gain the workflow field; `gate` joins the notify tier.
+
+Updated 2026-07-16 again: "Fleet" is renamed "Tasks" throughout the UI,
+and projects are first-class (Decision 9) with their own management view —
+six views total.
 
 ---
 
