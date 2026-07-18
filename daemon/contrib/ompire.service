@@ -1,0 +1,13 @@
+[Unit]
+Description=ompire daemon
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/proj/ompire/daemon
+ExecStart=/usr/bin/env uv run ompire-daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
