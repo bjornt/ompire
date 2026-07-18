@@ -214,7 +214,8 @@ small tray helper that talks to the daemon.
 ## Decision 3: Daemon language — Python
 
 **Decision:** The daemon is Python 3.12+ (`asyncio`; FastAPI or Starlette
-for REST + WebSockets; Pydantic for validated frames; stdlib `sqlite3`).
+for REST + WebSockets; Pydantic for validated frames; SQLite via
+SQLAlchemy Core — no ORM — with Alembic for schema migrations).
 The browser frontend remains TypeScript/React — unavoidable, but it is the
 untrusted presentation side; all sensitive logic (process spawning,
 approval relay, auth, audit) lives in the daemon.
