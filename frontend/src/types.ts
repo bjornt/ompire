@@ -4,17 +4,38 @@ export interface Project {
   upstream_url: string;
   fork_url: string | null;
   checkout_path: string;
+  base_branch: string;
+  branch_pattern: string;
 }
 
-/** Placeholder shape — the daemon has no task entity yet (ROADMAP chunk 3). */
-export interface TaskRecord {
-  id: string;
-  [key: string]: unknown;
+export type TaskState = "created" | "failed" | "archived";
+
+export interface Task {
+  id: number;
+  project_name: string;
+  slug: string;
+  branch: string;
+  clone_path: string;
+  state: TaskState;
+  prompt: string;
+  error: string | null;
+  spawn_completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type SpawnStepName = "fetch" | "clone" | "branch";
+
+export interface SpawnStepPayload {
+  task_id: number;
+  step: SpawnStepName;
+  status: "started" | "ok" | "failed";
+  stderr?: string;
 }
 
 export interface SnapshotPayload {
   projects: Project[];
-  tasks: TaskRecord[];
+  tasks: Task[];
 }
 
 export interface Envelope<T = unknown> {

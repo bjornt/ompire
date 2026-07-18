@@ -2,6 +2,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { DaemonProvider } from "./lib/daemonSocket";
 import { Chrome } from "./components/Chrome";
 import { TasksView } from "./routes/TasksView";
+import { SpawnView } from "./routes/SpawnView";
 import { StubPage } from "./routes/StubPage";
 
 export function App() {
@@ -14,7 +15,7 @@ export function App() {
             <Route path="/tasks" element={<TasksView />} />
             <Route path="/tasks/:id" element={<StubPage title="Task detail" />} />
             <Route path="/projects" element={<StubPage title="Projects" />} />
-            <Route path="/spawn" element={<StubPage title="Spawn task" />} />
+            <Route path="/spawn" element={<SpawnView />} />
             <Route path="/ship" element={<StubPage title="Ship flow" />} />
             <Route path="/settings" element={<StubPage title="Templates & settings" />} />
           </Route>

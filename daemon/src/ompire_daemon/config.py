@@ -13,8 +13,18 @@ DEFAULT_BIND = "127.0.0.1"
 DEFAULT_DATA_DIR = Path("~/.local/share/ompire").expanduser()
 DEFAULT_TASK_DIR_ROOT = Path("~/tasks").expanduser()
 DEFAULT_CHECKOUT_ROOT = Path("~/proj").expanduser()
+DEFAULT_BRANCH_PATTERN = "ompire/<slug>"
+DEFAULT_SPAWN_STEP_TIMEOUT = 120
 
-_KNOWN_KEYS = {"port", "bind", "data_dir", "task_dir_root", "checkout_root"}
+_KNOWN_KEYS = {
+    "port",
+    "bind",
+    "data_dir",
+    "task_dir_root",
+    "checkout_root",
+    "default_branch_pattern",
+    "spawn_step_timeout",
+}
 
 
 class ConfigError(Exception):
@@ -28,6 +38,8 @@ class Config:
     data_dir: Path = DEFAULT_DATA_DIR
     task_dir_root: Path = DEFAULT_TASK_DIR_ROOT
     checkout_root: Path = DEFAULT_CHECKOUT_ROOT
+    default_branch_pattern: str = DEFAULT_BRANCH_PATTERN
+    spawn_step_timeout: int = DEFAULT_SPAWN_STEP_TIMEOUT
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -69,12 +81,26 @@ def load_config(path: Path | None = None) -> Config:
     task_dir_root = _path_value(data, "task_dir_root", DEFAULT_TASK_DIR_ROOT)
     checkout_root = _path_value(data, "checkout_root", DEFAULT_CHECKOUT_ROOT)
 
+    default_branch_pattern = data.get("default_branch_pattern", DEFAULT_BRANCH_PATTERN)
+    if not isinstance(default_branch_pattern, str):
+        raise ConfigError(
+            f"config key 'default_branch_pattern' must be a string, got {default_branch_pattern!r}"
+        )
+
+    spawn_step_timeout = data.get("spawn_step_timeout", DEFAULT_SPAWN_STEP_TIMEOUT)
+    if not isinstance(spawn_step_timeout, int) or isinstance(spawn_step_timeout, bool):
+        raise ConfigError(
+            f"config key 'spawn_step_timeout' must be an integer, got {spawn_step_timeout!r}"
+        )
+
     return Config(
         port=port,
         bind=bind,
         data_dir=data_dir,
         task_dir_root=task_dir_root,
         checkout_root=checkout_root,
+        default_branch_pattern=default_branch_pattern,
+        spawn_step_timeout=spawn_step_timeout,
     )
 
 

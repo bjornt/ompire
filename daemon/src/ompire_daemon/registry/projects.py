@@ -9,9 +9,11 @@ from pathlib import Path
 from sqlalchemy import Engine
 from sqlalchemy.exc import IntegrityError
 
-from ompire_daemon.db import projects
+from ompire_daemon.db import projects, tasks
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+# Everything but the <slug> placeholder must be safe in a git ref name.
+_BRANCH_PATTERN_SAFE_RE = re.compile(r"^[A-Za-z0-9._/-]*$")
 
 
 class InvalidSlugError(ValueError):
@@ -33,9 +35,20 @@ class ProjectNotFoundError(Exception):
 
 
 class ProjectHasReferencingTasksError(Exception):
-    def __init__(self, name: str) -> None:
-        super().__init__(f"project {name!r} has tasks referencing it")
+    def __init__(self, name: str, task_labels: list[str] | None = None) -> None:
+        detail = f": {', '.join(task_labels)}" if task_labels else ""
+        super().__init__(f"project {name!r} has tasks referencing it{detail}")
         self.name = name
+        self.task_labels = task_labels or []
+
+
+class InvalidBranchPatternError(ValueError):
+    def __init__(self, pattern: str) -> None:
+        super().__init__(
+            f"invalid branch pattern {pattern!r}: must contain exactly one <slug> "
+            "placeholder and otherwise only git-ref-safe characters (A-Za-z0-9._/-)"
+        )
+        self.pattern = pattern
 
 
 @dataclass(frozen=True)
@@ -45,11 +58,20 @@ class Project:
     upstream_url: str
     fork_url: str | None
     checkout_path: str
+    base_branch: str
+    branch_pattern: str
 
 
 def validate_slug(name: str) -> None:
     if not _SLUG_RE.match(name):
         raise InvalidSlugError(name)
+
+
+def validate_branch_pattern(pattern: str) -> None:
+    if pattern.count("<slug>") != 1:
+        raise InvalidBranchPatternError(pattern)
+    if not _BRANCH_PATTERN_SAFE_RE.match(pattern.replace("<slug>", "")):
+        raise InvalidBranchPatternError(pattern)
 
 
 def _row_to_project(row) -> Project:  # noqa: ANN001
@@ -59,6 +81,8 @@ def _row_to_project(row) -> Project:  # noqa: ANN001
         upstream_url=row.upstream_url,
         fork_url=row.fork_url,
         checkout_path=row.checkout_path,
+        base_branch=row.base_branch,
+        branch_pattern=row.branch_pattern,
     )
 
 
@@ -84,10 +108,15 @@ def create_project(
     upstream_url: str,
     fork_url: str | None = None,
     checkout_path: str | None = None,
+    base_branch: str = "main",
+    branch_pattern: str | None = None,
+    default_branch_pattern: str,
     default_checkout_root: Path,
 ) -> Project:
     validate_slug(name)
     resolved_checkout_path = checkout_path or str(default_checkout_root / name)
+    resolved_branch_pattern = branch_pattern or default_branch_pattern
+    validate_branch_pattern(resolved_branch_pattern)
     try:
         with engine.begin() as conn:
             conn.execute(
@@ -97,6 +126,8 @@ def create_project(
                     upstream_url=upstream_url,
                     fork_url=fork_url,
                     checkout_path=resolved_checkout_path,
+                    base_branch=base_branch,
+                    branch_pattern=resolved_branch_pattern,
                 )
             )
     except IntegrityError as exc:
@@ -112,7 +143,10 @@ def update_project(
     upstream_url: str,
     fork_url: str | None,
     checkout_path: str,
+    base_branch: str,
+    branch_pattern: str,
 ) -> Project:
+    validate_branch_pattern(branch_pattern)
     with engine.begin() as conn:
         result = conn.execute(
             projects.update()
@@ -122,6 +156,8 @@ def update_project(
                 upstream_url=upstream_url,
                 fork_url=fork_url,
                 checkout_path=checkout_path,
+                base_branch=base_branch,
+                branch_pattern=branch_pattern,
             )
         )
         if result.rowcount == 0:
@@ -129,16 +165,23 @@ def update_project(
     return get_project(engine, name)
 
 
-def _has_referencing_tasks(engine: Engine, name: str) -> bool:
-    # Removal-guard hook: the tasks table doesn't exist yet, so nothing can
-    # reference this project. add-task-spawn-clone replaces this body with a
-    # real query against the tasks table.
-    return False
+def _referencing_task_labels(engine: Engine, name: str) -> list[str]:
+    # Any referencing row blocks removal, archived included: purging archived
+    # tasks (DELETE /api/tasks/{id}) is the way to unblock. Keeps the FK honest.
+    with engine.connect() as conn:
+        rows = conn.execute(
+            tasks.select()
+            .with_only_columns(tasks.c.slug, tasks.c.state)
+            .where(tasks.c.project_name == name)
+            .order_by(tasks.c.id)
+        ).all()
+    return [f"{name}/{row.slug} ({row.state})" for row in rows]
 
 
 def delete_project(engine: Engine, name: str) -> None:
-    if _has_referencing_tasks(engine, name):
-        raise ProjectHasReferencingTasksError(name)
+    labels = _referencing_task_labels(engine, name)
+    if labels:
+        raise ProjectHasReferencingTasksError(name, labels)
     with engine.begin() as conn:
         result = conn.execute(projects.delete().where(projects.c.name == name))
         if result.rowcount == 0:

@@ -17,6 +17,7 @@ from sqlalchemy import Engine
 from ompire_daemon.auth import check_ws_token
 from ompire_daemon.events import EventHub
 from ompire_daemon.registry.projects import list_projects
+from ompire_daemon.registry.tasks import list_tasks
 
 router = APIRouter()
 
@@ -50,7 +51,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     seq = itertools.count()
     projects_payload = [asdict(p) for p in list_projects(engine)]
-    await _send_envelope(websocket, next(seq), "snapshot", {"projects": projects_payload, "tasks": []})
+    tasks_payload = [asdict(t) for t in list_tasks(engine)]
+    await _send_envelope(
+        websocket, next(seq), "snapshot", {"projects": projects_payload, "tasks": tasks_payload}
+    )
 
     queue = events.subscribe()
     forwarder = asyncio.create_task(_forward_events(websocket, queue, seq))

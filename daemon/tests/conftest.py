@@ -17,8 +17,9 @@ def daemon_config(tmp_path: Path) -> Config:
 
 
 @pytest.fixture
-def app(daemon_config: Config):
-    return create_app(daemon_config)
+def app(daemon_config: Config, tmp_path: Path):
+    # Point at a nonexistent dist so tests don't depend on a real frontend build.
+    return create_app(daemon_config, frontend_dist=tmp_path / "no-dist")
 
 
 @pytest.fixture
@@ -28,9 +29,40 @@ def auth_token(app) -> str:
 
 @pytest.fixture
 def client(app) -> TestClient:
-    return TestClient(app)
+    # Context-managed so one event loop lives for the whole test: background
+    # jobs started by request handlers (the spawn pipeline) keep running.
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 @pytest.fixture
 def auth_headers(auth_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {auth_token}"}
+
+
+@pytest.fixture
+def git_checkout(tmp_path: Path) -> Path:
+    """A real project checkout with an `origin` remote and a committed `main`."""
+    import subprocess
+
+    def git(*args: str, cwd: Path) -> None:
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+        )
+
+    upstream = tmp_path / "upstream.git"
+    upstream.mkdir()
+    git("init", "--bare", "--initial-branch=main", ".", cwd=upstream)
+
+    checkout = tmp_path / "proj" / "demo"
+    checkout.mkdir(parents=True)
+    git("init", "--initial-branch=main", ".", cwd=checkout)
+    (checkout / "README.md").write_text("demo\n")
+    git("add", "README.md", cwd=checkout)
+    git("commit", "-m", "initial", cwd=checkout)
+    git("remote", "add", "origin", str(upstream), cwd=checkout)
+    git("push", "origin", "main", cwd=checkout)
+    return checkout

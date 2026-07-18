@@ -7,7 +7,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlalchemy import Column, Engine, MetaData, String, Table, create_engine, event
+from sqlalchemy import (
+    Column,
+    Engine,
+    ForeignKey,
+    Index,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    create_engine,
+    event,
+    text,
+)
 
 metadata = MetaData()
 
@@ -19,6 +32,32 @@ projects = Table(
     Column("upstream_url", String, nullable=False),
     Column("fork_url", String, nullable=True),
     Column("checkout_path", String, nullable=False),
+    Column("base_branch", String, nullable=False, server_default="main"),
+    Column("branch_pattern", String, nullable=False, server_default="ompire/<slug>"),
+)
+
+tasks = Table(
+    "tasks",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("project_name", String, ForeignKey("projects.name"), nullable=False),
+    Column("slug", String, nullable=False),
+    Column("branch", String, nullable=False),
+    Column("clone_path", String, nullable=False),
+    Column("state", String, nullable=False),
+    Column("prompt", Text, nullable=False),
+    Column("error", Text, nullable=True),
+    Column("spawn_completed_at", String, nullable=True),
+    Column("created_at", String, nullable=False),
+    Column("updated_at", String, nullable=False),
+    # A slug is reusable after archive; uniqueness applies to live rows only.
+    Index(
+        "uq_tasks_live_project_slug",
+        "project_name",
+        "slug",
+        unique=True,
+        sqlite_where=text("state != 'archived'"),
+    ),
 )
 
 

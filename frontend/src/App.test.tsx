@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -58,7 +58,6 @@ describe("App", () => {
 
     for (const [label, title] of [
       ["Projects", "Projects"],
-      ["Spawn task", "Spawn task"],
       ["Ship flow", "Ship flow"],
       ["Templates & settings", "Templates & settings"],
     ] as const) {
@@ -68,5 +67,16 @@ describe("App", () => {
       const navLink = screen.getByRole("link", { name: label });
       expect(navLink.className).toContain("navLinkActive");
     }
+  });
+
+  it("renders the real Spawn view (not a stub) inside chrome", async () => {
+    await renderAppWithEmptySnapshot();
+    const user = userEvent.setup();
+
+    const header = screen.getByTestId("chrome-header");
+    await user.click(within(header).getByRole("link", { name: "Spawn task" }));
+    expect(await screen.findByTestId("spawn-form")).toBeInTheDocument();
+    expect(screen.queryByTestId("stub-page")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chrome-header")).toBeInTheDocument();
   });
 });

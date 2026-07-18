@@ -35,8 +35,9 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
                 text("SELECT name FROM sqlite_master WHERE type='table'")
             )
         }
-    assert version == "0001"
+    assert version == "0002"
     assert "projects" in tables
+    assert "tasks" in tables
 
 
 def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
@@ -58,7 +59,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0001"
+    assert version == "0002"
     assert row == "demo"
 
 
