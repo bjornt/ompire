@@ -1,5 +1,6 @@
 design/ds-bundle/
 node_modules/
+.pnpm-store/
 .workshop.lock
 __pycache__/
 *.pyc

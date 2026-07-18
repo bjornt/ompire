@@ -52,6 +52,23 @@ journalctl --user -u ompire -f
 The auth token lives at `<data_dir>/token` (default
 `~/.local/share/ompire/token`) — `cat` it once to paste into the frontend.
 
+## Building and serving the frontend
+
+The daemon serves `frontend/dist/` at `/` when it exists (falling back to a
+placeholder page otherwise; API routes always take precedence). Build it
+from the `frontend/` project:
+
+```sh
+cd frontend
+pnpm install
+pnpm build
+```
+
+Then visit `http://127.0.0.1:<port>/?token=<the token from <data_dir>/token>`
+once — the frontend stashes the token in `localStorage` and strips it from
+the URL. For local development against `pnpm dev` instead (a separate origin
+from the daemon), set `VITE_OMPIRE_TOKEN` in `frontend/.env.local`.
+
 ## Configuration
 
 Optional file at `~/.config/ompire/config.toml`. All keys are optional; the

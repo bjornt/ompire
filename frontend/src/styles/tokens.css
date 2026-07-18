@@ -1,0 +1,84 @@
+/* Design tokens ported verbatim from design/handoff/README.md and the
+   .dc.html mockups. Do not hand-tune values here — update the source of
+   truth first, then re-port. */
+
+:root {
+  --bg: #eef1f4;
+  --surface: #ffffff;
+  --surface2: #f3f6f8;
+  --line: #d6dee4;
+  --line-soft: #e3e9ee;
+  --text: #1f2b34;
+  --muted: #5d6d7a;
+  --faint: #8b98a3;
+  --accent: #147c6b;
+  --on-hue: #ffffff;
+  --red: #c8382e;
+  --amber: #a06a08;
+  --cyan: #146f9e;
+  --violet: #6d4fd3;
+  --green: #2c8642;
+  --shadow: 0 1px 2px rgba(24, 39, 50, 0.06), 0 2px 8px rgba(24, 39, 50, 0.05);
+
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1418;
+    --surface: #151c22;
+    --surface2: #1a232b;
+    --line: #27333d;
+    --line-soft: #1f2a33;
+    --text: #d5dee6;
+    --muted: #8797a6;
+    --faint: #5b6a77;
+    --accent: #4fb3a1;
+    --on-hue: #10161b;
+    --red: #f16a5f;
+    --amber: #e6a23c;
+    --cyan: #56b9e4;
+    --violet: #a78bfa;
+    --green: #63bd75;
+    --shadow: none;
+  }
+}
+
+:root[data-theme="light"] {
+  --bg: #eef1f4;
+  --surface: #ffffff;
+  --surface2: #f3f6f8;
+  --line: #d6dee4;
+  --line-soft: #e3e9ee;
+  --text: #1f2b34;
+  --muted: #5d6d7a;
+  --faint: #8b98a3;
+  --accent: #147c6b;
+  --on-hue: #ffffff;
+  --red: #c8382e;
+  --amber: #a06a08;
+  --cyan: #146f9e;
+  --violet: #6d4fd3;
+  --green: #2c8642;
+  --shadow: 0 1px 2px rgba(24, 39, 50, 0.06), 0 2px 8px rgba(24, 39, 50, 0.05);
+}
+
+:root[data-theme="dark"] {
+  --bg: #0f1418;
+  --surface: #151c22;
+  --surface2: #1a232b;
+  --line: #27333d;
+  --line-soft: #1f2a33;
+  --text: #d5dee6;
+  --muted: #8797a6;
+  --faint: #5b6a77;
+  --accent: #4fb3a1;
+  --on-hue: #10161b;
+  --red: #f16a5f;
+  --amber: #e6a23c;
+  --cyan: #56b9e4;
+  --violet: #a78bfa;
+  --green: #63bd75;
+  --shadow: none;
+}
