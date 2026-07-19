@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 DEFAULT_CONFIG_PATH = Path("~/.config/ompire/config.toml").expanduser()
@@ -20,6 +20,9 @@ DEFAULT_MY_WORKSHOP_COMMAND = ("my-workshop",)
 # and cold starts are slower still, so this is deliberately much larger than
 # the git-step timeout.
 DEFAULT_WORKSHOP_STEP_TIMEOUT = 600
+# Ready handshake covers container-side omp startup; the spike saw ~1.6s.
+DEFAULT_AGENT_READY_TIMEOUT = 30
+DEFAULT_AGENT_RING_BUFFER_SIZE = 1000
 
 _KNOWN_KEYS = {
     "port",
@@ -31,6 +34,9 @@ _KNOWN_KEYS = {
     "spawn_step_timeout",
     "my_workshop_command",
     "workshop_step_timeout",
+    "agent_env",
+    "agent_ready_timeout",
+    "agent_ring_buffer_size",
 }
 
 
@@ -49,6 +55,11 @@ class Config:
     spawn_step_timeout: int = DEFAULT_SPAWN_STEP_TIMEOUT
     my_workshop_command: tuple[str, ...] = DEFAULT_MY_WORKSHOP_COMMAND
     workshop_step_timeout: int = DEFAULT_WORKSHOP_STEP_TIMEOUT
+    # Injected verbatim into agent children (design D-3): the daemon does not
+    # know what a credential is, it forwards what the operator configured.
+    agent_env: dict[str, str] = field(default_factory=dict)
+    agent_ready_timeout: int = DEFAULT_AGENT_READY_TIMEOUT
+    agent_ring_buffer_size: int = DEFAULT_AGENT_RING_BUFFER_SIZE
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -123,6 +134,35 @@ def load_config(path: Path | None = None) -> Config:
             f"config key 'workshop_step_timeout' must be an integer, got {workshop_step_timeout!r}"
         )
 
+    agent_env = data.get("agent_env", {})
+    if not isinstance(agent_env, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in agent_env.items()
+    ):
+        raise ConfigError(
+            f"config key 'agent_env' must be a table of string values, got {agent_env!r}"
+        )
+
+    agent_ready_timeout = data.get("agent_ready_timeout", DEFAULT_AGENT_READY_TIMEOUT)
+    if (
+        not isinstance(agent_ready_timeout, int)
+        or isinstance(agent_ready_timeout, bool)
+        or agent_ready_timeout <= 0
+    ):
+        raise ConfigError(
+            f"config key 'agent_ready_timeout' must be a positive integer, got {agent_ready_timeout!r}"
+        )
+
+    agent_ring_buffer_size = data.get("agent_ring_buffer_size", DEFAULT_AGENT_RING_BUFFER_SIZE)
+    if (
+        not isinstance(agent_ring_buffer_size, int)
+        or isinstance(agent_ring_buffer_size, bool)
+        or agent_ring_buffer_size <= 0
+    ):
+        raise ConfigError(
+            f"config key 'agent_ring_buffer_size' must be a positive integer, "
+            f"got {agent_ring_buffer_size!r}"
+        )
+
     return Config(
         port=port,
         bind=bind,
@@ -133,6 +173,9 @@ def load_config(path: Path | None = None) -> Config:
         spawn_step_timeout=spawn_step_timeout,
         my_workshop_command=my_workshop_command,
         workshop_step_timeout=workshop_step_timeout,
+        agent_env=agent_env,
+        agent_ready_timeout=agent_ready_timeout,
+        agent_ring_buffer_size=agent_ring_buffer_size,
     )
 
 

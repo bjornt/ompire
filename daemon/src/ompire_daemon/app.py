@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.api.rest import router as api_router
 from ompire_daemon.api.ws import router as ws_router
 from ompire_daemon.auth import load_or_create_token
@@ -28,6 +29,7 @@ def create_app(config: Config, *, frontend_dist: Path = DEFAULT_FRONTEND_DIST) -
     app.state.auth_token = load_or_create_token(config.data_dir)
     app.state.events = EventHub()
     app.state.spawn_jobs = set()
+    app.state.agents = AgentSupervisor(config, app.state.events)
 
     # Before any snapshot is served: spawns interrupted by a daemon death are dead.
     reconcile_interrupted_spawns(app.state.engine)

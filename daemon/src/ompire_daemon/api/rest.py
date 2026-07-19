@@ -11,9 +11,16 @@ from sqlalchemy import Engine
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, field_validator
 
+from ompire_daemon.agent import (
+    AgentAlreadyRunningError,
+    AgentStartError,
+    AgentSupervisor,
+    NoLiveAgentError,
+)
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
+from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.registry.projects import (
     DuplicateProjectError,
     InvalidBranchPatternError,
@@ -303,6 +310,76 @@ async def cleanup_task_route(
     archived = mark_archived(engine, task_id)
     events.publish("task_updated", asdict(archived))
     return archived
+
+
+# --- Provisional agent control surface (design D-7) ---------------------------
+# Scaffolding so this chunk is dogfoodable: thin calls into the supervisor, no
+# registry writes. Chunk 7's state machine supersedes start/prompt as the way
+# agents get started; stop likely survives.
+
+
+def _supervisor(request: Request) -> AgentSupervisor:
+    return request.app.state.agents
+
+
+def _require_task(engine: Engine, task_id: int) -> Task:
+    try:
+        return get_task(engine, task_id)
+    except TaskNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+
+class AgentPromptBody(BaseModel):
+    message: str
+
+
+@router.post("/tasks/{task_id}/agent/start")
+async def start_agent_route(
+    task_id: int,
+    engine: Engine = Depends(_engine),
+    supervisor: AgentSupervisor = Depends(_supervisor),
+) -> dict[str, object]:
+    task = _require_task(engine, task_id)
+    try:
+        await supervisor.start(task.id, task.clone_path)
+    except AgentAlreadyRunningError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except AgentStartError as exc:
+        detail = str(exc) if not exc.stderr else f"{exc}\n{exc.stderr}"
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail) from exc
+    return {"task_id": task_id, "agent": "running"}
+
+
+@router.post("/tasks/{task_id}/agent/prompt")
+async def prompt_agent_route(
+    task_id: int,
+    body: AgentPromptBody,
+    engine: Engine = Depends(_engine),
+    supervisor: AgentSupervisor = Depends(_supervisor),
+) -> dict[str, object]:
+    _require_task(engine, task_id)
+    handle = supervisor.get(task_id)
+    if handle is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, f"task {task_id} has no live agent")
+    try:
+        # The returned frame is omp's receipt ack ("queued"), not completion.
+        return await handle.prompt(body.message)
+    except (RequestFailedError, AgentGoneError) as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+
+
+@router.post("/tasks/{task_id}/agent/stop")
+async def stop_agent_route(
+    task_id: int,
+    engine: Engine = Depends(_engine),
+    supervisor: AgentSupervisor = Depends(_supervisor),
+) -> dict[str, object]:
+    _require_task(engine, task_id)
+    try:
+        await supervisor.stop(task_id)
+    except NoLiveAgentError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    return {"task_id": task_id, "agent": "stopped"}
 
 
 @router.delete("/tasks/{task_id}")
