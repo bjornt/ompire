@@ -68,6 +68,7 @@ class Task:
     state: str
     prompt: str
     error: str | None
+    workshop_id: str | None
     spawn_completed_at: str | None
     created_at: str
     updated_at: str
@@ -106,6 +107,7 @@ def _row_to_task(row) -> Task:  # noqa: ANN001
         state=row.state,
         prompt=row.prompt,
         error=row.error,
+        workshop_id=row.workshop_id,
         spawn_completed_at=row.spawn_completed_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -134,6 +136,7 @@ def create_task(
                     state="created",
                     prompt=prompt,
                     error=None,
+                    workshop_id=None,
                     spawn_completed_at=None,
                     created_at=now,
                     updated_at=now,
@@ -171,6 +174,10 @@ def _update(engine: Engine, task_id: int, **values) -> Task:  # noqa: ANN003
 
 def mark_spawn_completed(engine: Engine, task_id: int) -> Task:
     return _update(engine, task_id, spawn_completed_at=_now_iso())
+
+
+def mark_workshop_launched(engine: Engine, task_id: int, workshop_id: str) -> Task:
+    return _update(engine, task_id, workshop_id=workshop_id)
 
 
 def mark_failed(engine: Engine, task_id: int, error: str) -> Task:

@@ -15,6 +15,11 @@ DEFAULT_TASK_DIR_ROOT = Path("~/tasks").expanduser()
 DEFAULT_CHECKOUT_ROOT = Path("~/proj").expanduser()
 DEFAULT_BRANCH_PATTERN = "ompire/<slug>"
 DEFAULT_SPAWN_STEP_TIMEOUT = 120
+DEFAULT_MY_WORKSHOP_COMMAND = ("my-workshop",)
+# Workshop launch includes SDK installs; the spike measured 7.34s warm-cache
+# and cold starts are slower still, so this is deliberately much larger than
+# the git-step timeout.
+DEFAULT_WORKSHOP_STEP_TIMEOUT = 600
 
 _KNOWN_KEYS = {
     "port",
@@ -24,6 +29,8 @@ _KNOWN_KEYS = {
     "checkout_root",
     "default_branch_pattern",
     "spawn_step_timeout",
+    "my_workshop_command",
+    "workshop_step_timeout",
 }
 
 
@@ -40,6 +47,8 @@ class Config:
     checkout_root: Path = DEFAULT_CHECKOUT_ROOT
     default_branch_pattern: str = DEFAULT_BRANCH_PATTERN
     spawn_step_timeout: int = DEFAULT_SPAWN_STEP_TIMEOUT
+    my_workshop_command: tuple[str, ...] = DEFAULT_MY_WORKSHOP_COMMAND
+    workshop_step_timeout: int = DEFAULT_WORKSHOP_STEP_TIMEOUT
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -93,6 +102,27 @@ def load_config(path: Path | None = None) -> Config:
             f"config key 'spawn_step_timeout' must be an integer, got {spawn_step_timeout!r}"
         )
 
+    my_workshop_command = data.get("my_workshop_command")
+    if my_workshop_command is None:
+        my_workshop_command = DEFAULT_MY_WORKSHOP_COMMAND
+    elif (
+        not isinstance(my_workshop_command, list)
+        or not my_workshop_command
+        or not all(isinstance(part, str) for part in my_workshop_command)
+    ):
+        raise ConfigError(
+            f"config key 'my_workshop_command' must be a non-empty list of strings, "
+            f"got {my_workshop_command!r}"
+        )
+    else:
+        my_workshop_command = tuple(my_workshop_command)
+
+    workshop_step_timeout = data.get("workshop_step_timeout", DEFAULT_WORKSHOP_STEP_TIMEOUT)
+    if not isinstance(workshop_step_timeout, int) or isinstance(workshop_step_timeout, bool):
+        raise ConfigError(
+            f"config key 'workshop_step_timeout' must be an integer, got {workshop_step_timeout!r}"
+        )
+
     return Config(
         port=port,
         bind=bind,
@@ -101,6 +131,8 @@ def load_config(path: Path | None = None) -> Config:
         checkout_root=checkout_root,
         default_branch_pattern=default_branch_pattern,
         spawn_step_timeout=spawn_step_timeout,
+        my_workshop_command=my_workshop_command,
+        workshop_step_timeout=workshop_step_timeout,
     )
 
 

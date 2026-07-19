@@ -42,6 +42,7 @@ from ompire_daemon.registry.tasks import (
     validate_task_slug,
 )
 from ompire_daemon.spawn import run_spawn_pipeline
+from ompire_daemon.workshop import WorkshopRemoveError, remove_workshop, workshop_status
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_bearer_token)])
 
@@ -197,6 +198,7 @@ class TaskOut(BaseModel):
     state: str
     prompt: str
     error: str | None
+    workshop_id: str | None
     spawn_completed_at: str | None
     created_at: str
     updated_at: str
@@ -209,12 +211,19 @@ def list_tasks_route(engine: Engine = Depends(_engine)) -> list[Task]:
     return list_tasks(engine)
 
 
-@router.get("/tasks/{task_id}", response_model=TaskOut)
-def get_task_route(task_id: int, engine: Engine = Depends(_engine)) -> Task:
+class TaskDetailOut(TaskOut):
+    # Derived on demand from the workshop CLI, never persisted (design D-3).
+    workshop_status: str | None
+
+
+@router.get("/tasks/{task_id}", response_model=TaskDetailOut)
+async def get_task_route(task_id: int, engine: Engine = Depends(_engine)) -> TaskDetailOut:
     try:
-        return get_task(engine, task_id)
+        task = get_task(engine, task_id)
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    derived_status = await workshop_status(task.clone_path) if task.workshop_id else None
+    return TaskDetailOut(**asdict(task), workshop_status=derived_status)
 
 
 @router.post("/tasks", response_model=TaskOut, status_code=status.HTTP_202_ACCEPTED)
@@ -258,7 +267,7 @@ async def spawn_task_route(
 
 
 @router.post("/tasks/{task_id}/cleanup", response_model=TaskOut)
-def cleanup_task_route(
+async def cleanup_task_route(
     task_id: int,
     engine: Engine = Depends(_engine),
     config: Config = Depends(_config),
@@ -276,8 +285,20 @@ def cleanup_task_route(
             status.HTTP_409_CONFLICT,
             f"refusing to delete {clone_path}: outside task root {task_root}",
         )
+
+    # Tear down the container before deleting the clone under it (design D-4);
+    # an already-gone workshop is fine, any other failure aborts un-archived.
+    if task.workshop_id is not None:
+        try:
+            await remove_workshop(str(clone_path), config.workshop_step_timeout)
+        except WorkshopRemoveError as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                f"workshop remove failed; clone retained:\n{exc.stderr}",
+            ) from exc
+
     # Idempotent: a missing directory is already cleaned up.
-    shutil.rmtree(clone_path, ignore_errors=True)
+    await asyncio.to_thread(shutil.rmtree, clone_path, ignore_errors=True)
 
     archived = mark_archived(engine, task_id)
     events.publish("task_updated", asdict(archived))

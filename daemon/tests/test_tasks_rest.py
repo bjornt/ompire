@@ -131,6 +131,48 @@ def test_cleanup_deletes_clone_and_is_idempotent(
     assert second.json()["state"] == "archived"
 
 
+def test_spawn_records_workshop_id(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    task = _spawn(client, auth_headers)
+    settled = _wait_settled(client, auth_headers, task["id"])
+    assert settled["workshop_id"] == "ws-test"
+
+
+def test_detail_reports_workshop_status(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    task = _spawn(client, auth_headers)
+    _wait_settled(client, auth_headers, task["id"])
+
+    detail = client.get(f"/api/tasks/{task['id']}", headers=auth_headers).json()
+    # The autouse fake workshop CLI exits 0 for `info`.
+    assert detail["workshop_status"] == "present"
+
+
+def test_cleanup_aborts_when_workshop_remove_fails(
+    client: TestClient, auth_headers: dict, demo_project: dict, fake_workshop_cli: Path
+) -> None:
+    task = _spawn(client, auth_headers)
+    settled = _wait_settled(client, auth_headers, task["id"])
+    clone = Path(settled["clone_path"])
+
+    fake_workshop_cli.write_text('#!/bin/sh\necho "lxd exploded" >&2\nexit 1\n')
+    response = client.post(f"/api/tasks/{task['id']}/cleanup", headers=auth_headers)
+    assert response.status_code == 502
+    assert "lxd exploded" in response.json()["detail"]
+    assert clone.is_dir()
+    refreshed = client.get(f"/api/tasks/{task['id']}", headers=auth_headers).json()
+    assert refreshed["state"] == "created"
+
+    # Repairing the tool lets cleanup complete.
+    fake_workshop_cli.write_text("#!/bin/sh\nexit 0\n")
+    retried = client.post(f"/api/tasks/{task['id']}/cleanup", headers=auth_headers)
+    assert retried.status_code == 200
+    assert retried.json()["state"] == "archived"
+    assert not clone.exists()
+
+
 def test_cleanup_refuses_path_outside_task_root(
     app, client: TestClient, auth_headers: dict, demo_project: dict, tmp_path: Path
 ) -> None:

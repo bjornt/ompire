@@ -100,6 +100,7 @@ const task = {
   state: "created" as const,
   prompt: "fix it",
   error: null,
+  workshop_id: null,
   spawn_completed_at: null,
   created_at: "2026-07-18T00:00:00Z",
   updated_at: "2026-07-18T00:00:00Z",

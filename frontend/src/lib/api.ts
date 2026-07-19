@@ -1,4 +1,4 @@
-import type { Task } from "../types";
+import type { Task, TaskDetail } from "../types";
 import { getDaemonToken } from "./token";
 
 /** Minimal authenticated REST client. Commands go over REST, events come
@@ -38,4 +38,8 @@ export function spawnTask(input: {
 
 export function cleanupTask(id: number): Promise<Task> {
   return request<Task>("POST", `/api/tasks/${id}/cleanup`);
+}
+
+export function getTaskDetail(id: number): Promise<TaskDetail> {
+  return request<TaskDetail>("GET", `/api/tasks/${id}`);
 }

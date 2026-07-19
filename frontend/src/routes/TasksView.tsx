@@ -23,8 +23,11 @@ function TaskCard({ task }: { task: Task }) {
   const pillLabel = spawning ? "spawning" : task.state;
 
   async function onCleanup() {
+    const workshopLine = task.workshop_id
+      ? `\n…and removes the workshop container:\n${task.workshop_id}`
+      : "";
     const confirmed = window.confirm(
-      `Clean up ${task.project_name}/${task.slug}?\n\nThis deletes the clone directory:\n${task.clone_path}`,
+      `Clean up ${task.project_name}/${task.slug}?\n\nThis deletes the clone directory:\n${task.clone_path}${workshopLine}`,
     );
     if (!confirmed) return;
     await cleanupTask(task.id);
@@ -44,7 +47,9 @@ function TaskCard({ task }: { task: Task }) {
           {pillLabel}
         </span>
       </div>
-      <div className="cardBranch">{task.branch}</div>
+      <Link className="cardBranch" to={`/tasks/${task.id}`} data-testid={`task-link-${task.id}`}>
+        {task.branch}
+      </Link>
       {failed && task.error && (
         <>
           <button

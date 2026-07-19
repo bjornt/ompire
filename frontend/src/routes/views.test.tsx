@@ -47,6 +47,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     state: "created",
     prompt: "fix it",
     error: null,
+    workshop_id: null,
     spawn_completed_at: "2026-07-18T00:01:00Z",
     created_at: "2026-07-18T00:00:00Z",
     updated_at: "2026-07-18T00:01:00Z",
@@ -113,6 +114,7 @@ describe("SpawnView", () => {
     expect([...steps].map((s) => s.getAttribute("data-step-status"))).toEqual([
       "ok",
       "running",
+      "pending",
       "pending",
     ]);
   });
@@ -212,5 +214,56 @@ describe("TasksView cards", () => {
     });
     expect(screen.queryByTestId("task-card-1")).not.toBeInTheDocument();
     expect(screen.getByTestId("tasks-empty-state")).toBeInTheDocument();
+  });
+
+  it("cleanup confirmation names the workshop container when one is recorded", async () => {
+    await renderAt("/tasks", { projects: [project], tasks: [makeTask({ workshop_id: "ws-maas-fix-bug" })] });
+    const user = userEvent.setup();
+    vi.stubGlobal("fetch", vi.fn());
+
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await user.click(screen.getByRole("button", { name: "Clean up" }));
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining("ws-maas-fix-bug"));
+  });
+});
+
+describe("TaskDetailView", () => {
+  function stubDetailFetch(detail: unknown) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(detail) }),
+    );
+  }
+
+  it("renders the metadata panel with derived workshop status", async () => {
+    const task = makeTask({ workshop_id: "ws-maas-fix-bug" });
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", { projects: [project], tasks: [task] });
+
+    const meta = await screen.findByTestId("task-metadata");
+    expect(meta).toHaveTextContent("bjornt/fix-bug");
+    expect(meta).toHaveTextContent("/home/op/tasks/maas/fix-bug");
+    expect(screen.getByTestId("workshop-status")).toHaveTextContent("present · ws-maas-fix-bug");
+  });
+
+  it("shows escape-hatch commands with the task's clone path", async () => {
+    const task = makeTask({ workshop_id: "ws-maas-fix-bug" });
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", { projects: [project], tasks: [task] });
+
+    const hatch = await screen.findByTestId("escape-hatch");
+    expect(hatch).toHaveTextContent("cd /home/op/tasks/maas/fix-bug");
+    expect(hatch).toHaveTextContent("workshop shell");
+    expect(hatch).toHaveTextContent("omp --resume");
+  });
+
+  it("task cards link to the detail route", async () => {
+    const task = makeTask({ workshop_id: "ws-maas-fix-bug" });
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks", { projects: [project], tasks: [task] });
+    const user = userEvent.setup();
+
+    await user.click(screen.getByTestId("task-link-1"));
+    expect(await screen.findByTestId("task-metadata")).toBeInTheDocument();
   });
 });

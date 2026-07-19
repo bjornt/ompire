@@ -9,6 +9,7 @@ const PIPELINE_STEPS: { name: SpawnStepName; label: string; detail: (task: Task)
   { name: "fetch", label: "Fetch", detail: (t) => `git fetch origin (project ${t.project_name})` },
   { name: "clone", label: "Clone", detail: (t) => `git clone → ${t.clone_path}` },
   { name: "branch", label: "Branch", detail: (t) => `${t.branch} off origin base` },
+  { name: "workshop", label: "Workshop", detail: () => "my-workshop: container + SDKs (can take a while)" },
 ];
 
 type StepStatus = "pending" | "running" | "ok" | "failed";
@@ -57,7 +58,7 @@ export function SpawnView() {
     <>
       <div className="headerRow">
         <h1>Spawn task</h1>
-        <span className="subline">clone → branch (containers and agents come in later chunks)</span>
+        <span className="subline">clone → branch → workshop container (agents come in later chunks)</span>
       </div>
 
       <div className="spawnGrid">

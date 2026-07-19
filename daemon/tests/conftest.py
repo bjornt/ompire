@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -7,12 +8,35 @@ from ompire_daemon.app import create_app
 from ompire_daemon.config import Config
 
 
+@pytest.fixture(autouse=True)
+def fake_workshop_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Shadow any real `workshop` binary with a benign fake on PATH.
+
+    Defaults to success for every subcommand; tests overwrite the script to
+    exercise absent/error paths. Autouse so no test can ever touch real
+    containers.
+    """
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    script = bin_dir / "workshop"
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    return script
+
+
 @pytest.fixture
 def daemon_config(tmp_path: Path) -> Config:
+    # A fake my-workshop so pipelines can complete without real containers;
+    # individual tests override my_workshop_command to exercise failure modes.
+    fake_my_workshop = tmp_path / "fake-my-workshop"
+    fake_my_workshop.write_text('#!/bin/sh\necho "ws-test" > .workshop.lock\n')
+    fake_my_workshop.chmod(0o755)
     return Config(
         data_dir=tmp_path / "data",
         task_dir_root=tmp_path / "tasks",
         checkout_root=tmp_path / "proj",
+        my_workshop_command=(str(fake_my_workshop),),
     )
 
 

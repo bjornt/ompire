@@ -19,12 +19,20 @@ export interface Task {
   state: TaskState;
   prompt: string;
   error: string | null;
+  workshop_id: string | null;
   spawn_completed_at: string | null;
   created_at: string;
   updated_at: string;
 }
 
-export type SpawnStepName = "fetch" | "clone" | "branch";
+export type WorkshopStatus = "present" | "absent" | "unknown";
+
+/** GET /api/tasks/:id — the derived status is only computed on detail fetches. */
+export interface TaskDetail extends Task {
+  workshop_status: WorkshopStatus | null;
+}
+
+export type SpawnStepName = "fetch" | "clone" | "branch" | "workshop";
 
 export interface SpawnStepPayload {
   task_id: number;
