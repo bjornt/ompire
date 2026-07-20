@@ -41,13 +41,57 @@ export interface SpawnStepPayload {
   stderr?: string;
 }
 
-/** SPEC Decision 4 core subset; later chunks add waiting/reviewing/etc. */
-export type SessionStatus = "starting" | "working" | "idle" | "failed";
+/** SPEC Decision 4: core subset plus the `ask-approvals` waiting states;
+ * later chunks add reviewing/stalled/retrying/etc. */
+export type SessionStatus =
+  | "starting"
+  | "working"
+  | "idle"
+  | "failed"
+  | "waiting-input"
+  | "waiting-approval";
+
+/** Normalized pending-question payload (ask-approvals capability, design
+ * D-4): `kind` distinguishes an `ask` question from an approval gate; only
+ * `ask` questions carry structured `questions`. */
+export type PendingQuestionKind = "ask" | "approval";
+
+export interface PendingOption {
+  value: string;
+  label: string;
+  description: string | null;
+}
+
+export interface PendingAskQuestion {
+  prompt: string;
+  options: PendingOption[];
+  multi: boolean;
+  recommended: string | null;
+  allowsOther: boolean;
+}
+
+export interface PendingQuestion {
+  id: string;
+  kind: PendingQuestionKind;
+  questions: PendingAskQuestion[];
+}
 
 export interface SessionInfo {
   status: SessionStatus;
   reason: string;
   since: string;
+  /** Present while the session is `waiting-input` / `waiting-approval`. */
+  question?: PendingQuestion;
+}
+
+export interface QuestionPostedPayload {
+  task_id: number;
+  question: PendingQuestion;
+}
+
+export interface QuestionResolvedPayload {
+  task_id: number;
+  question_id: string;
 }
 
 /** GET /api/tasks/:id/agent/state — the agent's `get_state` `data`, passed

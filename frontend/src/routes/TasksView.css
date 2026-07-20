@@ -281,3 +281,56 @@
 .cleanupButton:hover {
   border-color: var(--line);
 }
+
+/* --- Inline quick-answer (ask-approvals capability) --- */
+
+.quickAnswer {
+  border: 1px solid color-mix(in srgb, var(--cyan) 30%, var(--line));
+  background: color-mix(in srgb, var(--cyan) 5%, var(--surface));
+  border-radius: 6px;
+  padding: 9px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.quickAnswerPrompt {
+  font-size: 12.5px;
+}
+
+.quickAnswerOptions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.quickAnswerOption {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: 5px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.quickAnswerOption:hover {
+  border-color: var(--cyan);
+}
+
+.quickAnswerOption:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.recommendedTag {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--cyan);
+  font-weight: 700;
+  margin-left: 4px;
+}
+
+.quickAnswerDefer {
+  font-size: 12px;
+  color: var(--muted);
+}

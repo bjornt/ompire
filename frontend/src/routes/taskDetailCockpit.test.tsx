@@ -213,6 +213,120 @@ describe("cockpit composer", () => {
     expect(screen.getByRole("button", { name: "Interrupt" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Follow-up" })).toBeEnabled();
   });
+
+  it("stays enabled with a note while a question is pending (waiting-input)", async () => {
+    stubFetch({ state: { isStreaming: false, queuedMessageCount: 0 } });
+    await renderDetail({
+      "1": {
+        status: "waiting-input",
+        reason: "pending question 'ask-ui-1'",
+        since: "t0",
+        question: {
+          id: "ask-ui-1",
+          kind: "ask",
+          questions: [
+            {
+              prompt: "?",
+              options: [{ value: "a", label: "A", description: null }],
+              multi: false,
+              recommended: null,
+              allowsOther: false,
+            },
+          ],
+        },
+      },
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Steer" })).toBeEnabled());
+
+    expect(screen.getByRole("button", { name: "Follow-up" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+    expect(screen.getByTestId("composer-note")).toHaveTextContent("A question is pending");
+  });
+});
+
+const askQuestion = {
+  id: "ask-ui-1",
+  kind: "ask" as const,
+  questions: [
+    {
+      prompt: "Apply the same lock ordering to the dhcpd6 loop?",
+      options: [
+        { value: "both", label: "Yes, both loops", description: "Widen the fix" },
+        { value: "v4-only", label: "v4 only", description: "Match the reproducer" },
+      ],
+      multi: false,
+      recommended: "both",
+      allowsOther: true,
+    },
+  ],
+};
+
+const approvalQuestion = { id: "approval-ui-1", kind: "approval" as const, questions: [] };
+
+const waitingInputSession = {
+  "1": { status: "waiting-input", reason: "pending question 'ask-ui-1'", since: "t0", question: askQuestion },
+};
+
+const waitingApprovalSession = {
+  "1": {
+    status: "waiting-approval",
+    reason: "pending approval 'approval-ui-1'",
+    since: "t0",
+    question: approvalQuestion,
+  },
+};
+
+describe("cockpit question card", () => {
+  it("renders an ask question with recommended option and answers it", async () => {
+    const fetchMock = stubFetch();
+    await renderDetail(waitingInputSession);
+
+    const card = screen.getByTestId("question-card");
+    expect(within(card).getByText(/lock ordering/)).toBeInTheDocument();
+    const recommended = within(card).getByRole("button", { name: /Yes, both loops/ });
+    expect(within(recommended).getByText("rec")).toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.click(recommended);
+    await user.click(within(card).getByRole("button", { name: "Send answer" }));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/1/agent/answer",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ question_id: "ask-ui-1", selections: ["both"] }),
+      }),
+    );
+  });
+
+  it("renders an approval gate as approve/deny", async () => {
+    const fetchMock = stubFetch();
+    await renderDetail(waitingApprovalSession);
+
+    const card = screen.getByTestId("question-card");
+    const user = userEvent.setup();
+    await user.click(within(card).getByRole("button", { name: "Approve" }));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/1/agent/answer",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ question_id: "approval-ui-1", approved: true }),
+      }),
+    );
+  });
+
+  it("removes the card once the question resolves", async () => {
+    stubFetch();
+    await renderDetail(waitingInputSession);
+    expect(screen.getByTestId("question-card")).toBeInTheDocument();
+
+    act(() => {
+      mainSocket().emit("question_resolved", { task_id: 1, question_id: "ask-ui-1" });
+    });
+
+    expect(screen.queryByTestId("question-card")).not.toBeInTheDocument();
+  });
 });
 
 describe("cockpit status strip", () => {

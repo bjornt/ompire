@@ -65,3 +65,11 @@ export function getAgentState(id: number): Promise<AgentStateData> {
 export function getAgentStats(id: number): Promise<AgentStatsData> {
   return request<AgentStatsData>("GET", `/api/tasks/${id}/agent/stats`);
 }
+
+/** Answers a task's pending ask/approval question (ask-approvals capability). */
+export function answerAgent(
+  id: number,
+  answer: { question_id: string; selections?: string[]; text?: string; approved?: boolean },
+): Promise<unknown> {
+  return request("POST", `/api/tasks/${id}/agent/answer`, answer);
+}

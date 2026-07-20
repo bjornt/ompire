@@ -26,6 +26,27 @@ magic messages:
   big      include a ~200 KB event frame in the burst (>64 KiB stream limit)
   queue    after the burst, get_state reports queuedMessageCount: 1
   no-end   emit the burst without the trailing agent_end frame
+  ask      an `ask` tool_execution_start (single-select, recommended,
+           allows-other question) -> extension_ui_request -> waits for the
+           daemon's reply frame -> tool_execution_end -> burst tail
+  approve  an approval-gate extension_ui_request (options exactly
+           ["Approve", "Deny"], no ask tool in flight) -> waits for the
+           daemon's reply frame -> burst tail
+  ask-cancel  like `ask`, but the `ask` execution ends immediately without
+           ever waiting for a reply (models the agent/tool cancelling the
+           ask on its own)
+
+The `ask`/`approve` reply frame shape (`extension_ui_response`, echoing the
+request `id`, with a single `value` string field) is confirmed against the
+omp source during dogfooding 2026-07-20 (see the `omp-rpc-field-assumptions`
+memory note) and echoed into the assistant's reply text so tests can assert
+on what the daemon sent.
+
+While a `extension_ui_response` reply is outstanding, other requests (e.g. an
+operator interrupt's `abort_and_prompt`) are still answered normally — the
+main loop tracks "waiting for this ui reply" as state rather than blocking a
+single read, so it can interleave both (real omp's rpc reader is not blocked
+on the ask tool call either).
 """
 
 from __future__ import annotations
@@ -65,6 +86,107 @@ def burst(prompt_id: str, message: str, big: bool = False, end: bool = True) -> 
         emit({"type": "agent_end", "messages": [user_message, assistant_message]})
 
 
+def ask_start(prompt_id: str, message: str) -> dict:
+    """Emit up through the `ask` question's `extension_ui_request` and return
+    the state main() needs to finish the burst once the reply arrives.
+
+    Shape and ordering confirmed against real omp during dogfooding
+    2026-07-20 (see the `omp-rpc-field-assumptions` memory note):
+    `extension_ui_request` arrives *before* `tool_execution_start` for `ask`
+    (the reverse of the design's original assumption — the daemon handles
+    this by provisionally classifying the request, then upgrading it in
+    place once the structured args arrive). `tool_execution_start` uses
+    `toolCallId` / `toolName` / `args.questions[].question` /
+    `options[].label` (no separate `value`) / `recommended` as an *index*;
+    the `extension_ui_request` mirrors it as flat display strings with the
+    recommendation and free-text-other affordance baked into the option
+    text itself, rather than as separate flags."""
+    emit({"id": prompt_id, "type": "response", "command": "prompt", "success": True})
+    emit({"type": "agent_start"})
+    emit({"type": "turn_start"})
+    user_message = {"role": "user", "content": [{"type": "text", "text": message}]}
+    emit({"type": "message_start", "message": user_message})
+    emit({"type": "message_end", "message": user_message})
+    emit(
+        {
+            "type": "extension_ui_request",
+            "id": "ask-ui-1",
+            "method": "select",
+            "title": "Apply the same lock ordering to the dhcpd6 loop?",
+            "options": ["Yes, both loops (Recommended)", "v4 only", "Other (type your own)"],
+        }
+    )
+    tool_call_id = "toolu_ask1"
+    emit(
+        {
+            "type": "tool_execution_start",
+            "toolCallId": tool_call_id,
+            "toolName": "ask",
+            "args": {
+                "questions": [
+                    {
+                        "id": "demo",
+                        "question": "Apply the same lock ordering to the dhcpd6 loop?",
+                        "options": [
+                            {"label": "Yes, both loops", "description": "Widen the fix"},
+                            {"label": "v4 only", "description": "Match the reproducer"},
+                        ],
+                        "recommended": 0,
+                    }
+                ]
+            },
+            "intent": "Demonstrating ask tool",
+        }
+    )
+    return {"kind": "ask", "ui_id": "ask-ui-1", "tool_call_id": tool_call_id, "user_message": user_message}
+
+
+def ask_finish(pending_ui: dict, reply: dict) -> None:
+    emit({"type": "tool_execution_end", "toolCallId": pending_ui["tool_call_id"]})
+    answer_text = f"got answer: {reply}"
+    assistant_message = {"role": "assistant", "content": [{"type": "text", "text": answer_text}]}
+    emit({"type": "message_start", "message": {"role": "assistant", "content": []}})
+    emit({"type": "message_end", "message": assistant_message})
+    emit({"type": "turn_end", "message": assistant_message})
+    emit({"type": "agent_end", "messages": [pending_ui["user_message"], assistant_message]})
+
+
+def approval_start(prompt_id: str, message: str) -> dict:
+    """Emit up through the approval gate's `extension_ui_request` (no `ask`
+    tool in flight, options exactly `["Approve", "Deny"]`).
+
+    Confirmed against the omp source during dogfooding 2026-07-20 (see the
+    `omp-rpc-field-assumptions` memory note): the approval gate uses the same
+    `method: "select"` dialog as `ask` (`extensibility/extensions/wrapper.ts`'s
+    `uiContext.select(prompt, ["Approve", "Deny"])`), answered with
+    `{"value": "Approve"}` / `{"value": "Deny"}` — an exact string match, not
+    a boolean `confirmed` field."""
+    emit({"id": prompt_id, "type": "response", "command": "prompt", "success": True})
+    emit({"type": "agent_start"})
+    emit({"type": "turn_start"})
+    user_message = {"role": "user", "content": [{"type": "text", "text": message}]}
+    emit({"type": "message_start", "message": user_message})
+    emit({"type": "message_end", "message": user_message})
+    emit(
+        {
+            "type": "extension_ui_request",
+            "id": "approval-ui-1",
+            "method": "select",
+            "options": ["Approve", "Deny"],
+        }
+    )
+    return {"kind": "approval", "ui_id": "approval-ui-1", "user_message": user_message}
+
+
+def approval_finish(pending_ui: dict, reply: dict) -> None:
+    answer_text = f"got answer: {reply}"
+    assistant_message = {"role": "assistant", "content": [{"type": "text", "text": answer_text}]}
+    emit({"type": "message_start", "message": {"role": "assistant", "content": []}})
+    emit({"type": "message_end", "message": assistant_message})
+    emit({"type": "turn_end", "message": assistant_message})
+    emit({"type": "agent_end", "messages": [pending_ui["user_message"], assistant_message]})
+
+
 def get_state_response(request_id: str, queued: int, message_count: int) -> dict:
     """The response shape verified against omp 16.5.2: isStreaming and
     queuedMessageCount at the top level of `data`."""
@@ -81,6 +203,62 @@ def get_state_response(request_id: str, queued: int, message_count: int) -> dict
             "sessionId": "fake-session-id",
         },
     }
+
+
+def handle_generic_request(request: dict, scenario: str, queued: int, message_count: int) -> None:
+    """Answer a non-`prompt`, non-ui-reply request. Used both from the main
+    dispatch loop and while a `extension_ui_request` reply is outstanding
+    (real omp's rpc reader is not blocked on the ask tool call either)."""
+    request_id = request.get("id", "")
+    if request.get("type") == "get_state":
+        if scenario == "get-state-fails":
+            emit(
+                {
+                    "id": request_id,
+                    "type": "response",
+                    "command": "get_state",
+                    "success": False,
+                    "error": "state unavailable",
+                }
+            )
+        else:
+            emit(get_state_response(request_id, queued, message_count))
+        return
+    if request.get("type") == "get_session_stats":
+        emit(
+            {
+                "id": request_id,
+                "type": "response",
+                "command": "get_session_stats",
+                "success": True,
+                "data": {
+                    "inputTokens": 1200,
+                    "outputTokens": 340,
+                    "totalCostUsd": 0.0123,
+                    "messageCount": message_count,
+                },
+            }
+        )
+        return
+    # Composer actions: acked success, mirroring omp's `message` field.
+    if request.get("type") in ("steer", "follow_up", "abort_and_prompt"):
+        command = request.get("type")
+        if request.get("message", "") == "fail":
+            emit(
+                {"id": request_id, "type": "response", "command": command, "success": False, "error": "boom"}
+            )
+            return
+        emit({"id": request_id, "type": "response", "command": command, "success": True})
+        return
+    emit(
+        {
+            "id": request_id,
+            "type": "response",
+            "command": request.get("type"),
+            "success": False,
+            "error": f"Unknown command: {request.get('type')}",
+        }
+    )
 
 
 def main() -> None:
@@ -100,79 +278,59 @@ def main() -> None:
 
     queued = 0
     message_count = 0
+    # Set while an `ask`/approval burst is waiting on its `extension_ui_response`
+    # (design D-5's "ask.timeout=0, waits indefinitely"): other requests keep
+    # being answered in the meantime, matching real omp's non-blocking reader.
+    pending_ui: dict | None = None
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
         request = json.loads(line)
-        request_id = request.get("id", "")
-        if request.get("type") == "get_state":
-            if scenario == "get-state-fails":
-                emit(
-                    {
-                        "id": request_id,
-                        "type": "response",
-                        "command": "get_state",
-                        "success": False,
-                        "error": "state unavailable",
-                    }
-                )
-            else:
-                emit(get_state_response(request_id, queued, message_count))
-            continue
-        if request.get("type") == "get_session_stats":
-            emit(
-                {
-                    "id": request_id,
-                    "type": "response",
-                    "command": "get_session_stats",
-                    "success": True,
-                    "data": {
-                        "inputTokens": 1200,
-                        "outputTokens": 340,
-                        "totalCostUsd": 0.0123,
-                        "messageCount": message_count,
-                    },
-                }
-            )
-            continue
-        # Composer actions: acked success, mirroring omp's `message` field.
-        if request.get("type") in ("steer", "follow_up", "abort_and_prompt"):
-            command = request.get("type")
-            if request.get("message", "") == "fail":
-                emit(
-                    {
-                        "id": request_id,
-                        "type": "response",
-                        "command": command,
-                        "success": False,
-                        "error": "boom",
-                    }
-                )
+
+        if pending_ui is not None:
+            if request.get("type") == "extension_ui_response" and request.get("id") == pending_ui["ui_id"]:
+                if pending_ui["kind"] == "ask":
+                    ask_finish(pending_ui, request)
+                else:
+                    approval_finish(pending_ui, request)
+                pending_ui = None
                 continue
-            emit(
-                {
-                    "id": request_id,
-                    "type": "response",
-                    "command": command,
-                    "success": True,
-                }
-            )
+            handle_generic_request(request, scenario, queued, message_count)
             continue
+
         if request.get("type") != "prompt":
-            emit(
-                {
-                    "id": request_id,
-                    "type": "response",
-                    "command": request.get("type"),
-                    "success": False,
-                    "error": f"Unknown command: {request.get('type')}",
-                }
-            )
+            handle_generic_request(request, scenario, queued, message_count)
             continue
+
+        request_id = request.get("id", "")
         message = request.get("message", "")
         if message == "die":
             sys.exit(23)
+        if message == "ask":
+            message_count += 2
+            pending_ui = ask_start(request_id, message)
+            continue
+        if message == "approve":
+            message_count += 2
+            pending_ui = approval_start(request_id, message)
+            continue
+        if message == "ask-cancel":
+            # The `ask` execution ends on its own without an operator answer
+            # ever arriving (design D-6: tool_execution_end must still clear
+            # the pending question and return the session to working).
+            message_count += 2
+            ask_finish(ask_start(request_id, message), {"cancelled": True})
+            continue
+        if message == "bad-ask":
+            # A malformed `extension_ui_request` (missing the required `id`)
+            # exercises the interpreted-subset containment path.
+            message_count += 2
+            emit({"id": request_id, "type": "response", "command": "prompt", "success": True})
+            emit({"type": "agent_start"})
+            emit({"type": "extension_ui_request"})
+            emit({"type": "agent_end"})
+            continue
         if message == "fail":
             emit(
                 {

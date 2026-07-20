@@ -424,10 +424,69 @@ async def interrupt_agent_route(
     body: AgentMessage,
     engine: Engine = Depends(_engine),
     supervisor: AgentSupervisor = Depends(_supervisor),
+    sessions: SessionTracker = Depends(_sessions),
 ) -> dict[str, object]:
     _require_task(engine, task_id)
     handle = _require_live_agent(supervisor, task_id)
+    # Any pending question is moot once the turn is aborted (design D-6); the
+    # abort's own agent_start/agent_end then drives state normally.
+    sessions.clear_pending(task_id)
     return await _agent_request(handle, "abort_and_prompt", message=body.message)
+
+
+# --- Ask/approval answers (ask-approvals capability) ------------------------
+# Replies to a pending `extension_ui_request` over the agent's stdin (design
+# D-5). Reply shape confirmed against the omp source during dogfooding
+# 2026-07-20 (see the `omp-rpc-field-assumptions` memory note): both `ask` and
+# the approval gate use the same `method: "select"` dialog, answered with a
+# single `{"value": <string>}` — approval's value must be literally "Approve"
+# or "Deny" (an exact string match in the omp tool wrapper); there is no
+# separate multi-value or free-text reply shape — arbitrary text is accepted
+# as `value` with no membership check against the offered options.
+
+
+class AgentAnswer(BaseModel):
+    question_id: str
+    selections: list[str] | None = None
+    text: str | None = None
+    approved: bool | None = None
+
+
+def _answer_reply_payload(body: AgentAnswer) -> dict[str, object]:
+    if body.approved is not None:
+        return {"value": "Approve" if body.approved else "Deny"}
+    if body.text is not None:
+        return {"value": body.text}
+    if body.selections:
+        # The wire protocol carries one `value`; multi-select isn't exposed
+        # over rpc-ui mode (see `_build_ask_pending`), so only the first
+        # selection is sent.
+        return {"value": body.selections[0]}
+    return {"cancelled": True}
+
+
+@router.post("/tasks/{task_id}/agent/answer")
+async def answer_agent_route(
+    task_id: int,
+    body: AgentAnswer,
+    engine: Engine = Depends(_engine),
+    supervisor: AgentSupervisor = Depends(_supervisor),
+    sessions: SessionTracker = Depends(_sessions),
+) -> dict[str, object]:
+    _require_task(engine, task_id)
+    handle = _require_live_agent(supervisor, task_id)
+    pending = sessions.pending(task_id)
+    if pending is None or pending.id != body.question_id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"task {task_id} has no pending question {body.question_id!r}",
+        )
+    await handle.respond_ui_request(body.question_id, _answer_reply_payload(body))
+    # Optimistic clear (design D-5): omp sends no distinct "answer accepted"
+    # frame, so the card disappears on send and the fan-out corrects any
+    # surprise (e.g. a re-posted question arrives as a fresh question_posted).
+    sessions.answer_pending(task_id)
+    return {"task_id": task_id, "question_id": body.question_id, "answered": True}
 
 
 @router.get("/tasks/{task_id}/agent/state")

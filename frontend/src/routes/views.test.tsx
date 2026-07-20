@@ -371,6 +371,145 @@ describe("TasksView session status", () => {
     expect(screen.getByText("2 need you")).toBeInTheDocument();
     expect(document.title).toBe("(2) ompire");
   });
+
+  const askQuestion = {
+    id: "ask-ui-1",
+    kind: "ask" as const,
+    questions: [
+      {
+        prompt: "Widen the fix to both loops?",
+        options: [
+          { value: "both", label: "Both loops", description: null },
+          { value: "v4-only", label: "v4 only", description: null },
+        ],
+        multi: false,
+        recommended: "both",
+        allowsOther: false,
+      },
+    ],
+  };
+
+  it("renders an inline quick-answer for a fitting single-select ask and answers it", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve({}) }));
+    vi.stubGlobal("fetch", fetchMock);
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": {
+          status: "waiting-input",
+          reason: "pending question 'ask-ui-1'",
+          since: "t0",
+          question: askQuestion,
+        },
+      },
+    });
+
+    const quick = screen.getByTestId("quick-answer-1");
+    expect(quick).toHaveTextContent("Widen the fix to both loops?");
+    const recommended = within(quick).getByRole("button", { name: /Both loops/ });
+    expect(recommended).toHaveTextContent("·rec");
+
+    const user = userEvent.setup();
+    await user.click(recommended);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/1/agent/answer",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ question_id: "ask-ui-1", selections: ["both"] }),
+      }),
+    );
+  });
+
+  it("defers a non-fitting question (multi-select) and an approval gate to task detail", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [
+        makeTask(),
+        makeTask({ id: 2, slug: "other", branch: "bjornt/other" }),
+      ],
+      sessions: {
+        "1": {
+          status: "waiting-input",
+          reason: "pending question",
+          since: "t0",
+          question: {
+            id: "ask-ui-2",
+            kind: "ask",
+            questions: [
+              {
+                prompt: "Pick one or more",
+                options: [{ value: "a", label: "A", description: null }],
+                multi: true,
+                recommended: null,
+                allowsOther: false,
+              },
+            ],
+          },
+        },
+        "2": {
+          status: "waiting-approval",
+          reason: "pending approval",
+          since: "t0",
+          question: { id: "approval-ui-1", kind: "approval", questions: [] },
+        },
+      },
+    });
+
+    expect(screen.queryByTestId("quick-answer-1")).not.toBeInTheDocument();
+    expect(screen.getByTestId("quick-answer-defer-1")).toHaveTextContent("Open task detail to answer");
+    expect(screen.queryByTestId("quick-answer-2")).not.toBeInTheDocument();
+    expect(screen.getByTestId("quick-answer-defer-2")).toHaveTextContent("Open task detail to answer");
+  });
+
+  it("removes the quick-answer control once the question resolves", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": {
+          status: "waiting-input",
+          reason: "pending question",
+          since: "t0",
+          question: askQuestion,
+        },
+      },
+    });
+    expect(screen.getByTestId("quick-answer-1")).toBeInTheDocument();
+
+    act(() => {
+      socket().emit("question_resolved", { task_id: 1, question_id: "ask-ui-1" });
+    });
+    act(() => {
+      socket().emit("status_changed", {
+        task_id: 1,
+        from: "waiting-input",
+        to: "working",
+        reason: "operator answered the pending question",
+      });
+    });
+
+    expect(screen.queryByTestId("quick-answer-1")).not.toBeInTheDocument();
+  });
+
+  it("counts waiting-input/waiting-approval sessions in the N-need-you pill", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [
+        makeTask(),
+        makeTask({ id: 2, slug: "other", branch: "bjornt/other" }),
+        makeTask({ id: 3, slug: "third", branch: "bjornt/third" }),
+      ],
+      sessions: {
+        "1": { status: "waiting-input", reason: "pending question", since: "t0" },
+        "2": { status: "waiting-approval", reason: "pending approval", since: "t0" },
+        "3": { status: "working", reason: "agent_start frame", since: "t0" },
+      },
+    });
+
+    expect(screen.getByText("2 need you")).toBeInTheDocument();
+  });
 });
 
 describe("TaskDetailView", () => {

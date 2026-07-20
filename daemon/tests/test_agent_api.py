@@ -56,14 +56,16 @@ def registry_task_id(app, tmp_path: Path) -> int:
     return task.id
 
 
-def _spawn_live_task(client: TestClient, auth_headers: dict, auth_token: str) -> int:
+def _spawn_live_task(
+    client: TestClient, auth_headers: dict, auth_token: str, slug: str = "agent-live", prompt: str = "hi"
+) -> int:
     """Spawn through the real pipeline (fake omp) and wait for completion."""
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         ws.receive_json()  # snapshot
         response = client.post(
             "/api/tasks",
             headers=auth_headers,
-            json={"project_name": "demo", "slug": "agent-live", "prompt": "hi"},
+            json={"project_name": "demo", "slug": slug, "prompt": prompt},
         )
         assert response.status_code == 202, response.text
         task_id = response.json()["id"]
@@ -73,6 +75,21 @@ def _spawn_live_task(client: TestClient, auth_headers: dict, auth_token: str) ->
                 assert event["payload"]["state"] == "created", event["payload"]
                 if event["payload"]["spawn_completed_at"] is not None:
                     return task_id
+
+
+def _wait_for_question_posted(ws, task_id: int) -> dict:
+    """Drain the main WS until `question_posted` for `task_id` carries a
+    fully resolved question, returning the normalized payload. An `ask` is
+    posted provisionally first (empty `questions` — confirmed by dogfooding
+    2026-07-20: real omp emits `extension_ui_request` before
+    `tool_execution_start`) and then upgraded in place once the structured
+    args arrive; an `approval` never gets a second post."""
+    while True:
+        event = ws.receive_json()
+        if event["type"] == "question_posted" and event["payload"]["task_id"] == task_id:
+            question = event["payload"]["question"]
+            if question["kind"] == "approval" or question["questions"]:
+                return question
 
 
 def drain_channel_until(ws, event_type: str) -> list[dict]:
@@ -269,3 +286,147 @@ def test_agent_ws_rejects_missing_agent(
         with pytest.raises(WebSocketDisconnect) as excinfo:
             ws.receive_json()
     assert excinfo.value.code == 4404
+
+
+# --- Ask/approval answer route (ask-approvals capability) -------------------
+
+
+def test_answer_resolves_ask_and_returns_to_working(
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
+) -> None:
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        ws.receive_json()  # snapshot
+        response = client.post(
+            "/api/tasks",
+            headers=auth_headers,
+            json={"project_name": "demo", "slug": "agent-ask", "prompt": "ask"},
+        )
+        assert response.status_code == 202, response.text
+        task_id = response.json()["id"]
+
+        question = _wait_for_question_posted(ws, task_id)
+        assert question["kind"] == "ask"
+        assert question["questions"][0]["recommended"] == "Yes, both loops (Recommended)"
+        assert question["questions"][0]["options"][0]["value"] == "Yes, both loops (Recommended)"
+
+        answer = client.post(
+            f"/api/tasks/{task_id}/agent/answer",
+            headers=auth_headers,
+            json={"question_id": question["id"], "selections": [question["questions"][0]["options"][0]["value"]]},
+        )
+        assert answer.status_code == 200, answer.text
+        assert answer.json() == {"task_id": task_id, "question_id": question["id"], "answered": True}
+
+        seen_resolved = seen_working = False
+        while not (seen_resolved and seen_working):
+            event = ws.receive_json()
+            if event["type"] == "question_resolved" and event["payload"]["task_id"] == task_id:
+                assert event["payload"]["question_id"] == question["id"]
+                seen_resolved = True
+            if (
+                event["type"] == "status_changed"
+                and event["payload"]["task_id"] == task_id
+                and event["payload"]["to"] == "working"
+            ):
+                assert event["payload"]["from"] == "waiting-input"
+                seen_working = True
+
+        assert client.post(f"/api/tasks/{task_id}/agent/stop", headers=auth_headers).status_code == 200
+
+
+def test_answer_resolves_approval(
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
+) -> None:
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        ws.receive_json()  # snapshot
+        response = client.post(
+            "/api/tasks",
+            headers=auth_headers,
+            json={"project_name": "demo", "slug": "agent-approve", "prompt": "approve"},
+        )
+        assert response.status_code == 202, response.text
+        task_id = response.json()["id"]
+
+        question = _wait_for_question_posted(ws, task_id)
+        assert question["kind"] == "approval"
+
+        answer = client.post(
+            f"/api/tasks/{task_id}/agent/answer",
+            headers=auth_headers,
+            json={"question_id": question["id"], "approved": True},
+        )
+        assert answer.status_code == 200, answer.text
+
+        assert client.post(f"/api/tasks/{task_id}/agent/stop", headers=auth_headers).status_code == 200
+
+
+def test_answer_stale_question_id_conflicts(
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
+) -> None:
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        ws.receive_json()  # snapshot
+        response = client.post(
+            "/api/tasks",
+            headers=auth_headers,
+            json={"project_name": "demo", "slug": "agent-ask-stale", "prompt": "ask"},
+        )
+        task_id = response.json()["id"]
+        _wait_for_question_posted(ws, task_id)
+
+        answer = client.post(
+            f"/api/tasks/{task_id}/agent/answer",
+            headers=auth_headers,
+            json={"question_id": "not-the-pending-one", "selections": ["Yes, both loops"]},
+        )
+        assert answer.status_code == 409
+
+    assert client.post(f"/api/tasks/{task_id}/agent/stop", headers=auth_headers).status_code == 200
+
+
+def test_answer_409_without_live_agent(
+    client: TestClient, auth_headers: dict, registry_task_id: int
+) -> None:
+    response = client.post(
+        f"/api/tasks/{registry_task_id}/agent/answer",
+        headers=auth_headers,
+        json={"question_id": "whatever"},
+    )
+    assert response.status_code == 409
+
+
+def test_answer_404_for_unknown_task(client: TestClient, auth_headers: dict) -> None:
+    response = client.post(
+        "/api/tasks/999/agent/answer", headers=auth_headers, json={"question_id": "whatever"}
+    )
+    assert response.status_code == 404
+
+
+def test_interrupt_clears_pending_question(
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
+) -> None:
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        ws.receive_json()  # snapshot
+        response = client.post(
+            "/api/tasks",
+            headers=auth_headers,
+            json={"project_name": "demo", "slug": "agent-ask-interrupt", "prompt": "ask"},
+        )
+        task_id = response.json()["id"]
+        question = _wait_for_question_posted(ws, task_id)
+
+        interrupt = client.post(
+            f"/api/tasks/{task_id}/agent/interrupt",
+            headers=auth_headers,
+            json={"message": "never mind, stop"},
+        )
+        assert interrupt.status_code == 200, interrupt.text
+
+        # The pending question is gone; answering it now is a stale-id conflict.
+        answer = client.post(
+            f"/api/tasks/{task_id}/agent/answer",
+            headers=auth_headers,
+            json={"question_id": question["id"], "selections": ["Yes, both loops"]},
+        )
+        assert answer.status_code == 409
+
+    assert client.post(f"/api/tasks/{task_id}/agent/stop", headers=auth_headers).status_code == 200

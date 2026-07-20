@@ -6,6 +6,7 @@ import { getTaskDetail } from "../lib/api";
 import { useDaemonState } from "../lib/daemonSocket";
 import type { SessionInfo, TaskDetail, WorkshopStatus } from "../types";
 import { formatElapsed } from "./TasksView";
+import { QuestionCard } from "./QuestionCard";
 import { TaskComposer } from "./TaskComposer";
 import { TaskStatusStrip } from "./TaskStatusStrip";
 import { TaskTranscript } from "./TaskTranscript";
@@ -149,6 +150,8 @@ export function TaskDetailView() {
       </div>
 
       <TaskStatusStrip session={session} status={status} />
+
+      {session?.question && <QuestionCard taskId={taskId} question={session.question} />}
 
       <div className="cockpitGrid">
         <TaskTranscript transcript={transcript} />

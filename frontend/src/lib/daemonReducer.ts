@@ -2,6 +2,8 @@ import type {
   ConnectionState,
   Envelope,
   Project,
+  QuestionPostedPayload,
+  QuestionResolvedPayload,
   SessionInfo,
   SnapshotPayload,
   SpawnStepPayload,
@@ -99,6 +101,22 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
           [task_id]: { status: to, reason, since: envelope.ts },
         },
       };
+    }
+    case "question_posted": {
+      const { task_id, question } = envelope.payload as QuestionPostedPayload;
+      const existing = state.sessions[task_id];
+      if (!existing) return state;
+      return {
+        ...state,
+        sessions: { ...state.sessions, [task_id]: { ...existing, question } },
+      };
+    }
+    case "question_resolved": {
+      const { task_id } = envelope.payload as QuestionResolvedPayload;
+      const existing = state.sessions[task_id];
+      if (!existing?.question) return state;
+      const { question: _dropped, ...rest } = existing;
+      return { ...state, sessions: { ...state.sessions, [task_id]: rest } };
     }
     default:
       return state;

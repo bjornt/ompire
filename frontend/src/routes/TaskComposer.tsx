@@ -5,7 +5,9 @@ import type { SessionStatus } from "../types";
 /* Composer with the three omp interaction modes. Availability tracks whether
  * the agent is streaming: steering and interrupting only make sense mid-turn,
  * while a follow-up can be queued whenever an agent is live. The whole composer
- * is disabled when the task has no live agent. */
+ * is disabled when the task has no live agent. A pending `ask` (`waiting-input`)
+ * counts as an in-flight turn too — the turn hasn't ended, it's just paused on
+ * a question — so steer/follow-up stay available, with a note explaining why. */
 
 type Mode = "steer" | "follow-up" | "interrupt";
 
@@ -43,10 +45,17 @@ export function TaskComposer({
   const [busy, setBusy] = useState(false);
 
   // Prefer the agent's own streaming flag; fall back to the session status
-  // until the first state read lands.
-  const streaming = isStreaming ?? sessionStatus === "working";
+  // until the first state read lands. `waiting-input` is a paused turn, not
+  // an ended one, so it counts as streaming regardless of the raw flag.
+  const streaming = sessionStatus === "waiting-input" || (isStreaming ?? sessionStatus === "working");
   const currentEnabled = hasLiveAgent && modeEnabled(mode, streaming);
   const canSend = currentEnabled && message.trim().length > 0 && !busy;
+  const note =
+    sessionStatus === "waiting-input"
+      ? "A question is pending — steer or send a follow-up while it waits."
+      : sessionStatus === "waiting-approval"
+        ? "Waiting on an approval decision."
+        : null;
 
   async function send() {
     if (!canSend) return;
@@ -92,6 +101,7 @@ export function TaskComposer({
           }
         }}
       />
+      {note && <div className="composerNote" data-testid="composer-note">{note}</div>}
       {error && <div className="composerError" data-testid="composer-error">{error}</div>}
       <div className="composerActions">
         <button type="button" className="sendButton" disabled={!canSend} onClick={() => void send()}>

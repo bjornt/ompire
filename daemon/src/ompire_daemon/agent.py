@@ -153,6 +153,17 @@ class AgentHandle:
     async def request(self, request_type: str, **fields: Any) -> dict[str, Any]:
         return await self._conn.request(request_type, **fields)
 
+    async def respond_ui_request(self, request_id: str, payload: dict[str, Any]) -> None:
+        """Reply to an agent-raised `extension_ui_request` (design D-5): this
+        replies to the *agent's* request id, the reverse direction of
+        `request()`, so there is no daemon-generated id or pending future to
+        correlate — the frame is written and the turn simply continues. Frame
+        shape (`extension_ui_response`, `id`, and `value`/`confirmed`/
+        `cancelled` payload variants) confirmed against the omp source
+        (`rpc-types.ts`) during dogfooding 2026-07-20; see the
+        `omp-rpc-field-assumptions` memory note."""
+        await self._conn.write_frame({"type": "extension_ui_response", "id": request_id, **payload})
+
     def subscribe(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue()
         self._subscribers.add(queue)

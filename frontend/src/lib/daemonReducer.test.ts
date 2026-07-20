@@ -236,4 +236,92 @@ describe("applyEnvelope session events", () => {
     });
     expect(state.sessions).toEqual({});
   });
+
+  const question = {
+    id: "ask-ui-1",
+    kind: "ask" as const,
+    questions: [
+      {
+        prompt: "Widen the fix?",
+        options: [{ value: "both", label: "Both", description: null }],
+        multi: false,
+        recommended: "both",
+        allowsOther: true,
+      },
+    ],
+  };
+
+  it("upserts the pending question on question_posted", () => {
+    let state = applyEnvelope(empty, {
+      seq: 1,
+      ts: "t1",
+      type: "status_changed",
+      payload: { task_id: 1, from: "working", to: "waiting-input", reason: "pending question" },
+    });
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "t2",
+      type: "question_posted",
+      payload: { task_id: 1, question },
+    });
+    expect(state.sessions[1]).toEqual({
+      status: "waiting-input",
+      reason: "pending question",
+      since: "t1",
+      question,
+    });
+  });
+
+  it("ignores question_posted for an untracked task", () => {
+    const state = applyEnvelope(empty, {
+      seq: 1,
+      ts: "t1",
+      type: "question_posted",
+      payload: { task_id: 99, question },
+    });
+    expect(state.sessions).toEqual({});
+  });
+
+  it("clears the pending question on question_resolved", () => {
+    let state = applyEnvelope(empty, {
+      seq: 1,
+      ts: "t1",
+      type: "status_changed",
+      payload: { task_id: 1, from: "working", to: "waiting-input", reason: "pending question" },
+    });
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "t2",
+      type: "question_posted",
+      payload: { task_id: 1, question },
+    });
+    state = applyEnvelope(state, {
+      seq: 3,
+      ts: "t3",
+      type: "question_resolved",
+      payload: { task_id: 1, question_id: question.id },
+    });
+    expect(state.sessions[1]).toEqual({
+      status: "waiting-input",
+      reason: "pending question",
+      since: "t1",
+    });
+  });
+
+  it("drops the pending question on task_deleted", () => {
+    let state = applyEnvelope(empty, {
+      seq: 1,
+      ts: "t1",
+      type: "status_changed",
+      payload: { task_id: 1, from: "working", to: "waiting-input", reason: "pending question" },
+    });
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "t2",
+      type: "question_posted",
+      payload: { task_id: 1, question },
+    });
+    state = applyEnvelope(state, { seq: 3, ts: "", type: "task_deleted", payload: { id: 1 } });
+    expect(state.sessions).toEqual({});
+  });
 });

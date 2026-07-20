@@ -200,3 +200,144 @@ async def test_prompt_skipped_goes_idle_from_starting(tracked) -> None:
 def test_snapshot_shape(tracked) -> None:
     _, tracker, hub, _ = tracked
     assert tracker.snapshot() == {}
+
+
+async def test_ask_enters_waiting_input_and_posts_question(tracked) -> None:
+    supervisor, tracker, hub, _ = tracked
+    queue = hub.subscribe()
+    handle = await supervisor.start(1, "/clone")
+    await handle.prompt("hi")
+    await wait_for_status(queue, "working")
+
+    # Confirmed by dogfooding 2026-07-20: real omp emits `extension_ui_request`
+    # *before* `tool_execution_start` for `ask`, so the daemon posts the
+    # question provisionally (empty `questions`) and then upgrades it in
+    # place — wait for the upgraded post rather than the first one.
+    posted_queue = hub.subscribe()
+    await handle.prompt("ask")
+    transitions = await wait_for_status(queue, "waiting-input")
+    assert transitions[-1]["from"] == "working"
+    assert tracker.get(1).status == "waiting-input"
+
+    async with asyncio.timeout(5):
+        while True:
+            event = await posted_queue.get()
+            if event.type == "question_posted" and event.payload["question"]["questions"]:
+                break
+
+    pending = tracker.pending(1)
+    assert pending is not None
+    assert pending.kind == "ask"
+    assert pending.questions[0].recommended == "Yes, both loops (Recommended)"
+    assert pending.questions[0].options[0].value == "Yes, both loops (Recommended)"
+
+    # Snapshot carries the pending question (reconnect scenario).
+    snap = tracker.snapshot()
+    assert snap[1]["question"]["id"] == pending.id
+
+    await supervisor.stop(1)
+
+
+async def test_answering_ask_clears_and_returns_to_working(tracked) -> None:
+    # Mirrors what the answer endpoint (task 4.2) does: write the reply over
+    # stdin, then tell the tracker the question was answered.
+    supervisor, tracker, hub, _ = tracked
+    queue = hub.subscribe()
+    handle = await supervisor.start(1, "/clone")
+    await handle.prompt("hi")
+    await wait_for_status(queue, "working")
+
+    await handle.prompt("ask")
+    await wait_for_status(queue, "waiting-input")
+    pending = tracker.pending(1)
+    assert pending is not None
+
+    resolved_queue = hub.subscribe()
+    await handle.respond_ui_request(pending.id, {"value": "Yes, both loops (Recommended)"})
+    resolved = tracker.answer_pending(1)
+    assert resolved is not None and resolved.id == pending.id
+
+    async with asyncio.timeout(5):
+        while True:
+            event = await resolved_queue.get()
+            if event.type == "question_resolved":
+                assert event.payload == {"task_id": 1, "question_id": pending.id}
+                break
+
+    assert tracker.pending(1) is None
+    transitions = await wait_for_status(queue, "working")
+    assert transitions[-1]["from"] == "waiting-input"
+    assert transitions[-1]["reason"] == "operator answered the pending question"
+    # The burst continues on to its own agent_end -> idle.
+    await wait_for_status(queue, "idle")
+    await supervisor.stop(1)
+
+
+async def test_approval_enters_waiting_approval(tracked) -> None:
+    supervisor, tracker, hub, _ = tracked
+    queue = hub.subscribe()
+    handle = await supervisor.start(1, "/clone")
+    await handle.prompt("hi")
+    await wait_for_status(queue, "working")
+
+    await handle.prompt("approve")
+    transitions = await wait_for_status(queue, "waiting-approval")
+    assert transitions[-1]["from"] == "working"
+    pending = tracker.pending(1)
+    assert pending is not None
+    assert pending.kind == "approval"
+
+    await handle.respond_ui_request(pending.id, {"value": "Approve"})
+    tracker.answer_pending(1)
+    transitions = await wait_for_status(queue, "working")
+    assert transitions[-1]["from"] == "waiting-approval"
+    await wait_for_status(queue, "idle")
+    assert tracker.pending(1) is None
+    await supervisor.stop(1)
+
+
+async def test_ask_cancelled_without_answer_returns_to_working(tracked) -> None:
+    # Confirmed by dogfooding 2026-07-20: `tool_execution_end` must clear the
+    # pending question and return the session to `working` on its own — not
+    # only via the answer endpoint's optimistic transition — or a cancelled
+    # ask leaves the session stuck in `waiting-input` forever.
+    supervisor, tracker, hub, _ = tracked
+    queue = hub.subscribe()
+    handle = await supervisor.start(1, "/clone")
+    await handle.prompt("hi")
+    await wait_for_status(queue, "working")
+
+    await handle.prompt("ask-cancel")
+    transitions = await wait_for_status(queue, "waiting-input")
+    assert transitions[-1]["from"] == "working"
+
+    transitions = await wait_for_status(queue, "working")
+    assert transitions[-1]["from"] == "waiting-input"
+    assert transitions[-1]["reason"] == "ask tool_execution_end"
+    assert tracker.pending(1) is None
+
+    await wait_for_status(queue, "idle")
+    await supervisor.stop(1)
+
+
+async def test_exit_during_waiting_discards_pending_no_resolve(tracked) -> None:
+    supervisor, tracker, hub, _ = tracked
+    queue = hub.subscribe()
+    handle = await supervisor.start(1, "/clone")
+    await handle.prompt("hi")
+    await wait_for_status(queue, "working")
+
+    await handle.prompt("ask")
+    await wait_for_status(queue, "waiting-input")
+    assert tracker.pending(1) is not None
+
+    resolved_queue = hub.subscribe()
+    await supervisor.stop(1)
+
+    transitions = await wait_for_status(queue, "failed")
+    assert transitions[-1]["from"] == "waiting-input"
+    assert tracker.pending(1) is None
+    # No question_resolved: exit wins without a separate resolve broadcast.
+    while not resolved_queue.empty():
+        event = resolved_queue.get_nowait()
+        assert event.type != "question_resolved"

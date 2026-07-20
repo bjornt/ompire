@@ -103,3 +103,41 @@ async def test_eof_fails_pending_requests(connection) -> None:
     with pytest.raises(rpc.AgentGoneError):
         await asyncio.wait_for(conn.prompt("die"), timeout=5)
     assert await process.wait() == 23
+
+
+async def test_ask_frames_reach_channel_and_validate(connection) -> None:
+    conn, events, _ = connection
+    await asyncio.wait_for(conn.ready, timeout=5)
+    await asyncio.wait_for(conn.prompt("ask"), timeout=5)
+    start = await wait_for_event(events, "tool_execution_start")
+    assert start["toolName"] == "ask"
+    assert start["args"]["questions"][0]["recommended"] == 0
+    request = await wait_for_event(events, "extension_ui_request")
+    assert request["id"] == "ask-ui-1"
+    await conn.write_frame(
+        {"type": "extension_ui_response", "id": "ask-ui-1", "value": "Yes, both loops (Recommended)"}
+    )
+    end = await wait_for_event(events, "tool_execution_end")
+    assert end["toolCallId"] == start["toolCallId"]
+    await wait_for_event(events, "agent_end")
+
+
+async def test_approval_frame_reaches_channel_and_validates(connection) -> None:
+    conn, events, _ = connection
+    await asyncio.wait_for(conn.ready, timeout=5)
+    await asyncio.wait_for(conn.prompt("approve"), timeout=5)
+    request = await wait_for_event(events, "extension_ui_request")
+    assert request["options"] == ["Approve", "Deny"]
+    await conn.write_frame({"type": "extension_ui_response", "id": "approval-ui-1", "value": "Approve"})
+    await wait_for_event(events, "agent_end")
+
+
+async def test_malformed_interpreted_frame_stays_contained(connection) -> None:
+    conn, events, _ = connection
+    await asyncio.wait_for(conn.ready, timeout=5)
+    await asyncio.wait_for(conn.prompt("bad-ask"), timeout=5)
+    # Missing the required `id`: validation fails, but the frame still reaches
+    # the channel opaquely and the reader survives to the trailing agent_end.
+    frame = await wait_for_event(events, "extension_ui_request")
+    assert "id" not in frame
+    await wait_for_event(events, "agent_end")

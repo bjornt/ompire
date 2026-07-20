@@ -1,10 +1,54 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import { cleanupTask } from "../lib/api";
+import { answerAgent, cleanupTask } from "../lib/api";
 import { isSpawning } from "../lib/daemonReducer";
 import { useDaemonState } from "../lib/daemonSocket";
-import type { SessionInfo, Task } from "../types";
+import type { PendingQuestion, SessionInfo, Task } from "../types";
 import "./TasksView.css";
+
+/** A pending `ask` fits a one-tap inline answer when it's a single,
+ * non-multi question with options (tasks spec: multi-select, multi-question,
+ * free-text-only asks, and approval gates all defer to task detail). */
+function fitsInlineQuickAnswer(question: PendingQuestion): boolean {
+  if (question.kind !== "ask" || question.questions.length !== 1) return false;
+  const [q] = question.questions;
+  return !q.multi && q.options.length > 0;
+}
+
+function QuickAnswer({ taskId, question }: { taskId: number; question: PendingQuestion }) {
+  const [busy, setBusy] = useState(false);
+  const q = question.questions[0];
+
+  async function answer(value: string) {
+    setBusy(true);
+    try {
+      await answerAgent(taskId, { question_id: question.id, selections: [value] });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="quickAnswer" data-testid={`quick-answer-${taskId}`}>
+      <div className="quickAnswerPrompt">{q.prompt}</div>
+      <div className="quickAnswerOptions">
+        {q.options.map((opt) => (
+          <button
+            key={opt.value}
+            type="button"
+            className="quickAnswerOption"
+            disabled={busy}
+            title={opt.description ?? undefined}
+            onClick={() => void answer(opt.value)}
+          >
+            {opt.label}
+            {q.recommended === opt.value && <span className="recommendedTag">·rec</span>}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export function formatElapsed(fromIso: string, now: Date = new Date()): string {
   const ms = now.getTime() - new Date(fromIso).getTime();
@@ -85,6 +129,19 @@ function TaskCard({ task, session }: { task: Task; session: SessionInfo | undefi
       {sessionFailed && (
         <div className="sessionReason" data-testid={`session-reason-${task.id}`}>
           {session.reason}
+        </div>
+      )}
+      {session?.status === "waiting-input" &&
+        (session.question && fitsInlineQuickAnswer(session.question) ? (
+          <QuickAnswer taskId={task.id} question={session.question} />
+        ) : (
+          <div className="quickAnswerDefer" data-testid={`quick-answer-defer-${task.id}`}>
+            Open task detail to answer.
+          </div>
+        ))}
+      {session?.status === "waiting-approval" && (
+        <div className="quickAnswerDefer" data-testid={`quick-answer-defer-${task.id}`}>
+          Open task detail to answer.
         </div>
       )}
       {animating && (

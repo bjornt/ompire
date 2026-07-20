@@ -1,11 +1,12 @@
 """NDJSON RPC protocol core for `omp --mode rpc-ui` children (design D-4).
 
 One reader task per connection parses stdout lines as JSON frames. Frames of
-an interpreted type (`ready`, `response`, `agent_start`, `agent_end`) are
-validated with typed models; everything else passes through opaque to the
-event callback (design D-3). `response` frames resolve daemon-generated
-request ids; push events interleaved on the same stream are never treated as
-responses (spike finding).
+an interpreted type (`ready`, `response`, `agent_start`, `agent_end`, and —
+for ask/approval handling — `extension_ui_request`, `tool_execution_start`,
+`tool_execution_end`) are validated with typed models; everything else passes
+through opaque to the event callback (design D-3). `response` frames resolve
+daemon-generated request ids; push events interleaved on the same stream are
+never treated as responses (spike finding).
 """
 
 from __future__ import annotations
@@ -49,11 +50,45 @@ class AgentEndFrame(BaseModel):
     type: Literal["agent_end"]
 
 
+class ExtensionUiRequestFrame(BaseModel):
+    """An `ask` question or approval gate mid-turn (design D-2/D-3). Only the
+    reply-addressing id and the options (for the approval cross-check) are
+    acted on; the rest — including any display text — passes through opaque
+    for the frontend to render from the normalized payload instead."""
+
+    model_config = {"extra": "allow"}
+    type: Literal["extension_ui_request"]
+    id: str
+    options: list[str] | None = None
+
+
+class ToolExecutionStartFrame(BaseModel):
+    """Tracks in-flight tool executions (design D-1); for the `ask` tool the
+    `args` payload (unvalidated here) carries the structured questions that
+    become the normalized `PendingQuestion`. Field names confirmed against
+    real omp during dogfooding 2026-07-20 (see the `omp-rpc-field-assumptions`
+    memory note): `toolCallId` / `toolName`, not `toolUseId` / `name`."""
+
+    model_config = {"extra": "allow"}
+    type: Literal["tool_execution_start"]
+    toolCallId: str
+    toolName: str
+
+
+class ToolExecutionEndFrame(BaseModel):
+    model_config = {"extra": "allow"}
+    type: Literal["tool_execution_end"]
+    toolCallId: str
+
+
 INTERPRETED_FRAMES: dict[str, type[BaseModel]] = {
     "ready": ReadyFrame,
     "response": ResponseFrame,
     "agent_start": AgentStartFrame,
     "agent_end": AgentEndFrame,
+    "extension_ui_request": ExtensionUiRequestFrame,
+    "tool_execution_start": ToolExecutionStartFrame,
+    "tool_execution_end": ToolExecutionEndFrame,
 }
 
 
