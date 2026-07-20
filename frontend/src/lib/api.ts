@@ -1,4 +1,4 @@
-import type { Task, TaskDetail } from "../types";
+import type { AgentStateData, AgentStatsData, Task, TaskDetail } from "../types";
 import { getDaemonToken } from "./token";
 
 /** Minimal authenticated REST client. Commands go over REST, events come
@@ -42,4 +42,26 @@ export function cleanupTask(id: number): Promise<Task> {
 
 export function getTaskDetail(id: number): Promise<TaskDetail> {
   return request<TaskDetail>("GET", `/api/tasks/${id}`);
+}
+
+/** Composer modes — each proxies to the live agent (agent-interaction).
+ * `interrupt` aborts the current turn and re-prompts (`abort_and_prompt`). */
+export function steerAgent(id: number, message: string): Promise<unknown> {
+  return request("POST", `/api/tasks/${id}/agent/steer`, { message });
+}
+
+export function followUpAgent(id: number, message: string): Promise<unknown> {
+  return request("POST", `/api/tasks/${id}/agent/follow-up`, { message });
+}
+
+export function interruptAgent(id: number, message: string): Promise<unknown> {
+  return request("POST", `/api/tasks/${id}/agent/interrupt`, { message });
+}
+
+export function getAgentState(id: number): Promise<AgentStateData> {
+  return request<AgentStateData>("GET", `/api/tasks/${id}/agent/state`);
+}
+
+export function getAgentStats(id: number): Promise<AgentStatsData> {
+  return request<AgentStatsData>("GET", `/api/tasks/${id}/agent/stats`);
 }

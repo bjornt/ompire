@@ -1,14 +1,25 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { useAgentChannel } from "../lib/agentChannel";
+import { isStreaming, useAgentStatus } from "../lib/agentStatus";
 import { getTaskDetail } from "../lib/api";
 import { useDaemonState } from "../lib/daemonSocket";
-import type { TaskDetail, WorkshopStatus } from "../types";
+import type { SessionInfo, TaskDetail, WorkshopStatus } from "../types";
 import { formatElapsed } from "./TasksView";
+import { TaskComposer } from "./TaskComposer";
+import { TaskStatusStrip } from "./TaskStatusStrip";
+import { TaskTranscript } from "./TaskTranscript";
 import "./TaskDetailView.css";
 
-/* Task detail v0 (design D-6): metadata panel + escape hatch only. The
- * transcript, composer, and status strip areas from the mockup belong to
- * later chunks and are omitted entirely, not stubbed. */
+/* Task detail: metadata panel + escape hatch, plus the single-session cockpit —
+ * streaming transcript, composer, and status strip. A task has a live agent
+ * while its session status is tracked and not `failed` (session-states keeps a
+ * failed status after the child exits); the cockpit regions degrade to an
+ * inactive/empty state when no agent is live rather than disappearing. */
+
+function hasLiveAgent(session: SessionInfo | null): boolean {
+  return session !== null && session.status !== "failed";
+}
 
 function workshopLabel(detail: TaskDetail): { text: string; status: WorkshopStatus | "none" } {
   if (!detail.workshop_id) return { text: "not launched", status: "none" };
@@ -19,13 +30,20 @@ function workshopLabel(detail: TaskDetail): { text: string; status: WorkshopStat
 export function TaskDetailView() {
   const { id } = useParams();
   const taskId = Number(id);
-  const { tasks } = useDaemonState();
+  const { tasks, sessions } = useDaemonState();
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Live card data from the socket snapshot; derived workshop status needs
   // the detail fetch. Refetch when the socket's copy of the task changes.
   const liveTask = tasks.find((t) => t.id === taskId) ?? null;
+  const session = sessions[taskId] ?? null;
+  const live = hasLiveAgent(session);
+
+  // The cockpit: transcript from the raw event channel, metrics polled at turn
+  // boundaries, both gated on there being a live agent.
+  const { transcript, turnEpoch } = useAgentChannel(taskId, live);
+  const status = useAgentStatus(taskId, live, turnEpoch);
 
   useEffect(() => {
     if (!Number.isInteger(taskId)) return;
@@ -128,6 +146,18 @@ export function TaskDetailView() {
             the daemon will supervise from later chunks.
           </div>
         </div>
+      </div>
+
+      <TaskStatusStrip session={session} status={status} />
+
+      <div className="cockpitGrid">
+        <TaskTranscript transcript={transcript} />
+        <TaskComposer
+          taskId={taskId}
+          hasLiveAgent={live}
+          isStreaming={isStreaming(status.state)}
+          sessionStatus={session?.status ?? null}
+        />
       </div>
     </>
   );

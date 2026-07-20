@@ -50,6 +50,26 @@ export interface SessionInfo {
   since: string;
 }
 
+/** GET /api/tasks/:id/agent/state — the agent's `get_state` `data`, passed
+ * through untouched by the daemon. Field names beyond isStreaming/queued are
+ * read defensively (this change's open SPEC question); unknown keys tolerated. */
+export interface AgentStateData {
+  isStreaming?: boolean;
+  queuedMessageCount?: number;
+  todos?: unknown;
+  model?: string;
+  modelId?: string;
+  [key: string]: unknown;
+}
+
+/** GET /api/tasks/:id/agent/stats — the agent's `get_session_stats` `data`. */
+export interface AgentStatsData {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalCostUsd?: number;
+  [key: string]: unknown;
+}
+
 export interface StatusChangedPayload {
   task_id: number;
   from: SessionStatus | null;

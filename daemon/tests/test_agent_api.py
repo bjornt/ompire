@@ -168,6 +168,94 @@ def test_replay_then_live_on_late_connect(
     assert client.post(f"/api/tasks/{task_id}/agent/stop", headers=auth_headers).status_code == 200
 
 
+@pytest.mark.parametrize(
+    ("path", "command"),
+    [
+        ("steer", "steer"),
+        ("follow-up", "follow_up"),
+        ("interrupt", "abort_and_prompt"),
+    ],
+)
+def test_composer_action_reaches_live_agent(
+    client: TestClient,
+    auth_headers: dict,
+    auth_token: str,
+    demo_project: dict,
+    path: str,
+    command: str,
+) -> None:
+    task_id = _spawn_live_task(client, auth_headers, auth_token)
+    response = client.post(
+        f"/api/tasks/{task_id}/agent/{path}",
+        headers=auth_headers,
+        json={"message": "keep going"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["command"] == command
+    assert response.json()["success"] is True
+    assert client.post(f"/api/tasks/{task_id}/agent/stop", headers=auth_headers).status_code == 200
+
+
+def test_composer_action_surfaces_agent_rejection(
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
+) -> None:
+    task_id = _spawn_live_task(client, auth_headers, auth_token)
+    # `fail` makes the fake agent answer success: false → 502 upstream error.
+    response = client.post(
+        f"/api/tasks/{task_id}/agent/steer", headers=auth_headers, json={"message": "fail"}
+    )
+    assert response.status_code == 502, response.text
+    assert "boom" in response.json()["detail"]
+    assert client.post(f"/api/tasks/{task_id}/agent/stop", headers=auth_headers).status_code == 200
+
+
+def test_state_and_stats_pass_through(
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
+) -> None:
+    task_id = _spawn_live_task(client, auth_headers, auth_token)
+    state = client.get(f"/api/tasks/{task_id}/agent/state", headers=auth_headers)
+    assert state.status_code == 200, state.text
+    assert state.json()["isStreaming"] is False
+    assert "queuedMessageCount" in state.json()
+
+    stats = client.get(f"/api/tasks/{task_id}/agent/stats", headers=auth_headers)
+    assert stats.status_code == 200, stats.text
+    assert stats.json()["outputTokens"] == 340
+    assert stats.json()["totalCostUsd"] == pytest.approx(0.0123)
+    assert client.post(f"/api/tasks/{task_id}/agent/stop", headers=auth_headers).status_code == 200
+
+
+@pytest.mark.parametrize("path", ["steer", "follow-up", "interrupt"])
+def test_composer_action_404_for_unknown_task(
+    client: TestClient, auth_headers: dict, path: str
+) -> None:
+    response = client.post(
+        f"/api/tasks/999/agent/{path}", headers=auth_headers, json={"message": "x"}
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("post", "steer"),
+        ("post", "follow-up"),
+        ("post", "interrupt"),
+        ("get", "state"),
+        ("get", "stats"),
+    ],
+)
+def test_agent_interaction_409_without_live_agent(
+    client: TestClient, auth_headers: dict, registry_task_id: int, method: str, path: str
+) -> None:
+    url = f"/api/tasks/{registry_task_id}/agent/{path}"
+    if method == "post":
+        response = client.post(url, headers=auth_headers, json={"message": "x"})
+    else:
+        response = client.get(url, headers=auth_headers)
+    assert response.status_code == 409
+
+
 def test_agent_ws_rejects_bad_token(client: TestClient, registry_task_id: int) -> None:
     with pytest.raises(WebSocketDisconnect):
         with client.websocket_connect(f"/api/ws/agents/{registry_task_id}?token=wrong"):

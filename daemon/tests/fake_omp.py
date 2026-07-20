@@ -13,9 +13,12 @@ Scenarios:
 
 `get_state` requests get the response shape verified against omp 16.5.2
 (see the add-session-states change's findings-omp-verification.md):
-`isStreaming` / `queuedMessageCount` at the top level of `data`. Other
-non-`prompt` requests get the recorded `success: false` "Unknown command"
-response; `prompt` requests get the recorded ack + event burst, with these
+`isStreaming` / `queuedMessageCount` at the top level of `data`.
+`get_session_stats` returns token/cost `data`; `steer` / `follow_up` /
+`abort_and_prompt` are acked `success: true` (or `success: false` when their
+message is `fail`). Any other request type gets the recorded `success: false`
+"Unknown command" response; `prompt` requests get the recorded ack + event
+burst, with these
 magic messages:
   die      exit 23 without answering
   fail     respond success: false, error "boom"
@@ -116,6 +119,45 @@ def main() -> None:
                 )
             else:
                 emit(get_state_response(request_id, queued, message_count))
+            continue
+        if request.get("type") == "get_session_stats":
+            emit(
+                {
+                    "id": request_id,
+                    "type": "response",
+                    "command": "get_session_stats",
+                    "success": True,
+                    "data": {
+                        "inputTokens": 1200,
+                        "outputTokens": 340,
+                        "totalCostUsd": 0.0123,
+                        "messageCount": message_count,
+                    },
+                }
+            )
+            continue
+        # Composer actions: acked success, mirroring omp's `message` field.
+        if request.get("type") in ("steer", "follow_up", "abort_and_prompt"):
+            command = request.get("type")
+            if request.get("message", "") == "fail":
+                emit(
+                    {
+                        "id": request_id,
+                        "type": "response",
+                        "command": command,
+                        "success": False,
+                        "error": "boom",
+                    }
+                )
+                continue
+            emit(
+                {
+                    "id": request_id,
+                    "type": "response",
+                    "command": command,
+                    "success": True,
+                }
+            )
             continue
         if request.get("type") != "prompt":
             emit(

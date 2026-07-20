@@ -11,7 +11,8 @@ from sqlalchemy import Engine
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, field_validator
 
-from ompire_daemon.agent import AgentSupervisor, NoLiveAgentError
+from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
+from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
@@ -356,6 +357,103 @@ async def stop_agent_route(
         sessions.clear_operator_stop(task_id)
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     return {"task_id": task_id, "agent": "stopped"}
+
+
+# --- Agent interaction: thin proxies over the live AgentHandle (design D-1) ---
+# Composer actions and status reads for a task's live agent. `interrupt` maps
+# to the RPC `abort_and_prompt`; the message field name mirrors `prompt`
+# (`message`) — verified against real omp in this change's verification task.
+
+
+class AgentMessage(BaseModel):
+    message: str
+
+
+def _require_live_agent(supervisor: AgentSupervisor, task_id: int) -> AgentHandle:
+    handle = supervisor.get(task_id)
+    if handle is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(NoLiveAgentError(task_id)))
+    return handle
+
+
+async def _agent_request(
+    handle: AgentHandle, request_type: str, **fields: object
+) -> dict[str, object]:
+    """Issue an RPC request and turn agent-side failures into clean errors:
+    a `success: false` response is a 502 (the agent rejected it), and a child
+    that exits mid-request is a 409 (no live agent anymore)."""
+    try:
+        return await handle.request(request_type, **fields)
+    except RequestFailedError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, f"agent rejected {request_type}: {exc}"
+        ) from exc
+    except AgentGoneError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"agent exited during {request_type}: {exc}"
+        ) from exc
+
+
+@router.post("/tasks/{task_id}/agent/steer")
+async def steer_agent_route(
+    task_id: int,
+    body: AgentMessage,
+    engine: Engine = Depends(_engine),
+    supervisor: AgentSupervisor = Depends(_supervisor),
+) -> dict[str, object]:
+    _require_task(engine, task_id)
+    handle = _require_live_agent(supervisor, task_id)
+    return await _agent_request(handle, "steer", message=body.message)
+
+
+@router.post("/tasks/{task_id}/agent/follow-up")
+async def follow_up_agent_route(
+    task_id: int,
+    body: AgentMessage,
+    engine: Engine = Depends(_engine),
+    supervisor: AgentSupervisor = Depends(_supervisor),
+) -> dict[str, object]:
+    _require_task(engine, task_id)
+    handle = _require_live_agent(supervisor, task_id)
+    return await _agent_request(handle, "follow_up", message=body.message)
+
+
+@router.post("/tasks/{task_id}/agent/interrupt")
+async def interrupt_agent_route(
+    task_id: int,
+    body: AgentMessage,
+    engine: Engine = Depends(_engine),
+    supervisor: AgentSupervisor = Depends(_supervisor),
+) -> dict[str, object]:
+    _require_task(engine, task_id)
+    handle = _require_live_agent(supervisor, task_id)
+    return await _agent_request(handle, "abort_and_prompt", message=body.message)
+
+
+@router.get("/tasks/{task_id}/agent/state")
+async def agent_state_route(
+    task_id: int,
+    engine: Engine = Depends(_engine),
+    supervisor: AgentSupervisor = Depends(_supervisor),
+) -> dict[str, object]:
+    _require_task(engine, task_id)
+    handle = _require_live_agent(supervisor, task_id)
+    # Pass the agent's `data` through untouched (isStreaming, queuedMessageCount,
+    # todos, context usage, model); the daemon never reinterprets its meaning.
+    response = await _agent_request(handle, "get_state")
+    return response.get("data") or {}
+
+
+@router.get("/tasks/{task_id}/agent/stats")
+async def agent_stats_route(
+    task_id: int,
+    engine: Engine = Depends(_engine),
+    supervisor: AgentSupervisor = Depends(_supervisor),
+) -> dict[str, object]:
+    _require_task(engine, task_id)
+    handle = _require_live_agent(supervisor, task_id)
+    response = await _agent_request(handle, "get_session_stats")
+    return response.get("data") or {}
 
 
 @router.delete("/tasks/{task_id}")
