@@ -2,8 +2,10 @@ import type {
   ConnectionState,
   Envelope,
   Project,
+  SessionInfo,
   SnapshotPayload,
   SpawnStepPayload,
+  StatusChangedPayload,
   Task,
 } from "../types";
 
@@ -15,6 +17,9 @@ export interface DaemonState {
    * `spawn_step` events, never part of the snapshot — a reconnect drops it,
    * and the persisted task state is authoritative from then on. */
   spawnProgress: Record<number, SpawnStepPayload[]>;
+  /** Live session status per task id: loaded from the snapshot, upserted by
+   * `status_changed`, dropped with the task. */
+  sessions: Record<number, SessionInfo>;
 }
 
 export const initialDaemonState: DaemonState = {
@@ -22,6 +27,7 @@ export const initialDaemonState: DaemonState = {
   projects: [],
   tasks: [],
   spawnProgress: {},
+  sessions: {},
 };
 
 /** Applies one envelope from the daemon's WebSocket. `snapshot` is a full
@@ -32,7 +38,17 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
   switch (envelope.type) {
     case "snapshot": {
       const payload = envelope.payload as SnapshotPayload;
-      return { ...state, projects: payload.projects, tasks: payload.tasks, spawnProgress: {} };
+      const sessions: Record<number, SessionInfo> = {};
+      for (const [taskId, info] of Object.entries(payload.sessions ?? {})) {
+        sessions[Number(taskId)] = info;
+      }
+      return {
+        ...state,
+        projects: payload.projects,
+        tasks: payload.tasks,
+        spawnProgress: {},
+        sessions,
+      };
     }
     case "project_created": {
       const project = envelope.payload as Project;
@@ -63,7 +79,8 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
     case "task_deleted": {
       const { id } = envelope.payload as { id: number };
       const { [id]: _dropped, ...spawnProgress } = state.spawnProgress;
-      return { ...state, tasks: state.tasks.filter((t) => t.id !== id), spawnProgress };
+      const { [id]: _droppedSession, ...sessions } = state.sessions;
+      return { ...state, tasks: state.tasks.filter((t) => t.id !== id), spawnProgress, sessions };
     }
     case "spawn_step": {
       const step = envelope.payload as SpawnStepPayload;
@@ -71,6 +88,16 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       return {
         ...state,
         spawnProgress: { ...state.spawnProgress, [step.task_id]: [...existing, step] },
+      };
+    }
+    case "status_changed": {
+      const { task_id, to, reason } = envelope.payload as StatusChangedPayload;
+      return {
+        ...state,
+        sessions: {
+          ...state.sessions,
+          [task_id]: { status: to, reason, since: envelope.ts },
+        },
       };
     }
     default:

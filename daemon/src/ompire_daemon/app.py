@@ -15,6 +15,7 @@ from ompire_daemon.db import db_path_for, make_engine
 from ompire_daemon.events import EventHub
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.registry.tasks import reconcile_interrupted_spawns
+from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.static import DEFAULT_FRONTEND_DIST, mount_frontend
 
 
@@ -29,7 +30,8 @@ def create_app(config: Config, *, frontend_dist: Path = DEFAULT_FRONTEND_DIST) -
     app.state.auth_token = load_or_create_token(config.data_dir)
     app.state.events = EventHub()
     app.state.spawn_jobs = set()
-    app.state.agents = AgentSupervisor(config, app.state.events)
+    app.state.sessions = SessionTracker(app.state.events, config.session_idle_debounce)
+    app.state.agents = AgentSupervisor(config, app.state.events, app.state.sessions)
 
     # Before any snapshot is served: spawns interrupted by a daemon death are dead.
     reconcile_interrupted_spawns(app.state.engine)

@@ -32,7 +32,7 @@ export interface TaskDetail extends Task {
   workshop_status: WorkshopStatus | null;
 }
 
-export type SpawnStepName = "fetch" | "clone" | "branch" | "workshop";
+export type SpawnStepName = "fetch" | "clone" | "branch" | "workshop" | "agent" | "prompt";
 
 export interface SpawnStepPayload {
   task_id: number;
@@ -41,9 +41,27 @@ export interface SpawnStepPayload {
   stderr?: string;
 }
 
+/** SPEC Decision 4 core subset; later chunks add waiting/reviewing/etc. */
+export type SessionStatus = "starting" | "working" | "idle" | "failed";
+
+export interface SessionInfo {
+  status: SessionStatus;
+  reason: string;
+  since: string;
+}
+
+export interface StatusChangedPayload {
+  task_id: number;
+  from: SessionStatus | null;
+  to: SessionStatus;
+  reason: string;
+}
+
 export interface SnapshotPayload {
   projects: Project[];
   tasks: Task[];
+  /** Keyed by task id (JSON object keys arrive as strings). */
+  sessions: Record<string, SessionInfo>;
 }
 
 export interface Envelope<T = unknown> {

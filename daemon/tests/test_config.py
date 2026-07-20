@@ -139,3 +139,19 @@ def test_invalid_agent_ring_buffer_size_fails_fast(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="agent_ring_buffer_size"):
         load_config(config_path)
+
+
+def test_session_idle_debounce_default_and_override(tmp_path: Path) -> None:
+    assert load_config(tmp_path / "does-not-exist.toml").session_idle_debounce == 2.0
+
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("session_idle_debounce = 0.5\n")
+    assert load_config(config_path).session_idle_debounce == 0.5
+
+
+def test_invalid_session_idle_debounce_fails_fast(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("session_idle_debounce = -1\n")
+
+    with pytest.raises(ConfigError, match="session_idle_debounce"):
+        load_config(config_path)

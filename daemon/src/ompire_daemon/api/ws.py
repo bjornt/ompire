@@ -56,8 +56,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     seq = itertools.count()
     projects_payload = [asdict(p) for p in list_projects(engine)]
     tasks_payload = [asdict(t) for t in list_tasks(engine)]
+    # Session statuses ride separately from task rows (design D-4); JSON
+    # object keys are strings, so task ids are stringified here.
+    sessions_payload = {
+        str(task_id): info for task_id, info in websocket.app.state.sessions.snapshot().items()
+    }
     await _send_envelope(
-        websocket, next(seq), "snapshot", {"projects": projects_payload, "tasks": tasks_payload}
+        websocket,
+        next(seq),
+        "snapshot",
+        {"projects": projects_payload, "tasks": tasks_payload, "sessions": sessions_payload},
     )
 
     queue = events.subscribe()

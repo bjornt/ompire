@@ -10,7 +10,14 @@ const PIPELINE_STEPS: { name: SpawnStepName; label: string; detail: (task: Task)
   { name: "clone", label: "Clone", detail: (t) => `git clone → ${t.clone_path}` },
   { name: "branch", label: "Branch", detail: (t) => `${t.branch} off origin base` },
   { name: "workshop", label: "Workshop", detail: () => "my-workshop: container + SDKs (can take a while)" },
+  { name: "agent", label: "Agent", detail: () => "omp --mode rpc-ui: spawn + ready handshake" },
+  { name: "prompt", label: "Prompt", detail: () => "deliver the stored prompt to the agent" },
 ];
+
+/** An empty prompt skips the prompt step server-side; hide it too. */
+function stepsFor(task: Task) {
+  return task.prompt ? PIPELINE_STEPS : PIPELINE_STEPS.filter((s) => s.name !== "prompt");
+}
 
 type StepStatus = "pending" | "running" | "ok" | "failed";
 
@@ -58,7 +65,7 @@ export function SpawnView() {
     <>
       <div className="headerRow">
         <h1>Spawn task</h1>
-        <span className="subline">clone → branch → workshop container (agents come in later chunks)</span>
+        <span className="subline">clone → branch → workshop container → agent + prompt</span>
       </div>
 
       <div className="spawnGrid">
@@ -116,7 +123,7 @@ export function SpawnView() {
               rows={9}
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              placeholder="What should the agent do? (stored now, sent to the agent from chunk 7 on)"
+              placeholder="What should the agent do? (delivered once the agent is ready)"
             />
           </div>
 
@@ -142,12 +149,12 @@ export function SpawnView() {
             </p>
           ) : (
             <div className="pipeline">
-              {PIPELINE_STEPS.map((stepDef, index) => {
+              {stepsFor(spawnedTask).map((stepDef, index, pipelineSteps) => {
                 const status = statusOf(steps, stepDef.name);
                 const failed = stepStatus(steps, stepDef.name);
                 return (
                   <div className="step" key={stepDef.name} data-step-status={status}>
-                    {index < PIPELINE_STEPS.length - 1 && <span className="rail" />}
+                    {index < pipelineSteps.length - 1 && <span className="rail" />}
                     <span className={`bullet ${status}`}>
                       {status === "ok" ? "✓" : status === "failed" ? "✕" : index + 1}
                     </span>
@@ -173,7 +180,8 @@ export function SpawnView() {
           )}
           {spawnedTask && spawnedTask.state === "created" && spawnedTask.spawn_completed_at && (
             <div className="doneNote">
-              Workspace ready at <code>{spawnedTask.clone_path}</code> —{" "}
+              Agent launched in <code>{spawnedTask.clone_path}</code>
+              {spawnedTask.prompt ? " — working on the prompt" : ""} —{" "}
               <Link to="/tasks">back to Tasks</Link>
             </div>
           )}

@@ -169,3 +169,71 @@ describe("applyEnvelope task events", () => {
     expect(state.tasks).toEqual([task]);
   });
 });
+
+describe("applyEnvelope session events", () => {
+  const empty = applyEnvelope(initialDaemonState, {
+    seq: 0,
+    ts: "",
+    type: "snapshot",
+    payload: { projects: [], tasks: [], sessions: {} },
+  });
+
+  it("loads sessions from the snapshot with numeric task-id keys", () => {
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: {
+        projects: [],
+        tasks: [task],
+        sessions: { "1": { status: "working", reason: "agent_start frame", since: "t0" } },
+      },
+    });
+    expect(state.sessions[1]).toEqual({
+      status: "working",
+      reason: "agent_start frame",
+      since: "t0",
+    });
+  });
+
+  it("upserts on status_changed using the envelope timestamp", () => {
+    let state = applyEnvelope(empty, {
+      seq: 1,
+      ts: "t1",
+      type: "status_changed",
+      payload: { task_id: 1, from: null, to: "starting", reason: "agent spawned" },
+    });
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "t2",
+      type: "status_changed",
+      payload: { task_id: 1, from: "starting", to: "working", reason: "agent_start frame" },
+    });
+    expect(state.sessions[1]).toEqual({
+      status: "working",
+      reason: "agent_start frame",
+      since: "t2",
+    });
+  });
+
+  it("drops the session on task_deleted", () => {
+    let state = applyEnvelope(empty, {
+      seq: 1,
+      ts: "t1",
+      type: "status_changed",
+      payload: { task_id: 1, from: null, to: "failed", reason: "process exited with code 137" },
+    });
+    state = applyEnvelope(state, { seq: 2, ts: "", type: "task_deleted", payload: { id: 1 } });
+    expect(state.sessions).toEqual({});
+  });
+
+  it("tolerates snapshots without a sessions map", () => {
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [] },
+    });
+    expect(state.sessions).toEqual({});
+  });
+});

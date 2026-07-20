@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -7,19 +8,32 @@ from fastapi.testclient import TestClient
 from ompire_daemon.app import create_app
 from ompire_daemon.config import Config
 
+FAKE_OMP = Path(__file__).parent / "fake_omp.py"
+
+# Answers the daemon's two in-container invocations so REST-spawned pipelines
+# run end-to-end against the fake omp: the ask-timeout preflight gets `0`,
+# the rpc-ui spawn execs fake_omp, anything else (info/remove) succeeds.
+FAKE_WORKSHOP_SCRIPT = f"""#!/bin/sh
+case "$*" in
+  *"config get ask.timeout"*) echo 0 ;;
+  *"--mode rpc-ui"*) exec {sys.executable} -u {FAKE_OMP} happy ;;
+  *) exit 0 ;;
+esac
+"""
+
 
 @pytest.fixture(autouse=True)
 def fake_workshop_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Shadow any real `workshop` binary with a benign fake on PATH.
+    """Shadow any real `workshop` binary with a fake on PATH.
 
-    Defaults to success for every subcommand; tests overwrite the script to
-    exercise absent/error paths. Autouse so no test can ever touch real
-    containers.
+    Defaults to success for every subcommand and speaks fake omp for agent
+    spawns; tests overwrite the script to exercise absent/error paths.
+    Autouse so no test can ever touch real containers.
     """
     bin_dir = tmp_path / "fake-bin"
     bin_dir.mkdir()
     script = bin_dir / "workshop"
-    script.write_text("#!/bin/sh\nexit 0\n")
+    script.write_text(FAKE_WORKSHOP_SCRIPT)
     script.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     return script
@@ -37,6 +51,8 @@ def daemon_config(tmp_path: Path) -> Config:
         task_dir_root=tmp_path / "tasks",
         checkout_root=tmp_path / "proj",
         my_workshop_command=(str(fake_my_workshop),),
+        # Fast turn boundaries so idle transitions land within test budgets.
+        session_idle_debounce=0.1,
     )
 
 

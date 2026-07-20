@@ -15,11 +15,14 @@ import logging
 import os
 from collections import deque
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ompire_daemon import rpc
 from ompire_daemon.config import Config
 from ompire_daemon.events import Event, EventHub
+
+if TYPE_CHECKING:
+    from ompire_daemon.sessions import SessionTracker
 
 logger = logging.getLogger(__name__)
 
@@ -240,9 +243,12 @@ class AgentSupervisor:
     """Task id → live AgentHandle (design D-1); in-memory only, no registry
     writes — persistence questions belong to later chunks."""
 
-    def __init__(self, config: Config, hub: EventHub) -> None:
+    def __init__(
+        self, config: Config, hub: EventHub, tracker: SessionTracker | None = None
+    ) -> None:
         self._config = config
         self._hub = hub
+        self._tracker = tracker
         self._handles: dict[int, AgentHandle] = {}
         self._waiters: set[asyncio.Task] = set()
         self._ask_timeout_verified: set[int] = set()
@@ -257,6 +263,9 @@ class AgentSupervisor:
             await verify_ask_timeout(clone_path)
             self._ask_timeout_verified.add(task_id)
         argv = build_agent_argv(clone_path, self._config.agent_env)
+        if self._tracker is not None:
+            # `starting` covers the spawn and ready handshake (design D-2).
+            self._tracker.agent_spawning(task_id)
         handle = await AgentHandle.start(
             argv,
             ready_timeout=self._config.agent_ready_timeout,
@@ -267,6 +276,8 @@ class AgentSupervisor:
             await handle.kill()
             raise AgentAlreadyRunningError(task_id)
         self._handles[task_id] = handle
+        if self._tracker is not None:
+            self._tracker.watch(task_id, handle)
         waiter = asyncio.create_task(self._watch(task_id, handle))
         self._waiters.add(waiter)
         waiter.add_done_callback(self._waiters.discard)
@@ -282,6 +293,7 @@ class AgentSupervisor:
         code = await handle.wait_exited()
         if self._handles.get(task_id) is handle:
             del self._handles[task_id]
-        # Exit is an event, not a state (design D-6): dashboards learn the
-        # fact on the main hub; interpreting it is chunk 7's job.
+        # Interpretation first (session goes `failed`), then the raw fact.
+        if self._tracker is not None:
+            self._tracker.agent_exited(task_id, code)
         self._hub.publish("agent_exited", {"task_id": task_id, "exit_code": code})

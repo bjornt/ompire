@@ -23,6 +23,9 @@ DEFAULT_WORKSHOP_STEP_TIMEOUT = 600
 # Ready handshake covers container-side omp startup; the spike saw ~1.6s.
 DEFAULT_AGENT_READY_TIMEOUT = 30
 DEFAULT_AGENT_RING_BUFFER_SIZE = 1000
+# Turn-boundary debounce before a session goes idle (SPEC D4): chained
+# agent_end → agent_start hops must not flicker through idle.
+DEFAULT_SESSION_IDLE_DEBOUNCE = 2.0
 
 _KNOWN_KEYS = {
     "port",
@@ -37,6 +40,7 @@ _KNOWN_KEYS = {
     "agent_env",
     "agent_ready_timeout",
     "agent_ring_buffer_size",
+    "session_idle_debounce",
 }
 
 
@@ -60,6 +64,7 @@ class Config:
     agent_env: dict[str, str] = field(default_factory=dict)
     agent_ready_timeout: int = DEFAULT_AGENT_READY_TIMEOUT
     agent_ring_buffer_size: int = DEFAULT_AGENT_RING_BUFFER_SIZE
+    session_idle_debounce: float = DEFAULT_SESSION_IDLE_DEBOUNCE
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -163,6 +168,17 @@ def load_config(path: Path | None = None) -> Config:
             f"got {agent_ring_buffer_size!r}"
         )
 
+    session_idle_debounce = data.get("session_idle_debounce", DEFAULT_SESSION_IDLE_DEBOUNCE)
+    if (
+        not isinstance(session_idle_debounce, (int, float))
+        or isinstance(session_idle_debounce, bool)
+        or session_idle_debounce < 0
+    ):
+        raise ConfigError(
+            f"config key 'session_idle_debounce' must be a non-negative number, "
+            f"got {session_idle_debounce!r}"
+        )
+
     return Config(
         port=port,
         bind=bind,
@@ -176,6 +192,7 @@ def load_config(path: Path | None = None) -> Config:
         agent_env=agent_env,
         agent_ready_timeout=agent_ready_timeout,
         agent_ring_buffer_size=agent_ring_buffer_size,
+        session_idle_debounce=float(session_idle_debounce),
     )
 
 

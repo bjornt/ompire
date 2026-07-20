@@ -21,7 +21,7 @@ class MockWebSocket {
     this.onmessage?.({ data: JSON.stringify({ seq: 0, ts: "", type, payload }) });
   }
 
-  emitSnapshot(payload: { projects: unknown[]; tasks: unknown[] }) {
+  emitSnapshot(payload: { projects: unknown[]; tasks: unknown[]; sessions?: unknown }) {
     this.onopen?.();
     this.emit("snapshot", payload);
   }
@@ -59,7 +59,10 @@ function socket(): MockWebSocket {
   return MockWebSocket.instances[0];
 }
 
-async function renderAt(path: string, snapshot: { projects: unknown[]; tasks: unknown[] }) {
+async function renderAt(
+  path: string,
+  snapshot: { projects: unknown[]; tasks: unknown[]; sessions?: unknown },
+) {
   window.history.pushState({}, "", path);
   render(<App />);
   act(() => {
@@ -116,7 +119,66 @@ describe("SpawnView", () => {
       "running",
       "pending",
       "pending",
+      "pending",
+      "pending",
     ]);
+  });
+
+  it("renders the agent and prompt steps as they run", async () => {
+    await renderAt("/spawn", { projects: [project], tasks: [] });
+    const user = userEvent.setup();
+    const spawned = makeTask({ spawn_completed_at: null });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
+    );
+
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await user.type(screen.getByLabelText("Prompt"), "fix it");
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+
+    act(() => {
+      socket().emit("task_created", spawned);
+      for (const step of ["fetch", "clone", "branch", "workshop", "agent"]) {
+        socket().emit("spawn_step", { task_id: 1, step, status: "started" });
+        socket().emit("spawn_step", { task_id: 1, step, status: "ok" });
+      }
+      socket().emit("spawn_step", { task_id: 1, step: "prompt", status: "started" });
+    });
+
+    const progress = screen.getByTestId("spawn-progress");
+    expect(within(progress).getByText("Agent")).toBeInTheDocument();
+    expect(within(progress).getByText("Prompt")).toBeInTheDocument();
+    const steps = progress.querySelectorAll("[data-step-status]");
+    expect([...steps].map((s) => s.getAttribute("data-step-status"))).toEqual([
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "ok",
+      "running",
+    ]);
+  });
+
+  it("hides the prompt step for a promptless spawn", async () => {
+    await renderAt("/spawn", { projects: [project], tasks: [] });
+    const user = userEvent.setup();
+    const spawned = makeTask({ spawn_completed_at: null, prompt: "" });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
+    );
+
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+
+    act(() => {
+      socket().emit("task_created", spawned);
+    });
+
+    const progress = screen.getByTestId("spawn-progress");
+    expect(within(progress).getByText("Agent")).toBeInTheDocument();
+    expect(within(progress).queryByText("Prompt")).not.toBeInTheDocument();
   });
 
   it("expands stderr inline when a step fails and links to the dashboard", async () => {
@@ -224,6 +286,90 @@ describe("TasksView cards", () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
     await user.click(screen.getByRole("button", { name: "Clean up" }));
     expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining("ws-maas-fix-bug"));
+  });
+});
+
+describe("TasksView session status", () => {
+  it("renders the working pill with breathing dot and slide bar from the snapshot", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: { "1": { status: "working", reason: "agent_start frame", since: "t0" } },
+    });
+
+    const card = screen.getByTestId("task-card-1");
+    expect(card).toHaveTextContent("working");
+    expect(card).not.toHaveTextContent("created");
+    expect(card.querySelector(".breathingDot")).toBeInTheDocument();
+    expect(screen.getByTestId("slide-bar-1")).toBeInTheDocument();
+  });
+
+  it("updates pill and tier styling live on status_changed", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: { "1": { status: "working", reason: "agent_start frame", since: "t0" } },
+    });
+
+    act(() => {
+      socket().emit("status_changed", {
+        task_id: 1,
+        from: "working",
+        to: "idle",
+        reason: "agent_end, queue empty after 2.0s",
+      });
+    });
+
+    const card = screen.getByTestId("task-card-1");
+    expect(card).toHaveTextContent("idle");
+    expect(screen.queryByTestId("slide-bar-1")).not.toBeInTheDocument();
+    expect(card.querySelector(".breathingDot")).not.toBeInTheDocument();
+  });
+
+  it("failed sessions render interrupt styling with the reason accessible", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": { status: "failed", reason: "process exited with code 137", since: "t0" },
+      },
+    });
+
+    const card = screen.getByTestId("task-card-1");
+    expect(card.className).toContain("failed");
+    expect(screen.getByTestId("session-reason-1")).toHaveTextContent(
+      "process exited with code 137",
+    );
+  });
+
+  it("falls back to the spawn-derived pill when no session exists", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask({ spawn_completed_at: null })],
+      sessions: {},
+    });
+
+    expect(screen.getByTestId("task-card-1")).toHaveTextContent("spawning");
+  });
+
+  it("counts failed sessions in the N-need-you pill; working sessions stay silent", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [
+        makeTask(),
+        makeTask({ id: 2, slug: "other", branch: "bjornt/other" }),
+        makeTask({ id: 3, slug: "third", branch: "bjornt/third", state: "failed", error: "x" }),
+      ],
+      sessions: {
+        "1": { status: "working", reason: "agent_start frame", since: "t0" },
+        "2": { status: "failed", reason: "process exited with code 137", since: "t0" },
+        "3": { status: "failed", reason: "stopped by operator", since: "t0" },
+      },
+    });
+
+    // Task 3 is failed twice over (registry + session) but counts once.
+    expect(screen.getByText("2 need you")).toBeInTheDocument();
+    expect(document.title).toBe("(2) ompire");
   });
 });
 

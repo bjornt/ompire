@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { cleanupTask } from "../lib/api";
 import { isSpawning } from "../lib/daemonReducer";
 import { useDaemonState } from "../lib/daemonSocket";
-import type { Task } from "../types";
+import type { SessionInfo, Task } from "../types";
 import "./TasksView.css";
 
 export function formatElapsed(fromIso: string, now: Date = new Date()): string {
@@ -16,11 +16,39 @@ export function formatElapsed(fromIso: string, now: Date = new Date()): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
-function TaskCard({ task }: { task: Task }) {
+/** The session pill with SPEC D4 tier styling (per the Tasks.dc.html mockup):
+ * working/starting breathe quietly, idle is a bordered badge, failed is the
+ * interrupt tier with the transition reason accessible on the pill. */
+function SessionPill({ session }: { session: SessionInfo }) {
+  if (session.status === "failed") {
+    return (
+      <span className="statePill failed" title={session.reason}>
+        {session.status}
+      </span>
+    );
+  }
+  if (session.status === "idle") {
+    return (
+      <span className="statePill neutral" title={session.reason}>
+        <span className="ringDot" />
+        {session.status}
+      </span>
+    );
+  }
+  return (
+    <span className="statePill live" title={session.reason}>
+      <span className="breathingDot" />
+      {session.status}
+    </span>
+  );
+}
+
+function TaskCard({ task, session }: { task: Task; session: SessionInfo | undefined }) {
   const [showError, setShowError] = useState(false);
   const spawning = isSpawning(task);
-  const failed = task.state === "failed";
-  const pillLabel = spawning ? "spawning" : task.state;
+  const sessionFailed = session?.status === "failed";
+  const failed = task.state === "failed" || sessionFailed;
+  const animating = session?.status === "working" || session?.status === "starting";
 
   async function onCleanup() {
     const workshopLine = task.workshop_id
@@ -42,14 +70,28 @@ function TaskCard({ task }: { task: Task }) {
       <div className="cardTop">
         <span className="cardProject">{task.project_name}</span>
         <span className="cardSpacer" />
-        <span className={`statePill ${failed ? "failed" : spawning ? "spawning" : "neutral"}`}>
-          {spawning && <span className="pillDot" />}
-          {pillLabel}
-        </span>
+        {session ? (
+          <SessionPill session={session} />
+        ) : (
+          <span className={`statePill ${failed ? "failed" : spawning ? "spawning" : "neutral"}`}>
+            {spawning && <span className="pillDot" />}
+            {spawning ? "spawning" : task.state}
+          </span>
+        )}
       </div>
       <Link className="cardBranch" to={`/tasks/${task.id}`} data-testid={`task-link-${task.id}`}>
         {task.branch}
       </Link>
+      {sessionFailed && (
+        <div className="sessionReason" data-testid={`session-reason-${task.id}`}>
+          {session.reason}
+        </div>
+      )}
+      {animating && (
+        <div className="slideTrack" data-testid={`slide-bar-${task.id}`}>
+          <span className="slideBar" />
+        </div>
+      )}
       {failed && task.error && (
         <>
           <button
@@ -82,7 +124,7 @@ function TaskCard({ task }: { task: Task }) {
 }
 
 export function TasksView() {
-  const { tasks, projects } = useDaemonState();
+  const { tasks, projects, sessions } = useDaemonState();
   const visible = tasks.filter((t) => t.state !== "archived");
 
   return (
@@ -106,7 +148,7 @@ export function TasksView() {
       ) : (
         <div className="cardGrid" data-testid="tasks-list">
           {visible.map((task) => (
-            <TaskCard key={task.id} task={task} />
+            <TaskCard key={task.id} task={task} session={sessions[task.id]} />
           ))}
         </div>
       )}

@@ -21,8 +21,8 @@ const DAEMON_CHIP_BY_STATE: Record<ConnectionState, { dot: string; title: string
 };
 
 export function Chrome() {
-  const { connectionState, tasks } = useDaemonState();
-  const needsYou = countNeedsAttention(tasks);
+  const { connectionState, tasks, sessions } = useDaemonState();
+  const needsYou = countNeedsAttention(tasks, sessions);
   const daemonChip = DAEMON_CHIP_BY_STATE[connectionState];
 
   useEffect(() => {

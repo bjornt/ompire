@@ -11,16 +11,10 @@ from sqlalchemy import Engine
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, field_validator
 
-from ompire_daemon.agent import (
-    AgentAlreadyRunningError,
-    AgentStartError,
-    AgentSupervisor,
-    NoLiveAgentError,
-)
+from ompire_daemon.agent import AgentSupervisor, NoLiveAgentError
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.registry.projects import (
     DuplicateProjectError,
     InvalidBranchPatternError,
@@ -48,6 +42,7 @@ from ompire_daemon.registry.tasks import (
     purge_task,
     validate_task_slug,
 )
+from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.spawn import run_spawn_pipeline
 from ompire_daemon.workshop import WorkshopRemoveError, remove_workshop, workshop_status
 
@@ -101,6 +96,10 @@ def _config(request: Request) -> Config:
 
 def _events(request: Request) -> EventHub:
     return request.app.state.events
+
+
+def _sessions(request: Request) -> SessionTracker:
+    return request.app.state.sessions
 
 
 @router.get("/projects", response_model=list[ProjectOut])
@@ -265,7 +264,17 @@ async def spawn_task_route(
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
     events.publish("task_created", asdict(task))
-    job = asyncio.create_task(run_spawn_pipeline(engine, events, config, task.id, project))
+    job = asyncio.create_task(
+        run_spawn_pipeline(
+            engine,
+            events,
+            config,
+            task.id,
+            project,
+            request.app.state.agents,
+            request.app.state.sessions,
+        )
+    )
     # Keep a reference so the job isn't garbage-collected mid-pipeline.
     jobs: set[asyncio.Task] = request.app.state.spawn_jobs
     jobs.add(job)
@@ -279,6 +288,7 @@ async def cleanup_task_route(
     engine: Engine = Depends(_engine),
     config: Config = Depends(_config),
     events: EventHub = Depends(_events),
+    sessions: SessionTracker = Depends(_sessions),
 ) -> Task:
     try:
         task = get_task(engine, task_id)
@@ -308,14 +318,14 @@ async def cleanup_task_route(
     await asyncio.to_thread(shutil.rmtree, clone_path, ignore_errors=True)
 
     archived = mark_archived(engine, task_id)
+    sessions.discard(task_id)
     events.publish("task_updated", asdict(archived))
     return archived
 
 
-# --- Provisional agent control surface (design D-7) ---------------------------
-# Scaffolding so this chunk is dogfoodable: thin calls into the supervisor, no
-# registry writes. Chunk 7's state machine supersedes start/prompt as the way
-# agents get started; stop likely survives.
+# --- Agent control surface --------------------------------------------------
+# Start and prompt are the spawn pipeline's job now (design D-5); stop stays
+# as the manual kill switch, feeding the tracker's operator-stop reason.
 
 
 def _supervisor(request: Request) -> AgentSupervisor:
@@ -329,62 +339,31 @@ def _require_task(engine: Engine, task_id: int) -> Task:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
 
-class AgentPromptBody(BaseModel):
-    message: str
-
-
-@router.post("/tasks/{task_id}/agent/start")
-async def start_agent_route(
-    task_id: int,
-    engine: Engine = Depends(_engine),
-    supervisor: AgentSupervisor = Depends(_supervisor),
-) -> dict[str, object]:
-    task = _require_task(engine, task_id)
-    try:
-        await supervisor.start(task.id, task.clone_path)
-    except AgentAlreadyRunningError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except AgentStartError as exc:
-        detail = str(exc) if not exc.stderr else f"{exc}\n{exc.stderr}"
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail) from exc
-    return {"task_id": task_id, "agent": "running"}
-
-
-@router.post("/tasks/{task_id}/agent/prompt")
-async def prompt_agent_route(
-    task_id: int,
-    body: AgentPromptBody,
-    engine: Engine = Depends(_engine),
-    supervisor: AgentSupervisor = Depends(_supervisor),
-) -> dict[str, object]:
-    _require_task(engine, task_id)
-    handle = supervisor.get(task_id)
-    if handle is None:
-        raise HTTPException(status.HTTP_409_CONFLICT, f"task {task_id} has no live agent")
-    try:
-        # The returned frame is omp's receipt ack ("queued"), not completion.
-        return await handle.prompt(body.message)
-    except (RequestFailedError, AgentGoneError) as exc:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
-
-
 @router.post("/tasks/{task_id}/agent/stop")
 async def stop_agent_route(
     task_id: int,
     engine: Engine = Depends(_engine),
     supervisor: AgentSupervisor = Depends(_supervisor),
+    sessions: SessionTracker = Depends(_sessions),
 ) -> dict[str, object]:
     _require_task(engine, task_id)
+    # Flag before the kill so the exit lands as "stopped by operator", not a
+    # crash (design D-2); cleared again if there was nothing to stop.
+    sessions.expect_operator_stop(task_id)
     try:
         await supervisor.stop(task_id)
     except NoLiveAgentError as exc:
+        sessions.clear_operator_stop(task_id)
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     return {"task_id": task_id, "agent": "stopped"}
 
 
 @router.delete("/tasks/{task_id}")
 def purge_task_route(
-    task_id: int, engine: Engine = Depends(_engine), events: EventHub = Depends(_events)
+    task_id: int,
+    engine: Engine = Depends(_engine),
+    events: EventHub = Depends(_events),
+    sessions: SessionTracker = Depends(_sessions),
 ) -> dict[str, int]:
     try:
         purge_task(engine, task_id)
@@ -392,5 +371,6 @@ def purge_task_route(
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except TaskNotArchivedError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    sessions.discard(task_id)
     events.publish("task_deleted", {"id": task_id})
     return {"deleted": task_id}

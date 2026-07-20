@@ -1,21 +1,25 @@
-"""Spawn pipeline: fetch → hardlink clone → branch → workshop launch
-(SPEC Decision 5, steps 1–2).
+"""Spawn pipeline: fetch → hardlink clone → branch → workshop launch →
+agent start → prompt delivery (SPEC Decision 5, steps 1–4).
 
-Runs as an asyncio background job after POST /api/tasks returns 202. Each step
-is a subprocess exec'd with an argument list (no shell), bounded by a
-per-step timeout, with stderr captured. Progress is ephemeral — broadcast as
-`spawn_step` events, never persisted; the registry records only the outcome
-(and, for the workshop step, the launched workshop's lock id).
+Runs as an asyncio background job after POST /api/tasks returns 202. The
+first four steps are subprocesses exec'd with argument lists (no shell),
+bounded by per-step timeouts, with stderr captured; the `agent` and `prompt`
+steps are coroutines against the supervisor (design D-5). All six share the
+same `spawn_step` started/ok/failed event contract. Progress is ephemeral —
+broadcast, never persisted; the registry records only the outcome (and, for
+the workshop step, the launched workshop's lock id).
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from sqlalchemy import Engine
 
+from ompire_daemon.agent import AgentStartError, AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.registry.projects import Project
@@ -26,6 +30,8 @@ from ompire_daemon.registry.tasks import (
     mark_spawn_completed,
     mark_workshop_launched,
 )
+from ompire_daemon.rpc import AgentGoneError, RequestFailedError
+from ompire_daemon.sessions import SessionTracker
 
 _STDERR_LIMIT = 64 * 1024
 
@@ -66,14 +72,14 @@ async def _run_step(step: Step) -> str:
     except TimeoutError:
         process.kill()
         await process.wait()
-        raise
+        raise StepFailedError(step.name, f"timed out after {step.timeout}s") from None
     stderr = stderr_bytes[-_STDERR_LIMIT:].decode("utf-8", errors="replace")
     if process.returncode != 0:
         raise StepFailedError(step.name, stderr)
     return stderr
 
 
-def _pipeline_steps(config: Config, project: Project, task: Task) -> list[Step]:
+def _git_steps(config: Config, project: Project, task: Task) -> list[Step]:
     clone_path = task.clone_path
     git_timeout = config.spawn_step_timeout
     return [
@@ -84,15 +90,6 @@ def _pipeline_steps(config: Config, project: Project, task: Task) -> list[Step]:
             "branch",
             ["git", "-C", clone_path, "checkout", "-b", task.branch, f"origin/{project.base_branch}"],
             git_timeout,
-        ),
-        # my-workshop creates/augments workshop.yaml, hides it from git, and
-        # launches the container. Its contract with the daemon is only
-        # "exit 0 and leave a .workshop.lock" (design D-1).
-        Step(
-            "workshop",
-            [*config.my_workshop_command],
-            config.workshop_step_timeout,
-            cwd=clone_path,
         ),
     ]
 
@@ -121,6 +118,8 @@ async def run_spawn_pipeline(
     config: Config,
     task_id: int,
     project: Project,
+    supervisor: AgentSupervisor,
+    tracker: SessionTracker,
 ) -> None:
     task = get_task(engine, task_id)
 
@@ -135,31 +134,80 @@ async def run_spawn_pipeline(
         events.publish("task_updated", asdict(failed))
         return
 
-    for step in _pipeline_steps(config, project, task):
-        events.publish("spawn_step", {"task_id": task_id, "step": step.name, "status": "started"})
+    async def run_workshop() -> None:
+        # my-workshop creates/augments workshop.yaml, hides it from git, and
+        # launches the container. Its contract with the daemon is only
+        # "exit 0 and leave a .workshop.lock" (design D-1).
+        await _run_step(
+            Step(
+                "workshop",
+                [*config.my_workshop_command],
+                config.workshop_step_timeout,
+                cwd=task.clone_path,
+            )
+        )
+        lock_id = _read_workshop_lock(task.clone_path)
+        mark_workshop_launched(engine, task_id, lock_id)
+
+    async def run_agent() -> None:
+        # The ask-timeout preflight and ready handshake live in the
+        # supervisor; the ready timeout bounds the whole start (design D-5).
         try:
+            await supervisor.start(task_id, task.clone_path)
+        except AgentStartError as exc:
+            detail = str(exc) if not exc.stderr else f"{exc}\n{exc.stderr}"
+            raise StepFailedError("agent", detail) from exc
+        except Exception as exc:  # noqa: BLE001 — e.g. a concurrent-start race
+            raise StepFailedError("agent", str(exc)) from exc
+
+    async def run_prompt() -> None:
+        handle = supervisor.get(task_id)
+        if handle is None:
+            raise StepFailedError("prompt", "agent is no longer live")
+        try:
+            # The ack is a receipt ("queued"), not turn completion (spike
+            # finding): the step is done once omp has accepted the prompt.
+            await asyncio.wait_for(handle.prompt(task.prompt), timeout=config.spawn_step_timeout)
+        except TimeoutError:
+            raise StepFailedError(
+                "prompt", f"no ack within {config.spawn_step_timeout}s"
+            ) from None
+        except (RequestFailedError, AgentGoneError) as exc:
+            raise StepFailedError("prompt", str(exc)) from exc
+
+    def subprocess_runner(step: Step) -> Callable[[], Awaitable[None]]:
+        async def run() -> None:
             await _run_step(step)
-            if step.name == "workshop":
-                lock_id = _read_workshop_lock(task.clone_path)
-                mark_workshop_launched(engine, task_id, lock_id)
+
+        return run
+
+    steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
+        (step.name, subprocess_runner(step)) for step in _git_steps(config, project, task)
+    ]
+    steps.append(("workshop", run_workshop))
+    steps.append(("agent", run_agent))
+    if task.prompt:
+        steps.append(("prompt", run_prompt))
+
+    for name, runner in steps:
+        events.publish("spawn_step", {"task_id": task_id, "step": name, "status": "started"})
+        try:
+            await runner()
         except StepFailedError as exc:
             events.publish(
                 "spawn_step",
-                {"task_id": task_id, "step": step.name, "status": "failed", "stderr": exc.stderr},
+                {"task_id": task_id, "step": name, "status": "failed", "stderr": exc.stderr},
             )
-            failed = mark_failed(engine, task_id, f"step {step.name!r} failed:\n{exc.stderr}")
+            failed = mark_failed(engine, task_id, f"step {name!r} failed:\n{exc.stderr}")
+            # A session only exists once the agent step began; earlier
+            # failures no-op in the tracker (design D-2).
+            tracker.spawn_step_failed(task_id, f"spawn step {name!r} failed")
             events.publish("task_updated", asdict(failed))
             return
-        except TimeoutError:
-            stderr = f"timed out after {step.timeout}s"
-            events.publish(
-                "spawn_step",
-                {"task_id": task_id, "step": step.name, "status": "failed", "stderr": stderr},
-            )
-            failed = mark_failed(engine, task_id, f"step {step.name!r} {stderr}")
-            events.publish("task_updated", asdict(failed))
-            return
-        events.publish("spawn_step", {"task_id": task_id, "step": step.name, "status": "ok"})
+        events.publish("spawn_step", {"task_id": task_id, "step": name, "status": "ok"})
 
     completed = mark_spawn_completed(engine, task_id)
     events.publish("task_updated", asdict(completed))
+    if not task.prompt:
+        # Promptless task: ready → idle instead of hanging in starting.
+        tracker.prompt_skipped(task_id)
