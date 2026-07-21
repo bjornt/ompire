@@ -41,15 +41,66 @@ export interface SpawnStepPayload {
   stderr?: string;
 }
 
-/** SPEC Decision 4: core subset plus the `ask-approvals` waiting states;
- * later chunks add reviewing/stalled/retrying/etc. */
+/** SPEC Decision 4: core subset plus the `ask-approvals` waiting states and
+ * the notifications/attention chunk's `stalled`/`retrying`; later chunks add
+ * `reviewing`/etc. */
 export type SessionStatus =
   | "starting"
   | "working"
   | "idle"
   | "failed"
   | "waiting-input"
-  | "waiting-approval";
+  | "waiting-approval"
+  | "stalled"
+  | "retrying";
+
+/** SPEC Decision 4 attention tier, owned by the daemon's notifier
+ * (attention-notifications capability): `notify`/`interrupt` are the only
+ * tiers that ever appear in an `attention` entry — `silent`/`badge` sessions
+ * never get one. */
+export type AttentionTier = "silent" | "badge" | "notify" | "interrupt";
+
+/** An active daemon attention entry (attention-notifications capability):
+ * present for a task while its session is in the `notify`/`interrupt` tier,
+ * driving the "N need you" count, tab-title badge, and favicon badge. */
+export interface AttentionEntry {
+  tier: AttentionTier;
+  status: SessionStatus;
+  reason: string;
+}
+
+export interface AttentionPayload extends AttentionEntry {
+  task_id: number;
+}
+
+export interface AttentionClearedPayload {
+  task_id: number;
+}
+
+/** GET .../agent/stats-shaped `stats` event (session-advisories capability):
+ * throttled per task at each turn boundary. */
+export interface StatsPayload {
+  task_id: number;
+  context_pct: number | null;
+  tokens: { input?: number; output?: number } | null;
+  cost: number | null;
+}
+
+export type AdvisoryKind = "context-high" | "maybe-waiting";
+
+/** An advisory decoration (session-advisories capability): never a session
+ * state, never contributes to the attention tier. `context_pct` is present
+ * only for `context-high`. */
+export interface AdvisoryPayload {
+  task_id: number;
+  kind: AdvisoryKind;
+  context_pct?: number;
+}
+
+export interface AdvisoryClearedPayload {
+  task_id: number;
+  kind: AdvisoryKind;
+}
 
 /** Normalized pending-question payload (ask-approvals capability, design
  * D-4): `kind` distinguishes an `ask` question from an approval gate; only
@@ -126,6 +177,9 @@ export interface SnapshotPayload {
   tasks: Task[];
   /** Keyed by task id (JSON object keys arrive as strings). */
   sessions: Record<string, SessionInfo>;
+  /** Active attention entries, keyed by task id (JSON object keys arrive as
+   * strings); absent from snapshots emitted before this chunk. */
+  attention?: Record<string, AttentionEntry>;
 }
 
 export interface Envelope<T = unknown> {

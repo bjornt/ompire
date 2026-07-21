@@ -2,6 +2,7 @@ import { NavLink, Outlet } from "react-router-dom";
 import { useEffect } from "react";
 import { useDaemonState } from "../lib/daemonSocket";
 import { countNeedsAttention } from "../lib/attention";
+import { setFaviconBadge } from "../lib/favicon";
 import type { ConnectionState } from "../types";
 import "./Chrome.css";
 
@@ -21,12 +22,13 @@ const DAEMON_CHIP_BY_STATE: Record<ConnectionState, { dot: string; title: string
 };
 
 export function Chrome() {
-  const { connectionState, tasks, sessions } = useDaemonState();
-  const needsYou = countNeedsAttention(tasks, sessions);
+  const { connectionState, tasks, attention } = useDaemonState();
+  const needsYou = countNeedsAttention(tasks, attention);
   const daemonChip = DAEMON_CHIP_BY_STATE[connectionState];
 
   useEffect(() => {
     document.title = needsYou > 0 ? `(${needsYou}) ompire` : "ompire";
+    setFaviconBadge(needsYou);
   }, [needsYou]);
 
   return (

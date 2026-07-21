@@ -1,5 +1,7 @@
+import { ContextRing } from "../components/ContextRing";
 import type { AgentStatus } from "../lib/agentStatus";
 import { contextPercent, modelName, todoSummary } from "../lib/agentStatus";
+import { CONTEXT_ADVISORY_THRESHOLD_DEFAULT } from "../lib/advisories";
 import type { SessionInfo } from "../types";
 
 /* Status strip: live session state + reason (from the session-states stream)
@@ -31,6 +33,7 @@ export function TaskStatusStrip({
   const { state, stats } = status;
   const todos = todoSummary(state);
   const context = contextPercent(state);
+  const contextHigh = context !== null && context >= CONTEXT_ADVISORY_THRESHOLD_DEFAULT;
   const model = modelName(state);
   const cost = typeof stats?.totalCostUsd === "number" ? `$${stats.totalCostUsd.toFixed(4)}` : "—";
 
@@ -52,11 +55,18 @@ export function TaskStatusStrip({
           testid="metric-todos"
           value={todos ? `${todos.done}/${todos.total}` : "—"}
         />
-        <Metric
-          label="context"
-          testid="metric-context"
-          value={context === null ? "—" : `${context}%`}
-        />
+        {context !== null && contextHigh ? (
+          <div className="metric" data-testid="metric-context">
+            <span className="metricLabel">context</span>
+            <ContextRing pct={context} title={`context ${context}% — consider compacting or handing off`} />
+          </div>
+        ) : (
+          <Metric
+            label="context"
+            testid="metric-context"
+            value={context === null ? "—" : `${context}%`}
+          />
+        )}
         <Metric
           label="tokens"
           testid="metric-tokens"

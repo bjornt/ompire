@@ -85,6 +85,65 @@ checkout_root = "~/proj"
 An unknown key or malformed TOML causes the daemon to exit non-zero with an
 error naming the offending key.
 
+### Attention/notifications keys
+
+```toml
+stall_threshold = 300              # seconds of silence before a `working` session is marked `stalled`
+renotify_interval = 300            # seconds between re-firing an unanswered notify/interrupt-tier notification
+context_advisory_threshold = 80    # context percent that triggers the "context-high" advisory
+stats_throttle_interval = 10       # minimum seconds between `stats` samples per task
+notifications_enabled = true       # set false to disable desktop notifications (attention badges still work)
+```
+
+## Desktop notifications
+
+The daemon fires desktop notifications itself (via the host's `notify-send`,
+not the browser) when a task needs the operator — SPEC Decision 4's `notify`
+and `interrupt` attention tiers. This requires:
+
+- **`notify-send`** (from `libnotify-bin`/`libnotify`) on `PATH`, with
+  `--action` support (used for the notification's single **Open** button).
+- **A reachable D-Bus session bus.** Under a normal desktop login this is
+  automatic. Under a `systemctl --user` service (see above), the user
+  session's D-Bus address is not always inherited — if notifications never
+  appear, run once (in the graphical session):
+
+  ```sh
+  systemctl --user import-environment DBUS_SESSION_BUS_ADDRESS
+  ```
+
+  and restart the `ompire` unit. Some distros need the same treatment for
+  `DISPLAY`/`WAYLAND_DISPLAY` if `xdg-open` (used for the notification's Open
+  action) also fails to launch a browser tab.
+
+Missing `notify-send`, an unreachable bus, or `notifications_enabled = false`
+all degrade gracefully: the daemon logs one warning at startup and keeps
+running with attention badges (the "N need you" pill, tab-title/favicon
+badge, and task-card tier styling) intact — no desktop popups, nothing else
+affected.
+
+### Stock GNOME: notifications appear but the Open action doesn't work
+
+At startup the daemon queries the notification server's actual capabilities
+(`gdbus ... GetCapabilities`) rather than trusting the `notify-send` binary
+alone. On stock GNOME (confirmed on Ubuntu with the default GNOME Shell),
+that query comes back **without** `actions` — GNOME's notification daemon
+doesn't advertise interactive actions for the legacy `org.freedesktop.Notifications`
+interface `notify-send` uses; that capability is effectively reserved for
+apps going through the XDG Desktop Portal instead (why a browser's own
+notifications, or Firefox-as-a-snap's, can have clickable buttons while a
+plain `notify-send --action ...` call can't). If you see
+`notify-send: Actions are not supported by this notifications server.` when
+testing manually, this is what's happening.
+
+The daemon detects this automatically and falls back to a plain,
+non-interactive notification — you'll still see the popup, but clicking it
+does nothing; use the "N need you" pill / favicon badge to jump to the task
+instead. There's no config workaround for this today; supporting the XDG
+Desktop Portal notification API instead of `notify-send` would fix it, but
+that's a larger change (a new D-Bus dependency) deferred unless this
+degradation proves too costly in practice.
+
 ## Security posture
 
 The daemon binds to `127.0.0.1` only by default and requires a bearer token

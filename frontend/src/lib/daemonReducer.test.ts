@@ -325,3 +325,129 @@ describe("applyEnvelope session events", () => {
     expect(state.sessions).toEqual({});
   });
 });
+
+describe("applyEnvelope attention/advisory events", () => {
+  const empty = applyEnvelope(initialDaemonState, {
+    seq: 0,
+    ts: "",
+    type: "snapshot",
+    payload: { projects: [], tasks: [], sessions: {}, attention: {} },
+  });
+
+  it("loads attention entries from the snapshot with numeric task-id keys", () => {
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: {
+        projects: [],
+        tasks: [task],
+        sessions: {},
+        attention: { "1": { tier: "interrupt", status: "failed", reason: "process exited with code 1" } },
+      },
+    });
+    expect(state.attention[1]).toEqual({
+      tier: "interrupt",
+      status: "failed",
+      reason: "process exited with code 1",
+    });
+  });
+
+  it("tolerates a snapshot without an attention map", () => {
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [], sessions: {} },
+    });
+    expect(state.attention).toEqual({});
+  });
+
+  it("upserts on attention and drops on attention_cleared", () => {
+    let state = applyEnvelope(empty, {
+      seq: 1,
+      ts: "",
+      type: "attention",
+      payload: { task_id: 1, tier: "notify", status: "stalled", reason: "no frames for 300s" },
+    });
+    expect(state.attention[1]).toEqual({ tier: "notify", status: "stalled", reason: "no frames for 300s" });
+
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "",
+      type: "attention_cleared",
+      payload: { task_id: 1 },
+    });
+    expect(state.attention).toEqual({});
+  });
+
+  it("drops attention/stats/advisories on task_deleted", () => {
+    let state = applyEnvelope(empty, { seq: 1, ts: "", type: "task_created", payload: task });
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "",
+      type: "attention",
+      payload: { task_id: 1, tier: "notify", status: "stalled", reason: "x" },
+    });
+    state = applyEnvelope(state, {
+      seq: 3,
+      ts: "",
+      type: "stats",
+      payload: { task_id: 1, context_pct: 50, tokens: { input: 10, output: 5 }, cost: 0.01 },
+    });
+    state = applyEnvelope(state, {
+      seq: 4,
+      ts: "",
+      type: "advisory",
+      payload: { task_id: 1, kind: "maybe-waiting" },
+    });
+    state = applyEnvelope(state, { seq: 5, ts: "", type: "task_deleted", payload: { id: 1 } });
+    expect(state.attention).toEqual({});
+    expect(state.stats).toEqual({});
+    expect(state.advisories).toEqual({});
+  });
+
+  it("upserts the latest stats sample per task", () => {
+    const state = applyEnvelope(empty, {
+      seq: 1,
+      ts: "",
+      type: "stats",
+      payload: { task_id: 1, context_pct: 42, tokens: { input: 1200, output: 340 }, cost: 0.0123 },
+    });
+    expect(state.stats[1]).toEqual({
+      task_id: 1,
+      context_pct: 42,
+      tokens: { input: 1200, output: 340 },
+      cost: 0.0123,
+    });
+  });
+
+  it("tracks active advisories per task and kind, cleared independently", () => {
+    let state = applyEnvelope(empty, {
+      seq: 1,
+      ts: "",
+      type: "advisory",
+      payload: { task_id: 1, kind: "context-high", context_pct: 85 },
+    });
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "",
+      type: "advisory",
+      payload: { task_id: 1, kind: "maybe-waiting" },
+    });
+    expect(state.advisories[1]).toEqual({
+      "context-high": { task_id: 1, kind: "context-high", context_pct: 85 },
+      "maybe-waiting": { task_id: 1, kind: "maybe-waiting" },
+    });
+
+    state = applyEnvelope(state, {
+      seq: 3,
+      ts: "",
+      type: "advisory_cleared",
+      payload: { task_id: 1, kind: "context-high" },
+    });
+    expect(state.advisories[1]).toEqual({
+      "maybe-waiting": { task_id: 1, kind: "maybe-waiting" },
+    });
+  });
+});

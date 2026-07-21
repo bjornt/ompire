@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import Any, TYPE_CHECKING
@@ -34,7 +36,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SESSION_STATUSES = ("starting", "working", "idle", "failed", "waiting-input", "waiting-approval")
+SESSION_STATUSES = (
+    "starting",
+    "working",
+    "idle",
+    "failed",
+    "waiting-input",
+    "waiting-approval",
+    "stalled",
+    "retrying",
+)
+
+DEFAULT_STALL_THRESHOLD = 300.0
 
 _APPROVAL_OPTIONS = ["Approve", "Deny"]
 
@@ -147,12 +160,17 @@ def _build_ask_pending(request_id: str, args: dict[str, Any]) -> PendingQuestion
 
 
 class SessionTracker:
-    def __init__(self, hub: EventHub, idle_debounce: float) -> None:
+    def __init__(
+        self, hub: EventHub, idle_debounce: float, stall_threshold: float = DEFAULT_STALL_THRESHOLD
+    ) -> None:
         self._hub = hub
         self._idle_debounce = idle_debounce
+        self._stall_threshold = stall_threshold
         self._sessions: dict[int, SessionInfo] = {}
         self._watchers: dict[int, asyncio.Task] = {}
         self._debounces: dict[int, asyncio.Task] = {}
+        self._watchdogs: dict[int, asyncio.Task] = {}
+        self._last_frame_at: dict[int, float] = {}
         self._operator_stops: set[int] = set()
         self._pending: dict[int, PendingQuestion] = {}
         # In-flight tool executions per task: toolCallId -> tool name.
@@ -160,6 +178,30 @@ class SessionTracker:
         # The current in-flight `ask` execution per task (at most one, since
         # `ask` declares `concurrency: "exclusive"`): (toolCallId, args).
         self._inflight_asks: dict[int, tuple[str, dict[str, Any]]] = {}
+        # Turn-boundary/idle-entry observers (design D-5: "hooking the
+        # existing debounce path or subscribing to the watcher") — the
+        # advisory sampler registers here so the tracker itself stays a pure
+        # classifier with no advisory/tier knowledge (mirrors design D-1).
+        self._turn_end_hooks: list[Callable[[int, AgentHandle], Awaitable[None]]] = []
+        self._idle_entered_hooks: list[Callable[[int, AgentHandle], Awaitable[None]]] = []
+
+    def add_turn_end_hook(self, hook: Callable[[int, AgentHandle], Awaitable[None]]) -> None:
+        self._turn_end_hooks.append(hook)
+
+    def add_idle_entered_hook(self, hook: Callable[[int, AgentHandle], Awaitable[None]]) -> None:
+        self._idle_entered_hooks.append(hook)
+
+    def _fire_hooks(
+        self, hooks: list[Callable[[int, AgentHandle], Awaitable[None]]], task_id: int, handle: AgentHandle
+    ) -> None:
+        for hook in hooks:
+            task = asyncio.create_task(hook(task_id, handle))
+            task.add_done_callback(self._log_hook_failure)
+
+    @staticmethod
+    def _log_hook_failure(task: asyncio.Task) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("session tracker observer hook failed", exc_info=task.exception())
 
     def get(self, task_id: int) -> SessionInfo | None:
         return self._sessions.get(task_id)
@@ -195,9 +237,11 @@ class SessionTracker:
 
     def agent_exited(self, task_id: int, exit_code: int) -> None:
         """Any child exit lands `failed` (design D-2); the reason distinguishes
-        an operator stop from a crash. Exit wins any pending idle debounce and
-        any pending question (D-6: discarded, not resolved — `failed` wins)."""
+        an operator stop from a crash. Exit wins any pending idle debounce,
+        any pending stall watchdog/retry (design D-4), and any pending
+        question (D-6: discarded, not resolved — `failed` wins)."""
         self._cancel_debounce(task_id)
+        self._cancel_watchdog(task_id)
         self.clear_pending(task_id, broadcast=False)
         self._inflight_tools.pop(task_id, None)
         if task_id in self._operator_stops:
@@ -224,12 +268,14 @@ class SessionTracker:
     def discard(self, task_id: int) -> None:
         """Drop the entry on task cleanup/purge; late events cannot resurrect it."""
         self._cancel_debounce(task_id)
+        self._cancel_watchdog(task_id)
         self.unwatch(task_id)
         self._operator_stops.discard(task_id)
         self._sessions.pop(task_id, None)
         self._pending.pop(task_id, None)
         self._inflight_tools.pop(task_id, None)
         self._inflight_asks.pop(task_id, None)
+        self._last_frame_at.pop(task_id, None)
 
     def unwatch(self, task_id: int) -> None:
         watcher = self._watchers.pop(task_id, None)
@@ -296,23 +342,47 @@ class SessionTracker:
                 event = await queue.get()
                 if event is EVENT_STREAM_END:
                     return
+                self._last_frame_at[task_id] = time.monotonic()
+                # Any interpreted frame recovers a `stalled` session (design
+                # D-4): `agent_start` and `auto_retry_*` already transition
+                # out of `stalled` on their own via `allow_from`, so this only
+                # needs to cover the other frame types.
+                if event.type not in ("agent_start", "auto_retry_start", "auto_retry_end"):
+                    self._recover_from_stall(task_id, event.type)
                 if event.type == "agent_start":
                     self._cancel_debounce(task_id)
+                    self._cancel_watchdog(task_id)
                     # A turn starting abandons any question left over from the
                     # previous one (design D-6); tool tracking resets too.
                     self.clear_pending(task_id)
                     self._inflight_tools.pop(task_id, None)
                     self._transition(task_id, "working", "agent_start frame")
+                    self._arm_watchdog(task_id)
                 elif event.type == "agent_end":
+                    # Turn end cancels the stall watchdog (design D-4): the
+                    # debounce, not the watchdog, owns the quiet period now.
+                    self._cancel_watchdog(task_id)
                     self.clear_pending(task_id)
                     self._inflight_tools.pop(task_id, None)
                     self._start_debounce(task_id, handle)
+                    # Turn-boundary observer hook (design D-5): the advisory
+                    # sampler piggybacks here rather than a poll loop.
+                    self._fire_hooks(self._turn_end_hooks, task_id, handle)
                 elif event.type == "tool_execution_start":
                     self._on_tool_execution_start(task_id, event.payload)
+                    self._sync_watchdog(task_id)
                 elif event.type == "tool_execution_end":
                     self._on_tool_execution_end(task_id, event.payload)
+                    self._sync_watchdog(task_id)
                 elif event.type == "extension_ui_request":
                     self._on_extension_ui_request(task_id, event.payload)
+                    self._sync_watchdog(task_id)
+                elif event.type == "auto_retry_start":
+                    self._on_auto_retry_start(task_id, event.payload)
+                    self._cancel_watchdog(task_id)
+                elif event.type == "auto_retry_end":
+                    self._on_auto_retry_end(task_id, event.payload)
+                    self._sync_watchdog(task_id)
         finally:
             handle.unsubscribe(queue)
 
@@ -431,6 +501,79 @@ class SessionTracker:
         self._transition(task_id, status, reason, allow_from={"working"})
         self._hub.publish("question_posted", {"task_id": task_id, "question": asdict(pending)})
 
+    def _on_auto_retry_start(self, task_id: int, payload: dict[str, Any]) -> None:
+        """`auto_retry_start`'s field shape is confirmed against the omp
+        source (`extensibility/shared-events.ts`'s `AutoRetryStartEvent`,
+        forwarded verbatim by `rpc-mode.ts`'s `session.subscribe(event =>
+        output(event))` — see the `omp-rpc-field-assumptions` memory note):
+        `attempt` / `maxAttempts` / `delayMs` / `errorMessage` (`errorId`
+        optional). Still read defensively (a live daemon should not crash on
+        a future omp shape change) and fall back to a generic reason when a
+        field is missing or the wrong type."""
+        attempt = payload.get("attempt")
+        max_attempts = payload.get("maxAttempts")
+        error_message = payload.get("errorMessage")
+        if (
+            isinstance(attempt, int)
+            and isinstance(max_attempts, int)
+            and isinstance(error_message, str)
+            and error_message
+        ):
+            reason = f"auto_retry_start: {error_message} (attempt {attempt}/{max_attempts})"
+        else:
+            reason = "auto_retry_start frame"
+        self._transition(task_id, "retrying", reason, allow_from={"working", "stalled"})
+
+    def _on_auto_retry_end(self, task_id: int, payload: dict[str, Any]) -> None:
+        """`auto_retry_end`'s field shape is confirmed the same way:
+        `success` / `attempt` / `finalError` (optional) / `recoveredErrors`
+        (optional)."""
+        success = payload.get("success")
+        final_error = payload.get("finalError")
+        if success is False and isinstance(final_error, str) and final_error:
+            reason = f"auto_retry_end: gave up — {final_error}"
+        else:
+            reason = "auto_retry_end frame"
+        self._transition(task_id, "working", reason, allow_from={"retrying"})
+
+    def _recover_from_stall(self, task_id: int, event_type: str) -> None:
+        """Any interpreted frame recovers a `stalled` session to `working`
+        (design D-4), reason naming the frame that arrived."""
+        current = self._sessions.get(task_id)
+        if current is not None and current.status == "stalled":
+            self._transition(task_id, "working", f"{event_type} frame", allow_from={"stalled"})
+
+    def _arm_watchdog(self, task_id: int) -> None:
+        """(Re)arm the stall watchdog, mirroring `_start_debounce` (design
+        D-4): armed on entering/staying `working`, cancelled otherwise."""
+        self._cancel_watchdog(task_id)
+        task = asyncio.create_task(self._watchdog_fire(task_id))
+        self._watchdogs[task_id] = task
+        task.add_done_callback(lambda t: self._pop_if_current(self._watchdogs, task_id, t))
+
+    def _cancel_watchdog(self, task_id: int) -> None:
+        pending = self._watchdogs.pop(task_id, None)
+        if pending is not None:
+            pending.cancel()
+
+    def _sync_watchdog(self, task_id: int) -> None:
+        """Re-arm if a frame left the session `working`; cancel otherwise
+        (e.g. a frame that entered `waiting-input`/`waiting-approval`)."""
+        current = self._sessions.get(task_id)
+        if current is not None and current.status == "working":
+            self._arm_watchdog(task_id)
+        else:
+            self._cancel_watchdog(task_id)
+
+    async def _watchdog_fire(self, task_id: int) -> None:
+        await asyncio.sleep(self._stall_threshold)
+        self._transition(
+            task_id,
+            "stalled",
+            f"no frames for {self._stall_threshold:.0f}s",
+            allow_from={"working"},
+        )
+
     def _start_debounce(self, task_id: int, handle: AgentHandle) -> None:
         self._cancel_debounce(task_id)
         task = asyncio.create_task(self._debounced_idle(task_id, handle))
@@ -470,8 +613,16 @@ class SessionTracker:
                     else "agent_end, but still streaming",
                     allow_from={"working"},
                 )
+                # Genuinely still working (design D-4): the stall watchdog,
+                # cancelled on turn end, resumes owning the quiet period.
+                self._arm_watchdog(task_id)
                 return
         self._transition(task_id, "idle", reason, allow_from={"working"})
+        current = self._sessions.get(task_id)
+        if current is not None and current.status == "idle":
+            # Idle-entry observer hook (design D-6): the advisory sampler's
+            # "maybe waiting for a reply" heuristic runs from here.
+            self._fire_hooks(self._idle_entered_hooks, task_id, handle)
 
     @staticmethod
     def _pop_if_current(registry: dict[int, asyncio.Task], task_id: int, task: asyncio.Task) -> None:

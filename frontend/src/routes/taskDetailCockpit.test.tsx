@@ -343,6 +343,23 @@ describe("cockpit status strip", () => {
     expect(screen.getByTestId("metric-model")).toHaveTextContent("opus-4.8");
   });
 
+  it("renders an amber context ring instead of plain text at/above the advisory threshold", async () => {
+    stubFetch({
+      state: {
+        isStreaming: false,
+        queuedMessageCount: 0,
+        todos: [],
+        model: "opus-4.8",
+        contextUsage: 0.85,
+      },
+    });
+    await renderDetail(workingSession);
+
+    const metric = await screen.findByTestId("metric-context");
+    expect(metric).toHaveTextContent("85%");
+    expect(metric.querySelector("[data-testid='context-ring']")).toBeInTheDocument();
+  });
+
   it("updates the session state live on a status_changed event", async () => {
     stubFetch();
     await renderDetail(workingSession);

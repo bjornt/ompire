@@ -61,11 +61,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     sessions_payload = {
         str(task_id): info for task_id, info in websocket.app.state.sessions.snapshot().items()
     }
+    # Active attention entries (design: a reconnecting client sees them
+    # without replaying `attention` events).
+    attention_payload = {
+        str(task_id): entry
+        for task_id, entry in websocket.app.state.notifications.snapshot().items()
+    }
     await _send_envelope(
         websocket,
         next(seq),
         "snapshot",
-        {"projects": projects_payload, "tasks": tasks_payload, "sessions": sessions_payload},
+        {
+            "projects": projects_payload,
+            "tasks": tasks_payload,
+            "sessions": sessions_payload,
+            "attention": attention_payload,
+        },
     )
 
     queue = events.subscribe()

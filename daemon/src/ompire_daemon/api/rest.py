@@ -11,6 +11,7 @@ from sqlalchemy import Engine
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, field_validator
 
+from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.auth import require_bearer_token
@@ -101,6 +102,10 @@ def _events(request: Request) -> EventHub:
 
 def _sessions(request: Request) -> SessionTracker:
     return request.app.state.sessions
+
+
+def _advisories(request: Request) -> AdvisorySampler:
+    return request.app.state.advisories
 
 
 @router.get("/projects", response_model=list[ProjectOut])
@@ -290,6 +295,7 @@ async def cleanup_task_route(
     config: Config = Depends(_config),
     events: EventHub = Depends(_events),
     sessions: SessionTracker = Depends(_sessions),
+    advisories: AdvisorySampler = Depends(_advisories),
 ) -> Task:
     try:
         task = get_task(engine, task_id)
@@ -320,6 +326,7 @@ async def cleanup_task_route(
 
     archived = mark_archived(engine, task_id)
     sessions.discard(task_id)
+    advisories.clear_task(task_id)
     events.publish("task_updated", asdict(archived))
     return archived
 
@@ -521,6 +528,7 @@ def purge_task_route(
     engine: Engine = Depends(_engine),
     events: EventHub = Depends(_events),
     sessions: SessionTracker = Depends(_sessions),
+    advisories: AdvisorySampler = Depends(_advisories),
 ) -> dict[str, int]:
     try:
         purge_task(engine, task_id)
@@ -529,5 +537,6 @@ def purge_task_route(
     except TaskNotArchivedError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     sessions.discard(task_id)
+    advisories.clear_task(task_id)
     events.publish("task_deleted", {"id": task_id})
     return {"deleted": task_id}

@@ -155,3 +155,72 @@ def test_invalid_session_idle_debounce_fails_fast(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="session_idle_debounce"):
         load_config(config_path)
+
+
+def test_attention_config_defaults(tmp_path: Path) -> None:
+    config = load_config(tmp_path / "does-not-exist.toml")
+
+    assert config.stall_threshold == 300
+    assert config.renotify_interval == 300
+    assert config.context_advisory_threshold == 80
+    assert config.stats_throttle_interval == 10
+    assert config.notifications_enabled is True
+
+
+def test_attention_config_overrides(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        "stall_threshold = 60\n"
+        "renotify_interval = 30\n"
+        "context_advisory_threshold = 90\n"
+        "stats_throttle_interval = 5\n"
+        "notifications_enabled = false\n"
+    )
+
+    config = load_config(config_path)
+
+    assert config.stall_threshold == 60
+    assert config.renotify_interval == 30
+    assert config.context_advisory_threshold == 90
+    assert config.stats_throttle_interval == 5
+    assert config.notifications_enabled is False
+
+
+def test_invalid_stall_threshold_fails_fast(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("stall_threshold = 0\n")
+
+    with pytest.raises(ConfigError, match="stall_threshold"):
+        load_config(config_path)
+
+
+def test_invalid_renotify_interval_fails_fast(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("renotify_interval = -5\n")
+
+    with pytest.raises(ConfigError, match="renotify_interval"):
+        load_config(config_path)
+
+
+def test_invalid_context_advisory_threshold_fails_fast(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("context_advisory_threshold = 101\n")
+
+    with pytest.raises(ConfigError, match="context_advisory_threshold"):
+        load_config(config_path)
+
+
+def test_invalid_stats_throttle_interval_fails_fast(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("stats_throttle_interval = -1\n")
+
+    with pytest.raises(ConfigError, match="stats_throttle_interval"):
+        load_config(config_path)
+
+
+def test_invalid_notifications_enabled_fails_fast(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('notifications_enabled = "yes"\n')
+
+    with pytest.raises(ConfigError, match="notifications_enabled"):
+        load_config(config_path)

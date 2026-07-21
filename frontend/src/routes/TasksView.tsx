@@ -1,9 +1,11 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
+import { ContextRing } from "../components/ContextRing";
 import { answerAgent, cleanupTask } from "../lib/api";
+import { formatTokensCost } from "../lib/advisories";
 import { isSpawning } from "../lib/daemonReducer";
 import { useDaemonState } from "../lib/daemonSocket";
-import type { PendingQuestion, SessionInfo, Task } from "../types";
+import type { AdvisoryPayload, PendingQuestion, SessionInfo, StatsPayload, Task } from "../types";
 import "./TasksView.css";
 
 /** A pending `ask` fits a one-tap inline answer when it's a single,
@@ -61,8 +63,9 @@ export function formatElapsed(fromIso: string, now: Date = new Date()): string {
 }
 
 /** The session pill with SPEC D4 tier styling (per the Tasks.dc.html mockup):
- * working/starting breathe quietly, idle is a bordered badge, failed is the
- * interrupt tier with the transition reason accessible on the pill. */
+ * working/starting breathe quietly, idle/retrying are bordered quiet badges,
+ * stalled is the notify tier (amber), failed is the interrupt tier — with
+ * the transition reason accessible on the pill. */
 function SessionPill({ session }: { session: SessionInfo }) {
   if (session.status === "failed") {
     return (
@@ -71,7 +74,15 @@ function SessionPill({ session }: { session: SessionInfo }) {
       </span>
     );
   }
-  if (session.status === "idle") {
+  if (session.status === "stalled") {
+    return (
+      <span className="statePill notify" title={session.reason}>
+        <span className="notifyDot" />
+        {session.status}
+      </span>
+    );
+  }
+  if (session.status === "idle" || session.status === "retrying") {
     return (
       <span className="statePill neutral" title={session.reason}>
         <span className="ringDot" />
@@ -87,12 +98,26 @@ function SessionPill({ session }: { session: SessionInfo }) {
   );
 }
 
-function TaskCard({ task, session }: { task: Task; session: SessionInfo | undefined }) {
+function TaskCard({
+  task,
+  session,
+  stats,
+  advisories,
+}: {
+  task: Task;
+  session: SessionInfo | undefined;
+  stats: StatsPayload | undefined;
+  advisories: Partial<Record<"context-high" | "maybe-waiting", AdvisoryPayload>> | undefined;
+}) {
   const [showError, setShowError] = useState(false);
   const spawning = isSpawning(task);
   const sessionFailed = session?.status === "failed";
   const failed = task.state === "failed" || sessionFailed;
+  const stalled = session?.status === "stalled";
   const animating = session?.status === "working" || session?.status === "starting";
+  const contextHigh = advisories?.["context-high"];
+  const maybeWaiting = advisories?.["maybe-waiting"];
+  const tokensCost = formatTokensCost(stats);
 
   async function onCleanup() {
     const workshopLine = task.workshop_id
@@ -107,10 +132,11 @@ function TaskCard({ task, session }: { task: Task; session: SessionInfo | undefi
 
   return (
     <article
-      className={`taskCard ${failed ? "failed" : ""} ${spawning ? "spawning" : ""}`}
+      className={`taskCard ${failed ? "failed" : ""} ${stalled ? "stalled" : ""} ${spawning ? "spawning" : ""}`}
       data-testid={`task-card-${task.id}`}
     >
       {failed && <span className="spine" />}
+      {stalled && <span className="spine spineAmber" />}
       <div className="cardTop">
         <span className="cardProject">{task.project_name}</span>
         <span className="cardSpacer" />
@@ -129,6 +155,24 @@ function TaskCard({ task, session }: { task: Task; session: SessionInfo | undefi
       {sessionFailed && (
         <div className="sessionReason" data-testid={`session-reason-${task.id}`}>
           {session.reason}
+        </div>
+      )}
+      {(contextHigh || tokensCost) && (
+        <div className="cardStats" data-testid={`card-stats-${task.id}`}>
+          {contextHigh && (
+            <ContextRing
+              pct={contextHigh.context_pct ?? 0}
+              title={`context ${contextHigh.context_pct}% — consider compacting or handing off`}
+            />
+          )}
+          {tokensCost && <span className="tokensCost">{tokensCost}</span>}
+          {contextHigh && <span className="compactHint">consider compacting or handing off</span>}
+        </div>
+      )}
+      {session?.status === "idle" && maybeWaiting && (
+        <div className="maybeWaiting" data-testid={`maybe-waiting-${task.id}`}>
+          <span className="maybeWaitingIcon">?</span>
+          may be waiting for a reply — last message ends with a question
         </div>
       )}
       {session?.status === "waiting-input" &&
@@ -181,7 +225,7 @@ function TaskCard({ task, session }: { task: Task; session: SessionInfo | undefi
 }
 
 export function TasksView() {
-  const { tasks, projects, sessions } = useDaemonState();
+  const { tasks, projects, sessions, stats, advisories } = useDaemonState();
   const visible = tasks.filter((t) => t.state !== "archived");
 
   return (
@@ -205,7 +249,13 @@ export function TasksView() {
       ) : (
         <div className="cardGrid" data-testid="tasks-list">
           {visible.map((task) => (
-            <TaskCard key={task.id} task={task} session={sessions[task.id]} />
+            <TaskCard
+              key={task.id}
+              task={task}
+              session={sessions[task.id]}
+              stats={stats[task.id]}
+              advisories={advisories[task.id]}
+            />
           ))}
         </div>
       )}

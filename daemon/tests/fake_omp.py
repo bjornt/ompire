@@ -35,6 +35,16 @@ magic messages:
   ask-cancel  like `ask`, but the `ask` execution ends immediately without
            ever waiting for a reply (models the agent/tool cancelling the
            ask on its own)
+  auto-retry       agent_start -> auto_retry_start -> auto_retry_end -> a
+           normal burst tail (models a retry that completes and the turn
+           finishing normally). `auto_retry_*` field shapes (`attempt` /
+           `maxAttempts` / `delayMs` / `errorMessage` for start; `success` /
+           `attempt` / `finalError` for end) are confirmed against the omp
+           source (`extensibility/shared-events.ts`'s `AutoRetryStartEvent`
+           / `AutoRetryEndEvent`, forwarded verbatim by rpc-mode.ts) — see
+           the `omp-rpc-field-assumptions` memory note.
+  auto-retry-hang  agent_start -> auto_retry_start, then nothing further
+           (models a retry stuck in flight, for exit-during-retry tests)
 
 The `ask`/`approve` reply frame shape (`extension_ui_response`, echoing the
 request `id`, with a single `value` string field) is confirmed against the
@@ -321,6 +331,49 @@ def main() -> None:
             # the pending question and return the session to working).
             message_count += 2
             ask_finish(ask_start(request_id, message), {"cancelled": True})
+            continue
+        if message == "auto-retry":
+            message_count += 2
+            emit({"id": request_id, "type": "response", "command": "prompt", "success": True})
+            emit({"type": "agent_start"})
+            emit(
+                {
+                    "type": "auto_retry_start",
+                    "attempt": 1,
+                    "maxAttempts": 5,
+                    "delayMs": 40000,
+                    "errorMessage": "HTTP 429 from gateway",
+                }
+            )
+            emit({"type": "auto_retry_end", "success": True, "attempt": 1})
+            emit({"type": "turn_start"})
+            user_message = {"role": "user", "content": [{"type": "text", "text": message}]}
+            emit({"type": "message_start", "message": user_message})
+            emit({"type": "message_end", "message": user_message})
+            assistant_message = {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "retried ok"}],
+            }
+            emit({"type": "message_start", "message": {"role": "assistant", "content": []}})
+            emit({"type": "message_end", "message": assistant_message})
+            emit({"type": "turn_end", "message": assistant_message})
+            emit({"type": "agent_end", "messages": [user_message, assistant_message]})
+            continue
+        if message == "auto-retry-hang":
+            # Emits the retry-start frame and nothing further, for
+            # exit-during-retry tests.
+            message_count += 2
+            emit({"id": request_id, "type": "response", "command": "prompt", "success": True})
+            emit({"type": "agent_start"})
+            emit(
+                {
+                    "type": "auto_retry_start",
+                    "attempt": 1,
+                    "maxAttempts": 5,
+                    "delayMs": 40000,
+                    "errorMessage": "HTTP 429 from gateway",
+                }
+            )
             continue
         if message == "bad-ask":
             # A malformed `extension_ui_request` (missing the required `id`)

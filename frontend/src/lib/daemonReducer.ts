@@ -1,4 +1,10 @@
 import type {
+  AdvisoryClearedPayload,
+  AdvisoryKind,
+  AdvisoryPayload,
+  AttentionClearedPayload,
+  AttentionEntry,
+  AttentionPayload,
   ConnectionState,
   Envelope,
   Project,
@@ -7,6 +13,7 @@ import type {
   SessionInfo,
   SnapshotPayload,
   SpawnStepPayload,
+  StatsPayload,
   StatusChangedPayload,
   Task,
 } from "../types";
@@ -22,6 +29,18 @@ export interface DaemonState {
   /** Live session status per task id: loaded from the snapshot, upserted by
    * `status_changed`, dropped with the task. */
   sessions: Record<number, SessionInfo>;
+  /** Active daemon attention entries per task id (attention-notifications
+   * capability): loaded from the snapshot, upserted by `attention`, dropped
+   * by `attention_cleared`/the task's own deletion. The single seam
+   * `countNeedsAttention` reads (design D-7). */
+  attention: Record<number, AttentionEntry>;
+  /** Latest `stats` sample per task id (session-advisories capability):
+   * transient, never part of the snapshot — a reconnect waits for the next
+   * turn boundary. */
+  stats: Record<number, StatsPayload>;
+  /** Active advisory decorations per task id, keyed by kind
+   * (session-advisories capability): transient, never part of the snapshot. */
+  advisories: Record<number, Partial<Record<AdvisoryKind, AdvisoryPayload>>>;
 }
 
 export const initialDaemonState: DaemonState = {
@@ -30,6 +49,9 @@ export const initialDaemonState: DaemonState = {
   tasks: [],
   spawnProgress: {},
   sessions: {},
+  attention: {},
+  stats: {},
+  advisories: {},
 };
 
 /** Applies one envelope from the daemon's WebSocket. `snapshot` is a full
@@ -44,12 +66,19 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       for (const [taskId, info] of Object.entries(payload.sessions ?? {})) {
         sessions[Number(taskId)] = info;
       }
+      const attention: Record<number, AttentionEntry> = {};
+      for (const [taskId, entry] of Object.entries(payload.attention ?? {})) {
+        attention[Number(taskId)] = entry;
+      }
       return {
         ...state,
         projects: payload.projects,
         tasks: payload.tasks,
         spawnProgress: {},
         sessions,
+        attention,
+        stats: {},
+        advisories: {},
       };
     }
     case "project_created": {
@@ -82,7 +111,18 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       const { id } = envelope.payload as { id: number };
       const { [id]: _dropped, ...spawnProgress } = state.spawnProgress;
       const { [id]: _droppedSession, ...sessions } = state.sessions;
-      return { ...state, tasks: state.tasks.filter((t) => t.id !== id), spawnProgress, sessions };
+      const { [id]: _droppedAttention, ...attention } = state.attention;
+      const { [id]: _droppedStats, ...stats } = state.stats;
+      const { [id]: _droppedAdvisories, ...advisories } = state.advisories;
+      return {
+        ...state,
+        tasks: state.tasks.filter((t) => t.id !== id),
+        spawnProgress,
+        sessions,
+        attention,
+        stats,
+        advisories,
+      };
     }
     case "spawn_step": {
       const step = envelope.payload as SpawnStepPayload;
@@ -117,6 +157,41 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       if (!existing?.question) return state;
       const { question: _dropped, ...rest } = existing;
       return { ...state, sessions: { ...state.sessions, [task_id]: rest } };
+    }
+    case "attention": {
+      const { task_id, tier, status, reason } = envelope.payload as AttentionPayload;
+      return {
+        ...state,
+        attention: { ...state.attention, [task_id]: { tier, status, reason } },
+      };
+    }
+    case "attention_cleared": {
+      const { task_id } = envelope.payload as AttentionClearedPayload;
+      if (!(task_id in state.attention)) return state;
+      const { [task_id]: _dropped, ...attention } = state.attention;
+      return { ...state, attention };
+    }
+    case "stats": {
+      const payload = envelope.payload as StatsPayload;
+      return { ...state, stats: { ...state.stats, [payload.task_id]: payload } };
+    }
+    case "advisory": {
+      const payload = envelope.payload as AdvisoryPayload;
+      const existing = state.advisories[payload.task_id] ?? {};
+      return {
+        ...state,
+        advisories: {
+          ...state.advisories,
+          [payload.task_id]: { ...existing, [payload.kind]: payload },
+        },
+      };
+    }
+    case "advisory_cleared": {
+      const { task_id, kind } = envelope.payload as AdvisoryClearedPayload;
+      const existing = state.advisories[task_id];
+      if (!existing?.[kind]) return state;
+      const { [kind]: _dropped, ...rest } = existing;
+      return { ...state, advisories: { ...state.advisories, [task_id]: rest } };
     }
     default:
       return state;

@@ -26,6 +26,17 @@ DEFAULT_AGENT_RING_BUFFER_SIZE = 1000
 # Turn-boundary debounce before a session goes idle (SPEC D4): chained
 # agent_end → agent_start hops must not flicker through idle.
 DEFAULT_SESSION_IDLE_DEBOUNCE = 2.0
+# Silence past which a `working` session is considered `stalled` (design D-4).
+DEFAULT_STALL_THRESHOLD = 300
+# Re-notify interval for an unanswered notify/interrupt-tier attention entry
+# (design D-3).
+DEFAULT_RENOTIFY_INTERVAL = 300
+# Context-percent crossing that fires a `context-high` advisory (design D-5).
+DEFAULT_CONTEXT_ADVISORY_THRESHOLD = 80
+# Minimum spacing between `stats` events for the same task (design D-5).
+DEFAULT_STATS_THROTTLE_INTERVAL = 10
+# Desktop notifications on/off switch (design: graceful degradation/opt-out).
+DEFAULT_NOTIFICATIONS_ENABLED = True
 
 _KNOWN_KEYS = {
     "port",
@@ -41,6 +52,11 @@ _KNOWN_KEYS = {
     "agent_ready_timeout",
     "agent_ring_buffer_size",
     "session_idle_debounce",
+    "stall_threshold",
+    "renotify_interval",
+    "context_advisory_threshold",
+    "stats_throttle_interval",
+    "notifications_enabled",
 }
 
 
@@ -65,6 +81,11 @@ class Config:
     agent_ready_timeout: int = DEFAULT_AGENT_READY_TIMEOUT
     agent_ring_buffer_size: int = DEFAULT_AGENT_RING_BUFFER_SIZE
     session_idle_debounce: float = DEFAULT_SESSION_IDLE_DEBOUNCE
+    stall_threshold: float = DEFAULT_STALL_THRESHOLD
+    renotify_interval: float = DEFAULT_RENOTIFY_INTERVAL
+    context_advisory_threshold: int = DEFAULT_CONTEXT_ADVISORY_THRESHOLD
+    stats_throttle_interval: float = DEFAULT_STATS_THROTTLE_INTERVAL
+    notifications_enabled: bool = DEFAULT_NOTIFICATIONS_ENABLED
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -179,6 +200,58 @@ def load_config(path: Path | None = None) -> Config:
             f"got {session_idle_debounce!r}"
         )
 
+    stall_threshold = data.get("stall_threshold", DEFAULT_STALL_THRESHOLD)
+    if (
+        not isinstance(stall_threshold, (int, float))
+        or isinstance(stall_threshold, bool)
+        or stall_threshold <= 0
+    ):
+        raise ConfigError(
+            f"config key 'stall_threshold' must be a positive number, got {stall_threshold!r}"
+        )
+
+    renotify_interval = data.get("renotify_interval", DEFAULT_RENOTIFY_INTERVAL)
+    if (
+        not isinstance(renotify_interval, (int, float))
+        or isinstance(renotify_interval, bool)
+        or renotify_interval <= 0
+    ):
+        raise ConfigError(
+            f"config key 'renotify_interval' must be a positive number, got {renotify_interval!r}"
+        )
+
+    context_advisory_threshold = data.get(
+        "context_advisory_threshold", DEFAULT_CONTEXT_ADVISORY_THRESHOLD
+    )
+    if (
+        not isinstance(context_advisory_threshold, int)
+        or isinstance(context_advisory_threshold, bool)
+        or not (0 < context_advisory_threshold <= 100)
+    ):
+        raise ConfigError(
+            f"config key 'context_advisory_threshold' must be an integer in (0, 100], "
+            f"got {context_advisory_threshold!r}"
+        )
+
+    stats_throttle_interval = data.get(
+        "stats_throttle_interval", DEFAULT_STATS_THROTTLE_INTERVAL
+    )
+    if (
+        not isinstance(stats_throttle_interval, (int, float))
+        or isinstance(stats_throttle_interval, bool)
+        or stats_throttle_interval < 0
+    ):
+        raise ConfigError(
+            f"config key 'stats_throttle_interval' must be a non-negative number, "
+            f"got {stats_throttle_interval!r}"
+        )
+
+    notifications_enabled = data.get("notifications_enabled", DEFAULT_NOTIFICATIONS_ENABLED)
+    if not isinstance(notifications_enabled, bool):
+        raise ConfigError(
+            f"config key 'notifications_enabled' must be a boolean, got {notifications_enabled!r}"
+        )
+
     return Config(
         port=port,
         bind=bind,
@@ -193,6 +266,11 @@ def load_config(path: Path | None = None) -> Config:
         agent_ready_timeout=agent_ready_timeout,
         agent_ring_buffer_size=agent_ring_buffer_size,
         session_idle_debounce=float(session_idle_debounce),
+        stall_threshold=float(stall_threshold),
+        renotify_interval=float(renotify_interval),
+        context_advisory_threshold=context_advisory_threshold,
+        stats_throttle_interval=float(stats_throttle_interval),
+        notifications_enabled=notifications_enabled,
     )
 
 

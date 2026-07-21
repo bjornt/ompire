@@ -21,7 +21,7 @@ class MockWebSocket {
     this.onmessage?.({ data: JSON.stringify({ seq: 0, ts: "", type, payload }) });
   }
 
-  emitSnapshot(payload: { projects: unknown[]; tasks: unknown[]; sessions?: unknown }) {
+  emitSnapshot(payload: { projects: unknown[]; tasks: unknown[]; sessions?: unknown; attention?: unknown }) {
     this.onopen?.();
     this.emit("snapshot", payload);
   }
@@ -61,7 +61,7 @@ function socket(): MockWebSocket {
 
 async function renderAt(
   path: string,
-  snapshot: { projects: unknown[]; tasks: unknown[]; sessions?: unknown },
+  snapshot: { projects: unknown[]; tasks: unknown[]; sessions?: unknown; attention?: unknown },
 ) {
   window.history.pushState({}, "", path);
   render(<App />);
@@ -352,7 +352,100 @@ describe("TasksView session status", () => {
     expect(screen.getByTestId("task-card-1")).toHaveTextContent("spawning");
   });
 
-  it("counts failed sessions in the N-need-you pill; working sessions stay silent", async () => {
+  it("stalled sessions render notify/amber styling with the reason accessible", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": { status: "stalled", reason: "no frames for 300s", since: "t0" },
+      },
+    });
+
+    const card = screen.getByTestId("task-card-1");
+    expect(card.className).toContain("stalled");
+    expect(card).toHaveTextContent("stalled");
+    expect(card.querySelector(".notifyDot")).toBeInTheDocument();
+    expect(card.querySelector(".statePill.notify")).toHaveAttribute(
+      "title",
+      "no frames for 300s",
+    );
+  });
+
+  it("retrying sessions render quiet badge styling and don't raise the count", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": { status: "retrying", reason: "auto_retry_start: HTTP 429", since: "t0" },
+      },
+      attention: {},
+    });
+
+    const card = screen.getByTestId("task-card-1");
+    expect(card).toHaveTextContent("retrying");
+    expect(card.querySelector(".ringDot")).toBeInTheDocument();
+    expect(card.className).not.toContain("failed");
+    expect(card.className).not.toContain("stalled");
+    expect(screen.getByText("0 need you")).toBeInTheDocument();
+  });
+
+  it("shows an amber context ring and tokens/cost line from a stats event", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": { status: "working", reason: "agent_start frame", since: "t0" },
+      },
+    });
+
+    act(() => {
+      socket().emit("stats", {
+        task_id: 1,
+        context_pct: 85,
+        tokens: { input: 1200, output: 340 },
+        cost: 0.0123,
+      });
+      socket().emit("advisory", { task_id: 1, kind: "context-high", context_pct: 85 });
+    });
+
+    const stats = screen.getByTestId("card-stats-1");
+    expect(stats).toHaveTextContent("1200 in / 340 out");
+    expect(stats).toHaveTextContent("$0.0123");
+    expect(stats).toHaveTextContent("85%");
+    expect(stats.querySelector("[data-testid='context-ring']")).toBeInTheDocument();
+  });
+
+  it("decorates an idle card with a maybe-waiting advisory", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": { status: "idle", reason: "agent_end, queue empty after 2.0s", since: "t0" },
+      },
+    });
+
+    act(() => {
+      socket().emit("advisory", { task_id: 1, kind: "maybe-waiting" });
+    });
+
+    expect(screen.getByTestId("maybe-waiting-1")).toHaveTextContent(
+      "may be waiting for a reply",
+    );
+
+    act(() => {
+      socket().emit("status_changed", {
+        task_id: 1,
+        from: "idle",
+        to: "working",
+        reason: "agent_start frame",
+      });
+      socket().emit("advisory_cleared", { task_id: 1, kind: "maybe-waiting" });
+    });
+
+    expect(screen.queryByTestId("maybe-waiting-1")).not.toBeInTheDocument();
+  });
+
+  it("counts tasks with an active daemon attention entry; working sessions stay silent", async () => {
     await renderAt("/tasks", {
       projects: [project],
       tasks: [
@@ -365,11 +458,80 @@ describe("TasksView session status", () => {
         "2": { status: "failed", reason: "process exited with code 137", since: "t0" },
         "3": { status: "failed", reason: "stopped by operator", since: "t0" },
       },
+      attention: {
+        "2": { tier: "interrupt", status: "failed", reason: "process exited with code 137" },
+        "3": { tier: "interrupt", status: "failed", reason: "stopped by operator" },
+      },
     });
 
-    // Task 3 is failed twice over (registry + session) but counts once.
+    // Task 3 is failed twice over (registry + attention entry) but counts once.
     expect(screen.getByText("2 need you")).toBeInTheDocument();
     expect(document.title).toBe("(2) ompire");
+  });
+
+  it("raises the count live on an attention event and lowers it on attention_cleared", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: { "1": { status: "working", reason: "agent_start frame", since: "t0" } },
+      attention: {},
+    });
+    expect(screen.getByText("0 need you")).toBeInTheDocument();
+
+    act(() => {
+      socket().emit("status_changed", {
+        task_id: 1,
+        from: "working",
+        to: "waiting-input",
+        reason: "pending question",
+      });
+      socket().emit("attention", {
+        task_id: 1,
+        tier: "notify",
+        status: "waiting-input",
+        reason: "pending question",
+      });
+    });
+    expect(screen.getByText("1 need you")).toBeInTheDocument();
+    expect(document.title).toBe("(1) ompire");
+
+    act(() => {
+      socket().emit("status_changed", {
+        task_id: 1,
+        from: "waiting-input",
+        to: "working",
+        reason: "operator answered the pending question",
+      });
+      socket().emit("attention_cleared", { task_id: 1 });
+    });
+    expect(screen.getByText("0 need you")).toBeInTheDocument();
+    expect(document.title).toBe("ompire");
+  });
+
+  it("sets a badged favicon while the count is nonzero and reverts to the plain mark at zero", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {},
+      attention: {},
+    });
+    const icon = () => document.querySelector("link[rel='icon']");
+    expect(icon()?.getAttribute("href")).toBe("/favicon.svg");
+
+    act(() => {
+      socket().emit("attention", {
+        task_id: 1,
+        tier: "interrupt",
+        status: "failed",
+        reason: "process exited with code 1",
+      });
+    });
+    expect(icon()?.getAttribute("href")).toMatch(/^data:image\/svg\+xml/);
+
+    act(() => {
+      socket().emit("attention_cleared", { task_id: 1 });
+    });
+    expect(icon()?.getAttribute("href")).toBe("/favicon.svg");
   });
 
   const askQuestion = {
@@ -505,6 +667,10 @@ describe("TasksView session status", () => {
         "1": { status: "waiting-input", reason: "pending question", since: "t0" },
         "2": { status: "waiting-approval", reason: "pending approval", since: "t0" },
         "3": { status: "working", reason: "agent_start frame", since: "t0" },
+      },
+      attention: {
+        "1": { tier: "notify", status: "waiting-input", reason: "pending question" },
+        "2": { tier: "interrupt", status: "waiting-approval", reason: "pending approval" },
       },
     });
 

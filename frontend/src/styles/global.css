@@ -57,3 +57,24 @@ a:hover {
     animation: none !important;
   }
 }
+
+/* Shared amber context ring (components/ContextRing.tsx): task cards and the
+ * task-detail status strip both use this once context is at/above the
+ * advisory threshold. */
+.contextRing {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+  color: var(--amber);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.contextRingTrack {
+  stroke: var(--line);
+}
+
+.contextRingFill {
+  stroke: var(--amber);
+}

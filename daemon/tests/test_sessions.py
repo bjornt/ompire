@@ -16,11 +16,17 @@ from ompire_daemon.sessions import SessionTracker
 from tests.test_rpc import fake_omp_argv
 
 DEBOUNCE = 0.2
+# Deliberately much larger than DEBOUNCE/the sleeps unrelated tests use, so
+# the stall watchdog never fires incidentally in tests that don't exercise it
+# (e.g. a queued-message re-check sleeping past DEBOUNCE*3).
+STALL_THRESHOLD = 30.0
+FAST_STALL_THRESHOLD = 0.2
 
 
 @pytest.fixture
 def tracked(monkeypatch: pytest.MonkeyPatch):
-    """Supervisor + tracker wired to the fake omp, with a fast debounce."""
+    """Supervisor + tracker wired to the fake omp, with a fast debounce and a
+    stall watchdog slow enough not to interfere with unrelated tests."""
     scenario = {"name": "happy"}
     monkeypatch.setattr(
         agent_module, "build_agent_argv", lambda clone, env: fake_omp_argv(scenario["name"])
@@ -31,7 +37,27 @@ def tracked(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
     hub = EventHub()
-    tracker = SessionTracker(hub, idle_debounce=DEBOUNCE)
+    tracker = SessionTracker(hub, idle_debounce=DEBOUNCE, stall_threshold=STALL_THRESHOLD)
+    config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100)
+    supervisor = AgentSupervisor(config, hub, tracker)
+    return supervisor, tracker, hub, scenario
+
+
+@pytest.fixture
+def tracked_stall(monkeypatch: pytest.MonkeyPatch):
+    """Like `tracked`, but with a fast stall watchdog and a debounce slow
+    enough not to fire during a stall test's timeframe."""
+    scenario = {"name": "happy"}
+    monkeypatch.setattr(
+        agent_module, "build_agent_argv", lambda clone, env: fake_omp_argv(scenario["name"])
+    )
+
+    async def no_preflight(clone_path: str) -> None:
+        return None
+
+    monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
+    hub = EventHub()
+    tracker = SessionTracker(hub, idle_debounce=5.0, stall_threshold=FAST_STALL_THRESHOLD)
     config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100)
     supervisor = AgentSupervisor(config, hub, tracker)
     return supervisor, tracker, hub, scenario
@@ -318,6 +344,94 @@ async def test_ask_cancelled_without_answer_returns_to_working(tracked) -> None:
 
     await wait_for_status(queue, "idle")
     await supervisor.stop(1)
+
+
+async def test_silence_stalls_a_working_session(tracked_stall) -> None:
+    supervisor, tracker, hub, _ = tracked_stall
+    queue = hub.subscribe()
+    handle = await supervisor.start(1, "/clone")
+    # "no-end" bursts through agent_start with no trailing agent_end, so the
+    # session stays working and silent past the stall threshold.
+    await handle.prompt("no-end")
+
+    transitions = await wait_for_status(queue, "stalled")
+    assert transitions[-1]["from"] == "working"
+    assert "no frames for" in transitions[-1]["reason"]
+    assert tracker.get(1).status == "stalled"
+    await supervisor.stop(1)
+
+
+async def test_frame_recovers_a_stalled_session(tracked_stall) -> None:
+    supervisor, tracker, hub, _ = tracked_stall
+    queue = hub.subscribe()
+    handle = await supervisor.start(1, "/clone")
+    await handle.prompt("no-end")
+    await wait_for_status(queue, "stalled")
+
+    # Any interpreted frame recovers it; the next burst's leading
+    # extension_ui_request (setWidget) is the first frame to arrive. This
+    # burst also has no trailing agent_end, so the watchdog re-arms and the
+    # session stalls again on its own silence.
+    await handle.prompt("no-end")
+    transitions = await wait_for_status(queue, "working")
+    assert transitions[-1]["from"] == "stalled"
+    assert "frame" in transitions[-1]["reason"]
+
+    await wait_for_status(queue, "stalled")
+    await supervisor.stop(1)
+
+
+async def test_exit_during_stall_still_fails(tracked_stall) -> None:
+    supervisor, tracker, hub, _ = tracked_stall
+    queue = hub.subscribe()
+    handle = await supervisor.start(1, "/clone")
+    await handle.prompt("no-end")
+    await wait_for_status(queue, "stalled")
+
+    await supervisor.stop(1)
+
+    transitions = await wait_for_status(queue, "failed")
+    assert transitions[-1]["from"] == "stalled"
+    assert tracker.get(1).status == "failed"
+    # No late stall lands after the exit either.
+    await asyncio.sleep(FAST_STALL_THRESHOLD * 3)
+    assert tracker.get(1).status == "failed"
+
+
+async def test_auto_retry_start_and_end_transitions(tracked) -> None:
+    supervisor, tracker, hub, _ = tracked
+    queue = hub.subscribe()
+    handle = await supervisor.start(1, "/clone")
+
+    await handle.prompt("auto-retry")
+
+    transitions = await wait_for_status(queue, "retrying")
+    assert transitions[-1]["from"] == "working"
+    # Confirmed against the omp source (see `omp-rpc-field-assumptions`):
+    # `attempt`/`maxAttempts`/`errorMessage`, not `reason`/`message`/`error`.
+    assert transitions[-1]["reason"] == "auto_retry_start: HTTP 429 from gateway (attempt 1/5)"
+
+    transitions = await wait_for_status(queue, "working")
+    assert transitions[-1]["from"] == "retrying"
+    assert transitions[-1]["reason"] == "auto_retry_end frame"
+
+    await wait_for_status(queue, "idle")
+    await supervisor.stop(1)
+
+
+async def test_exit_during_retry_still_fails(tracked) -> None:
+    supervisor, tracker, hub, _ = tracked
+    queue = hub.subscribe()
+    handle = await supervisor.start(1, "/clone")
+
+    await handle.prompt("auto-retry-hang")
+    await wait_for_status(queue, "retrying")
+
+    await supervisor.stop(1)
+
+    transitions = await wait_for_status(queue, "failed")
+    assert transitions[-1]["from"] == "retrying"
+    assert tracker.get(1).status == "failed"
 
 
 async def test_exit_during_waiting_discards_pending_no_resolve(tracked) -> None:
