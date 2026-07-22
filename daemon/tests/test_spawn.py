@@ -115,6 +115,8 @@ async def test_successful_pipeline(app, git_checkout: Path, fake_my_workshop, pi
     assert refreshed.state == "created"
     assert refreshed.spawn_completed_at is not None
     assert refreshed.workshop_id == "ws-demo-fix-bug"
+    # Session id captured after ready (crash-recovery capability, design D-2).
+    assert refreshed.session_id == "fake-session-id"
 
     # The agent is live with the stored prompt delivered.
     assert supervisor.get(task.id) is not None
@@ -199,6 +201,41 @@ async def test_agent_step_failure_marks_task_failed(
     # The session lands failed too (design D-2).
     assert tracker.get(task.id).status == "failed"
     assert tracker.get(task.id).reason == "spawn step 'agent' failed"
+
+
+async def test_session_id_capture_failure_leaves_it_null_and_spawn_succeeds(
+    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, pipeline  # noqa: ANN001
+) -> None:
+    engine = app.state.engine
+    run, hub, tracker, supervisor = pipeline
+    config: Config = replace(
+        app.state.config,
+        my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
+    )
+    # The agent starts fine, but `get_state` (used to capture the session id)
+    # answers success: false — capture must degrade gracefully, not fail the
+    # spawn (design D-2).
+    fake_workshop_cli.write_text(FAKE_WORKSHOP_SCRIPT.replace(" happy", " get-state-fails"))
+    queue = hub.subscribe()
+
+    project = _make_project(engine, git_checkout)
+    task = _make_task(engine, config)
+
+    await run(engine, task.id, project, config)
+
+    refreshed = get_task(engine, task.id)
+    assert refreshed.state == "created"
+    assert refreshed.spawn_completed_at is not None
+    assert refreshed.session_id is None
+
+    spawn_steps = [
+        (e.payload["step"], e.payload["status"])
+        for e in _drain(queue)
+        if e.type == "spawn_step"
+    ]
+    assert ("agent", "ok") in spawn_steps
+    assert ("prompt", "ok") in spawn_steps
+    await supervisor.stop(task.id)
 
 
 async def test_prompt_step_failure_marks_task_failed(

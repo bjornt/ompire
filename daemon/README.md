@@ -95,6 +95,20 @@ stats_throttle_interval = 10       # minimum seconds between `stats` samples per
 notifications_enabled = true       # set false to disable desktop notifications (attention badges still work)
 ```
 
+### Crash-recovery keys
+
+```toml
+shutdown_grace = 10          # seconds a live agent gets to exit cleanly on SIGTERM before SIGKILL
+recovery_concurrency = 4     # max agents resumed concurrently on startup after a restart
+```
+
+On shutdown the daemon terminates every live agent concurrently and waits up
+to `shutdown_grace` seconds total (not per agent) before force-killing
+stragglers — well under systemd's default 90s `TimeoutStopSec` for the
+default value. If you raise `shutdown_grace` past that, raise the unit's
+`TimeoutStopSec` (in `contrib/ompire.service`) to match, or systemd will
+SIGKILL the daemon itself before its own graceful shutdown finishes.
+
 ## Desktop notifications
 
 The daemon fires desktop notifications itself (via the host's `notify-send`,

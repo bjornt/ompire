@@ -69,6 +69,7 @@ class Task:
     prompt: str
     error: str | None
     workshop_id: str | None
+    session_id: str | None
     spawn_completed_at: str | None
     created_at: str
     updated_at: str
@@ -108,6 +109,7 @@ def _row_to_task(row) -> Task:  # noqa: ANN001
         prompt=row.prompt,
         error=row.error,
         workshop_id=row.workshop_id,
+        session_id=row.session_id,
         spawn_completed_at=row.spawn_completed_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -137,6 +139,7 @@ def create_task(
                     prompt=prompt,
                     error=None,
                     workshop_id=None,
+                    session_id=None,
                     spawn_completed_at=None,
                     created_at=now,
                     updated_at=now,
@@ -180,6 +183,10 @@ def mark_workshop_launched(engine: Engine, task_id: int, workshop_id: str) -> Ta
     return _update(engine, task_id, workshop_id=workshop_id)
 
 
+def mark_session_id(engine: Engine, task_id: int, session_id: str) -> Task:
+    return _update(engine, task_id, session_id=session_id)
+
+
 def mark_failed(engine: Engine, task_id: int, error: str) -> Task:
     return _update(engine, task_id, state="failed", error=error, spawn_completed_at=_now_iso())
 
@@ -196,15 +203,30 @@ def purge_task(engine: Engine, task_id: int) -> None:
         conn.execute(tasks.delete().where(tasks.c.id == task_id))
 
 
-def reconcile_interrupted_spawns(engine: Engine) -> list[Task]:
-    """Mark tasks whose spawn never completed as failed (daemon died mid-pipeline)."""
+def reconcile_startup(engine: Engine) -> tuple[list[Task], list[Task]]:
+    """Classify every `created` task per the startup reconciliation matrix
+    (crash-recovery capability, design D-4), as far as the registry alone can
+    tell: a spawn that never completed, or one that completed with no
+    recorded session id, is unresumable and marked `failed` here. A
+    spawn-completed task with a session id still needs its container's
+    presence checked (async, `workshop_status`) before it can be recovered or
+    failed as `fail-missing-container` — those are returned as candidates for
+    the caller to finish classifying.
+
+    Returns `(failed, candidates)`.
+    """
     with engine.connect() as conn:
-        rows = conn.execute(
-            tasks.select().where(
-                tasks.c.spawn_completed_at.is_(None), tasks.c.state == "created"
+        rows = conn.execute(tasks.select().where(tasks.c.state == "created")).all()
+    failed: list[Task] = []
+    candidates: list[Task] = []
+    for row in rows:
+        task = _row_to_task(row)
+        if task.spawn_completed_at is None:
+            failed.append(
+                mark_failed(engine, task.id, "daemon restarted during spawn; pipeline did not complete")
             )
-        ).all()
-    return [
-        mark_failed(engine, row.id, "daemon restarted during spawn; pipeline did not complete")
-        for row in rows
-    ]
+        elif task.session_id is None:
+            failed.append(mark_failed(engine, task.id, "no session id recorded; cannot resume"))
+        else:
+            candidates.append(task)
+    return failed, candidates

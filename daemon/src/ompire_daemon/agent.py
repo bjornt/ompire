@@ -53,15 +53,23 @@ class NoLiveAgentError(Exception):
         self.task_id = task_id
 
 
-def build_agent_argv(clone_path: str, agent_env: Mapping[str, str]) -> list[str]:
+def build_agent_argv(
+    clone_path: str, agent_env: Mapping[str, str], *, resume: str | None = None
+) -> list[str]:
     """The spike's spawn recipe (design D-2): sessions ON (no `--no-session`),
     no `-s` flag (nonexistent), credentials via an `env` prefix inside the
-    container (design D-3)."""
-    return [
+    container (design D-3). `resume` appends `--resume <session-id>`
+    (crash-recovery capability, design D-1/D-3) — a bare session id, not a
+    file path, confirmed against the omp source (see the
+    `omp-rpc-field-assumptions` memory note)."""
+    argv = [
         "workshop", "exec", "-p", clone_path, "--",
         "env", *[f"{key}={value}" for key, value in agent_env.items()],
         "omp", "--mode", "rpc-ui", "--no-title",
     ]
+    if resume is not None:
+        argv += ["--resume", resume]
+    return argv
 
 
 async def verify_ask_timeout(clone_path: str) -> None:
@@ -153,6 +161,25 @@ class AgentHandle:
     async def request(self, request_type: str, **fields: Any) -> dict[str, Any]:
         return await self._conn.request(request_type, **fields)
 
+    async def read_session_id(self) -> str | None:
+        """Capture the omp session id via `get_state` (crash-recovery
+        capability, design D-2): best-effort — returns None without raising
+        on any failure, so a capture miss never fails the caller. `sessionId`
+        confirmed against the omp source, not a fake/guessed field (see the
+        `omp-rpc-field-assumptions` memory note)."""
+        try:
+            response = await self.request("get_state")
+        except Exception as exc:  # noqa: BLE001 — capture must never break the caller
+            logger.warning("session id capture failed: get_state request failed: %s", exc)
+            return None
+        data = response.get("data")
+        data = data if isinstance(data, dict) else {}
+        session_id = data.get("sessionId")
+        if not isinstance(session_id, str) or not session_id:
+            logger.warning("session id capture failed: no sessionId in get_state response")
+            return None
+        return session_id
+
     async def respond_ui_request(self, request_id: str, payload: dict[str, Any]) -> None:
         """Reply to an agent-raised `extension_ui_request` (design D-5): this
         replies to the *agent's* request id, the reverse direction of
@@ -184,6 +211,24 @@ class AgentHandle:
             with contextlib.suppress(ProcessLookupError):
                 self._process.kill()
         await self.wait_exited()
+
+    async def terminate(self, grace: float) -> None:
+        """Graceful stop (crash-recovery capability, design D-6): SIGTERM, a
+        bounded wait, then SIGKILL as a fallback via `kill()` — reuses the
+        same exit-flush wait either way. Idempotent, like `kill()`. SIGTERM
+        is expected to let container-side `omp` flush its session file
+        (confirmed against the omp source's teardown handlers, and signal
+        propagation through `workshop exec` confirmed live — see the
+        `omp-rpc-field-assumptions` memory note)."""
+        if self._process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self._process.terminate()
+            try:
+                await asyncio.wait_for(asyncio.shield(self._exited), timeout=grace)
+                return
+            except TimeoutError:
+                pass
+        await self.kill()
 
     async def wait_exited(self) -> int:
         """Block until the child has exited and both pipes are flushed."""
@@ -263,19 +308,27 @@ class AgentSupervisor:
         self._handles: dict[int, AgentHandle] = {}
         self._waiters: set[asyncio.Task] = set()
         self._ask_timeout_verified: set[int] = set()
+        # Set once by `shutdown()` (crash-recovery capability, design D-6):
+        # tells the exit watcher these exits are graceful, not crashes.
+        self._shutting_down = False
 
     def get(self, task_id: int) -> AgentHandle | None:
         return self._handles.get(task_id)
 
-    async def start(self, task_id: int, clone_path: str) -> AgentHandle:
+    async def start(
+        self, task_id: int, clone_path: str, *, resume: str | None = None
+    ) -> AgentHandle:
         if task_id in self._handles:
             raise AgentAlreadyRunningError(task_id)
         if task_id not in self._ask_timeout_verified:
             await verify_ask_timeout(clone_path)
             self._ask_timeout_verified.add(task_id)
-        argv = build_agent_argv(clone_path, self._config.agent_env)
-        if self._tracker is not None:
-            # `starting` covers the spawn and ready handshake (design D-2).
+        argv = build_agent_argv(clone_path, self._config.agent_env, resume=resume)
+        if self._tracker is not None and resume is None:
+            # `starting` covers the spawn and ready handshake (design D-2). A
+            # resumed start is already seeded `starting` with a recovery
+            # reason by the caller (crash-recovery design D-4) — don't
+            # clobber it with this generic one.
             self._tracker.agent_spawning(task_id)
         handle = await AgentHandle.start(
             argv,
@@ -300,10 +353,29 @@ class AgentSupervisor:
             raise NoLiveAgentError(task_id)
         await handle.kill()
 
+    async def shutdown(self) -> None:
+        """Terminate every live agent gracefully on daemon shutdown
+        (crash-recovery capability, design D-6): sets the shutting-down flag
+        first so the exit watcher skips the `agent_exited` -> `failed`
+        tracker call and event for these exits. Registry state is never
+        written on agent exit (only in-memory session status is), so the
+        tasks stay `created` and are recovered on the next startup."""
+        self._shutting_down = True
+        handles = list(self._handles.values())
+        await asyncio.gather(
+            *(handle.terminate(self._config.shutdown_grace) for handle in handles),
+            return_exceptions=True,
+        )
+
     async def _watch(self, task_id: int, handle: AgentHandle) -> None:
         code = await handle.wait_exited()
         if self._handles.get(task_id) is handle:
             del self._handles[task_id]
+        if self._shutting_down:
+            # A graceful-shutdown exit is not a crash (design D-6): no
+            # tracker call, no event — the task stays `created` for the next
+            # startup's recovery pass.
+            return
         # Interpretation first (session goes `failed`), then the raw fact.
         if self._tracker is not None:
             self._tracker.agent_exited(task_id, code)

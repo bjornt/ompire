@@ -19,6 +19,7 @@ from ompire_daemon.agent import (
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.rpc import AgentGoneError
+from ompire_daemon.sessions import SessionTracker
 
 from tests.test_rpc import fake_omp_argv
 
@@ -119,13 +120,57 @@ def test_build_agent_argv_recipe() -> None:
     assert "-s" not in argv
 
 
+def test_build_agent_argv_resume_appends_flag() -> None:
+    argv = build_agent_argv("/clones/t1", {}, resume="sess-abc")
+    assert argv[-2:] == ["--resume", "sess-abc"]
+
+
+def test_build_agent_argv_no_resume_by_default() -> None:
+    argv = build_agent_argv("/clones/t1", {})
+    assert "--resume" not in argv
+
+
+async def test_read_session_id_from_get_state() -> None:
+    handle = await start_fake()
+    session_id = await handle.read_session_id()
+    assert session_id == "fake-session-id"
+    await handle.kill()
+
+
+async def test_read_session_id_returns_none_on_request_failure() -> None:
+    handle = await start_fake("get-state-fails")
+    assert await handle.read_session_id() is None
+    await handle.kill()
+
+
+async def test_terminate_sigterm_exits_promptly() -> None:
+    handle = await start_fake()
+    await asyncio.wait_for(handle.terminate(grace=5), timeout=5)
+    assert handle.returncode is not None
+
+
+async def test_terminate_falls_back_to_sigkill_for_wedged_child() -> None:
+    handle = await start_fake("ignore-term")
+    await asyncio.wait_for(handle.terminate(grace=0.3), timeout=5)
+    assert handle.returncode is not None
+
+
+async def test_terminate_is_idempotent_after_exit() -> None:
+    handle = await start_fake("exit-after-ready")
+    await handle.wait_exited()
+    await asyncio.wait_for(handle.terminate(grace=1), timeout=5)
+    assert handle.returncode == 7
+
+
 @pytest.fixture
 def supervisor(monkeypatch: pytest.MonkeyPatch):
     """A supervisor whose spawns hit the fake omp and skip the container
     preflight; tests flip `scenario` to exercise failure paths."""
     scenario = {"name": "happy"}
     monkeypatch.setattr(
-        agent_module, "build_agent_argv", lambda clone, env: fake_omp_argv(scenario["name"])
+        agent_module,
+        "build_agent_argv",
+        lambda clone, env, resume=None: fake_omp_argv(scenario["name"]),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -169,6 +214,80 @@ async def test_supervisor_publishes_exit_code_on_crash(supervisor) -> None:
     event = await asyncio.wait_for(hub_queue.get(), timeout=5)
     assert event.type == "agent_exited"
     assert event.payload == {"task_id": 2, "exit_code": 7}
+
+
+async def test_supervisor_resume_appends_resume_flag(monkeypatch) -> None:
+    hub = EventHub()
+    config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100)
+    sup = AgentSupervisor(config, hub)
+    captured = {}
+
+    def fake_build(clone, env, resume=None):  # noqa: ANN001
+        captured["resume"] = resume
+        return fake_omp_argv("happy")
+
+    monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
+
+    async def no_preflight(clone_path: str) -> None:
+        return None
+
+    monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
+
+    await sup.start(1, "/clone", resume="sess-abc")
+    assert captured["resume"] == "sess-abc"
+    await sup.stop(1)
+
+
+@pytest.fixture
+def tracked_supervisor(monkeypatch: pytest.MonkeyPatch):
+    """Like `supervisor`, but wired to a real `SessionTracker` so recovery's
+    tracker interactions (`recovering`, the exit watcher's shutdown skip) can
+    be observed."""
+    scenario = {"name": "happy"}
+    monkeypatch.setattr(
+        agent_module,
+        "build_agent_argv",
+        lambda clone, env, resume=None: fake_omp_argv(scenario["name"]),
+    )
+
+    async def no_preflight(clone_path: str) -> None:
+        return None
+
+    monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
+    hub = EventHub()
+    tracker = SessionTracker(hub, idle_debounce=0.1)
+    config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100)
+    return AgentSupervisor(config, hub, tracker), tracker, hub, scenario
+
+
+async def test_supervisor_resume_does_not_clobber_recovering_reason(tracked_supervisor) -> None:
+    sup, tracker, _, _ = tracked_supervisor
+    tracker.recovering(1)
+
+    await sup.start(1, "/clone", resume="sess-abc")
+
+    # `agent_spawning`'s generic "agent spawned" reason is skipped for a
+    # resume (design D-4): the recovery reason painted before the resume
+    # call started is left in place until the caller drives it further.
+    assert tracker.get(1).status == "starting"
+    assert tracker.get(1).reason == "recovering after daemon restart"
+    await sup.stop(1)
+
+
+async def test_supervisor_shutdown_terminates_without_marking_failed(tracked_supervisor) -> None:
+    sup, tracker, hub, _ = tracked_supervisor
+    hub_queue = hub.subscribe()
+    await sup.start(1, "/clone")
+    assert tracker.get(1).status == "starting"
+
+    await asyncio.wait_for(sup.shutdown(), timeout=5)
+
+    assert sup.get(1) is None
+    # No crash reported: no `agent_exited` event, no `failed` transition.
+    assert tracker.get(1).status == "starting"
+    while not hub_queue.empty():
+        event = hub_queue.get_nowait()
+        assert event.type != "agent_exited"
 
 
 async def test_verify_ask_timeout_accepts_zero(fake_workshop_cli, tmp_path) -> None:

@@ -27,6 +27,7 @@ from ompire_daemon.registry.tasks import (
     Task,
     get_task,
     mark_failed,
+    mark_session_id,
     mark_spawn_completed,
     mark_workshop_launched,
 )
@@ -153,12 +154,19 @@ async def run_spawn_pipeline(
         # The ask-timeout preflight and ready handshake live in the
         # supervisor; the ready timeout bounds the whole start (design D-5).
         try:
-            await supervisor.start(task_id, task.clone_path)
+            handle = await supervisor.start(task_id, task.clone_path)
         except AgentStartError as exc:
             detail = str(exc) if not exc.stderr else f"{exc}\n{exc.stderr}"
             raise StepFailedError("agent", detail) from exc
         except Exception as exc:  # noqa: BLE001 — e.g. a concurrent-start race
             raise StepFailedError("agent", str(exc)) from exc
+        # Best-effort session-id capture (crash-recovery capability, design
+        # D-2): a fresh spawn only — resumes already know their id. A capture
+        # miss is logged inside `read_session_id` and never fails the spawn.
+        session_id = await handle.read_session_id()
+        if session_id is not None:
+            updated = mark_session_id(engine, task_id, session_id)
+            events.publish("task_updated", asdict(updated))
 
     async def run_prompt() -> None:
         handle = supervisor.get(task_id)

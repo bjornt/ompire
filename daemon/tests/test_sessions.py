@@ -29,7 +29,9 @@ def tracked(monkeypatch: pytest.MonkeyPatch):
     stall watchdog slow enough not to interfere with unrelated tests."""
     scenario = {"name": "happy"}
     monkeypatch.setattr(
-        agent_module, "build_agent_argv", lambda clone, env: fake_omp_argv(scenario["name"])
+        agent_module,
+        "build_agent_argv",
+        lambda clone, env, resume=None: fake_omp_argv(scenario["name"]),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -49,7 +51,9 @@ def tracked_stall(monkeypatch: pytest.MonkeyPatch):
     enough not to fire during a stall test's timeframe."""
     scenario = {"name": "happy"}
     monkeypatch.setattr(
-        agent_module, "build_agent_argv", lambda clone, env: fake_omp_argv(scenario["name"])
+        agent_module,
+        "build_agent_argv",
+        lambda clone, env, resume=None: fake_omp_argv(scenario["name"]),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -221,6 +225,62 @@ async def test_prompt_skipped_goes_idle_from_starting(tracked) -> None:
     transitions = await wait_for_status(queue, "idle")
     assert transitions[-1]["reason"] == "ready, no prompt to send"
     await supervisor.stop(1)
+
+
+def test_recovering_seeds_starting_from_untracked(tracked) -> None:
+    _, tracker, hub, _ = tracked
+    queue = hub.subscribe()
+
+    tracker.recovering(1)
+
+    transitions = await_status_sync(queue)
+    assert transitions["from"] is None
+    assert transitions["to"] == "starting"
+    assert transitions["reason"] == "recovering after daemon restart"
+    assert tracker.get(1).status == "starting"
+
+
+async def test_session_recovered_lands_idle_from_starting(tracked) -> None:
+    _, tracker, hub, _ = tracked
+    queue = hub.subscribe()
+    tracker.recovering(1)
+
+    tracker.session_recovered(1)
+
+    transitions = await wait_for_status(queue, "idle")
+    assert transitions[-1]["reason"] == "resumed after daemon restart"
+    assert tracker.get(1).status == "idle"
+
+
+async def test_recovery_failed_lands_failed_from_starting(tracked) -> None:
+    _, tracker, hub, _ = tracked
+    queue = hub.subscribe()
+    tracker.recovering(1)
+
+    tracker.recovery_failed(1, "resume failed: agent exited before ready")
+
+    transitions = await wait_for_status(queue, "failed")
+    assert transitions[-1]["reason"] == "resume failed: agent exited before ready"
+    assert tracker.get(1).status == "failed"
+
+
+def test_recovery_failed_is_terminal(tracked) -> None:
+    _, tracker, _, _ = tracked
+    tracker.recovering(1)
+    tracker.recovery_failed(1, "boom")
+
+    tracker.session_recovered(1)
+
+    assert tracker.get(1).status == "failed"
+    assert tracker.get(1).reason == "boom"
+
+
+def await_status_sync(queue: asyncio.Queue) -> dict:
+    """`recovering`/`_transition` publish synchronously, so the event is
+    already queued by the time this returns."""
+    event = queue.get_nowait()
+    assert event.type == "status_changed"
+    return event.payload
 
 
 def test_snapshot_shape(tracked) -> None:

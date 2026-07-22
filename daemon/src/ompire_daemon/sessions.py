@@ -11,8 +11,12 @@ so races (exit during the idle debounce, late frames after discard) resolve
 deterministically: exit wins.
 
 Status is in-memory only and independent of live handles — `failed` outlives
-the child's deregistration; entries are dropped on task cleanup/purge.
-Persistence across daemon restarts is a later chunk.
+the child's deregistration; entries are dropped on task cleanup/purge. A
+`SessionTracker` itself does not survive a daemon restart (it's a fresh
+object), but the crash-recovery capability re-establishes status for
+recovered tasks at startup: `recovering` seeds a never-tracked task
+`starting`, and `session_recovered`/`recovery_failed` drive it to `idle` or
+`failed` once the resumed agent is ready or fails to start.
 
 A pending `ask`/approval question rides alongside `SessionInfo` in a parallel
 `_pending` map (design D-1: "parallel map, not enriched rows"), so the
@@ -265,6 +269,30 @@ class SessionTracker:
         """Empty stored prompt: ready → idle instead of hanging in starting."""
         self._transition(task_id, "idle", "ready, no prompt to send", allow_from={"starting"})
 
+    def recovering(self, task_id: int) -> None:
+        """Startup recovery seeds a never-tracked task straight to `starting`
+        (crash-recovery capability, design D-4/6.2): a fresh `SessionTracker`
+        after a restart has no entry for this task yet, so this is the
+        ordinary "never-tracked task can start" path `_transition` already
+        allows. Painted before the first snapshot; the recovery job later
+        drives it to `idle` (`session_recovered`) or `failed`
+        (`recovery_failed`)."""
+        self._transition(task_id, "starting", "recovering after daemon restart")
+
+    def session_recovered(self, task_id: int) -> None:
+        """A resumed agent reached ready (crash-recovery capability, design
+        D-4/7.2): the in-flight turn is lost but the session is not, so land
+        `idle` straight from the recovery `starting` seed rather than hanging
+        (mirrors `prompt_skipped`)."""
+        self._transition(
+            task_id, "idle", "resumed after daemon restart", allow_from={"starting"}
+        )
+
+    def recovery_failed(self, task_id: int, reason: str) -> None:
+        """The resumed agent could not be started (crash-recovery capability,
+        design D-4/7.2)."""
+        self._transition(task_id, "failed", reason)
+
     def discard(self, task_id: int) -> None:
         """Drop the entry on task cleanup/purge; late events cannot resurrect it."""
         self._cancel_debounce(task_id)
@@ -322,7 +350,12 @@ class SessionTracker:
         if current is None and to != "starting":
             return  # discarded or never-tracked: late events are ignored
         if from_status == "failed":
-            return  # terminal until cleanup (no restart path this chunk)
+            # Terminal within a process — nothing revives a `failed` entry in
+            # place. Startup recovery (crash-recovery capability) doesn't
+            # need to: a daemon restart means a brand-new `SessionTracker`
+            # with no entry for the task yet, so `recovering()` seeds a fresh
+            # `starting` entry instead of reviving this one.
+            return
         if allow_from is not None and from_status not in allow_from:
             return
         info = SessionInfo(status=to, reason=reason, since=_now_iso())

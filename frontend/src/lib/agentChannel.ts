@@ -5,16 +5,28 @@ import { getDaemonToken } from "./token";
 
 /* Per-agent event-channel client (agent-event-stream): connects to
  * `/api/ws/agents/:taskId`, replays the daemon's ring buffer then follows live
- * events, and reconnects while the agent is live. The daemon closes the channel
- * with code 1000 ("agent exited") once its buffer is flushed, and 4404 when no
- * live agent backs the task — both are terminal, so we do not reconnect on them.
+ * events, and reconnects while the agent is live (`enabled`). The daemon closes
+ * the channel with code 1000 ("agent exited") once its buffer is flushed — that
+ * one is terminal, since the stream is genuinely done and `enabled` will soon
+ * flip false as the session lands `failed` on the main socket anyway.
+ *
+ * Code 4404 ("no live agent for this task yet") is NOT treated as terminal:
+ * a session can be `starting` (crash-recovery capability — recovering after a
+ * daemon restart, or the ordinary spawn-in-progress window) for a long time
+ * with `enabled` already true but no `AgentHandle` registered yet. Giving up
+ * on the first 4404 left the channel permanently dead until the component
+ * remounted (e.g. navigating away and back) even once the agent went live —
+ * `enabled` staying continuously true across that whole window means the
+ * connect effect never reruns on its own. Retrying with backoff here instead
+ * relies on `enabled` (driven by the main socket's session status) to be the
+ * sole stop signal: once a task is genuinely dead its session lands `failed`,
+ * `enabled` goes false, and the effect's cleanup tears the retry loop down.
  *
  * Because a reconnect replays the buffer from the top, the transcript is reset
  * to empty on every fresh connection and rebuilt from replay + live frames. */
 
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 10000;
-const NO_LIVE_AGENT_CLOSE_CODE = 4404;
 
 function agentWsUrl(taskId: number): string {
   const base = import.meta.env.VITE_OMPIRE_DAEMON_WS_URL as string | undefined;
@@ -84,8 +96,9 @@ export function useAgentChannel(taskId: number, enabled: boolean): AgentChannel 
       socket.onclose = (event: CloseEvent) => {
         setConnected(false);
         if (closedByEffectRef.current) return;
-        // Terminal closes: the agent is gone, nothing to reconnect to.
-        if (event.code === NO_LIVE_AGENT_CLOSE_CODE || event.code === 1000) return;
+        // Only code 1000 ("agent exited", buffer flushed) is terminal; 4404
+        // ("no live agent yet") retries — see the module doc comment above.
+        if (event.code === 1000) return;
         const delay = backoffRef.current;
         backoffRef.current = Math.min(backoffRef.current * 2, MAX_BACKOFF_MS);
         timeoutRef.current = setTimeout(connect, delay);

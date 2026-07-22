@@ -90,15 +90,15 @@ def test_task_events_and_snapshot(
         assert created["payload"]["slug"] == "fix-bug"
         assert created["payload"]["branch"] == "ompire/fix-bug"
 
-        # Drain until the pipeline settles: spawn_step (and status_changed)
-        # events, then the completing task_updated.
+        # Drain until the pipeline settles: spawn_step/status_changed events,
+        # an interim task_updated once the session id is captured (design
+        # D-2, crash-recovery capability), then the completing task_updated.
         steps = []
         while True:
             event = ws.receive_json()
-            if event["type"] == "task_updated":
-                assert event["payload"]["spawn_completed_at"] is not None
+            if event["type"] == "task_updated" and event["payload"]["spawn_completed_at"] is not None:
                 break
-            assert event["type"] in ("spawn_step", "status_changed")
+            assert event["type"] in ("spawn_step", "status_changed", "task_updated")
             if event["type"] == "spawn_step":
                 steps.append((event["payload"]["step"], event["payload"]["status"]))
         assert ("clone", "ok") in steps

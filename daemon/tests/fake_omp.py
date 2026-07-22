@@ -9,6 +9,8 @@ Scenarios:
   silent            never emit ready; swallow stdin until killed
   crash             exit 1 with "No models available" on stderr before ready
   exit-after-ready  emit ready then exit 7
+  ignore-term       emit ready, then ignore SIGTERM and hang until killed
+                    (AgentHandle.terminate()'s SIGKILL-fallback path)
   get-state-fails   like happy, but get_state responds success: false
 
 `get_state` requests get the response shape verified against omp 16.5.2
@@ -285,6 +287,15 @@ def main() -> None:
     emit({"type": "ready"})
     if scenario == "exit-after-ready":
         sys.exit(7)
+    if scenario == "ignore-term":
+        # Models a wedged child that doesn't honor SIGTERM, for
+        # AgentHandle.terminate()'s SIGKILL-fallback path.
+        import signal
+
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        for _ in sys.stdin:
+            pass
+        return
 
     queued = 0
     message_count = 0

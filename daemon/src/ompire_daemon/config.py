@@ -37,6 +37,13 @@ DEFAULT_CONTEXT_ADVISORY_THRESHOLD = 80
 DEFAULT_STATS_THROTTLE_INTERVAL = 10
 # Desktop notifications on/off switch (design: graceful degradation/opt-out).
 DEFAULT_NOTIFICATIONS_ENABLED = True
+# SIGTERM-to-SIGKILL grace period for agent children on daemon shutdown
+# (crash-recovery capability, design D-6): long enough for omp's teardown
+# handlers to flush the session file.
+DEFAULT_SHUTDOWN_GRACE = 10.0
+# Startup-recovery fan-out bound (crash-recovery capability, design D-4):
+# deliberately small — each resume is a real container-side omp startup.
+DEFAULT_RECOVERY_CONCURRENCY = 4
 
 _KNOWN_KEYS = {
     "port",
@@ -57,6 +64,8 @@ _KNOWN_KEYS = {
     "context_advisory_threshold",
     "stats_throttle_interval",
     "notifications_enabled",
+    "shutdown_grace",
+    "recovery_concurrency",
 }
 
 
@@ -86,6 +95,8 @@ class Config:
     context_advisory_threshold: int = DEFAULT_CONTEXT_ADVISORY_THRESHOLD
     stats_throttle_interval: float = DEFAULT_STATS_THROTTLE_INTERVAL
     notifications_enabled: bool = DEFAULT_NOTIFICATIONS_ENABLED
+    shutdown_grace: float = DEFAULT_SHUTDOWN_GRACE
+    recovery_concurrency: int = DEFAULT_RECOVERY_CONCURRENCY
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -252,6 +263,27 @@ def load_config(path: Path | None = None) -> Config:
             f"config key 'notifications_enabled' must be a boolean, got {notifications_enabled!r}"
         )
 
+    shutdown_grace = data.get("shutdown_grace", DEFAULT_SHUTDOWN_GRACE)
+    if (
+        not isinstance(shutdown_grace, (int, float))
+        or isinstance(shutdown_grace, bool)
+        or shutdown_grace <= 0
+    ):
+        raise ConfigError(
+            f"config key 'shutdown_grace' must be a positive number, got {shutdown_grace!r}"
+        )
+
+    recovery_concurrency = data.get("recovery_concurrency", DEFAULT_RECOVERY_CONCURRENCY)
+    if (
+        not isinstance(recovery_concurrency, int)
+        or isinstance(recovery_concurrency, bool)
+        or recovery_concurrency <= 0
+    ):
+        raise ConfigError(
+            f"config key 'recovery_concurrency' must be a positive integer, "
+            f"got {recovery_concurrency!r}"
+        )
+
     return Config(
         port=port,
         bind=bind,
@@ -271,6 +303,8 @@ def load_config(path: Path | None = None) -> Config:
         context_advisory_threshold=context_advisory_threshold,
         stats_throttle_interval=float(stats_throttle_interval),
         notifications_enabled=notifications_enabled,
+        shutdown_grace=float(shutdown_grace),
+        recovery_concurrency=recovery_concurrency,
     )
 
 

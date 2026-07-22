@@ -35,7 +35,7 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
                 text("SELECT name FROM sqlite_master WHERE type='table'")
             )
         }
-    assert version == "0003"
+    assert version == "0004"
     assert "projects" in tables
     assert "tasks" in tables
 
@@ -59,8 +59,37 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0003"
+    assert version == "0004"
     assert row == "demo"
+
+
+def test_migration_0004_session_id_upgrade_downgrade_roundtrip(tmp_path: Path) -> None:
+    db_path = tmp_path / "ompire.db"
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    engine = make_engine(db_path)
+    with engine.connect() as conn:
+        columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
+    assert "session_id" in columns
+
+    from alembic import command
+    from alembic.config import Config as AlembicConfig
+
+    cfg = AlembicConfig(str(REAL_ALEMBIC_INI))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
+    command.downgrade(cfg, "0003")
+
+    with engine.connect() as conn:
+        version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+        columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
+    assert version == "0003"
+    assert "session_id" not in columns
+
+    # Back to head: the column returns and existing rows survive the round trip.
+    command.upgrade(cfg, "head")
+    with engine.connect() as conn:
+        columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
+    assert "session_id" in columns
 
 
 @pytest.fixture
