@@ -3,6 +3,7 @@ import { DaemonProvider } from "./lib/daemonSocket";
 import { Chrome } from "./components/Chrome";
 import { TasksView } from "./routes/TasksView";
 import { TaskDetailView } from "./routes/TaskDetailView";
+import { ShipFlowView } from "./routes/ShipFlowView";
 import { SpawnView } from "./routes/SpawnView";
 import { StubPage } from "./routes/StubPage";
 
@@ -17,7 +18,7 @@ export function App() {
             <Route path="/tasks/:id" element={<TaskDetailView />} />
             <Route path="/projects" element={<StubPage title="Projects" />} />
             <Route path="/spawn" element={<SpawnView />} />
-            <Route path="/ship" element={<StubPage title="Ship flow" />} />
+            <Route path="/ship/:id" element={<ShipFlowView />} />
             <Route path="/settings" element={<StubPage title="Templates & settings" />} />
           </Route>
         </Routes>

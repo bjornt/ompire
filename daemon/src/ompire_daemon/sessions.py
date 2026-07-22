@@ -18,6 +18,13 @@ recovered tasks at startup: `recovering` seeds a never-tracked task
 `starting`, and `session_recovered`/`recovery_failed` drive it to `idle` or
 `failed` once the resumed agent is ready or fails to start.
 
+The `reviewing` status is driven by the `ReviewManager`, not by agent frames:
+it enters only from `idle` when the daemon opens an llmvet review, and leaves
+to `idle` on approval/abort/error or to `working` when a comment prompt is
+looped back to the agent. Like other session statuses, it does not survive a
+daemon restart; a crash mid-review is recovered via the git ref the review
+manager leaves in the clone.
+
 A pending `ask`/approval question rides alongside `SessionInfo` in a parallel
 `_pending` map (design D-1: "parallel map, not enriched rows"), so the
 transition machinery and the pending-question machinery stay decoupled.
@@ -49,6 +56,7 @@ SESSION_STATUSES = (
     "waiting-approval",
     "stalled",
     "retrying",
+    "reviewing",
 )
 
 DEFAULT_STALL_THRESHOLD = 300.0
@@ -292,6 +300,16 @@ class SessionTracker:
         """The resumed agent could not be started (crash-recovery capability,
         design D-4/7.2)."""
         self._transition(task_id, "failed", reason)
+
+    # --- review transitions (review capability) ------------------------------
+
+    def review_opened(self, task_id: int, reason: str) -> None:
+        """The daemon opened an llmvet review for an `idle` task."""
+        self._transition(task_id, "reviewing", reason, allow_from={"idle"})
+
+    def review_closed(self, task_id: int, reason: str) -> None:
+        """The review finished (approved/aborted/error); return to `idle`."""
+        self._transition(task_id, "idle", reason, allow_from={"reviewing"})
 
     def discard(self, task_id: int) -> None:
         """Drop the entry on task cleanup/purge; late events cannot resurrect it."""

@@ -16,6 +16,11 @@ DEFAULT_CHECKOUT_ROOT = Path("~/proj").expanduser()
 DEFAULT_BRANCH_PATTERN = "ompire/<slug>"
 DEFAULT_SPAWN_STEP_TIMEOUT = 120
 DEFAULT_MY_WORKSHOP_COMMAND = ("my-workshop",)
+DEFAULT_LLMVET_COMMAND = ("llmvet",)
+# Port range for the daemon-run llmvet review server (design D-4). The
+# daemon probes this range with an ephemeral bind to avoid collisions
+# between concurrent reviews.
+DEFAULT_REVIEW_PORT_RANGE = (7180, 7280)
 # Workshop launch includes SDK installs; the spike measured 7.34s warm-cache
 # and cold starts are slower still, so this is deliberately much larger than
 # the git-step timeout.
@@ -54,6 +59,8 @@ _KNOWN_KEYS = {
     "default_branch_pattern",
     "spawn_step_timeout",
     "my_workshop_command",
+    "llmvet_command",
+    "review_port_range",
     "workshop_step_timeout",
     "agent_env",
     "agent_ready_timeout",
@@ -83,6 +90,8 @@ class Config:
     default_branch_pattern: str = DEFAULT_BRANCH_PATTERN
     spawn_step_timeout: int = DEFAULT_SPAWN_STEP_TIMEOUT
     my_workshop_command: tuple[str, ...] = DEFAULT_MY_WORKSHOP_COMMAND
+    llmvet_command: tuple[str, ...] = DEFAULT_LLMVET_COMMAND
+    review_port_range: tuple[int, int] = DEFAULT_REVIEW_PORT_RANGE
     workshop_step_timeout: int = DEFAULT_WORKSHOP_STEP_TIMEOUT
     # Injected verbatim into agent children (design D-3): the daemon does not
     # know what a credential is, it forwards what the operator configured.
@@ -164,6 +173,38 @@ def load_config(path: Path | None = None) -> Config:
         )
     else:
         my_workshop_command = tuple(my_workshop_command)
+
+    llmvet_command = data.get("llmvet_command")
+    if llmvet_command is None:
+        llmvet_command = DEFAULT_LLMVET_COMMAND
+    elif (
+        not isinstance(llmvet_command, list)
+        or not llmvet_command
+        or not all(isinstance(part, str) for part in llmvet_command)
+    ):
+        raise ConfigError(
+            f"config key 'llmvet_command' must be a non-empty list of strings, "
+            f"got {llmvet_command!r}"
+        )
+    else:
+        llmvet_command = tuple(llmvet_command)
+
+    review_port_range = data.get("review_port_range")
+    if review_port_range is None:
+        review_port_range = DEFAULT_REVIEW_PORT_RANGE
+    elif (
+        not isinstance(review_port_range, list)
+        or len(review_port_range) != 2
+        or not all(isinstance(n, int) and not isinstance(n, bool) for n in review_port_range)
+        or review_port_range[0] <= 0
+        or review_port_range[1] < review_port_range[0]
+    ):
+        raise ConfigError(
+            f"config key 'review_port_range' must be a two-element list of positive integers "
+            f"[low, high] with low <= high, got {review_port_range!r}"
+        )
+    else:
+        review_port_range = tuple(review_port_range)
 
     workshop_step_timeout = data.get("workshop_step_timeout", DEFAULT_WORKSHOP_STEP_TIMEOUT)
     if not isinstance(workshop_step_timeout, int) or isinstance(workshop_step_timeout, bool):
@@ -293,6 +334,8 @@ def load_config(path: Path | None = None) -> Config:
         default_branch_pattern=default_branch_pattern,
         spawn_step_timeout=spawn_step_timeout,
         my_workshop_command=my_workshop_command,
+        llmvet_command=llmvet_command,
+        review_port_range=review_port_range,
         workshop_step_timeout=workshop_step_timeout,
         agent_env=agent_env,
         agent_ready_timeout=agent_ready_timeout,

@@ -61,7 +61,13 @@ function socket(): MockWebSocket {
 
 async function renderAt(
   path: string,
-  snapshot: { projects: unknown[]; tasks: unknown[]; sessions?: unknown; attention?: unknown },
+  snapshot: {
+    projects: unknown[];
+    tasks: unknown[];
+    sessions?: unknown;
+    attention?: unknown;
+    reviews?: unknown;
+  },
 ) {
   window.history.pushState({}, "", path);
   render(<App />);
@@ -716,5 +722,96 @@ describe("TaskDetailView", () => {
 
     await user.click(screen.getByTestId("task-link-1"));
     expect(await screen.findByTestId("task-metadata")).toBeInTheDocument();
+  });
+});
+
+describe("Review capability (TasksView)", () => {
+  it("renders a reviewing card with violet styling and a reopen link", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": { status: "reviewing", reason: "llmvet review on http://127.0.0.1:7180", since: "t0" },
+      },
+      reviews: {
+        "1": {
+          status: "open",
+          url: "http://127.0.0.1:7180",
+          port: 7180,
+          iterations: [],
+        },
+      },
+    });
+
+    const card = screen.getByTestId("task-card-1");
+    expect(card).toHaveTextContent("reviewing");
+    expect(card.querySelector(".statePill.review")).toBeInTheDocument();
+    const link = card.querySelector(".reviewPillLink") as HTMLAnchorElement;
+    expect(link).toBeInTheDocument();
+    expect(link.href).toBe("http://127.0.0.1:7180/");
+  });
+
+  it("offers a Review action on idle cards and posts the review endpoint", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": { status: "idle", reason: "agent_end", since: "t0" },
+      },
+    });
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          task_id: 1,
+          status: "open",
+          url: "http://127.0.0.1:7180",
+          port: 7180,
+          iterations: [],
+        }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await user.click(screen.getByTestId("review-button-1"));
+    expect(fetchMock).toHaveBeenCalledWith("/api/tasks/1/review", expect.objectContaining({ method: "POST" }));
+  });
+});
+
+describe("ShipFlowView", () => {
+  it("renders the live review step and inert later steps", async () => {
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": { status: "reviewing", reason: "llmvet review", since: "t0" },
+      },
+      reviews: {
+        "1": {
+          status: "open",
+          url: "http://127.0.0.1:7180",
+          port: 7180,
+          iterations: [
+            { outcome: "comments", comment_count: 2, stderr: null, recorded_at: "t1" },
+            { outcome: "approved", comment_count: null, stderr: null, recorded_at: "t2" },
+          ],
+        },
+      },
+    });
+
+    expect(screen.getByTestId("ship-flow")).toBeInTheDocument();
+    expect(screen.getByTestId("ship-step-review")).toHaveTextContent("approved");
+    const link = screen.getByTestId("review-reopen-link") as HTMLAnchorElement;
+    expect(link.href).toBe("http://127.0.0.1:7180/");
+    expect(screen.getByTestId("review-iterations")).toHaveTextContent("comments");
+    expect(screen.getByTestId("review-iterations")).toHaveTextContent("2 comments");
+    expect(screen.getByTestId("ship-step-commit")).toHaveTextContent("Coming in a later chunk");
+    expect(screen.getByTestId("ship-step-push-pr")).toBeInTheDocument();
+    expect(screen.getByTestId("ship-step-cleanup")).toBeInTheDocument();
+  });
+
+  it("shows a not-found message for an unknown task id", async () => {
+    await renderAt("/ship/999", { projects: [project], tasks: [makeTask()] });
+    expect(screen.getByTestId("ship-flow-not-found")).toHaveTextContent("Task not found");
   });
 });

@@ -95,6 +95,15 @@ stats_throttle_interval = 10       # minimum seconds between `stats` samples per
 notifications_enabled = true       # set false to disable desktop notifications (attention badges still work)
 ```
 
+### Review keys
+
+```toml
+llmvet_command = ["llmvet"]      # command invoked to run llmvet (argument list, no shell)
+review_port_range = [7180, 7280] # ephemeral-bind probe range for concurrent llmvet instances
+```
+
+`llmvet_command` is the argument list (not a shell string) the daemon runs in the task clone's working directory, appending `-no-open -host 127.0.0.1 -port <n>`. `review_port_range` bounds the ephemeral socket bind used to pick a free localhost port for each review.
+
 ### Crash-recovery keys
 
 ```toml

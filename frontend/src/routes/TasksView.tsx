@@ -1,11 +1,18 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { ContextRing } from "../components/ContextRing";
-import { answerAgent, cleanupTask } from "../lib/api";
+import { answerAgent, cleanupTask, startReview } from "../lib/api";
 import { formatTokensCost } from "../lib/advisories";
 import { isSpawning } from "../lib/daemonReducer";
 import { useDaemonState } from "../lib/daemonSocket";
-import type { AdvisoryPayload, PendingQuestion, SessionInfo, StatsPayload, Task } from "../types";
+import type {
+  AdvisoryPayload,
+  PendingQuestion,
+  ReviewState,
+  SessionInfo,
+  StatsPayload,
+  Task,
+} from "../types";
 import "./TasksView.css";
 
 /** A pending `ask` fits a one-tap inline answer when it's a single,
@@ -66,7 +73,7 @@ export function formatElapsed(fromIso: string, now: Date = new Date()): string {
  * working/starting breathe quietly, idle/retrying are bordered quiet badges,
  * stalled is the notify tier (amber), failed is the interrupt tier — with
  * the transition reason accessible on the pill. */
-function SessionPill({ session }: { session: SessionInfo }) {
+function SessionPill({ session, review }: { session: SessionInfo; review?: ReviewState }) {
   if (session.status === "failed") {
     return (
       <span className="statePill failed" title={session.reason}>
@@ -79,6 +86,25 @@ function SessionPill({ session }: { session: SessionInfo }) {
       <span className="statePill notify" title={session.reason}>
         <span className="notifyDot" />
         {session.status}
+      </span>
+    );
+  }
+  if (session.status === "reviewing") {
+    return (
+      <span className="statePill review" title={session.reason}>
+        <span className="notifyDot" />
+        {session.status}
+        {review && (
+          <a
+            className="reviewPillLink"
+            href={review.url}
+            target="_blank"
+            rel="noreferrer"
+            onClick={(e) => e.stopPropagation()}
+          >
+            reopen
+          </a>
+        )}
       </span>
     );
   }
@@ -103,11 +129,13 @@ function TaskCard({
   session,
   stats,
   advisories,
+  review,
 }: {
   task: Task;
   session: SessionInfo | undefined;
   stats: StatsPayload | undefined;
   advisories: Partial<Record<"context-high" | "maybe-waiting", AdvisoryPayload>> | undefined;
+  review: ReviewState | undefined;
 }) {
   const [showError, setShowError] = useState(false);
   const spawning = isSpawning(task);
@@ -118,6 +146,17 @@ function TaskCard({
   const contextHigh = advisories?.["context-high"];
   const maybeWaiting = advisories?.["maybe-waiting"];
   const tokensCost = formatTokensCost(stats);
+  const [startingReview, setStartingReview] = useState(false);
+
+  async function onReview() {
+    if (!session || session.status !== "idle") return;
+    setStartingReview(true);
+    try {
+      await startReview(task.id);
+    } finally {
+      setStartingReview(false);
+    }
+  }
 
   async function onCleanup() {
     const workshopLine = task.workshop_id
@@ -141,7 +180,7 @@ function TaskCard({
         <span className="cardProject">{task.project_name}</span>
         <span className="cardSpacer" />
         {session ? (
-          <SessionPill session={session} />
+          <SessionPill session={session} review={review} />
         ) : (
           <span className={`statePill ${failed ? "failed" : spawning ? "spawning" : "neutral"}`}>
             {spawning && <span className="pillDot" />}
@@ -169,6 +208,19 @@ function TaskCard({
           {contextHigh && <span className="compactHint">consider compacting or handing off</span>}
         </div>
       )}
+      <div className="cardActions">
+        {session?.status === "idle" && (
+          <button
+            type="button"
+            className="reviewButton"
+            disabled={startingReview}
+            onClick={() => void onReview()}
+            data-testid={`review-button-${task.id}`}
+          >
+            {startingReview ? "Starting review…" : "Review"}
+          </button>
+        )}
+      </div>
       {session?.status === "idle" && maybeWaiting && (
         <div className="maybeWaiting" data-testid={`maybe-waiting-${task.id}`}>
           <span className="maybeWaitingIcon">?</span>
@@ -225,7 +277,7 @@ function TaskCard({
 }
 
 export function TasksView() {
-  const { tasks, projects, sessions, stats, advisories } = useDaemonState();
+  const { tasks, projects, sessions, stats, advisories, reviews } = useDaemonState();
   const visible = tasks.filter((t) => t.state !== "archived");
 
   return (
@@ -255,6 +307,7 @@ export function TasksView() {
               session={sessions[task.id]}
               stats={stats[task.id]}
               advisories={advisories[task.id]}
+              review={reviews[task.id]}
             />
           ))}
         </div>

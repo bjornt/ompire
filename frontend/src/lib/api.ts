@@ -1,4 +1,4 @@
-import type { AgentStateData, AgentStatsData, Task, TaskDetail } from "../types";
+import type { AgentStateData, AgentStatsData, ReviewState, Task, TaskDetail } from "../types";
 import { getDaemonToken } from "./token";
 
 /** Minimal authenticated REST client. Commands go over REST, events come
@@ -72,4 +72,14 @@ export function answerAgent(
   answer: { question_id: string; selections?: string[]; text?: string; approved?: boolean },
 ): Promise<unknown> {
   return request("POST", `/api/tasks/${id}/agent/answer`, answer);
+}
+
+/** Start an llmvet review for an idle task (review capability). */
+export function startReview(id: number): Promise<ReviewState> {
+  return request<ReviewState>("POST", `/api/tasks/${id}/review`);
+}
+
+/** Cancel an open llmvet review (review capability). */
+export function cancelReview(id: number): Promise<ReviewState> {
+  return request<ReviewState>("POST", `/api/tasks/${id}/review/cancel`);
 }

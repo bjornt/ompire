@@ -19,6 +19,7 @@ from ompire_daemon.auth import check_ws_token
 from ompire_daemon.events import EventHub
 from ompire_daemon.registry.projects import list_projects
 from ompire_daemon.registry.tasks import list_tasks
+from ompire_daemon.review import ReviewManager
 
 router = APIRouter()
 
@@ -67,6 +68,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         str(task_id): entry
         for task_id, entry in websocket.app.state.notifications.snapshot().items()
     }
+    # Live/completed reviews (review capability): reconnecting clients see
+    # the current state and iteration history without replaying events.
+    reviews_payload = {
+        str(task_id): info
+        for task_id, info in websocket.app.state.reviews.snapshot().items()
+    }
     await _send_envelope(
         websocket,
         next(seq),
@@ -76,6 +83,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             "tasks": tasks_payload,
             "sessions": sessions_payload,
             "attention": attention_payload,
+            "reviews": reviews_payload,
         },
     )
 

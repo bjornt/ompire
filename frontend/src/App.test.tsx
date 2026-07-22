@@ -58,7 +58,6 @@ describe("App", () => {
 
     for (const [label, title] of [
       ["Projects", "Projects"],
-      ["Ship flow", "Ship flow"],
       ["Templates & settings", "Templates & settings"],
     ] as const) {
       await user.click(screen.getByRole("link", { name: label }));

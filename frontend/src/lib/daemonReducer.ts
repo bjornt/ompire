@@ -10,6 +10,10 @@ import type {
   Project,
   QuestionPostedPayload,
   QuestionResolvedPayload,
+  ReviewFinishedPayload,
+  ReviewIterationPayload,
+  ReviewStartedPayload,
+  ReviewState,
   SessionInfo,
   SnapshotPayload,
   SpawnStepPayload,
@@ -41,6 +45,10 @@ export interface DaemonState {
   /** Active advisory decorations per task id, keyed by kind
    * (session-advisories capability): transient, never part of the snapshot. */
   advisories: Record<number, Partial<Record<AdvisoryKind, AdvisoryPayload>>>;
+  /** Live/completed reviews per task id (review capability): loaded from the
+   * snapshot, upserted by review events, dropped by review_finished and by
+   * task deletion/cleanup. */
+  reviews: Record<number, ReviewState>;
 }
 
 export const initialDaemonState: DaemonState = {
@@ -52,6 +60,7 @@ export const initialDaemonState: DaemonState = {
   attention: {},
   stats: {},
   advisories: {},
+  reviews: {},
 };
 
 /** Applies one envelope from the daemon's WebSocket. `snapshot` is a full
@@ -70,6 +79,10 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       for (const [taskId, entry] of Object.entries(payload.attention ?? {})) {
         attention[Number(taskId)] = entry;
       }
+      const reviews: Record<number, ReviewState> = {};
+      for (const [taskId, review] of Object.entries(payload.reviews ?? {})) {
+        reviews[Number(taskId)] = review;
+      }
       return {
         ...state,
         projects: payload.projects,
@@ -79,6 +92,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         attention,
         stats: {},
         advisories: {},
+        reviews,
       };
     }
     case "project_created": {
@@ -114,6 +128,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       const { [id]: _droppedAttention, ...attention } = state.attention;
       const { [id]: _droppedStats, ...stats } = state.stats;
       const { [id]: _droppedAdvisories, ...advisories } = state.advisories;
+      const { [id]: _droppedReview, ...reviews } = state.reviews;
       return {
         ...state,
         tasks: state.tasks.filter((t) => t.id !== id),
@@ -122,6 +137,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         attention,
         stats,
         advisories,
+        reviews,
       };
     }
     case "spawn_step": {
@@ -192,6 +208,46 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       if (!existing?.[kind]) return state;
       const { [kind]: _dropped, ...rest } = existing;
       return { ...state, advisories: { ...state.advisories, [task_id]: rest } };
+    }
+    case "review_started": {
+      const { task_id, url, port } = envelope.payload as ReviewStartedPayload;
+      const existing = state.reviews[task_id];
+      return {
+        ...state,
+        reviews: {
+          ...state.reviews,
+          [task_id]: {
+            status: "open",
+            url,
+            port,
+            iterations: existing?.iterations ?? [],
+          },
+        },
+      };
+    }
+    case "review_iteration": {
+      const { task_id, iteration } = envelope.payload as ReviewIterationPayload;
+      const existing = state.reviews[task_id];
+      if (!existing) return state;
+      return {
+        ...state,
+        reviews: {
+          ...state.reviews,
+          [task_id]: { ...existing, iterations: [...existing.iterations, iteration] },
+        },
+      };
+    }
+    case "review_finished": {
+      const { task_id, status } = envelope.payload as ReviewFinishedPayload;
+      const existing = state.reviews[task_id];
+      if (!existing) return state;
+      return {
+        ...state,
+        reviews: {
+          ...state.reviews,
+          [task_id]: { ...existing, status },
+        },
+      };
     }
     default:
       return state;

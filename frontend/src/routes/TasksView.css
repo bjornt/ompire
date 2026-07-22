@@ -161,6 +161,24 @@
   color: var(--amber);
 }
 
+/* Review-tier session pill (reviewing): bordered violet, plain dot, with a
+ * reopen link to the live llmvet UI (review capability). */
+.statePill.review {
+  border: 1px solid color-mix(in srgb, var(--violet) 55%, transparent);
+  background: color-mix(in srgb, var(--violet) 9%, transparent);
+  color: var(--violet);
+}
+
+.reviewPillLink {
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--violet);
+  text-decoration: underline;
+}
+
 .notifyDot {
   width: 6px;
   height: 6px;
@@ -315,6 +333,33 @@
   margin: 0;
   white-space: pre-wrap;
   overflow-x: auto;
+}
+
+.cardActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.reviewButton {
+  border: 1px solid color-mix(in srgb, var(--violet) 45%, transparent);
+  background: color-mix(in srgb, var(--violet) 10%, var(--surface));
+  border-radius: 5px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--violet);
+  cursor: pointer;
+  line-height: 1.5;
+}
+
+.reviewButton:hover {
+  border-color: var(--violet);
+}
+
+.reviewButton:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .cardFooter {

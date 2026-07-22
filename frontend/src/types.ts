@@ -41,9 +41,9 @@ export interface SpawnStepPayload {
   stderr?: string;
 }
 
-/** SPEC Decision 4: core subset plus the `ask-approvals` waiting states and
- * the notifications/attention chunk's `stalled`/`retrying`; later chunks add
- * `reviewing`/etc. */
+/** SPEC Decision 4: core subset plus the `ask-approvals` waiting states,
+ * the notifications/attention chunk's `stalled`/`retrying`, and the review
+ * chunk's `reviewing`. */
 export type SessionStatus =
   | "starting"
   | "working"
@@ -52,7 +52,8 @@ export type SessionStatus =
   | "waiting-input"
   | "waiting-approval"
   | "stalled"
-  | "retrying";
+  | "retrying"
+  | "reviewing";
 
 /** SPEC Decision 4 attention tier, owned by the daemon's notifier
  * (attention-notifications capability): `notify`/`interrupt` are the only
@@ -172,6 +173,36 @@ export interface StatusChangedPayload {
   reason: string;
 }
 
+export interface ReviewIteration {
+  outcome: "approved" | "comments" | "aborted" | "error";
+  comment_count: number | null;
+  stderr: string | null;
+  recorded_at: string;
+}
+
+export interface ReviewState {
+  status: "open" | "approved" | "aborted" | "error";
+  url: string;
+  port: number;
+  iterations: ReviewIteration[];
+}
+
+export interface ReviewStartedPayload {
+  task_id: number;
+  url: string;
+  port: number;
+}
+
+export interface ReviewIterationPayload {
+  task_id: number;
+  iteration: ReviewIteration;
+}
+
+export interface ReviewFinishedPayload {
+  task_id: number;
+  status: "approved" | "aborted" | "error";
+}
+
 export interface SnapshotPayload {
   projects: Project[];
   tasks: Task[];
@@ -180,6 +211,9 @@ export interface SnapshotPayload {
   /** Active attention entries, keyed by task id (JSON object keys arrive as
    * strings); absent from snapshots emitted before this chunk. */
   attention?: Record<string, AttentionEntry>;
+  /** Live/completed reviews, keyed by task id (JSON object keys arrive as
+   * strings); absent from snapshots emitted before the review chunk. */
+  reviews?: Record<string, ReviewState>;
 }
 
 export interface Envelope<T = unknown> {

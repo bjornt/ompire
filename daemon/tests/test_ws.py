@@ -17,6 +17,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
             "tasks": [],
             "sessions": {},
             "attention": {},
+            "reviews": {},
         }
 
 

@@ -1,0 +1,148 @@
+.shipFlow {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+}
+
+.shipStep {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+}
+
+.shipStep.stepOpen {
+  border-color: color-mix(in srgb, var(--violet) 45%, var(--line));
+}
+
+.shipStep.inert {
+  opacity: 0.65;
+  background: color-mix(in srgb, var(--surface2) 60%, var(--surface));
+}
+
+.stepHeader {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.stepIcon {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  flex: none;
+}
+
+.stepPending {
+  border: 1.5px solid var(--line);
+  color: var(--faint);
+}
+
+.stepActive {
+  border: 1.5px solid var(--violet);
+  color: var(--violet);
+}
+
+.stepDone {
+  background: var(--green);
+  color: var(--on-hue);
+}
+
+.stepError {
+  background: var(--red);
+  color: var(--on-hue);
+}
+
+.stepTitle {
+  font-weight: 650;
+  font-size: 14px;
+}
+
+.stepStatusBadge {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 7px;
+  border-radius: 4px;
+  margin-left: auto;
+}
+
+.stepStatusBadge.open {
+  border: 1px solid color-mix(in srgb, var(--violet) 50%, transparent);
+  color: var(--violet);
+}
+
+.stepStatusBadge.approved {
+  background: var(--green);
+  color: var(--on-hue);
+}
+
+.stepStatusBadge.aborted {
+  border: 1px solid var(--line);
+  color: var(--faint);
+}
+
+.stepStatusBadge.error {
+  background: var(--red);
+  color: var(--on-hue);
+}
+
+.stepHint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.reviewReopenLink {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--violet);
+  text-decoration: underline;
+  margin-bottom: 10px;
+}
+
+.iterationList {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.iterationItem {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  background: var(--surface2);
+}
+
+.iterationOutcome {
+  font-weight: 600;
+  text-transform: capitalize;
+}
+
+.iterationCount {
+  color: var(--muted);
+}
+
+.iterationError {
+  margin-left: auto;
+  color: var(--red);
+  font-size: 11px;
+  cursor: help;
+  text-decoration: underline;
+}

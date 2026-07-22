@@ -13,6 +13,7 @@ from pydantic import BaseModel, field_validator
 
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
+from ompire_daemon.review import ReviewAlreadyOpenError, ReviewError, ReviewManager
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
@@ -106,6 +107,10 @@ def _sessions(request: Request) -> SessionTracker:
 
 def _advisories(request: Request) -> AdvisorySampler:
     return request.app.state.advisories
+
+
+def _reviews(request: Request) -> ReviewManager:
+    return request.app.state.reviews
 
 
 @router.get("/projects", response_model=list[ProjectOut])
@@ -297,6 +302,7 @@ async def cleanup_task_route(
     events: EventHub = Depends(_events),
     sessions: SessionTracker = Depends(_sessions),
     advisories: AdvisorySampler = Depends(_advisories),
+    reviews: ReviewManager = Depends(_reviews),
 ) -> Task:
     try:
         task = get_task(engine, task_id)
@@ -325,6 +331,7 @@ async def cleanup_task_route(
     # Idempotent: a missing directory is already cleaned up.
     await asyncio.to_thread(shutil.rmtree, clone_path, ignore_errors=True)
 
+    await reviews.cancel_and_drop(task_id)
     archived = mark_archived(engine, task_id)
     sessions.discard(task_id)
     advisories.clear_task(task_id)
@@ -523,6 +530,89 @@ async def agent_stats_route(
     return response.get("data") or {}
 
 
+@router.post("/tasks/{task_id}/review")
+async def start_review_route(
+    task_id: int,
+    engine: Engine = Depends(_engine),
+    supervisor: AgentSupervisor = Depends(_supervisor),
+    sessions: SessionTracker = Depends(_sessions),
+    reviews: ReviewManager = Depends(_reviews),
+) -> dict[str, Any]:
+    try:
+        task = get_task(engine, task_id)
+    except TaskNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+    session = sessions.get(task_id)
+    if session is None or session.status != "idle":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"task {task_id} session is not idle",
+        )
+    if supervisor.get(task_id) is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"task {task_id} has no live agent",
+        )
+
+    try:
+        state = await reviews.start_review(task)
+    except ReviewAlreadyOpenError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except ReviewError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"review could not be started: {exc}",
+        ) from exc
+    return {
+        "task_id": task_id,
+        "status": state.status,
+        "url": state.url,
+        "port": state.port,
+        "iterations": [
+            {
+                "outcome": it.outcome,
+                "comment_count": it.comment_count,
+                "stderr": it.stderr,
+                "recorded_at": it.recorded_at,
+            }
+            for it in state.iterations
+        ],
+    }
+
+
+@router.post("/tasks/{task_id}/review/cancel")
+async def cancel_review_route(
+    task_id: int,
+    engine: Engine = Depends(_engine),
+    reviews: ReviewManager = Depends(_reviews),
+) -> dict[str, Any]:
+    try:
+        get_task(engine, task_id)
+    except TaskNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+    try:
+        state = await reviews.cancel_review(task_id)
+    except ReviewError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    return {
+        "task_id": task_id,
+        "status": state.status,
+        "url": state.url,
+        "port": state.port,
+        "iterations": [
+            {
+                "outcome": it.outcome,
+                "comment_count": it.comment_count,
+                "stderr": it.stderr,
+                "recorded_at": it.recorded_at,
+            }
+            for it in state.iterations
+        ],
+    }
+
+
 @router.delete("/tasks/{task_id}")
 def purge_task_route(
     task_id: int,
@@ -530,6 +620,7 @@ def purge_task_route(
     events: EventHub = Depends(_events),
     sessions: SessionTracker = Depends(_sessions),
     advisories: AdvisorySampler = Depends(_advisories),
+    reviews: ReviewManager = Depends(_reviews),
 ) -> dict[str, int]:
     try:
         purge_task(engine, task_id)
@@ -537,6 +628,7 @@ def purge_task_route(
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except TaskNotArchivedError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    reviews.drop_review(task_id)
     sessions.discard(task_id)
     advisories.clear_task(task_id)
     events.publish("task_deleted", {"id": task_id})
