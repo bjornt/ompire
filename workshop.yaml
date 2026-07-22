@@ -4,3 +4,4 @@ sdks:
   - name: node
     channel: 24
   - name: uv
+  - name: openspec
