@@ -95,6 +95,15 @@ stats_throttle_interval = 10       # minimum seconds between `stats` samples per
 notifications_enabled = true       # set false to disable desktop notifications (attention badges still work)
 ```
 
+### Ship/PR keys
+
+```toml
+gpg_signing_key = "your@key.id"  # key id/email passed to `git commit -S`; when unset the daemon falls back to `git config user.signingkey`
+gh_command = ["gh"]              # command invoked for `gh pr create` (argument list, no shell)
+```
+
+`gpg_signing_key` is optional; when absent the daemon reads `git config user.signingkey` to discover the signing key. The GPG lock state is probed via `gpg-connect-agent KEYINFO --no-ask <keygrip>` and exposed as a shared condition used by both the chrome chip and the ship commit gate.
+
 ### Review keys
 
 ```toml

@@ -12,13 +12,23 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         message = ws.receive_json()
         assert message["type"] == "snapshot"
         assert message["seq"] == 0
-        assert message["payload"] == {
-            "projects": [],
-            "tasks": [],
-            "sessions": {},
-            "attention": {},
-            "reviews": {},
+        payload = message["payload"]
+        assert payload.keys() == {
+            "projects",
+            "tasks",
+            "sessions",
+            "attention",
+            "reviews",
+            "ships",
+            "gpg",
         }
+        assert payload["projects"] == []
+        assert payload["tasks"] == []
+        assert payload["sessions"] == {}
+        assert payload["attention"] == {}
+        assert payload["reviews"] == {}
+        assert payload["ships"] == {}
+        assert payload["gpg"]["state"] in ("cached", "locked", "unknown")
 
 
 def test_mutation_broadcast(client: TestClient, auth_token: str, auth_headers: dict[str, str]) -> None:

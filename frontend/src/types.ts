@@ -21,6 +21,7 @@ export interface Task {
   error: string | null;
   workshop_id: string | null;
   spawn_completed_at: string | null;
+  pr_url: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -203,6 +204,61 @@ export interface ReviewFinishedPayload {
   status: "approved" | "aborted" | "error";
 }
 
+export interface ShipDraft {
+  commit_message: string;
+  pr_title: string;
+  pr_body: string;
+  source: "agent" | "manual";
+}
+
+export type ShipStatus = "drafting" | "drafted" | "committing" | "pushing" | "shipped" | "error";
+
+export interface ShipState {
+  status: ShipStatus;
+  mode?: "squash" | "retain";
+  draft: ShipDraft | null;
+  commit_sha: string | null;
+  pr_url: string | null;
+  error: string | null;
+  updated_at: string;
+  /** Augmented by the reducer from ship_step events for UI progress. */
+  lastStep?: { step: ShipStepName; status: "ok" | "failed"; detail?: string } | null;
+}
+
+export type ShipStepName = "fetch" | "commit" | "push" | "pr";
+
+export interface ShipDraftPayload {
+  task_id: number;
+  draft: ShipDraft;
+}
+
+export interface ShipStepPayload {
+  task_id: number;
+  step: ShipStepName;
+  status: "ok" | "failed";
+  detail?: string;
+}
+
+export interface ShipFinishedPayload {
+  task_id: number;
+  status: "shipped" | "error";
+  pr_url?: string;
+}
+
+export interface GpgStatus {
+  state: "cached" | "locked" | "unknown";
+  key: string | null;
+  keygrip: string | null;
+  detail: string | null;
+  checked_at: string;
+  /** Seconds remaining in the gpg-agent cache, when reported. */
+  ttl?: number | null;
+}
+
+export interface GpgStatusPayload {
+  status: GpgStatus;
+}
+
 export interface SnapshotPayload {
   projects: Project[];
   tasks: Task[];
@@ -214,6 +270,12 @@ export interface SnapshotPayload {
   /** Live/completed reviews, keyed by task id (JSON object keys arrive as
    * strings); absent from snapshots emitted before the review chunk. */
   reviews?: Record<string, ReviewState>;
+  /** Live/completed ship flows, keyed by task id (JSON object keys arrive as
+   * strings); absent from snapshots emitted before the ship chunk. */
+  ships?: Record<string, ShipState>;
+  /** Current GPG signing-key cache state; absent from snapshots emitted before
+   * the ship chunk. */
+  gpg?: GpgStatus;
 }
 
 export interface Envelope<T = unknown> {

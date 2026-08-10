@@ -17,9 +17,11 @@ from sqlalchemy import Engine
 from ompire_daemon.agent import EVENT_STREAM_END, AgentSupervisor
 from ompire_daemon.auth import check_ws_token
 from ompire_daemon.events import EventHub
+from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.registry.projects import list_projects
 from ompire_daemon.registry.tasks import list_tasks
 from ompire_daemon.review import ReviewManager
+from ompire_daemon.ship import ShipManager
 
 router = APIRouter()
 
@@ -74,6 +76,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         str(task_id): info
         for task_id, info in websocket.app.state.reviews.snapshot().items()
     }
+    # Live ship progress and the shared GPG lock condition.
+    ships_payload = {
+        str(task_id): info
+        for task_id, info in websocket.app.state.ships.snapshot().items()
+    }
+    gpg_payload = asdict(websocket.app.state.gpg.current())
     await _send_envelope(
         websocket,
         next(seq),
@@ -84,6 +92,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             "sessions": sessions_payload,
             "attention": attention_payload,
             "reviews": reviews_payload,
+            "ships": ships_payload,
+            "gpg": gpg_payload,
         },
     )
 

@@ -13,8 +13,10 @@ from pydantic import BaseModel, field_validator
 
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
+from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.review import ReviewAlreadyOpenError, ReviewError, ReviewManager
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
+from ompire_daemon.ship import ShipManager
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
@@ -111,6 +113,14 @@ def _advisories(request: Request) -> AdvisorySampler:
 
 def _reviews(request: Request) -> ReviewManager:
     return request.app.state.reviews
+
+
+def _ships(request: Request) -> ShipManager:
+    return request.app.state.ships
+
+
+def _gpg(request: Request) -> GpgProbe:
+    return request.app.state.gpg
 
 
 @router.get("/projects", response_model=list[ProjectOut])
@@ -217,6 +227,7 @@ class TaskOut(BaseModel):
     error: str | None
     workshop_id: str | None
     session_id: str | None
+    pr_url: str | None
     spawn_completed_at: str | None
     created_at: str
     updated_at: str
@@ -303,6 +314,7 @@ async def cleanup_task_route(
     sessions: SessionTracker = Depends(_sessions),
     advisories: AdvisorySampler = Depends(_advisories),
     reviews: ReviewManager = Depends(_reviews),
+    ships: ShipManager = Depends(_ships),
 ) -> Task:
     try:
         task = get_task(engine, task_id)
@@ -332,6 +344,7 @@ async def cleanup_task_route(
     await asyncio.to_thread(shutil.rmtree, clone_path, ignore_errors=True)
 
     await reviews.cancel_and_drop(task_id)
+    await ships.cancel_and_drop(task_id)
     archived = mark_archived(engine, task_id)
     sessions.discard(task_id)
     advisories.clear_task(task_id)
@@ -613,6 +626,98 @@ async def cancel_review_route(
     }
 
 
+class ShipCommitBody(BaseModel):
+    message: str
+    pr_title: str
+    pr_body: str
+    mode: str = "squash"
+
+
+_IN_FLIGHT_SHIP_STATUSES = {"drafting", "committing", "pushing"}
+
+
+@router.post("/tasks/{task_id}/ship/draft")
+async def draft_ship_route(
+    task_id: int,
+    engine: Engine = Depends(_engine),
+    supervisor: AgentSupervisor = Depends(_supervisor),
+    ships: ShipManager = Depends(_ships),
+) -> dict[str, Any]:
+    try:
+        task = get_task(engine, task_id)
+    except TaskNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+    _require_live_agent(supervisor, task_id)
+
+    try:
+        state = await ships.draft(task)
+    except ShipError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    return asdict(state)
+
+
+@router.post("/tasks/{task_id}/ship/commit")
+async def commit_ship_route(
+    task_id: int,
+    body: ShipCommitBody,
+    request: Request,
+    engine: Engine = Depends(_engine),
+    gpg: GpgProbe = Depends(_gpg),
+    ships: ShipManager = Depends(_ships),
+) -> dict[str, Any]:
+    try:
+        task = get_task(engine, task_id)
+    except TaskNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+    if body.mode != "squash":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"ship mode {body.mode!r} is not supported; only 'squash' is available",
+        )
+
+    existing = ships.get(task_id)
+    if existing is not None and existing.status in _IN_FLIGHT_SHIP_STATUSES:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"task {task_id} already has a ship in flight",
+        )
+
+    gpg_status = await gpg.probe()
+    if gpg_status.state != "cached":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "message": "GPG signing key is not cached",
+                "gpg": asdict(gpg_status),
+            },
+        )
+
+    ships.seed_commit(task.id)
+
+    job = asyncio.create_task(
+        ships.commit_and_ship(task, body.message, body.pr_title, body.pr_body)
+    )
+    jobs: set[asyncio.Task] = request.app.state.spawn_jobs
+    jobs.add(job)
+    job.add_done_callback(jobs.discard)
+
+    state = ships.get(task_id)
+    assert state is not None
+    return asdict(state)
+
+
+@router.get("/gpg")
+async def get_gpg_route(gpg: GpgProbe = Depends(_gpg)) -> dict[str, Any]:
+    return asdict(gpg.current())
+
+
+@router.post("/gpg/recheck")
+async def recheck_gpg_route(gpg: GpgProbe = Depends(_gpg)) -> dict[str, Any]:
+    return asdict(await gpg.probe())
+
+
 @router.delete("/tasks/{task_id}")
 def purge_task_route(
     task_id: int,
@@ -621,6 +726,7 @@ def purge_task_route(
     sessions: SessionTracker = Depends(_sessions),
     advisories: AdvisorySampler = Depends(_advisories),
     reviews: ReviewManager = Depends(_reviews),
+    ships: ShipManager = Depends(_ships),
 ) -> dict[str, int]:
     try:
         purge_task(engine, task_id)
@@ -629,6 +735,7 @@ def purge_task_route(
     except TaskNotArchivedError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     reviews.drop_review(task_id)
+    ships.drop_ship(task_id)
     sessions.discard(task_id)
     advisories.clear_task(task_id)
     events.publish("task_deleted", {"id": task_id})

@@ -21,6 +21,8 @@ DEFAULT_LLMVET_COMMAND = ("llmvet",)
 # daemon probes this range with an ephemeral bind to avoid collisions
 # between concurrent reviews.
 DEFAULT_REVIEW_PORT_RANGE = (7180, 7280)
+DEFAULT_GPG_SIGNING_KEY: str | None = None
+DEFAULT_GH_COMMAND = ("gh",)
 # Workshop launch includes SDK installs; the spike measured 7.34s warm-cache
 # and cold starts are slower still, so this is deliberately much larger than
 # the git-step timeout.
@@ -73,6 +75,8 @@ _KNOWN_KEYS = {
     "notifications_enabled",
     "shutdown_grace",
     "recovery_concurrency",
+    "gpg_signing_key",
+    "gh_command",
 }
 
 
@@ -106,6 +110,8 @@ class Config:
     notifications_enabled: bool = DEFAULT_NOTIFICATIONS_ENABLED
     shutdown_grace: float = DEFAULT_SHUTDOWN_GRACE
     recovery_concurrency: int = DEFAULT_RECOVERY_CONCURRENCY
+    gpg_signing_key: str | None = DEFAULT_GPG_SIGNING_KEY
+    gh_command: tuple[str, ...] = DEFAULT_GH_COMMAND
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -188,6 +194,27 @@ def load_config(path: Path | None = None) -> Config:
         )
     else:
         llmvet_command = tuple(llmvet_command)
+
+    gpg_signing_key = data.get("gpg_signing_key", DEFAULT_GPG_SIGNING_KEY)
+    if gpg_signing_key is not None and not isinstance(gpg_signing_key, str):
+        raise ConfigError(
+            f"config key 'gpg_signing_key' must be a string or unset, got {gpg_signing_key!r}"
+        )
+
+    gh_command = data.get("gh_command")
+    if gh_command is None:
+        gh_command = DEFAULT_GH_COMMAND
+    elif (
+        not isinstance(gh_command, list)
+        or not gh_command
+        or not all(isinstance(part, str) for part in gh_command)
+    ):
+        raise ConfigError(
+            f"config key 'gh_command' must be a non-empty list of strings, "
+            f"got {gh_command!r}"
+        )
+    else:
+        gh_command = tuple(gh_command)
 
     review_port_range = data.get("review_port_range")
     if review_port_range is None:
@@ -348,6 +375,8 @@ def load_config(path: Path | None = None) -> Config:
         notifications_enabled=notifications_enabled,
         shutdown_grace=float(shutdown_grace),
         recovery_concurrency=recovery_concurrency,
+        gpg_signing_key=gpg_signing_key,
+        gh_command=gh_command,
     )
 
 

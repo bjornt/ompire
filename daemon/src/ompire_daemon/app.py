@@ -19,12 +19,14 @@ from ompire_daemon.auth import load_or_create_token
 from ompire_daemon.config import Config
 from ompire_daemon.db import db_path_for, make_engine
 from ompire_daemon.events import EventHub
+from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
 from ompire_daemon.registry.tasks import list_tasks
 from ompire_daemon.review import ReviewManager
 from ompire_daemon.sessions import SessionTracker
+from ompire_daemon.ship import ShipManager
 from ompire_daemon.static import DEFAULT_FRONTEND_DIST, mount_frontend
 
 logger = logging.getLogger(__name__)
@@ -36,10 +38,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     advisories: AdvisorySampler = app.state.advisories
     agents: AgentSupervisor = app.state.agents
     reviews: ReviewManager = app.state.reviews
+    ships: ShipManager = app.state.ships
+    gpg: GpgProbe = app.state.gpg
     await notifier.probe()
     notifier.start()
     advisories.start()
     reviews.start()
+    # Prime the shared GPG lock condition before the first snapshot.
+    await gpg.probe()
     # Slow (real container-side omp startups): runs in the background so it
     # never blocks serving (crash-recovery capability, design D-4/7.3). The
     # fast, must-finish-before-the-first-snapshot classification already ran
@@ -77,16 +83,25 @@ async def _prepare_startup(
         if task.state == "archived":
             continue
         try:
-            restored = await ReviewManager.restore_parked_clone(
+            restored_review = await ReviewManager.restore_parked_clone(
                 task.clone_path, config.spawn_step_timeout
             )
         except Exception as exc:  # noqa: BLE001 — a single clone must not break startup
             logger.warning(
                 "failed to check/restore review ref for task %d: %s", task.id, exc
             )
-            continue
-        if restored:
-            logger.info("restored task %d clone from parked review ref", task.id)
+            restored_review = False
+        try:
+            restored_ship = await ShipManager.restore_parked_clone(
+                task.clone_path, config.spawn_step_timeout
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "failed to check/restore ship ref for task %d: %s", task.id, exc
+            )
+            restored_ship = False
+        if restored_review or restored_ship:
+            logger.info("restored task %d clone from parked ref", task.id)
     return await classify_startup_tasks(engine, events, sessions)
 
 
@@ -107,6 +122,15 @@ def create_app(config: Config, *, frontend_dist: Path = DEFAULT_FRONTEND_DIST) -
     app.state.agents = AgentSupervisor(config, app.state.events, app.state.sessions)
     app.state.reviews = ReviewManager(
         config, app.state.engine, app.state.events, app.state.sessions, app.state.agents
+    )
+    app.state.gpg = GpgProbe(config, app.state.events)
+    app.state.ships = ShipManager(
+        config,
+        app.state.engine,
+        app.state.events,
+        app.state.sessions,
+        app.state.agents,
+        app.state.gpg,
     )
     app.state.notifications = AttentionNotifier(
         app.state.events,

@@ -306,6 +306,18 @@
   text-decoration: underline;
 }
 
+.cardPrLink {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--violet);
+  text-decoration: underline;
+  overflow-wrap: anywhere;
+}
+
+.cardPrLink:hover {
+  color: var(--accent);
+}
+
 .errorToggle {
   align-self: flex-start;
   border: 1px solid var(--line);

@@ -191,6 +191,18 @@ function TaskCard({
       <Link className="cardBranch" to={`/tasks/${task.id}`} data-testid={`task-link-${task.id}`}>
         {task.branch}
       </Link>
+      {task.pr_url && (
+        <a
+          className="cardPrLink"
+          href={task.pr_url}
+          target="_blank"
+          rel="noreferrer"
+          data-testid={`task-pr-link-${task.id}`}
+          onClick={(e) => e.stopPropagation()}
+        >
+          {task.pr_url.replace("https://", "")}
+        </a>
+      )}
       {sessionFailed && (
         <div className="sessionReason" data-testid={`session-reason-${task.id}`}>
           {session.reason}

@@ -70,6 +70,7 @@ class Task:
     error: str | None
     workshop_id: str | None
     session_id: str | None
+    pr_url: str | None
     spawn_completed_at: str | None
     created_at: str
     updated_at: str
@@ -110,6 +111,7 @@ def _row_to_task(row) -> Task:  # noqa: ANN001
         error=row.error,
         workshop_id=row.workshop_id,
         session_id=row.session_id,
+        pr_url=row.pr_url,
         spawn_completed_at=row.spawn_completed_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -140,6 +142,7 @@ def create_task(
                     error=None,
                     workshop_id=None,
                     session_id=None,
+                    pr_url=None,
                     spawn_completed_at=None,
                     created_at=now,
                     updated_at=now,
@@ -185,6 +188,10 @@ def mark_workshop_launched(engine: Engine, task_id: int, workshop_id: str) -> Ta
 
 def mark_session_id(engine: Engine, task_id: int, session_id: str) -> Task:
     return _update(engine, task_id, session_id=session_id)
+
+
+def mark_pr_url(engine: Engine, task_id: int, url: str) -> Task:
+    return _update(engine, task_id, pr_url=url)
 
 
 def mark_failed(engine: Engine, task_id: int, error: str) -> Task:

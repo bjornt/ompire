@@ -1,4 +1,4 @@
-import type { AgentStateData, AgentStatsData, ReviewState, Task, TaskDetail } from "../types";
+import type { AgentStateData, AgentStatsData, GpgStatus, ReviewState, ShipState, Task, TaskDetail } from "../types";
 import { getDaemonToken } from "./token";
 
 /** Minimal authenticated REST client. Commands go over REST, events come
@@ -82,4 +82,27 @@ export function startReview(id: number): Promise<ReviewState> {
 /** Cancel an open llmvet review (review capability). */
 export function cancelReview(id: number): Promise<ReviewState> {
   return request<ReviewState>("POST", `/api/tasks/${id}/review/cancel`);
+}
+
+/** Draft a commit message + PR title/body via the live agent (ship capability). */
+export function draftShip(id: number): Promise<ShipState> {
+  return request<ShipState>("POST", `/api/tasks/${id}/ship/draft`);
+}
+
+/** Run the signed squash commit → push → PR flow (ship capability). */
+export function shipCommit(
+  id: number,
+  body: {
+    message: string;
+    pr_title: string;
+    pr_body: string;
+    mode?: "squash" | "retain";
+  },
+): Promise<ShipState> {
+  return request<ShipState>("POST", `/api/tasks/${id}/ship/commit`, body);
+}
+
+/** Force a fresh gpg-agent cache probe (ship capability). */
+export function recheckGpg(): Promise<GpgStatus> {
+  return request<GpgStatus>("POST", "/api/gpg/recheck");
 }

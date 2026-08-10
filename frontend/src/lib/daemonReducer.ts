@@ -7,6 +7,8 @@ import type {
   AttentionPayload,
   ConnectionState,
   Envelope,
+  GpgStatus,
+  GpgStatusPayload,
   Project,
   QuestionPostedPayload,
   QuestionResolvedPayload,
@@ -15,6 +17,10 @@ import type {
   ReviewStartedPayload,
   ReviewState,
   SessionInfo,
+  ShipDraftPayload,
+  ShipFinishedPayload,
+  ShipState,
+  ShipStepPayload,
   SnapshotPayload,
   SpawnStepPayload,
   StatsPayload,
@@ -49,6 +55,12 @@ export interface DaemonState {
    * snapshot, upserted by review events, dropped by review_finished and by
    * task deletion/cleanup. */
   reviews: Record<number, ReviewState>;
+  /** Live/completed ship flows per task id (ship capability): loaded from the
+   * snapshot, upserted by ship events, dropped by task deletion/cleanup. */
+  ships: Record<number, ShipState>;
+  /** Current GPG signing-key cache state (ship capability): loaded from the
+   * snapshot, upserted by gpg_status events. */
+  gpg: GpgStatus | null;
 }
 
 export const initialDaemonState: DaemonState = {
@@ -61,6 +73,8 @@ export const initialDaemonState: DaemonState = {
   stats: {},
   advisories: {},
   reviews: {},
+  ships: {},
+  gpg: null,
 };
 
 /** Applies one envelope from the daemon's WebSocket. `snapshot` is a full
@@ -83,6 +97,10 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       for (const [taskId, review] of Object.entries(payload.reviews ?? {})) {
         reviews[Number(taskId)] = review;
       }
+      const ships: Record<number, ShipState> = {};
+      for (const [taskId, ship] of Object.entries(payload.ships ?? {})) {
+        ships[Number(taskId)] = ship;
+      }
       return {
         ...state,
         projects: payload.projects,
@@ -93,6 +111,8 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         stats: {},
         advisories: {},
         reviews,
+        ships,
+        gpg: payload.gpg ?? null,
       };
     }
     case "project_created": {
@@ -129,6 +149,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       const { [id]: _droppedStats, ...stats } = state.stats;
       const { [id]: _droppedAdvisories, ...advisories } = state.advisories;
       const { [id]: _droppedReview, ...reviews } = state.reviews;
+      const { [id]: _droppedShip, ...ships } = state.ships;
       return {
         ...state,
         tasks: state.tasks.filter((t) => t.id !== id),
@@ -138,6 +159,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         stats,
         advisories,
         reviews,
+        ships,
       };
     }
     case "spawn_step": {
@@ -248,6 +270,70 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
           [task_id]: { ...existing, status },
         },
       };
+    }
+    case "ship_draft": {
+      const { task_id, draft } = envelope.payload as ShipDraftPayload;
+      const existing = state.ships[task_id];
+      return {
+        ...state,
+        ships: {
+          ...state.ships,
+          [task_id]: {
+            ...(existing ?? {
+              status: "drafted",
+              draft: null,
+              commit_sha: null,
+              pr_url: null,
+              error: null,
+              updated_at: envelope.ts,
+            }),
+            status: "drafted",
+            draft,
+            updated_at: envelope.ts,
+          } as ShipState,
+        },
+      };
+    }
+    case "ship_step": {
+      const { task_id, step, status, detail } = envelope.payload as ShipStepPayload;
+      const existing = state.ships[task_id];
+      if (!existing) return state;
+      const nextStatus: ShipState["status"] =
+        step === "commit" ? "committing" : step === "push" || step === "pr" ? "pushing" : existing.status;
+      return {
+        ...state,
+        ships: {
+          ...state.ships,
+          [task_id]: {
+            ...existing,
+            status: status === "failed" && existing.status !== "shipped" ? "error" : nextStatus,
+            error: status === "failed" ? detail ?? null : existing.error,
+            lastStep: { step, status, detail },
+            updated_at: envelope.ts,
+          },
+        },
+      };
+    }
+    case "ship_finished": {
+      const { task_id, status, pr_url } = envelope.payload as ShipFinishedPayload;
+      const existing = state.ships[task_id];
+      if (!existing) return state;
+      return {
+        ...state,
+        ships: {
+          ...state.ships,
+          [task_id]: {
+            ...existing,
+            status,
+            pr_url: pr_url ?? existing.pr_url,
+            updated_at: envelope.ts,
+          },
+        },
+      };
+    }
+    case "gpg_status": {
+      const { status } = envelope.payload as GpgStatusPayload;
+      return { ...state, gpg: status };
     }
     default:
       return state;

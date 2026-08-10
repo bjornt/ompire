@@ -1,6 +1,8 @@
+import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useDaemonState } from "../lib/daemonSocket";
-import type { ReviewIteration, ReviewState, SessionInfo } from "../types";
+import { draftShip, recheckGpg, shipCommit } from "../lib/api";
+import type { GpgStatus, ReviewIteration, ReviewState, SessionInfo, ShipState } from "../types";
 import "./ShipFlowView.css";
 
 function StepIcon({
@@ -109,14 +111,257 @@ function InertStep({
   );
 }
 
+function CommitStep({
+  taskId,
+  ship,
+  gpg,
+}: {
+  taskId: number;
+  ship: ShipState | undefined;
+  gpg: GpgStatus | null;
+}) {
+  const [mode, setMode] = useState<"squash" | "retain">("squash");
+  const [message, setMessage] = useState("");
+  const [prTitle, setPrTitle] = useState("");
+  const [prBody, setPrBody] = useState("");
+  const [touched, setTouched] = useState({ message: false, prTitle: false, prBody: false });
+  const [redrafting, setRedrafting] = useState(false);
+  const [rechecking, setRechecking] = useState(false);
+
+  useEffect(() => {
+    const draft = ship?.draft;
+    if (!draft) return;
+    setMessage((prev) => (touched.message ? prev : draft.commit_message));
+    setPrTitle((prev) => (touched.prTitle ? prev : draft.pr_title));
+    setPrBody((prev) => (touched.prBody ? prev : draft.pr_body));
+  }, [ship?.draft]); // eslint-disable-line react-hooks/exhaustive-deps
+  // touched resets intentionally omitted: the effect seeds untouched fields
+  // when a draft arrives without clobbering fields the user has edited.
+
+  const gpgCached = gpg?.state === "cached";
+  const gpgLocked = gpg?.state === "locked";
+  const busy = ship?.status === "drafting" || ship?.status === "committing";
+  const canCommit = gpgCached && !busy && mode === "squash" && message.trim().length > 0;
+  const unlockCommand = gpg?.key ? `echo | gpg --clearsign -u ${gpg.key} >/dev/null` : "";
+
+  async function onRedraft() {
+    setRedrafting(true);
+    setTouched({ message: false, prTitle: false, prBody: false });
+    try {
+      await draftShip(taskId);
+    } finally {
+      setRedrafting(false);
+    }
+  }
+
+  async function onCommit() {
+    if (!canCommit) return;
+    await shipCommit(taskId, {
+      message: message.trim(),
+      pr_title: prTitle.trim(),
+      pr_body: prBody.trim(),
+      mode,
+    });
+  }
+
+  async function onRecheck() {
+    setRechecking(true);
+    try {
+      await recheckGpg();
+    } finally {
+      setRechecking(false);
+    }
+  }
+
+  return (
+    <div className="shipStep" data-testid="ship-step-commit">
+      <div className="stepHeader">
+        <StepIcon
+          index={2}
+          active={ship?.status === "drafting" || ship?.status === "committing" || ship?.status === "drafted"}
+          done={ship?.status === "shipped"}
+          error={ship?.status === "error"}
+        />
+        <span className="stepTitle">Commit</span>
+        {ship?.status && ship.status !== "drafted" && ship.status !== "error" && (
+          <span className={`stepStatusBadge ${ship.status}`}>{ship.status}</span>
+        )}
+      </div>
+
+      <div className="commitMode" data-testid="commit-mode">
+        <label className="modeOption">
+          <input
+            type="radio"
+            name={`commit-mode-${taskId}`}
+            value="squash"
+            checked={mode === "squash"}
+            onChange={() => setMode("squash")}
+            disabled={busy}
+          />
+          Squash
+        </label>
+        <label className="modeOption" title="Retain-and-rewrite mode is planned for ROADMAP #19">
+          <input
+            type="radio"
+            name={`commit-mode-${taskId}`}
+            value="retain"
+            checked={mode === "retain"}
+            onChange={() => setMode("retain")}
+            disabled
+          />
+          Retain <span className="modeHint">#19</span>
+        </label>
+      </div>
+
+      <div className="commitFields">
+        <label>
+          Commit message
+          <textarea
+            rows={4}
+            value={message}
+            disabled={busy}
+            onChange={(e) => {
+              setMessage(e.target.value);
+              setTouched((t) => ({ ...t, message: true }));
+            }}
+            data-testid="commit-message"
+          />
+        </label>
+        <label>
+          PR title
+          <input
+            type="text"
+            value={prTitle}
+            disabled={busy}
+            onChange={(e) => {
+              setPrTitle(e.target.value);
+              setTouched((t) => ({ ...t, prTitle: true }));
+            }}
+            data-testid="pr-title"
+          />
+        </label>
+        <label>
+          PR body
+          <textarea
+            rows={5}
+            value={prBody}
+            disabled={busy}
+            onChange={(e) => {
+              setPrBody(e.target.value);
+              setTouched((t) => ({ ...t, prBody: true }));
+            }}
+            data-testid="pr-body"
+          />
+        </label>
+      </div>
+
+      <div className="commitActions">
+        <button
+          type="button"
+          disabled={redrafting || busy}
+          onClick={() => void onRedraft()}
+          data-testid="redraft-button"
+        >
+          {redrafting ? "Re-drafting…" : "Re-draft via agent"}
+        </button>
+        <button
+          type="button"
+          className="signCommitButton"
+          disabled={!canCommit}
+          onClick={() => void onCommit()}
+          data-testid="sign-commit-button"
+        >
+          Sign & commit
+        </button>
+      </div>
+
+      {gpgLocked && unlockCommand && (
+        <div className="gpgBanner" data-testid="gpg-locked-banner">
+          <strong>GPG signing key is locked</strong>
+          <p>Warm the passphrase cache in a terminal, then re-check:</p>
+          <code data-testid="gpg-unlock-command">{unlockCommand}</code>
+          <button
+            type="button"
+            disabled={rechecking}
+            onClick={() => void onRecheck()}
+            data-testid="recheck-gpg-button"
+          >
+            {rechecking ? "Checking…" : "Re-check key"}
+          </button>
+        </div>
+      )}
+
+      {ship?.status === "error" && ship.error && (
+        <div className="shipError" data-testid="ship-error">
+          {ship.error}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PushPrStep({
+  ship,
+  prUrl,
+}: {
+  ship: ShipState | undefined;
+  prUrl: string | null | undefined;
+}) {
+  const active = ship?.status === "committing" || ship?.status === "pushing";
+  const done = ship?.status === "shipped";
+  const error = ship?.status === "error";
+  const url = ship?.pr_url ?? prUrl ?? null;
+
+  let progress = "Waiting for a signed commit.";
+  if (done) progress = "Pull request opened.";
+  else if (ship?.lastStep?.step === "commit" && ship.lastStep.status === "failed")
+    progress = `Commit failed: ${ship.lastStep.detail ?? ""}`.trim();
+  else if (ship?.lastStep?.step === "push" && ship.lastStep.status === "failed")
+    progress = `Push failed: ${ship.lastStep.detail ?? ""}`.trim();
+  else if (ship?.lastStep?.step === "pr" && ship.lastStep.status === "failed")
+    progress = `PR failed: ${ship.lastStep.detail ?? ""}`.trim();
+  else if (ship?.status === "committing" || ship?.lastStep?.step === "commit")
+    progress = "Creating signed squash commit…";
+  else if (ship?.status === "pushing" || ship?.lastStep?.step === "push")
+    progress = "Pushing branch…";
+  else if (ship?.lastStep?.step === "pr") progress = "Opening pull request…";
+
+  return (
+    <div className="shipStep" data-testid="ship-step-push-pr">
+      <div className="stepHeader">
+        <StepIcon index={3} active={active} done={done} error={error} />
+        <span className="stepTitle">Push + PR</span>
+        {ship?.status && ["committing", "pushing", "shipped", "error"].includes(ship.status) && (
+          <span className={`stepStatusBadge ${ship.status}`}>{ship.status}</span>
+        )}
+      </div>
+      <p className="stepHint" data-testid="push-pr-progress">
+        {progress}
+      </p>
+      {url && (
+        <a
+          className="reviewReopenLink"
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          data-testid="pr-link"
+        >
+          {url.replace("https://", "")}
+        </a>
+      )}
+    </div>
+  );
+}
+
 export function ShipFlowView() {
   const { id } = useParams();
   const taskId = Number(id);
-  const { tasks, sessions, reviews } = useDaemonState();
+  const { tasks, sessions, reviews, ships, gpg } = useDaemonState();
 
   const task = tasks.find((t) => t.id === taskId);
   const session = sessions[taskId];
   const review = reviews[taskId];
+  const ship = ships[taskId];
 
   if (!task) {
     return (
@@ -142,18 +387,8 @@ export function ShipFlowView() {
 
       <div className="shipFlow" data-testid="ship-flow">
         <ReviewStep session={session} review={review} />
-        <InertStep
-          index={2}
-          title="Commit"
-          hint="Commit and sign changes after approval. (Coming in a later chunk.)"
-          testid="ship-step-commit"
-        />
-        <InertStep
-          index={3}
-          title="Push + PR"
-          hint="Push the branch and open a pull request. (Coming in a later chunk.)"
-          testid="ship-step-push-pr"
-        />
+        <CommitStep taskId={taskId} ship={ship} gpg={gpg} />
+        <PushPrStep ship={ship} prUrl={task.pr_url} />
         <InertStep
           index={4}
           title="Cleanup"

@@ -102,6 +102,7 @@ const task = {
   error: null,
   workshop_id: null,
   spawn_completed_at: null,
+  pr_url: null,
   created_at: "2026-07-18T00:00:00Z",
   updated_at: "2026-07-18T00:00:00Z",
 };
@@ -449,5 +450,165 @@ describe("applyEnvelope attention/advisory events", () => {
     expect(state.advisories[1]).toEqual({
       "maybe-waiting": { task_id: 1, kind: "maybe-waiting" },
     });
+  });
+});
+
+describe("applyEnvelope ship/gpg events", () => {
+  const draft = {
+    commit_message: "fix the bug",
+    pr_title: "Fix the bug",
+    pr_body: "This fixes the bug.",
+    source: "agent" as const,
+  };
+
+  it("loads ships and gpg from the snapshot", () => {
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: {
+        projects: [],
+        tasks: [task],
+        ships: {
+          "1": {
+            status: "drafted",
+            draft,
+            commit_sha: null,
+            pr_url: null,
+            error: null,
+            updated_at: "t0",
+          },
+        },
+        gpg: { state: "cached", key: "ABC", keygrip: "abc", detail: null, checked_at: "t0" },
+      },
+    });
+    expect(state.ships[1]).toEqual({
+      status: "drafted",
+      draft,
+      commit_sha: null,
+      pr_url: null,
+      error: null,
+      updated_at: "t0",
+    });
+    expect(state.gpg).toEqual({ state: "cached", key: "ABC", keygrip: "abc", detail: null, checked_at: "t0" });
+  });
+
+  it("upserts a ship on ship_draft", () => {
+    const empty = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [task] },
+    });
+    const state = applyEnvelope(empty, {
+      seq: 1,
+      ts: "t1",
+      type: "ship_draft",
+      payload: { task_id: 1, draft },
+    });
+    expect(state.ships[1]).toMatchObject({ status: "drafted", draft, updated_at: "t1" });
+  });
+
+  it("tracks step progress and failure on ship_step", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: {
+        projects: [],
+        tasks: [task],
+        ships: {
+          "1": {
+            status: "committing",
+            draft: null,
+            commit_sha: null,
+            pr_url: null,
+            error: null,
+            updated_at: "t0",
+          },
+        },
+      },
+    });
+    state = applyEnvelope(state, {
+      seq: 1,
+      ts: "t1",
+      type: "ship_step",
+      payload: { task_id: 1, step: "push", status: "ok" },
+    });
+    expect(state.ships[1].status).toBe("pushing");
+    expect(state.ships[1].lastStep).toEqual({ step: "push", status: "ok" });
+
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "t2",
+      type: "ship_step",
+      payload: { task_id: 1, step: "pr", status: "failed", detail: "denied" },
+    });
+    expect(state.ships[1].status).toBe("error");
+    expect(state.ships[1].error).toBe("denied");
+  });
+
+  it("sets shipped status and pr_url on ship_finished", () => {
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: {
+        projects: [],
+        tasks: [task],
+        ships: {
+          "1": {
+            status: "pushing",
+            draft: null,
+            commit_sha: "abc",
+            pr_url: null,
+            error: null,
+            updated_at: "t0",
+          },
+        },
+      },
+    });
+    const next = applyEnvelope(state, {
+      seq: 1,
+      ts: "t1",
+      type: "ship_finished",
+      payload: { task_id: 1, status: "shipped", pr_url: "https://github.com/o/p/pull/1" },
+    });
+    expect(next.ships[1].status).toBe("shipped");
+    expect(next.ships[1].pr_url).toBe("https://github.com/o/p/pull/1");
+  });
+
+  it("updates gpg state on gpg_status", () => {
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 1,
+      ts: "",
+      type: "gpg_status",
+      payload: { status: { state: "locked", key: "ABC", keygrip: "abc", detail: null, checked_at: "t0" } },
+    });
+    expect(state.gpg?.state).toBe("locked");
+  });
+
+  it("drops ships on task_deleted", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: {
+        projects: [],
+        tasks: [task],
+        ships: {
+          "1": {
+            status: "drafted",
+            draft,
+            commit_sha: null,
+            pr_url: null,
+            error: null,
+            updated_at: "t0",
+          },
+        },
+      },
+    });
+    state = applyEnvelope(state, { seq: 1, ts: "", type: "task_deleted", payload: { id: 1 } });
+    expect(state.ships).toEqual({});
   });
 });

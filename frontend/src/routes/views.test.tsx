@@ -21,7 +21,15 @@ class MockWebSocket {
     this.onmessage?.({ data: JSON.stringify({ seq: 0, ts: "", type, payload }) });
   }
 
-  emitSnapshot(payload: { projects: unknown[]; tasks: unknown[]; sessions?: unknown; attention?: unknown }) {
+  emitSnapshot(payload: {
+    projects: unknown[];
+    tasks: unknown[];
+    sessions?: unknown;
+    attention?: unknown;
+    reviews?: unknown;
+    ships?: unknown;
+    gpg?: unknown;
+  }) {
     this.onopen?.();
     this.emit("snapshot", payload);
   }
@@ -49,6 +57,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     error: null,
     workshop_id: null,
     spawn_completed_at: "2026-07-18T00:01:00Z",
+    pr_url: null,
     created_at: "2026-07-18T00:00:00Z",
     updated_at: "2026-07-18T00:01:00Z",
     ...overrides,
@@ -67,6 +76,8 @@ async function renderAt(
     sessions?: unknown;
     attention?: unknown;
     reviews?: unknown;
+    ships?: unknown;
+    gpg?: unknown;
   },
 ) {
   window.history.pushState({}, "", path);
@@ -779,39 +790,201 @@ describe("Review capability (TasksView)", () => {
 });
 
 describe("ShipFlowView", () => {
-  it("renders the live review step and inert later steps", async () => {
+  it("renders the live review step and live commit/push steps", async () => {
     await renderAt("/ship/1", {
       projects: [project],
       tasks: [makeTask()],
       sessions: {
         "1": { status: "reviewing", reason: "llmvet review", since: "t0" },
       },
+      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
       reviews: {
         "1": {
-          status: "open",
+          status: "approved",
           url: "http://127.0.0.1:7180",
           port: 7180,
-          iterations: [
-            { outcome: "comments", comment_count: 2, stderr: null, recorded_at: "t1" },
-            { outcome: "approved", comment_count: null, stderr: null, recorded_at: "t2" },
-          ],
+          iterations: [{ outcome: "approved", comment_count: null, stderr: null, recorded_at: "t2" }],
+        },
+      },
+      ships: {
+        "1": {
+          status: "drafted",
+          mode: "squash",
+          draft: {
+            commit_message: " agent commit",
+            pr_title: " agent pr title",
+            pr_body: " agent pr body",
+            source: "agent",
+          },
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t0",
         },
       },
     });
 
     expect(screen.getByTestId("ship-flow")).toBeInTheDocument();
     expect(screen.getByTestId("ship-step-review")).toHaveTextContent("approved");
-    const link = screen.getByTestId("review-reopen-link") as HTMLAnchorElement;
-    expect(link.href).toBe("http://127.0.0.1:7180/");
-    expect(screen.getByTestId("review-iterations")).toHaveTextContent("comments");
-    expect(screen.getByTestId("review-iterations")).toHaveTextContent("2 comments");
-    expect(screen.getByTestId("ship-step-commit")).toHaveTextContent("Coming in a later chunk");
-    expect(screen.getByTestId("ship-step-push-pr")).toBeInTheDocument();
+    expect(screen.getByTestId("ship-step-commit")).toHaveTextContent("Squash");
+    expect(screen.getByTestId("ship-step-commit")).toHaveTextContent("Retain");
+    expect((screen.getByTestId("commit-message") as HTMLTextAreaElement).value).toBe(" agent commit");
+    expect((screen.getByTestId("pr-title") as HTMLInputElement).value).toBe(" agent pr title");
+    expect((screen.getByTestId("pr-body") as HTMLTextAreaElement).value).toBe(" agent pr body");
+    expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled();
+    expect(screen.getByTestId("push-pr-progress")).toHaveTextContent("Waiting for a signed commit.");
     expect(screen.getByTestId("ship-step-cleanup")).toBeInTheDocument();
+  });
+
+  it("blocks Sign & commit and shows the GPG locked banner with unlock command", async () => {
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      gpg: { state: "locked", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+    });
+
+    expect(screen.getByTestId("sign-commit-button")).toBeDisabled();
+    expect(screen.getByTestId("gpg-locked-banner")).toBeInTheDocument();
+    expect(screen.getByTestId("gpg-unlock-command")).toHaveTextContent(
+      "echo | gpg --clearsign -u ABC123 >/dev/null",
+    );
+  });
+
+  it("posts ship commit with edited fields and squash mode", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          status: "committing",
+          draft: null,
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t1",
+        }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      ships: {
+        "1": {
+          status: "drafted",
+          mode: "squash",
+          draft: {
+            commit_message: "draft commit",
+            pr_title: "draft title",
+            pr_body: "draft body",
+            source: "agent",
+          },
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t0",
+        },
+      },
+    });
+
+    await user.clear(screen.getByTestId("commit-message"));
+    await user.type(screen.getByTestId("commit-message"), "Final commit");
+    await user.clear(screen.getByTestId("pr-title"));
+    await user.type(screen.getByTestId("pr-title"), "Final PR title");
+    await user.click(screen.getByTestId("sign-commit-button"));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/1/ship/commit",
+      expect.objectContaining({
+        method: "POST",
+        body: expect.stringContaining("Final commit"),
+      }),
+    );
+    const body = JSON.parse(fetchMock.mock.calls[fetchMock.mock.calls.length - 1][1].body as string);
+    expect(body).toEqual({
+      message: "Final commit",
+      pr_title: "Final PR title",
+      pr_body: "draft body",
+      mode: "squash",
+    });
+  });
+
+  it("shows the PR link once a ship finishes with a pr_url", async () => {
+    const task = makeTask();
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [task],
+      ships: {
+        "1": {
+          status: "shipped",
+          mode: "squash",
+          draft: null,
+          commit_sha: "abc123",
+          pr_url: "https://github.com/ompire/maas/pull/42",
+          error: null,
+          updated_at: "t1",
+        },
+      },
+    });
+
+    const link = screen.getByTestId("pr-link") as HTMLAnchorElement;
+    expect(link.href).toBe("https://github.com/ompire/maas/pull/42");
   });
 
   it("shows a not-found message for an unknown task id", async () => {
     await renderAt("/ship/999", { projects: [project], tasks: [makeTask()] });
     expect(screen.getByTestId("ship-flow-not-found")).toHaveTextContent("Task not found");
+  });
+});
+
+describe("Chrome GPG chip", () => {
+  it("shows cached when the daemon reports a cached key", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0", ttl: 10500 },
+    });
+
+    const chip = screen.getByTestId("gpg-chip");
+    expect(chip).toHaveTextContent("gpg cached 2h 55m");
+  });
+
+  it("shows locked with an unlock instruction in the title", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      gpg: { state: "locked", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+    });
+
+    const chip = screen.getByTestId("gpg-chip");
+    expect(chip).toHaveTextContent("gpg locked");
+    expect(chip).toHaveAttribute(
+      "title",
+      "GPG signing key is locked. Warm the cache with: echo | gpg --clearsign -u ABC123 >/dev/null",
+    );
+  });
+
+  it("shows a faint placeholder when gpg state is unknown", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+    });
+
+    const chip = screen.getByTestId("gpg-chip");
+    expect(chip).toHaveTextContent("gpg —");
+  });
+});
+
+describe("TasksView PR link", () => {
+  it("renders a PR link on a card when task.pr_url is set", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask({ pr_url: "https://github.com/ompire/maas/pull/7" })],
+    });
+
+    const link = screen.getByTestId("task-pr-link-1") as HTMLAnchorElement;
+    expect(link).toBeInTheDocument();
+    expect(link.href).toBe("https://github.com/ompire/maas/pull/7");
   });
 });
