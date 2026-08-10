@@ -279,7 +279,14 @@ class AgentHandle:
         ready = self._conn.ready
         if ready in done and not ready.cancelled() and ready.exception() is None:
             return
-        child_died_first = self._exited in done or self._process.returncode is not None
+        # A ready future that completed with an exception means stdout hit
+        # EOF before the ready frame (rpc sets AgentGoneError): the child is
+        # gone even if the exit watcher hasn't populated _exited/returncode
+        # yet. Check this first, or a dead child is misreported as a timeout.
+        ready_failed = ready in done and not ready.cancelled()
+        child_died_first = (
+            ready_failed or self._exited in done or self._process.returncode is not None
+        )
         await self.kill()
         # Consume/cancel the ready future so its AgentGoneError is never
         # reported as an unretrieved exception.
