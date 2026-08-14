@@ -338,7 +338,9 @@ async def test_commit_and_ship_squashes_delta(
     monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
 
     origin = tmp_root / "origin.git"
-    project, task = _make_project_and_task(engine, tmp_root)
+    project, task = _make_project_and_task(
+        engine, tmp_root, upstream_url="git@github.com:owner/repo.git"
+    )
 
     bin_dir = tmp_root / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -359,6 +361,18 @@ async def test_commit_and_ship_squashes_delta(
     _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
     _setup_signing_gpg(Path(task.clone_path), bin_dir)
 
+    # Assert the ship flow pushes to the project's upstream_url (not the
+    # clone's local-path origin), then redirect the transport to the local
+    # bare repo so the push actually lands. See test_push_and_pr_routes_to_*.
+    real_ensure = ships._ensure_ship_remote
+    seen_urls: list[str] = []
+
+    async def ensure_local(clone_path, url, timeout):
+        seen_urls.append(url)
+        return await real_ensure(clone_path, str(origin), timeout)
+
+    monkeypatch.setattr(ships, "_ensure_ship_remote", ensure_local)
+
     state = await ships.commit_and_ship(
         task,
         message="Final squash commit",
@@ -369,6 +383,7 @@ async def test_commit_and_ship_squashes_delta(
     assert state.status == "shipped", state.error
     assert state.commit_sha is not None
     assert state.pr_url == "https://github.com/owner/repo/pull/42"
+    assert seen_urls == ["git@github.com:owner/repo.git"]
 
     persisted = get_task(engine, task.id)
     assert persisted.pr_url == "https://github.com/owner/repo/pull/42"
@@ -496,6 +511,40 @@ async def test_push_and_pr_routes_to_fork(
     assert created["base"] == "main"
 
 
+async def test_push_and_pr_routes_to_upstream_without_fork(
+    tmp_root, engine, ships, gpg, monkeypatch
+):
+    """Task clones have origin = the local checkout path, so a non-fork push
+    must target the project's upstream URL, never the `origin` name (found via
+    dogfooding: pushes to `origin` updated only the local checkout)."""
+    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+
+    project, task = _make_project_and_task(
+        engine,
+        tmp_root,
+        upstream_url="git@github.com:upowner/uprepo.git",
+    )
+
+    pushed: list = []
+
+    async def fake_push(clone_path, remote_url, branch):
+        pushed.append((remote_url, branch))
+
+    async def fake_create_pr(clone_path, upstream_slug, base_branch, head, title, body):
+        assert head == task.branch
+        return "https://github.com/upowner/uprepo/pull/9"
+
+    monkeypatch.setattr(ships, "_push", fake_push)
+    monkeypatch.setattr(ships, "_create_pr", fake_create_pr)
+
+    ships._set_state(task.id, status="committing")
+    ships._set_state(task.id, commit_sha="abc123")
+    url = await ships._push_and_pr(task, project, pr_title="Title", pr_body="Body")
+
+    assert url == "https://github.com/upowner/uprepo/pull/9"
+    assert pushed == [("git@github.com:upowner/uprepo.git", "ompire/task-1")]
+
+
 async def test_push_uses_force_with_lease(tmp_root, engine, ships):
     origin = tmp_root / "origin-push.git"
     origin.mkdir()
@@ -570,7 +619,10 @@ class FakeAgentHandle:
 
     async def request(self, request_type: str, **fields) -> dict:
         if request_type == "get_last_assistant_text":
-            return {"data": self._draft}
+            # Live omp wraps the text: {"success": true, "data": {"text": ...}}
+            # (same shape advisories.py reads). A bare string here once masked
+            # a production bug found in dogfooding.
+            return {"success": True, "data": {"text": self._draft}}
         return {}
 
 

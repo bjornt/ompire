@@ -197,7 +197,11 @@ class ShipManager:
             except Exception as exc:  # noqa: BLE001
                 raise ShipError(f"agent request failed: {exc}") from exc
 
-            text = response.get("data") if isinstance(response, dict) else None
+            # Live omp wraps the text: {"data": {"text": ...}} — the same
+            # shape advisories.py reads (found via dogfooding: reading data
+            # as a bare string made every draft fail against real omp).
+            data = response.get("data") if isinstance(response, dict) else None
+            text = data.get("text") if isinstance(data, dict) else None
             if not isinstance(text, str):
                 raise ShipError("agent did not return text for draft")
 
@@ -463,7 +467,10 @@ class ShipManager:
             remote_url = project.fork_url
             head = f"{parse_github_owner(project.fork_url)}:{branch}"
         else:
-            remote_url = _SHIP_ORIGIN_NAME
+            # Task clones are hardlink-cloned from the local checkout, so their
+            # `origin` is a *local path* — pushing to `origin` never reaches
+            # GitHub (found via dogfooding). Push to the upstream URL instead.
+            remote_url = project.upstream_url
             head = branch
 
         self._hub.publish(
@@ -492,6 +499,12 @@ class ShipManager:
     async def _push(
         self, clone_path: str, remote_url: str, branch: str
     ) -> None:
+        # Push via a named remote + fetch: `--force-with-lease` needs
+        # remote-tracking refs to lease against; git rejects lease pushes to
+        # bare URLs with "stale info" (found via dogfooding).
+        name = await self._ensure_ship_remote(
+            clone_path, remote_url, self._config.spawn_step_timeout
+        )
         await _run_step(
             Step(
                 "ship-push",
@@ -500,13 +513,45 @@ class ShipManager:
                     "-C",
                     clone_path,
                     "push",
-                    remote_url,
+                    name,
                     f"HEAD:refs/heads/{branch}",
                     "--force-with-lease",
                 ],
                 self._config.spawn_step_timeout,
             )
         )
+
+    async def _ensure_ship_remote(
+        self, clone_path: str, remote_url: str, timeout: int
+    ) -> str:
+        """Point the `ship-target` remote at the push destination and fetch it."""
+        name = "ship-target"
+        existing = await _run_git_output(
+            ["git", "-C", clone_path, "remote"],
+            cwd=clone_path,
+            timeout=timeout,
+            step_name="ship-remote-list",
+        )
+        if name in existing.split():
+            await _run_step(
+                Step(
+                    "ship-remote-set-url",
+                    ["git", "-C", clone_path, "remote", "set-url", name, remote_url],
+                    timeout,
+                )
+            )
+        else:
+            await _run_step(
+                Step(
+                    "ship-remote-add",
+                    ["git", "-C", clone_path, "remote", "add", name, remote_url],
+                    timeout,
+                )
+            )
+        await _run_step(
+            Step("ship-fetch-target", ["git", "-C", clone_path, "fetch", name], timeout)
+        )
+        return name
 
     async def _create_pr(
         self,
