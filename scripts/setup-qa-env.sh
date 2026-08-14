@@ -22,8 +22,8 @@
 #                   agents through them. Skip with --skip-workshop.
 #   4. browser      delegate to setup-browser.sh (UI dogfooding via the
 #                   omp browser tool); skip with --skip-browser
-#   5. build        pnpm install (root + frontend), frontend production build
-#                   (the daemon serves frontend/dist), uv sync (daemon)
+#   5. build        pnpm install + production build (frontend; the daemon
+#                   serves frontend/dist), uv sync (daemon)
 #   6. config       ~/.config/ompire/config.toml: gpg_signing_key = the bot's
 #                   key, notifications_enabled = false (headless QA env)
 #   7. qa repo      resolve the QA sandbox repo (auto-discovered via the PAT —
@@ -54,7 +54,7 @@
 
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 QA_DIR="$ROOT/.qa-agent"
 OMPIRE_CONFIG_DIR="$HOME/.config/ompire"
 OMPIRE_CONFIG="$OMPIRE_CONFIG_DIR/config.toml"
@@ -155,14 +155,19 @@ if ! command -v node >/dev/null; then
 	sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs >/dev/null
 fi
 # corepack does not switch to alpha pins reliably; install the exact version
-# the repo's packageManager field demands, globally, so it wins PATH.
-PINNED_PNPM=$(jq -r '.packageManager // ""' "$ROOT/package.json" | sed -n 's/^pnpm@\([^+]*\).*/\1/p')
+# the frontend's packageManager field demands, globally, so it wins PATH.
+PINNED_PNPM=$(jq -r '.packageManager // ""' "$ROOT/frontend/package.json" | sed -n 's/^pnpm@\([^+]*\).*/\1/p')
 PINNED_PNPM=${PINNED_PNPM:-latest}
 if [ "$(pnpm --version 2>/dev/null || true)" != "$PINNED_PNPM" ]; then
 	log "pnpm: installing pinned $PINNED_PNPM via npm"
 	sudo rm -f /usr/bin/pnpm /usr/bin/pnpx /usr/local/bin/pnpm /usr/local/bin/pnpx # corepack shims block npm -g
 	sudo npm install -g "pnpm@$PINNED_PNPM" >/dev/null
 	hash -r
+fi
+# openspec is a global tool, not a project dependency
+if ! command -v openspec >/dev/null; then
+	log "openspec: installing globally via npm"
+	sudo npm install -g @fission-ai/openspec >/dev/null
 fi
 if ! command -v uv >/dev/null; then
 	log "uv: installing (astral installer)"
@@ -179,7 +184,8 @@ else
 	if ! command -v workshop >/dev/null; then
 		log "workshop: installing snap + LXD"
 		sudo snap install workshop --classic
-		sudo snap install lxd
+		# workshop requires LXD >= 6.8; Ubuntu's default channel serves 5.21.x
+		sudo snap install lxd --channel=6/stable
 		sudo lxd init --auto
 		sudo usermod -aG lxd "$USER"
 		warn "added $USER to group lxd — takes effect on next login; this run uses 'sg lxd'"
@@ -201,13 +207,12 @@ fi
 if [ "$OPT_SKIP_BROWSER" -eq 1 ]; then
 	log "browser: skipped (--skip-browser)"
 else
-	"$ROOT/setup-browser.sh"
+	"$ROOT/scripts/setup-browser.sh"
 fi
 
 # ---- 5. dependencies + build ----------------------------------------------
 
-log "deps: pnpm install (root + frontend), uv sync (daemon)"
-pnpm -C "$ROOT" install --frozen-lockfile
+log "deps: pnpm install (frontend), uv sync (daemon)"
 pnpm -C "$ROOT/frontend" install --frozen-lockfile
 uv sync --project "$ROOT/daemon" --quiet
 
