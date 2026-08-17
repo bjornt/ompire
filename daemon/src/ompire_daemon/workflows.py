@@ -15,8 +15,16 @@ fixed instruction block naming the path and schema; the engine unlinks any
 stale file before prompting and records the parsed document (or NULL with a
 note in the record's error field) at the session's debounced idle.
 
-The registry contains exactly `single-step` until ROADMAP #18; tests register
-their own workflows via `register_workflow`/`unregister_workflow`.
+The registry contains `single-step` (the pre-workflow behavior) and `bugfix`
+(the SPEC D8 example, below); tests register their own workflows via
+`register_workflow`/`unregister_workflow`.
+
+Two engine facilities sit beside the step kinds: a decision route may return
+the `COMPLETE` sentinel to finish the run early (loop exits), and the LLM
+judge (SPEC D8: fallback, never the router) classifies over a reserved
+`judge` session when an outcome file is missing/malformed or a deterministic
+route cannot resolve — an uncertain judge escalates to a gate rather than
+guessing (bugfix-workflow design D-3/D-4/D-5).
 """
 
 from __future__ import annotations
@@ -77,6 +85,18 @@ When you have finished the work above, write your result as JSON to \
 RESUME_NUDGE = "The daemon restarted while you were working; please continue."
 
 _COMMAND_OUTPUT_TAIL = 8 * 1024
+
+# A decision step's route may return this sentinel to finish the run early
+# (bugfix-workflow design D-3). Deliberately not slug-format, so it can never
+# collide with a declared step name.
+COMPLETE = "__complete__"
+
+# Engine-reserved session for the LLM-judge fallback (design D-4). It IS a
+# real session name (slug-format), so `Workflow` validation rejects any
+# workflow that declares it — registration fails at daemon startup, never at
+# task runtime.
+JUDGE_SESSION = "judge"
+
 
 
 # --- step/workflow definitions (design D-2) -----------------------------------
@@ -178,6 +198,11 @@ class Workflow:
                 raise WorkflowDefinitionError(
                     f"workflow {self.name!r} session {session!r} is not slug-format"
                 )
+            if session == JUDGE_SESSION:
+                raise WorkflowDefinitionError(
+                    f"workflow {self.name!r} may not declare the engine-reserved "
+                    f"session {JUDGE_SESSION!r}"
+                )
         if len(set(self.sessions)) != len(self.sessions):
             raise WorkflowDefinitionError(f"workflow {self.name!r} declares duplicate sessions")
         primary = self.primary or self.sessions[0]
@@ -268,6 +293,245 @@ register_workflow(
 )
 
 
+# --- the bugfix workflow (ROADMAP #18; bugfix-workflow design D-1/D-2/D-6) -----
+
+BUGFIX_MAX_FIX_ATTEMPTS = 3
+
+# The fixed, git-excluded reproducer entrypoint the reproduce step must write
+# (design D-2): exits non-zero while the bug is present, zero once fixed.
+BUGFIX_REPRO_PATH = ".ompire/repro.sh"
+
+
+def _bugfix_reproduce_prompt(ctx: RunContext) -> str:
+    return join_preamble(
+        ctx.template.preamble,
+        f"""\
+You are the reproducer on a bugfix task. The reported issue:
+
+{ctx.task.prompt}
+
+Work in the clone (your current directory). Your job:
+1. Investigate the issue and find a reliable way to reproduce it.
+2. Write an executable reproducer script at `{BUGFIX_REPRO_PATH}` such that
+   `bash {BUGFIX_REPRO_PATH}` exits non-zero while the bug is present and
+   exits 0 once the behavior is fixed. Keep it self-contained and fast.
+3. Run it and confirm it currently fails (non-zero exit).
+4. If the bug genuinely cannot be reproduced (missing information, not a
+   real bug, …), finish with status "failed" and explain why — do not fake
+   a reproduction.
+
+Do NOT fix the bug, do not modify the code under test, and do not commit
+anything — a separate coder session owns the fix. Your job ends at a
+confirmed, failing reproduction.
+
+Include these outcome artifacts when determinable:
+- "repro_command": the exact command that runs the reproducer. Omit it only
+  when the bug cannot be expressed as a runnable script (e.g. a purely
+  visual defect) — validation then falls back to an agent turn.
+- "expected_behavior": what should happen.
+- "observed_behavior": what actually happens.""",
+    )
+
+
+def _latest_fix_seq(records: list[StepRecord]) -> int:
+    """Sequence number of the newest `fix` record (0 when none ran yet)."""
+    return max((record.seq for record in records if record.step == "fix"), default=0)
+
+
+def _bugfix_validation(ctx: RunContext) -> tuple[str, str | None]:
+    """The validation signal for the current fix iteration: the newest
+    outcome-bearing validation record newer than the latest fix. Returns
+    ("validated" | "rejected" | "unknown", human report or None)."""
+    fix_seq = _latest_fix_seq(ctx.records())
+    candidates = [
+        record
+        for record in ctx.records()
+        if record.seq > fix_seq
+        and record.step in ("validate-script", "validate-agent")
+        and record.status == "ok"
+        and record.outcome is not None
+    ]
+    if not candidates:
+        return "unknown", None
+    latest = candidates[-1]
+    outcome = latest.outcome
+    assert outcome is not None
+    if latest.step == "validate-script":
+        exit_code = outcome.get("exit_code")
+        if exit_code == 0:
+            return "validated", None
+        output = outcome.get("output", "")
+        return "rejected", f"the reproducer still fails (exit {exit_code}):\n{output}"
+    if outcome.get("status") == "success":
+        return "validated", None
+    return "rejected", str(outcome.get("summary", "validation rejected the fix"))
+
+
+def _bugfix_fix_prompt(ctx: RunContext) -> str:
+    lines = [
+        "You are the coder on a bugfix task. The reported issue:",
+        "",
+        ctx.task.prompt,
+        "",
+    ]
+    reproduce = ctx.outcome("reproduce")
+    if reproduce is None:
+        lines.append(
+            "No structured reproduction handoff is available; inspect `.ompire/` "
+            "and the working tree for what the reproducer left behind."
+        )
+    else:
+        lines.append(f"Reproduction report: {reproduce.get('summary', '')}")
+        artifacts = reproduce.get("artifacts")
+        if isinstance(artifacts, dict):
+            for key in ("repro_command", "expected_behavior", "observed_behavior"):
+                value = artifacts.get(key)
+                if isinstance(value, str) and value:
+                    lines.append(f"- {key}: {value}")
+    verdict, report = _bugfix_validation(ctx)
+    if verdict == "rejected" and report is not None:
+        lines += [
+            "",
+            "Your previous fix did NOT validate. Validation report:",
+            report,
+            "",
+            "Revise the fix.",
+        ]
+    lines += [
+        "",
+        "Fix the bug in the working tree. Do not edit anything under `.ompire/` "
+        "and do not weaken or delete the reproducer script. Commit your change "
+        "on the current branch when done (the review flow unstages everything "
+        "for review and the ship flow squashes later — but never push). Then "
+        "write your outcome: a summary of the root cause and the fix.",
+    ]
+    return join_preamble(ctx.template.preamble, "\n".join(lines))
+
+
+def _bugfix_validate_agent_prompt(ctx: RunContext) -> str:
+    # The command-step reproducer already judged this iteration (design D-1):
+    # an empty prompt completes the step immediately without spending a turn.
+    fix_seq = _latest_fix_seq(ctx.records())
+    for record in reversed(ctx.records()):
+        if (
+            record.step == "validate-script"
+            and record.seq > fix_seq
+            and record.status == "ok"
+        ):
+            return ""
+    reproduce = ctx.outcome("reproduce")
+    handoff = ""
+    if reproduce is not None:
+        handoff = f"\n\nReproduction report: {reproduce.get('summary', '')}"
+        artifacts = reproduce.get("artifacts")
+        if isinstance(artifacts, dict):
+            for key in ("repro_command", "expected_behavior", "observed_behavior"):
+                value = artifacts.get(key)
+                if isinstance(value, str) and value:
+                    handoff += f"\n- {key}: {value}"
+    return join_preamble(
+        ctx.template.preamble,
+        f"""\
+Validate the fix for the bug you reproduced earlier.{handoff}
+
+The coder has edited the working tree since your reproduction. Re-run the
+reproduction and check the behavior rigorously; do not trust the coder's
+report. Do not modify the code and do not commit anything. Finish with
+status "success" only if the bug is genuinely fixed —
+otherwise status "failed" with a summary describing exactly what still
+misbehaves (that report goes back to the coder).""",
+    )
+
+
+def _bugfix_triage(ctx: RunContext) -> str:
+    reproduce = ctx.outcome("reproduce")
+    if reproduce is None:
+        raise RuntimeError("no reproduce outcome recorded")
+    if reproduce.get("status") == "success":
+        return "fix"
+    # A bug that cannot be reproduced is operator triage, not a coding task.
+    return "escalate"
+
+
+def _bugfix_route_validate(ctx: RunContext) -> str:
+    reproduce = ctx.outcome("reproduce")
+    if reproduce is None:
+        raise RuntimeError("no reproduce outcome recorded")
+    artifacts = reproduce.get("artifacts")
+    repro_command = artifacts.get("repro_command") if isinstance(artifacts, dict) else None
+    if isinstance(repro_command, str) and repro_command:
+        return "validate-script"
+    return "validate-agent"
+
+
+def _bugfix_check(ctx: RunContext) -> str:
+    verdict, _report = _bugfix_validation(ctx)
+    if verdict == "validated":
+        return COMPLETE
+    if verdict == "unknown":
+        raise RuntimeError("no validation outcome for the latest fix iteration")
+    attempts = len([record for record in ctx.records() if record.step == "fix"])
+    if attempts >= BUGFIX_MAX_FIX_ATTEMPTS:
+        return "escalate"
+    return "fix"
+
+
+def _bugfix_escalate_message(ctx: RunContext) -> str:
+    reproduce = ctx.outcome("reproduce")
+    if reproduce is not None and reproduce.get("status") == "failed":
+        return (
+            "The bug could not be reproduced: "
+            f"{reproduce.get('summary', '(no summary)')} "
+            "Resume to close out the run, then triage the issue manually."
+        )
+    verdict, report = _bugfix_validation(ctx)
+    if verdict == "rejected":
+        return (
+            f"The coder attempted a fix {BUGFIX_MAX_FIX_ATTEMPTS} times and the "
+            f"reproducer still fails. Latest validation report: {report} "
+            "Resume to close out the run, then review the working tree and "
+            "steer the sessions manually."
+        )
+    return (
+        "The bugfix workflow could not resolve its route deterministically. "
+        "Resume to close out the run; inspect the step history and sessions."
+    )
+
+
+register_workflow(
+    Workflow(
+        name="bugfix",
+        sessions=("reproducer", "coder"),
+        primary="coder",
+        steps=(
+            AgentStep(
+                name="reproduce",
+                session="reproducer",
+                prompt=_bugfix_reproduce_prompt,
+                expects_outcome=True,
+            ),
+            DecisionStep(name="triage", route=_bugfix_triage),
+            AgentStep(
+                name="fix",
+                session="coder",
+                prompt=_bugfix_fix_prompt,
+                expects_outcome=True,
+            ),
+            DecisionStep(name="route-validate", route=_bugfix_route_validate),
+            CommandStep(name="validate-script", argv=("bash", BUGFIX_REPRO_PATH)),
+            AgentStep(
+                name="validate-agent",
+                session="reproducer",
+                prompt=_bugfix_validate_agent_prompt,
+                expects_outcome=True,
+            ),
+            DecisionStep(name="check", route=_bugfix_check),
+            GateStep(name="escalate", message=_bugfix_escalate_message),
+        ),
+    )
+)
+
+
 # --- outcome reading (design D-3) ----------------------------------------------
 
 
@@ -298,6 +562,33 @@ def read_outcome(clone_path: str) -> tuple[dict[str, Any] | None, str | None]:
     ):
         return None, "outcome artifacts must be a string-keyed map"
     return document, None
+
+
+# --- judge helpers (bugfix-workflow design D-5) --------------------------------
+
+
+def _judge_transcript_path(seq: int) -> str:
+    """The in-clone transcript dump the judge prompt references, per judged
+    record (seq 0 for decision judgments, which have no record yet)."""
+    return f".ompire/judge-transcript-{seq}.jsonl"
+
+
+def _history_digest(records: list[StepRecord], *, per_record_limit: int = 500) -> str:
+    """One line per executed step for judge prompts: identity, status, and a
+    truncated outcome/error digest."""
+
+    def truncate(value: str) -> str:
+        return value if len(value) <= per_record_limit else value[:per_record_limit] + "…"
+
+    lines = []
+    for record in records:
+        line = f"- #{record.seq} {record.step} ({record.kind}): {record.status}"
+        if record.outcome is not None:
+            line += f", outcome: {truncate(json.dumps(record.outcome, default=str))}"
+        if record.error:
+            line += f", note: {truncate(record.error)}"
+        lines.append(line)
+    return "\n".join(lines) if lines else "(no steps executed yet)"
 
 
 # --- the runner (design D-2/D-4/D-6) -------------------------------------------
@@ -505,7 +796,7 @@ class WorkflowRunner:
             self._publish_task_updated(updated)
             self._publish_step(task_id, declared, "started")
             try:
-                result = await self._run_step(step, ctx, record, model, thinking)
+                result = await self._run_step(step, ctx, record, workflow, model, thinking)
             except _StepInfraFailure as exc:
                 self._fail_step(task_id, declared, record.seq, str(exc))
                 return
@@ -532,19 +823,14 @@ class WorkflowRunner:
                 error=result.error_note,
             )
             self._publish_step(task_id, declared, "ok")
+            if result.route == COMPLETE:
+                # Early run completion (bugfix-workflow design D-3).
+                break
             if result.route is not None:
+                # `_run_step` validated the route against the workflow (and
+                # the judge fallback) before returning it.
                 target = workflow.step_named(result.route)
-                if target is None:
-                    # Route names a step that does not exist: escalate rather
-                    # than guess (design D-2).
-                    step = GateStep(
-                        name=declared.name,
-                        message=lambda ctx, r=result.route, d=declared.name: (
-                            f"decision {d!r} routed to unknown step {r!r}; "
-                            "resume to continue at the step after the decision"
-                        ),
-                    )
-                    continue
+                assert target is not None
                 step = target
             else:
                 step = workflow.step_after(declared.name)
@@ -637,7 +923,14 @@ class WorkflowRunner:
             updated = set_run_status(self._engine, task_id, "waiting", last.step)
             self._publish_task_updated(updated)
             self._publish_gate_step(task_id, last.step, "waiting", message)
-            return await self._await_gate(task_id, workflow, last.seq, last.step, message)
+            next_step = await self._await_gate(task_id, workflow, last.seq, last.step, message)
+            if next_step is None:
+                # The gate is the last declared step: resuming fell off the
+                # end — complete the run here, mirroring the main loop's
+                # fall-off (bugfix's `escalate` gate relies on this).
+                updated = set_run_status(self._engine, task_id, "complete", None)
+                self._publish_task_updated(updated)
+            return next_step
         if last.status == "running":
             # The shutdown interrupted this step. Close its record and
             # re-drive per kind (commands/decisions re-execute; agent steps
@@ -669,6 +962,12 @@ class WorkflowRunner:
         # route); anything else falls through.
         if last.kind == "decision" and last.outcome is not None:
             route = last.outcome.get("route")
+            if route == COMPLETE:
+                # The run completed itself at the decision; a restart in the
+                # narrow window before the status write lands completes here.
+                updated = set_run_status(self._engine, task_id, "complete", None)
+                self._publish_task_updated(updated)
+                return None
             if isinstance(route, str):
                 target = workflow.step_named(route)
                 if target is not None:
@@ -682,6 +981,7 @@ class WorkflowRunner:
         step: Step | _NudgedAgentStep,
         ctx: _RunContext,
         record: StepRecord,
+        workflow: Workflow,
         model: str | None,
         thinking: str | None,
     ) -> _StepResult:
@@ -692,25 +992,71 @@ class WorkflowRunner:
         if isinstance(step, CommandStep):
             return await self._run_command_step(step, ctx)
         if isinstance(step, DecisionStep):
+            failure: str | None = None
             try:
                 route = step.route(ctx)
             except Exception as exc:  # noqa: BLE001 — escalate, never guess
-                return _StepResult(
-                    gate_message=(
-                        f"decision {step.name!r} could not resolve a route: {exc}; "
-                        "resume to continue at the step after the decision"
+                route = None
+                failure = f"decision {step.name!r} could not resolve a route: {exc}"
+            else:
+                if route is not None and route != COMPLETE and workflow.step_named(route) is None:
+                    failure = f"decision {step.name!r} routed to unknown step {route!r}"
+                    route = None
+                elif route is None:
+                    failure = (
+                        f"decision {step.name!r} resolved no route "
+                        "(a required outcome is missing?)"
                     )
-                )
-            if route is None:
+            if route is not None:
+                return _StepResult(outcome={"route": route}, route=route)
+            assert failure is not None
+            judged = await self._judge_route(ctx.task, workflow, step, ctx, failure)
+            if judged is not None:
                 return _StepResult(
-                    gate_message=(
-                        f"decision {step.name!r} resolved no route (a required outcome "
-                        "is missing?); resume to continue at the step after the decision"
-                    )
+                    outcome={"route": judged},
+                    route=judged,
+                    error_note="route chosen by LLM judge",
                 )
-            return _StepResult(outcome={"route": route}, route=route)
+            return _StepResult(
+                gate_message=f"{failure}; resume to continue at the step after the decision"
+            )
         assert isinstance(step, GateStep)
         return _StepResult(gate_message=step.message(ctx))
+
+    async def _ensure_session(
+        self, task: Task, session: str, *, model: str | None, thinking: str | None
+    ):
+        """Lazy spawn (design D-1): the same supervised start the old
+        pipeline used — ask-timeout preflight, ready handshake, then
+        per-session omp identity capture — shared by workflow sessions and
+        the engine-reserved judge session. Raises on failure."""
+        handle = self._supervisor.get(task.id, session)
+        if handle is not None and handle.returncode is None:
+            return handle
+        try:
+            handle = await self._supervisor.start(
+                task.id,
+                session,
+                task.clone_path,
+                model=model,
+                thinking=thinking,
+            )
+        except Exception as exc:
+            detail = str(exc)
+            stderr = getattr(exc, "stderr", "")
+            if stderr:
+                detail = f"{detail}\n{stderr}"
+            self._tracker.session_start_failed(
+                task.id, session, f"session spawn failed: {exc}"
+            )
+            raise _StepInfraFailure(detail) from exc
+        record_session_spawned(self._engine, task.id, session)
+        # Best-effort identity capture (crash-recovery): a miss is logged
+        # inside `read_session_id` and never fails the step.
+        session_id = await handle.read_session_id()
+        if session_id is not None:
+            mark_session_id(self._engine, task.id, session, session_id)
+        return handle
 
     async def _run_agent_step(
         self,
@@ -722,35 +1068,9 @@ class WorkflowRunner:
     ) -> _StepResult:
         task = ctx.task
         nudged = isinstance(step, _NudgedAgentStep)
+        await self._ensure_session(task, step.session, model=model, thinking=thinking)
         handle = self._supervisor.get(task.id, step.session)
-        if handle is None or handle.returncode is not None:
-            # Lazy spawn (design D-1): the same supervised start the old
-            # pipeline used — ask-timeout preflight, ready handshake, then
-            # per-session omp identity capture — with the spawn-resolved
-            # effective model/thinking.
-            try:
-                handle = await self._supervisor.start(
-                    task.id,
-                    step.session,
-                    task.clone_path,
-                    model=model,
-                    thinking=thinking,
-                )
-            except Exception as exc:
-                detail = str(exc)
-                stderr = getattr(exc, "stderr", "")
-                if stderr:
-                    detail = f"{detail}\n{stderr}"
-                self._tracker.session_start_failed(
-                    task.id, step.session, f"session spawn failed: {exc}"
-                )
-                raise _StepInfraFailure(detail) from exc
-            record_session_spawned(self._engine, task.id, step.session)
-            # Best-effort identity capture (crash-recovery): a miss is logged
-            # inside `read_session_id` and never fails the step.
-            session_id = await handle.read_session_id()
-            if session_id is not None:
-                mark_session_id(self._engine, task.id, step.session, session_id)
+        assert handle is not None
 
         if nudged:
             prompt = step.nudge
@@ -769,8 +1089,12 @@ class WorkflowRunner:
         if not prompt:
             # Empty prompt: nothing sent; the step completes once the session
             # is ready (parity with the old promptless-spawn idle behavior).
+            # No outcome instruction was given, so any file on disk is stale
+            # by definition — record a null outcome without reading it, and
+            # never judge a step that was deliberately inert (the
+            # validate-agent skip relies on this).
             self._tracker.prompt_skipped(task.id, step.session)
-            return self._outcome_result(task, step)
+            return _StepResult()
 
         try:
             # The ack is a receipt ("queued"), not turn completion.
@@ -784,7 +1108,18 @@ class WorkflowRunner:
         # dying mid-step is an infra failure; a pending question just keeps
         # the run running until the operator answers and the turn ends.
         await self._await_step_idle(task.id, step.session)
-        return self._outcome_result(task, step)
+        result = self._outcome_result(task, step)
+        if result.outcome is None and step.expects_outcome:
+            # LLM-judge fallback (bugfix-workflow design D-5): the agent had
+            # its chance (a prompt went out) and produced nothing parseable —
+            # judge before recording the null.
+            judged = await self._judge_step(task, step, record, prompt)
+            if judged is not None:
+                note = "outcome synthesized by LLM judge"
+                if result.error_note:
+                    note = f"{result.error_note}; {note}"
+                return _StepResult(outcome=judged, error_note=note)
+        return result
 
     def _outcome_result(
         self, task: Task, step: AgentStep | _NudgedAgentStep
@@ -796,6 +1131,149 @@ class WorkflowRunner:
             return _StepResult()
         outcome, note = read_outcome(task.clone_path)
         return _StepResult(outcome=outcome, error_note=note)
+
+    # --- LLM judge fallback (bugfix-workflow design D-4/D-5) -------------------
+
+    async def _judge_step(
+        self,
+        task: Task,
+        step: AgentStep | _NudgedAgentStep,
+        record: StepRecord,
+        prompt: str,
+    ) -> dict[str, Any] | None:
+        """Step-level judgment: the step idled without a valid outcome. Ask
+        the judge to classify the result; None means the judge could not
+        (uncertain or unavailable) and the null outcome stands."""
+        purpose = (
+            f"Workflow step {step.name!r} (session {step.session!r}) was given this task:\n"
+            f"---\n{prompt[:2000]}\n---\n"
+            "The step ended without leaving a parseable outcome file."
+        )
+        instruction = (
+            "If — and only if — you can say with confidence whether the step achieved "
+            "its goal, write the standard outcome document classifying it "
+            '(`status` "success" or "failed", `summary` stating the evidence). '
+            "If you cannot determine the result with confidence, write NO file at all."
+        )
+        return await self._run_judge(task, record.seq, step.session, purpose, instruction)
+
+    async def _judge_route(
+        self,
+        task: Task,
+        workflow: Workflow,
+        step: DecisionStep,
+        ctx: _RunContext,
+        failure: str,
+    ) -> str | None:
+        """Decision-level judgment: the deterministic route could not
+        resolve. Ask the judge to pick a route; None defers to the
+        synthesized-gate escalation."""
+        candidates = ", ".join(f"{s.name!r} ({step_kind(s)})" for s in workflow.steps)
+        purpose = (
+            f"Decision step {step.name!r} in workflow {workflow.name!r} must choose the "
+            f"run's next step, but its deterministic rule failed: {failure}.\n"
+            f"Candidate routes: {candidates}, or {COMPLETE!r} (complete the run now).\n"
+            f"Step history so far:\n{_history_digest(ctx.records())}"
+        )
+        instruction = (
+            "If — and only if — the right route is clear with confidence, write the "
+            'standard outcome document with `status` "success", a `summary` stating '
+            'your reasoning, and `artifacts`: {"route": "<chosen step or sentinel>"}. '
+            "If it is not clear, write NO file at all."
+        )
+        # The transcript that matters is the latest agent step's session.
+        transcript_session: str | None = None
+        for record in reversed(ctx.records()):
+            if record.session is not None:
+                transcript_session = record.session
+                break
+        judged = await self._run_judge(
+            task, 0, transcript_session, purpose, instruction
+        )
+        if judged is None:
+            return None
+        artifacts = judged.get("artifacts")
+        route = artifacts.get("route") if isinstance(artifacts, dict) else None
+        if not isinstance(route, str) or (route != COMPLETE and workflow.step_named(route) is None):
+            logger.warning("judge returned an invalid route %r; escalating", route)
+            return None
+        return route
+
+    async def _run_judge(
+        self,
+        task: Task,
+        record_seq: int,
+        transcript_session: str | None,
+        purpose: str,
+        instruction: str,
+    ) -> dict[str, Any] | None:
+        """One judgment on the engine-reserved `judge` session (design D-4):
+        spawn lazily with `judge_model`, dump the judged session's transcript
+        tail into the clone, prompt, await the turn, read the outcome. Any
+        failure degrades to None — judging never fails a run."""
+        try:
+            handle = await self._ensure_session(
+                task, JUDGE_SESSION, model=self._config.judge_model, thinking=None
+            )
+        except _StepInfraFailure as exc:
+            logger.warning("judge session unavailable for task %d: %s", task.id, exc)
+            return None
+
+        dump_note = "No session transcript is available."
+        if transcript_session is not None:
+            source = self._supervisor.get(task.id, transcript_session)
+            if source is not None:
+                dump_rel = _judge_transcript_path(record_seq)
+                try:
+                    dump_abs = Path(task.clone_path) / dump_rel
+                    dump_abs.parent.mkdir(parents=True, exist_ok=True)
+                    with dump_abs.open("w", encoding="utf-8") as fh:
+                        for event in source.snapshot():
+                            try:
+                                fh.write(
+                                    json.dumps(
+                                        {"type": event.type, "payload": event.payload},
+                                        default=str,
+                                    )
+                                    + "\n"
+                                )
+                            except (TypeError, ValueError):
+                                continue  # best-effort dump
+                    dump_note = (
+                        f"The transcript of session {transcript_session!r} (newest last) "
+                        f"is dumped as NDJSON at `{dump_rel}` in the clone."
+                    )
+                except OSError as exc:
+                    logger.warning("judge transcript dump failed: %s", exc)
+
+        # A judged document must be fresh: any stale/malformed outcome file
+        # (possibly the one that triggered this judgment) is removed first.
+        try:
+            (Path(task.clone_path) / OUTCOME_PATH).unlink()
+        except FileNotFoundError:
+            pass
+        prompt = (
+            "You are the fallback judge for the ompire workflow engine: another agent's "
+            "work must be classified exactly once, conservatively.\n\n"
+            f"The task at hand: {task.prompt}\n\n"
+            f"{purpose}\n\n"
+            f"{dump_note} The working tree in your current directory is the task's clone "
+            "— inspect it as needed.\n\n"
+            f"{instruction}\n\n"
+            f"{OUTCOME_INSTRUCTION}"
+        )
+        try:
+            await asyncio.wait_for(
+                handle.prompt(prompt), timeout=self._config.spawn_step_timeout
+            )
+            await self._await_step_idle(task.id, JUDGE_SESSION)
+        except (TimeoutError, RequestFailedError, AgentGoneError, _StepInfraFailure) as exc:
+            logger.warning("judge turn failed for task %d: %s", task.id, exc)
+            return None
+        outcome, note = read_outcome(task.clone_path)
+        if outcome is None:
+            logger.info("judge produced no outcome for task %d (%s)", task.id, note)
+        return outcome
 
     async def _await_step_idle(self, task_id: int, session: str) -> None:
         """Wait for the debounced idle turn boundary, watching hub events;

@@ -453,3 +453,48 @@ def test_interrupt_clears_pending_question(
         assert answer.status_code == 409
 
     assert client.post(f"/api/tasks/{task_id}/sessions/main/agent/stop", headers=auth_headers).status_code == 200
+
+
+def test_judge_session_admitted_on_session_routes(
+    client: TestClient, auth_headers: dict, auth_token: str, demo_template: dict
+) -> None:
+    """The engine-reserved judge session is reachable on session-scoped routes
+    (its transcript is the audit trail), while undeclared names still 404.
+
+    Drives a real bugfix run through the pipeline: fake omp never writes an
+    outcome file, so the reproduce step's judge fires, then triage's judge —
+    both come back empty and the run parks at the synthesized gate with the
+    judge session live."""
+    import time
+
+    created = client.post(
+        "/api/templates",
+        headers=auth_headers,
+        json={"name": "qa-bugfix", "project_name": "demo", "workflow": "bugfix"},
+    )
+    assert created.status_code == 201, created.text
+
+    response = client.post(
+        "/api/tasks",
+        headers=auth_headers,
+        json={"template_name": "qa-bugfix", "slug": "judge-route", "prompt": "fix the bug"},
+    )
+    assert response.status_code == 202, response.text
+    task_id = response.json()["id"]
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        task = client.get(f"/api/tasks/{task_id}", headers=auth_headers).json()
+        if task["workflow_status"] == "waiting":
+            break
+        time.sleep(0.2)
+    assert task["workflow_status"] == "waiting", task
+
+    state = client.get(
+        f"/api/tasks/{task_id}/sessions/judge/agent/state", headers=auth_headers
+    )
+    assert state.status_code == 200, state.text
+    ghost = client.get(
+        f"/api/tasks/{task_id}/sessions/ghost/agent/state", headers=auth_headers
+    )
+    assert ghost.status_code == 404

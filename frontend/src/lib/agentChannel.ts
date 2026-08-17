@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import type { Envelope } from "../types";
 import { emptyTranscript, reduceFrame, type Transcript } from "./agentFrames";
 import { getDaemonToken } from "./token";
@@ -28,6 +28,9 @@ import { getDaemonToken } from "./token";
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 10000;
 
+/** Handle for a reconnect-backoff timer (platform `setTimeout` return). */
+type BackoffTimer = ReturnType<typeof setTimeout>;
+
 function agentWsUrl(taskId: number, session: string): string {
   const base = import.meta.env.VITE_OMPIRE_DAEMON_WS_URL as string | undefined;
   if (base) {
@@ -50,16 +53,21 @@ export interface AgentChannel {
 
 /** Subscribe to one session's agent event channel while `enabled`. Disabled
  * (no live agent) tears the socket down and reports an empty, disconnected
- * view. */
+ * view.
+ *
+ * Every effect run is a generation with its own socket/timer bookkeeping:
+ * cleanup deactivates the run, and every socket callback and retry checks the
+ * generation before touching state. Without the guard, a retry timer that has
+ * already fired (or a socket mid-replay) outlives its cleanup — the daemon
+ * restart that arms the backoff loop is normal operation — and the zombie
+ * replays the *previous* session's buffer into the *current* session's
+ * transcript, clobbering `socketRef` so the live channel can no longer be
+ * closed (observed dogfooding the bugfix workflow: switching to the `judge`
+ * tab kept showing the reproducer's transcript). */
 export function useAgentChannel(taskId: number, session: string, enabled: boolean): AgentChannel {
   const [transcript, setTranscript] = useState<Transcript>(emptyTranscript);
   const [connected, setConnected] = useState(false);
   const [turnEpoch, setTurnEpoch] = useState(0);
-
-  const socketRef = useRef<WebSocket | null>(null);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const backoffRef = useRef(INITIAL_BACKOFF_MS);
-  const closedByEffectRef = useRef(false);
 
   useEffect(() => {
     if (!enabled || !Number.isInteger(taskId)) {
@@ -67,26 +75,33 @@ export function useAgentChannel(taskId: number, session: string, enabled: boolea
       setConnected(false);
       return;
     }
-    closedByEffectRef.current = false;
-    backoffRef.current = INITIAL_BACKOFF_MS;
+    const run: {
+      active: boolean;
+      socket: WebSocket | null;
+      timer: BackoffTimer | null;
+      backoff: number;
+    } = { active: true, socket: null, timer: null, backoff: INITIAL_BACKOFF_MS };
 
     function connect() {
+      if (!run.active) return; // a retry queued before cleanup is dead on arrival
       const token = getDaemonToken();
       const url = new URL(agentWsUrl(taskId, session));
       if (token) url.searchParams.set("token", token);
 
       const socket = new WebSocket(url.toString());
-      socketRef.current = socket;
+      run.socket = socket;
       // Fresh connection: the daemon replays the buffer from the top, so start
       // from empty to avoid duplicating already-seen frames.
       setTranscript(emptyTranscript);
 
       socket.onopen = () => {
-        backoffRef.current = INITIAL_BACKOFF_MS;
+        if (!run.active) return;
+        run.backoff = INITIAL_BACKOFF_MS;
         setConnected(true);
       };
 
       socket.onmessage = (event: MessageEvent<string>) => {
+        if (!run.active) return;
         const envelope = JSON.parse(event.data) as Envelope<Record<string, unknown>>;
         if (envelope.type === "agent_start" || envelope.type === "agent_end") {
           setTurnEpoch((n) => n + 1);
@@ -96,22 +111,22 @@ export function useAgentChannel(taskId: number, session: string, enabled: boolea
 
       socket.onclose = (event: CloseEvent) => {
         setConnected(false);
-        if (closedByEffectRef.current) return;
+        if (!run.active) return;
         // Only code 1000 ("agent exited", buffer flushed) is terminal; 4404
         // ("no live agent yet") retries — see the module doc comment above.
         if (event.code === 1000) return;
-        const delay = backoffRef.current;
-        backoffRef.current = Math.min(backoffRef.current * 2, MAX_BACKOFF_MS);
-        timeoutRef.current = setTimeout(connect, delay);
+        const delay = run.backoff;
+        run.backoff = Math.min(run.backoff * 2, MAX_BACKOFF_MS);
+        run.timer = setTimeout(connect, delay);
       };
     }
 
     connect();
 
     return () => {
-      closedByEffectRef.current = true;
-      if (timeoutRef.current) clearTimeout(timeoutRef.current);
-      socketRef.current?.close();
+      run.active = false;
+      if (run.timer) clearTimeout(run.timer);
+      run.socket?.close();
     };
   }, [taskId, session, enabled]);
 

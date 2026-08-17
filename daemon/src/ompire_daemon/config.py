@@ -54,6 +54,10 @@ DEFAULT_SHUTDOWN_GRACE = 10.0
 # Startup-recovery fan-out bound (crash-recovery capability, design D-4):
 # deliberately small — each resume is a real container-side omp startup.
 DEFAULT_RECOVERY_CONCURRENCY = 4
+# Model for the workflow engine's LLM-judge session (bugfix-workflow change,
+# design D-4): None = omp's configured default model. Model naming is
+# deployment-specific, so the daemon hardcodes nothing.
+DEFAULT_JUDGE_MODEL: str | None = None
 
 _KNOWN_KEYS = {
     "port",
@@ -81,6 +85,7 @@ _KNOWN_KEYS = {
     "gpg_signing_key",
     "gh_command",
     "pr_poll_interval",
+    "judge_model",
 }
 
 
@@ -117,6 +122,7 @@ class Config:
     gpg_signing_key: str | None = DEFAULT_GPG_SIGNING_KEY
     gh_command: tuple[str, ...] = DEFAULT_GH_COMMAND
     pr_poll_interval: float = DEFAULT_PR_POLL_INTERVAL
+    judge_model: str | None = DEFAULT_JUDGE_MODEL
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -204,6 +210,12 @@ def load_config(path: Path | None = None) -> Config:
     if gpg_signing_key is not None and not isinstance(gpg_signing_key, str):
         raise ConfigError(
             f"config key 'gpg_signing_key' must be a string or unset, got {gpg_signing_key!r}"
+        )
+
+    judge_model = data.get("judge_model", DEFAULT_JUDGE_MODEL)
+    if judge_model is not None and not isinstance(judge_model, str):
+        raise ConfigError(
+            f"config key 'judge_model' must be a string or unset, got {judge_model!r}"
         )
 
     gh_command = data.get("gh_command")
@@ -394,6 +406,7 @@ def load_config(path: Path | None = None) -> Config:
         gpg_signing_key=gpg_signing_key,
         gh_command=gh_command,
         pr_poll_interval=float(pr_poll_interval),
+        judge_model=judge_model,
     )
 
 

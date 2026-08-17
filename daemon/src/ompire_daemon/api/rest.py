@@ -68,6 +68,7 @@ from ompire_daemon.registry.templates import (
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.spawn import run_spawn_pipeline
 from ompire_daemon.workflows import (
+    JUDGE_SESSION,
     UnknownWorkflowNameError,
     Workflow,
     WorkflowNotWaitingError,
@@ -583,9 +584,12 @@ def _workflow_for(task: Task) -> Workflow:
 
 
 def _require_declared_session(task: Task, session: str) -> None:
-    """404 on a session the task's workflow does not declare (design D-1)."""
+    """404 on a session the task's workflow does not declare (design D-1).
+    The engine-reserved judge session (bugfix-workflow design D-4) is
+    admitted: it is spawned by the engine itself, never addressable in
+    advance, and its transcript must stay inspectable."""
     workflow = _workflow_for(task)
-    if session not in workflow.sessions:
+    if session != JUDGE_SESSION and session not in workflow.sessions:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             f"task {task.id} workflow {workflow.name!r} declares no session {session!r}",

@@ -117,3 +117,82 @@ describe("useAgentChannel reconnection", () => {
     expect(MockWebSocket.instances).toHaveLength(0);
   });
 });
+
+describe("useAgentChannel generation guard", () => {
+  beforeEach(() => {
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /* Dogfood finding (bugfix-workflow): after a daemon restart arms the
+   * reconnect backoff, a tab switch must kill the old session's generation
+   * outright — a zombie socket replaying its buffer into the new session's
+   * transcript is the bug this defends. */
+  function TranscriptProbe({ session }: { session: string }) {
+    const { transcript } = useAgentChannel(1, session, true);
+    return (
+      <div data-testid="items">
+        {transcript.items
+          .map((i) => ("text" in i ? i.text : ""))
+          .filter(Boolean)
+          .join("|")}
+      </div>
+    );
+  }
+
+  function emitText(socket: MockWebSocket, text: string) {
+    socket.onmessage?.({
+      data: JSON.stringify({
+        type: "message_end",
+        payload: { message: { role: "assistant", content: [{ type: "text", text }] } },
+      }),
+    });
+  }
+
+  it("a torn-down generation writes nothing and spawns no retries", () => {
+    const { rerender } = render(<TranscriptProbe session="main" />);
+    const mainSocket = MockWebSocket.instances[0];
+    act(() => {
+      mainSocket.onopen?.();
+      emitText(mainSocket, "main speaking");
+    });
+    expect(screen.getByTestId("items")).toHaveTextContent("main speaking");
+
+    // Daemon-restart close (abnormal) arms the backoff retry loop…
+    act(() => {
+      mainSocket.emitClose(1006);
+    });
+
+    // …and the tab switch tears the generation down before the retry fires.
+    rerender(<TranscriptProbe session="reviewer" />);
+    expect(MockWebSocket.instances).toHaveLength(2);
+    expect(MockWebSocket.instances[1].url).toContain("/api/ws/agents/1/reviewer");
+    // The switch reset the transcript for the new session's replay.
+    expect(screen.getByTestId("items")).not.toHaveTextContent("main speaking");
+
+    // A zombie frame from the old socket never reaches the new transcript.
+    act(() => {
+      emitText(mainSocket, "zombie frame");
+    });
+    expect(screen.getByTestId("items")).not.toHaveTextContent("zombie frame");
+
+    // No retry from the dead generation may spawn later either.
+    act(() => {
+      vi.advanceTimersByTime(60000);
+    });
+    expect(MockWebSocket.instances.filter((s) => s.url.includes("/main"))).toHaveLength(1);
+
+    // The live generation still streams normally.
+    act(() => {
+      MockWebSocket.instances[1].onopen?.();
+      emitText(MockWebSocket.instances[1], "reviewer speaking");
+    });
+    expect(screen.getByTestId("items")).toHaveTextContent("reviewer speaking");
+  });
+});

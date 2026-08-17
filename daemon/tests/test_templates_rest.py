@@ -201,7 +201,7 @@ def test_unregistered_workflow_rejected(
     response = client.post(
         "/api/templates",
         headers=auth_headers,
-        json={"name": "demo", "project_name": "demo", "workflow": "bugfix"},
+        json={"name": "demo", "project_name": "demo", "workflow": "no-such-workflow"},
     )
     assert response.status_code == 422
     assert "workflow" in response.json()["detail"]
@@ -210,9 +210,23 @@ def test_unregistered_workflow_rejected(
     response = client.put(
         "/api/templates/demo",
         headers=auth_headers,
-        json=_put_payload(template, workflow="bugfix"),
+        json=_put_payload(template, workflow="no-such-workflow"),
     )
     assert response.status_code == 422
+
+
+def test_registered_bugfix_workflow_accepted(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """The bugfix workflow (ROADMAP #18) is registered and selectable."""
+    _create_project(client, auth_headers)
+    response = client.post(
+        "/api/templates",
+        headers=auth_headers,
+        json={"name": "demo", "project_name": "demo", "workflow": "bugfix"},
+    )
+    assert response.status_code == 201
+    assert response.json()["workflow"] == "bugfix"
 
 
 def test_thinking_outside_vocabulary_rejected(
