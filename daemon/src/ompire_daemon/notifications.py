@@ -54,6 +54,13 @@ class AttentionEntry:
     tier: str
     status: str
     reason: str
+    # The session that raised the entry; None for workflow-gate waits
+    # (workflow-engine design D-7: attention stays one entry per task).
+    session: str | None = None
+
+
+# Worst tier wins when a task's sessions disagree (workflow-engine D-7).
+_TIER_RANK = {"silent": 0, "badge": 1, "notify": 2, "interrupt": 3}
 
 
 class AttentionNotifier:
@@ -77,7 +84,11 @@ class AttentionNotifier:
         self._enabled = enabled
         self._capable = False
         self._actions_supported = True
+        # The published task-level entry (worst tier across sources) and the
+        # per-source entries it aggregates: task → source → entry, where the
+        # source is the session name, or None for a workflow-gate wait.
         self._entries: dict[int, AttentionEntry] = {}
+        self._source_entries: dict[int, dict[str | None, AttentionEntry]] = {}
         self._notify_tasks: dict[int, asyncio.Task] = {}
         self._renotify_timers: dict[int, asyncio.Task] = {}
         self._queue: asyncio.Queue | None = None
@@ -107,7 +118,12 @@ class AttentionNotifier:
         """Active attention entries for the WS snapshot (design: a
         reconnecting client sees them without replaying events)."""
         return {
-            task_id: {"tier": entry.tier, "status": entry.status, "reason": entry.reason}
+            task_id: {
+                "tier": entry.tier,
+                "status": entry.status,
+                "reason": entry.reason,
+                "session": entry.session,
+            }
             for task_id, entry in self._entries.items()
         }
 
@@ -208,31 +224,84 @@ class AttentionNotifier:
             event = await self._queue.get()
             if event.type == "status_changed":
                 self._on_status_changed(event.payload)
+            elif event.type == "workflow_step":
+                self._on_workflow_step(event.payload)
 
     def _on_status_changed(self, payload: dict[str, Any]) -> None:
         task_id = payload.get("task_id")
+        session = payload.get("session")
         status = payload.get("to")
         reason = payload.get("reason", "")
-        if not isinstance(task_id, int) or not isinstance(status, str):
+        if (
+            not isinstance(task_id, int)
+            or not isinstance(session, str)
+            or not isinstance(status, str)
+        ):
             return
         tier = tier_for(status)
         if tier in _NOTIFYING_TIERS:
-            self._enter(task_id, tier, status, str(reason))
+            self._set_source(
+                task_id, session, AttentionEntry(tier, status, str(reason), session)
+            )
         else:
-            self._leave(task_id)
+            self._set_source(task_id, session, None)
 
-    def _enter(self, task_id: int, tier: str, status: str, reason: str) -> None:
-        # Any transition into notify/interrupt supersedes whatever notification
+    def _on_workflow_step(self, payload: dict[str, Any]) -> None:
+        """Gate waits classify `notify` (workflow-engine design D-7), sourced
+        under None (no session); the gate finishing clears that source."""
+        task_id = payload.get("task_id")
+        status = payload.get("status")
+        if not isinstance(task_id, int) or not isinstance(status, str):
+            return
+        if status == "waiting":
+            message = payload.get("message")
+            self._set_source(
+                task_id,
+                None,
+                AttentionEntry("notify", "waiting", str(message or "workflow gate"), None),
+            )
+        else:
+            self._set_source(task_id, None, None)
+
+    def _set_source(
+        self, task_id: int, source: str | None, entry: AttentionEntry | None
+    ) -> None:
+        """Update one source's entry, then re-aggregate the task's published
+        entry (worst tier wins) and fire/clear on change only — a session
+        moving beneath the current worst tier must not re-fire the toast."""
+        sources = self._source_entries.setdefault(task_id, {})
+        if entry is None:
+            sources.pop(source, None)
+        else:
+            sources[source] = entry
+        worst = max(sources.values(), key=lambda e: _TIER_RANK[e.tier], default=None)
+        if worst is None:
+            self._source_entries.pop(task_id, None)
+            self._leave(task_id)
+            return
+        if self._entries.get(task_id) == worst:
+            return
+        self._enter(task_id, worst)
+
+    def _enter(self, task_id: int, entry: AttentionEntry) -> None:
+        # Any change to the published entry supersedes whatever notification
         # was previously active for this task (design: "one active per task").
         self._cancel_notification(task_id)
         self._cancel_renotify(task_id)
-        self._entries[task_id] = AttentionEntry(tier=tier, status=status, reason=reason)
+        self._entries[task_id] = entry
         self._hub.publish(
-            "attention", {"task_id": task_id, "tier": tier, "status": status, "reason": reason}
+            "attention",
+            {
+                "task_id": task_id,
+                "tier": entry.tier,
+                "status": entry.status,
+                "reason": entry.reason,
+                "session": entry.session,
+            },
         )
         if self._capable:
-            self._fire(task_id, tier, status, reason)
-            self._arm_renotify(task_id, tier, status, reason)
+            self._fire(task_id, entry.tier, entry.status, entry.reason)
+            self._arm_renotify(task_id, entry.tier, entry.status, entry.reason)
 
     def _leave(self, task_id: int) -> None:
         had_entry = self._entries.pop(task_id, None) is not None
@@ -247,6 +316,7 @@ class AttentionNotifier:
         so without this the entry — e.g. the interrupt-tier `failed` the agent
         exit races in during workshop removal — would demand attention forever.
         """
+        self._source_entries.pop(task_id, None)
         self._leave(task_id)
 
     def _fire(self, task_id: int, tier: str, status: str, reason: str) -> None:

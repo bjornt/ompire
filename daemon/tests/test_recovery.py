@@ -1,7 +1,14 @@
 """Crash-recovery capability tests: `classify_startup_tasks` (the startup
 reconciliation matrix's container-probe half) and `run_recovery` (the
 background resume job), plus a full-stack shutdown -> restart -> resume
-integration test through the REST/app lifecycle."""
+integration test through the REST/app lifecycle.
+
+Recovery is per-session now (workflow-engine design D-6): recorded sessions
+are seeded via `registry.sessions` rows, `classify_startup_tasks` paints each
+resumable session `starting`, and `run_recovery` resumes them through the
+`WorkflowRunner`-owning supervisor. A spawn-completed task with no recorded
+session is a recovery candidate, not a failure — sessions are lazily spawned,
+so "no session id" says nothing about recoverability."""
 
 from __future__ import annotations
 
@@ -18,13 +25,24 @@ from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
 from ompire_daemon.registry.projects import create_project
+from ompire_daemon.registry.sessions import (
+    get_session,
+    mark_session_id,
+    record_session_spawned,
+)
 from ompire_daemon.registry.tasks import (
     create_task,
     get_task,
-    mark_session_id,
     mark_spawn_completed,
 )
+from ompire_daemon.registry.workflows import (
+    append_step_record,
+    finish_step_record,
+    list_step_records,
+    set_run_status,
+)
 from ompire_daemon.sessions import SessionTracker
+from ompire_daemon.workflows import WorkflowRunner
 
 from tests.test_rpc import fake_omp_argv
 
@@ -55,11 +73,18 @@ def _make_task(engine, project, tmp_path: Path, slug: str):  # noqa: ANN001, ANN
     )
 
 
+def _record_main_session(engine, task_id: int, omp_session_id: str = "sess-1") -> None:  # noqa: ANN001
+    """Seed the session rows a successful spawn would have written (lazy
+    spawn by the workflow engine records the row, then the omp identity)."""
+    record_session_spawned(engine, task_id, "main")
+    mark_session_id(engine, task_id, "main", omp_session_id)
+
+
 async def test_classify_missing_container_fails(engine_project, tmp_path: Path) -> None:
     engine, project = engine_project
     task = _make_task(engine, project, tmp_path, "no-clone")
     mark_spawn_completed(engine, task.id)
-    mark_session_id(engine, task.id, "sess-1")
+    _record_main_session(engine, task.id)
     # No clone directory created: workshop_status short-circuits to "absent".
 
     hub = EventHub()
@@ -70,7 +95,7 @@ async def test_classify_missing_container_fails(engine_project, tmp_path: Path) 
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "failed"
     assert "container" in (refreshed.error or "")
-    assert tracker.get(task.id) is None
+    assert tracker.get(task.id, "main") is None
 
 
 async def test_classify_recoverable_candidate_seeds_starting(
@@ -79,7 +104,7 @@ async def test_classify_recoverable_candidate_seeds_starting(
     engine, project = engine_project
     task = _make_task(engine, project, tmp_path, "recoverable")
     mark_spawn_completed(engine, task.id)
-    mark_session_id(engine, task.id, "sess-1")
+    _record_main_session(engine, task.id)
     Path(task.clone_path).mkdir(parents=True)
 
     hub = EventHub()
@@ -87,10 +112,32 @@ async def test_classify_recoverable_candidate_seeds_starting(
     recoverable = await classify_startup_tasks(engine, hub, tracker)
 
     assert [t.id for t in recoverable] == [task.id]
-    assert recoverable[0].session_id == "sess-1"
+    assert get_session(engine, task.id, "main").omp_session_id == "sess-1"
     assert get_task(engine, task.id).state == "created"
-    assert tracker.get(task.id).status == "starting"
-    assert tracker.get(task.id).reason == "recovering after daemon restart"
+    assert tracker.get(task.id, "main").status == "starting"
+    assert tracker.get(task.id, "main").reason == "recovering after daemon restart"
+
+
+async def test_classify_spawn_completed_without_session_is_recoverable(
+    engine_project, tmp_path: Path
+) -> None:
+    """A spawn-completed task with NO recorded session is a candidate, not a
+    failure (workflow-engine design D-6): sessions are lazily spawned, so a
+    task may legitimately have none (a command-only workflow, or a run that
+    failed before its first agent step)."""
+    engine, project = engine_project
+    task = _make_task(engine, project, tmp_path, "no-session")
+    mark_spawn_completed(engine, task.id)
+    Path(task.clone_path).mkdir(parents=True)
+
+    hub = EventHub()
+    tracker = SessionTracker(hub, idle_debounce=0.1)
+    recoverable = await classify_startup_tasks(engine, hub, tracker)
+
+    assert [t.id for t in recoverable] == [task.id]
+    assert get_task(engine, task.id).state == "created"
+    # No recorded session: nothing is seeded into the tracker.
+    assert tracker.get(task.id, "main") is None
 
 
 async def test_run_recovery_resumes_with_resume_argv_and_no_reprompt(
@@ -99,7 +146,7 @@ async def test_run_recovery_resumes_with_resume_argv_and_no_reprompt(
     engine, project = engine_project
     task = _make_task(engine, project, tmp_path, "resume-me")
     mark_spawn_completed(engine, task.id)
-    task = mark_session_id(engine, task.id, "sess-1")
+    _record_main_session(engine, task.id)
 
     captured_resume = {}
 
@@ -118,15 +165,24 @@ async def test_run_recovery_resumes_with_resume_argv_and_no_reprompt(
     tracker = SessionTracker(hub, idle_debounce=0.1)
     config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100)
     supervisor = AgentSupervisor(config, hub, tracker)
-    tracker.recovering(task.id)
+    tracker.recovering(task.id, "main")
+    runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
 
-    await run_recovery(engine, hub, config, supervisor, tracker, [task])
+    await run_recovery(engine, hub, config, supervisor, tracker, runner, [task])
 
     assert captured_resume["value"] == "sess-1"
-    assert tracker.get(task.id).status == "idle"
-    assert tracker.get(task.id).reason == "resumed after daemon restart"
-    assert supervisor.get(task.id) is not None
-    await supervisor.stop(task.id)
+    assert tracker.get(task.id, "main").status == "idle"
+    assert tracker.get(task.id, "main").reason == "resumed after daemon restart"
+    handle = supervisor.get(task.id, "main")
+    assert handle is not None
+    # The resumed session is not re-prompted: no user message ever echoed.
+    assert not [
+        event
+        for event in handle.snapshot()
+        if event.type == "message_start"
+        and event.payload.get("message", {}).get("role") == "user"
+    ]
+    await supervisor.stop(task.id, "main")
 
 
 async def test_run_recovery_failure_marks_task_and_session_failed(
@@ -135,7 +191,7 @@ async def test_run_recovery_failure_marks_task_and_session_failed(
     engine, project = engine_project
     task = _make_task(engine, project, tmp_path, "crash-on-resume")
     mark_spawn_completed(engine, task.id)
-    task = mark_session_id(engine, task.id, "sess-1")
+    _record_main_session(engine, task.id)
 
     monkeypatch.setattr(
         agent_module,
@@ -153,12 +209,13 @@ async def test_run_recovery_failure_marks_task_and_session_failed(
     tracker = SessionTracker(hub, idle_debounce=0.1)
     config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100)
     supervisor = AgentSupervisor(config, hub, tracker)
-    tracker.recovering(task.id)
+    tracker.recovering(task.id, "main")
+    runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
 
-    await run_recovery(engine, hub, config, supervisor, tracker, [task])
+    await run_recovery(engine, hub, config, supervisor, tracker, runner, [task])
 
-    assert tracker.get(task.id).status == "failed"
-    assert "resume failed" in tracker.get(task.id).reason
+    assert tracker.get(task.id, "main").status == "failed"
+    assert "resume failed" in tracker.get(task.id, "main").reason
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "failed"
     assert "resume failed" in (refreshed.error or "")
@@ -166,6 +223,60 @@ async def test_run_recovery_failure_marks_task_and_session_failed(
         e.payload for e in _drain(events_queue) if e.type == "task_updated"
     ]
     assert task_updates and task_updates[-1]["state"] == "failed"
+
+
+async def test_run_recovery_legacy_complete_run_is_not_redriven(
+    engine_project, tmp_path: Path, monkeypatch
+) -> None:
+    """Legacy-migrated tasks (workflow run already `complete`) are never
+    re-driven: their recorded sessions resume and land idle, and no prompt
+    is sent."""
+    engine, project = engine_project
+    task = _make_task(engine, project, tmp_path, "legacy-complete")
+    mark_spawn_completed(engine, task.id)
+    _record_main_session(engine, task.id)
+    # The 0008 migration's legacy backfill: a completed run with one ok record.
+    record = append_step_record(engine, task.id, step="work", kind="agent", session="main")
+    finish_step_record(engine, task.id, record.seq, status="ok")
+    task = set_run_status(engine, task.id, "complete", None)
+
+    def fake_build(clone, env, resume=None, model=None, thinking=None):  # noqa: ANN001
+        return fake_omp_argv("happy")
+
+    monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
+
+    async def no_preflight(clone_path: str) -> None:
+        return None
+
+    monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
+
+    hub = EventHub()
+    tracker = SessionTracker(hub, idle_debounce=0.1)
+    config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100)
+    supervisor = AgentSupervisor(config, hub, tracker)
+    tracker.recovering(task.id, "main")
+    runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
+
+    await run_recovery(engine, hub, config, supervisor, tracker, runner, [task])
+
+    assert tracker.get(task.id, "main").status == "idle"
+    assert tracker.get(task.id, "main").reason == "resumed after daemon restart"
+    refreshed = get_task(engine, task.id)
+    assert refreshed.state == "created"
+    assert refreshed.workflow_status == "complete"
+    assert refreshed.workflow_step is None
+    # Never re-driven: the backfilled record stays the only one, and the
+    # resumed session received no prompt.
+    assert len(list_step_records(engine, task.id)) == 1
+    handle = supervisor.get(task.id, "main")
+    assert handle is not None
+    assert not [
+        event
+        for event in handle.snapshot()
+        if event.type == "message_start"
+        and event.payload.get("message", {}).get("role") == "user"
+    ]
+    await supervisor.stop(task.id, "main")
 
 
 def _drain(queue) -> list:  # noqa: ANN001
@@ -176,10 +287,15 @@ def _drain(queue) -> list:  # noqa: ANN001
 
 
 def _wait_settled(client: TestClient, auth_headers: dict, task_id: int, timeout: float = 15.0) -> dict:
+    """Wait until the spawn pipeline AND the handed-off workflow run have
+    both settled: `spawn_completed_at` is stamped before the engine handoff,
+    so poll through to the run's terminal status."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         task = client.get(f"/api/tasks/{task_id}", headers=auth_headers).json()
-        if task["spawn_completed_at"] is not None or task["state"] == "failed":
+        if task["state"] == "failed":
+            return task
+        if task["spawn_completed_at"] is not None and task["workflow_status"] == "complete":
             return task
         time.sleep(0.05)
     raise AssertionError("spawn pipeline did not settle in time")
@@ -190,8 +306,9 @@ def test_shutdown_then_restart_resumes_without_reprompt(
 ) -> None:
     """Full-stack: spawn a live task, shut the daemon down gracefully (the
     TestClient context exit runs the lifespan `finally`), then start a fresh
-    `create_app` against the same data dir and confirm the task resumes to
-    `idle` without being re-prompted and without ever showing as a crash."""
+    `create_app` against the same data dir and confirm the task's `main`
+    session resumes to `idle` without being re-prompted and without ever
+    showing as a crash."""
     fake_my_workshop = tmp_path / "fake-my-workshop"
     fake_my_workshop.write_text('#!/bin/sh\necho "ws-test" > .workshop.lock\n')
     fake_my_workshop.chmod(0o755)
@@ -229,14 +346,15 @@ def test_shutdown_then_restart_resumes_without_reprompt(
         task_id = response.json()["id"]
         settled = _wait_settled(client, headers, task_id)
         assert settled["state"] == "created"
-        assert settled["session_id"] is not None
+        assert settled["workflow_status"] == "complete"
+        assert get_session(app.state.engine, task_id, "main").omp_session_id is not None
     # TestClient.__exit__ ran the lifespan shutdown: agents.shutdown() sent
     # SIGTERM to the live child, and the exit watcher's shutting-down flag
     # kept it from being reported as a crash.
 
     task_after_shutdown = get_task(app.state.engine, task_id)
     assert task_after_shutdown.state == "created"
-    assert task_after_shutdown.session_id is not None
+    assert get_session(app.state.engine, task_id, "main").omp_session_id is not None
     app.state.engine.dispose()
 
     restarted = create_app(config, frontend_dist=tmp_path / "no-dist")
@@ -248,17 +366,23 @@ def test_shutdown_then_restart_resumes_without_reprompt(
             sessions = snapshot["payload"]["sessions"]
             # Recovery already seeded `starting` synchronously before the
             # first snapshot (design D-4/6.2) — never absent, never a crash.
-            assert sessions[str(task_id)]["status"] == "starting"
-            assert sessions[str(task_id)]["reason"] == "recovering after daemon restart"
+            # The snapshot's sessions map is nested task -> session.
+            assert sessions[str(task_id)]["main"]["status"] == "starting"
+            assert sessions[str(task_id)]["main"]["reason"] == "recovering after daemon restart"
 
-            status = sessions[str(task_id)]["status"]
+            status = sessions[str(task_id)]["main"]["status"]
             deadline = time.monotonic() + 10.0
             while status == "starting" and time.monotonic() < deadline:
                 event = ws.receive_json()
-                if event["type"] == "status_changed" and event["payload"]["task_id"] == task_id:
+                if (
+                    event["type"] == "status_changed"
+                    and event["payload"]["task_id"] == task_id
+                    and event["payload"]["session"] == "main"
+                ):
                     status = event["payload"]["to"]
                 assert event["type"] != "agent_exited"
 
         assert status == "idle"
         task_final = get_task(restarted.state.engine, task_id)
         assert task_final.state == "created"
+        assert task_final.workflow_status == "complete"

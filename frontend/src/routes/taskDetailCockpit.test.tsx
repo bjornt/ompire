@@ -27,7 +27,12 @@ class MockWebSocket {
     this.onmessage?.({ data: JSON.stringify({ seq: 0, ts: "t", type, payload }) });
   }
 
-  emitSnapshot(payload: { projects: unknown[]; tasks: unknown[]; sessions?: unknown }) {
+  emitSnapshot(payload: {
+    projects: unknown[];
+    tasks: unknown[];
+    sessions?: unknown;
+    workflows?: unknown;
+  }) {
     this.onopen?.();
     this.emit("snapshot", payload);
   }
@@ -67,6 +72,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     pr_url: null,
     pr_state: null,
     pr_merged_at: null,
+    workflow_name: "single-step",
+    workflow_status: null,
+    workflow_step: null,
     created_at: "2026-07-18T00:00:00Z",
     updated_at: "2026-07-18T00:01:00Z",
     ...overrides,
@@ -103,17 +111,24 @@ function stubFetch(bodies: FetchBodies = {}) {
   return fetchMock;
 }
 
-async function renderDetail(session: unknown) {
+async function renderDetail(session: unknown, workflows?: unknown) {
   window.history.pushState({}, "", "/tasks/1");
   render(<App />);
   act(() => {
-    mainSocket().emitSnapshot({ projects: [project], tasks: [makeTask()], sessions: session ?? {} });
+    mainSocket().emitSnapshot({
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: session ?? {},
+      ...(workflows !== undefined ? { workflows } : {}),
+    });
   });
   // Wait for the detail fetch to resolve the metadata panel.
   await screen.findByTestId("task-metadata");
 }
 
-const workingSession = { "1": { status: "working", reason: "agent_start frame", since: "t0" } };
+const workingSession = {
+  "1": { main: { status: "working", reason: "agent_start frame", since: "t0" } },
+};
 
 beforeEach(() => {
   MockWebSocket.instances = [];
@@ -192,14 +207,15 @@ describe("cockpit composer", () => {
     await user.click(screen.getByRole("button", { name: "Send" }));
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/tasks/1/agent/steer",
+      "/api/tasks/1/sessions/main/agent/steer",
       expect.objectContaining({ method: "POST" }),
     );
+    expect(agentSocket()!.url).toContain("/api/ws/agents/1/main");
   });
 
   it("disables the composer entirely when no agent is live", async () => {
     stubFetch();
-    await renderDetail({ "1": { status: "failed", reason: "exited 137", since: "t0" } });
+    await renderDetail({ "1": { main: { status: "failed", reason: "exited 137", since: "t0" } } });
 
     expect(screen.getByLabelText("Message")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
@@ -208,7 +224,7 @@ describe("cockpit composer", () => {
 
   it("disables steer/interrupt when the agent is idle, keeps follow-up", async () => {
     stubFetch({ state: { isStreaming: false, queuedMessageCount: 0 } });
-    await renderDetail({ "1": { status: "idle", reason: "queue empty", since: "t0" } });
+    await renderDetail({ "1": { main: { status: "idle", reason: "queue empty", since: "t0" } } });
     await waitFor(() => expect(screen.getByRole("button", { name: "Follow-up" })).toBeEnabled());
 
     expect(screen.getByRole("button", { name: "Steer" })).toBeDisabled();
@@ -220,21 +236,23 @@ describe("cockpit composer", () => {
     stubFetch({ state: { isStreaming: false, queuedMessageCount: 0 } });
     await renderDetail({
       "1": {
-        status: "waiting-input",
-        reason: "pending question 'ask-ui-1'",
-        since: "t0",
-        question: {
-          id: "ask-ui-1",
-          kind: "ask",
-          questions: [
-            {
-              prompt: "?",
-              options: [{ value: "a", label: "A", description: null }],
-              multi: false,
-              recommended: null,
-              allowsOther: false,
-            },
-          ],
+        main: {
+          status: "waiting-input",
+          reason: "pending question 'ask-ui-1'",
+          since: "t0",
+          question: {
+            id: "ask-ui-1",
+            kind: "ask",
+            questions: [
+              {
+                prompt: "?",
+                options: [{ value: "a", label: "A", description: null }],
+                multi: false,
+                recommended: null,
+                allowsOther: false,
+              },
+            ],
+          },
         },
       },
     });
@@ -266,15 +284,24 @@ const askQuestion = {
 const approvalQuestion = { id: "approval-ui-1", kind: "approval" as const, questions: [] };
 
 const waitingInputSession = {
-  "1": { status: "waiting-input", reason: "pending question 'ask-ui-1'", since: "t0", question: askQuestion },
+  "1": {
+    main: {
+      status: "waiting-input",
+      reason: "pending question 'ask-ui-1'",
+      since: "t0",
+      question: askQuestion,
+    },
+  },
 };
 
 const waitingApprovalSession = {
   "1": {
-    status: "waiting-approval",
-    reason: "pending approval 'approval-ui-1'",
-    since: "t0",
-    question: approvalQuestion,
+    main: {
+      status: "waiting-approval",
+      reason: "pending approval 'approval-ui-1'",
+      since: "t0",
+      question: approvalQuestion,
+    },
   },
 };
 
@@ -293,7 +320,7 @@ describe("cockpit question card", () => {
     await user.click(within(card).getByRole("button", { name: "Send answer" }));
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/tasks/1/agent/answer",
+      "/api/tasks/1/sessions/main/agent/answer",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ question_id: "ask-ui-1", selections: ["both"] }),
@@ -310,7 +337,7 @@ describe("cockpit question card", () => {
     await user.click(within(card).getByRole("button", { name: "Approve" }));
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/tasks/1/agent/answer",
+      "/api/tasks/1/sessions/main/agent/answer",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ question_id: "approval-ui-1", approved: true }),
@@ -324,7 +351,7 @@ describe("cockpit question card", () => {
     expect(screen.getByTestId("question-card")).toBeInTheDocument();
 
     act(() => {
-      mainSocket().emit("question_resolved", { task_id: 1, question_id: "ask-ui-1" });
+      mainSocket().emit("question_resolved", { task_id: 1, session: "main", question_id: "ask-ui-1" });
     });
 
     expect(screen.queryByTestId("question-card")).not.toBeInTheDocument();
@@ -370,6 +397,7 @@ describe("cockpit status strip", () => {
     act(() => {
       mainSocket().emit("status_changed", {
         task_id: 1,
+        session: "main",
         from: "working",
         to: "idle",
         reason: "queue empty after 2.0s",
@@ -378,5 +406,303 @@ describe("cockpit status strip", () => {
 
     expect(screen.getByTestId("session-state")).toHaveTextContent("idle");
     expect(screen.getByTestId("session-reason")).toHaveTextContent("queue empty after 2.0s");
+  });
+});
+
+/* Workflow-engine surfaces (design D-9): the session tab bar, the workflow
+ * strip, and the gate card. */
+
+const twoSessionSnapshots = {
+  sessions: {
+    "1": {
+      reproducer: { status: "idle", reason: "queue empty", since: "t0" },
+      coder: { status: "working", reason: "agent_start frame", since: "t0" },
+    },
+  },
+  workflows: {
+    "1": {
+      name: "reproduce-and-fix",
+      status: "running",
+      step: "fix",
+      steps: [
+        {
+          task_id: 1,
+          seq: 1,
+          step: "reproduce",
+          kind: "agent",
+          session: "reproducer",
+          status: "ok",
+          outcome: { summary: "reproduced on vlan-mtu" },
+          error: null,
+          prompted_at: null,
+          started_at: "t0",
+          finished_at: "t1",
+        },
+        {
+          task_id: 1,
+          seq: 2,
+          step: "fix",
+          kind: "agent",
+          session: "coder",
+          status: "running",
+          outcome: null,
+          error: null,
+          prompted_at: null,
+          started_at: "t1",
+          finished_at: null,
+        },
+      ],
+    },
+  },
+};
+
+describe("session tabs", () => {
+  it("renders one tab per session, defaulting to the current step's session", async () => {
+    stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, twoSessionSnapshots.workflows);
+
+    const tabs = screen.getByTestId("session-tabs");
+    expect(within(tabs).getByTestId("session-tab-reproducer")).toBeInTheDocument();
+    const coder = within(tabs).getByTestId("session-tab-coder");
+    expect(coder).toHaveAttribute("aria-selected", "true");
+    expect(within(tabs).getByTestId("session-tab-reproducer")).toHaveAttribute(
+      "aria-selected",
+      "false",
+    );
+    // The default tab drives the agent channel URL.
+    expect(agentSocket()!.url).toContain("/api/ws/agents/1/coder");
+  });
+
+  it("switches the transcript channel and composer to the clicked tab", async () => {
+    const fetchMock = stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, twoSessionSnapshots.workflows);
+    const user = userEvent.setup();
+
+    await user.click(screen.getByTestId("session-tab-reproducer"));
+    expect(screen.getByTestId("session-tab-reproducer")).toHaveAttribute("aria-selected", "true");
+
+    // The composer's steer POST targets the selected session's endpoint.
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some((c) => String(c[0]).includes("/sessions/reproducer/agent/state")),
+      ).toBe(true),
+    );
+    await user.click(screen.getByRole("button", { name: "Follow-up" }));
+    await user.type(screen.getByLabelText("Message"), "try the other loop");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/1/sessions/reproducer/agent/follow-up",
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("hides the tab bar for a single-session workflow", async () => {
+    stubFetch();
+    await renderDetail(workingSession);
+    expect(screen.queryByTestId("session-tabs")).not.toBeInTheDocument();
+  });
+
+  it("disables tabs for unspawned sessions and marks a tab with a pending question", async () => {
+    stubFetch();
+    await renderDetail(
+      {
+        "1": {
+          reproducer: {
+            status: "waiting-input",
+            reason: "pending question 'ask-1'",
+            since: "t0",
+            question: askQuestion,
+          },
+        },
+      },
+      twoSessionSnapshots.workflows,
+    );
+
+    // The default tab is the current step's session (coder) — known from the
+    // workflow records but not yet spawned, so it stays inactive.
+    const coder = screen.getByTestId("session-tab-coder");
+    expect(coder).toBeDisabled();
+    expect(coder).toHaveAttribute("title", "coder: not started");
+    // No channel opens for the unspawned default tab.
+    expect(agentSocket()).toBeUndefined();
+
+    // The other session's pending question marks its tab instead of a card.
+    expect(screen.getByTestId("tab-question-reproducer")).toBeInTheDocument();
+    expect(screen.queryByTestId("question-card")).not.toBeInTheDocument();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId("session-tab-reproducer"));
+    expect(screen.queryByTestId("tab-question-reproducer")).not.toBeInTheDocument();
+    expect(screen.getByTestId("question-card")).toBeInTheDocument();
+  });
+});
+
+describe("workflow strip", () => {
+  it("renders one chip per executed step with the current step highlighted", async () => {
+    stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, twoSessionSnapshots.workflows);
+
+    const strip = screen.getByTestId("workflow-strip");
+    expect(within(strip).getByTestId("workflow-run-status")).toHaveTextContent(
+      "reproduce-and-fix · running",
+    );
+    const first = within(strip).getByTestId("workflow-chip-1");
+    expect(first).toHaveTextContent("reproduce");
+    expect(first.className).toContain("ok");
+    expect(first).toHaveAttribute("title", "reproduced on vlan-mtu");
+    const second = within(strip).getByTestId("workflow-chip-2");
+    expect(second).toHaveTextContent("fix");
+    expect(second.className).toContain("current");
+  });
+
+  it("updates live on workflow_step events", async () => {
+    stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, twoSessionSnapshots.workflows);
+
+    act(() => {
+      mainSocket().emit("workflow_step", {
+        task_id: 1,
+        step: "fix",
+        kind: "agent",
+        session: "coder",
+        status: "ok",
+      });
+      mainSocket().emit("workflow_step", {
+        task_id: 1,
+        step: "confirm",
+        kind: "gate",
+        session: null,
+        status: "waiting",
+        message: "Ship it?",
+      });
+    });
+
+    const strip = screen.getByTestId("workflow-strip");
+    expect(within(strip).getByTestId("workflow-chip-2").className).toContain("ok");
+    const gate = within(strip).getByTestId("workflow-chip-3");
+    expect(gate).toHaveTextContent("confirm");
+    expect(gate.className).toContain("waiting");
+    expect(gate).toHaveAttribute("title", "Ship it?");
+  });
+
+  it("omits the strip before any step has executed", async () => {
+    stubFetch();
+    await renderDetail(workingSession);
+    expect(screen.queryByTestId("workflow-strip")).not.toBeInTheDocument();
+  });
+});
+
+describe("gate card", () => {
+  const waitingGate = {
+    "1": {
+      name: "reproduce-and-fix",
+      status: "waiting",
+      step: "confirm",
+      steps: [
+        {
+          ...twoSessionSnapshots.workflows["1"].steps[0],
+          status: "ok",
+        },
+        {
+          task_id: 1,
+          seq: 2,
+          step: "confirm",
+          kind: "gate",
+          session: null,
+          status: "waiting",
+          outcome: { message: "Review the reproducer output?" },
+          error: null,
+          prompted_at: null,
+          started_at: "t1",
+          finished_at: null,
+        },
+      ],
+    },
+  };
+
+  it("renders the gate message from the snapshot and resumes with a note", async () => {
+    const fetchMock = stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, waitingGate);
+
+    const card = screen.getByTestId("gate-card");
+    expect(within(card).getByTestId("gate-message")).toHaveTextContent(
+      "Review the reproducer output?",
+    );
+
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText("Resume note"), "looks right");
+    await user.click(within(card).getByTestId("gate-resume"));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/1/workflow/resume",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ note: "looks right" }),
+      }),
+    );
+  });
+
+  it("posts a null note when the field is empty", async () => {
+    const fetchMock = stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, waitingGate);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId("gate-resume"));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/1/workflow/resume",
+      expect.objectContaining({ body: JSON.stringify({ note: null }) }),
+    );
+  });
+
+  it("surfaces a 409 inline when the run already moved on", async () => {
+    const fetchMock = stubFetch();
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes("/workflow/resume")) {
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          json: () => Promise.resolve({ detail: "workflow run is not waiting" }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    await renderDetail(twoSessionSnapshots.sessions, waitingGate);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId("gate-resume"));
+
+    expect(await screen.findByTestId("gate-error")).toHaveTextContent(
+      "workflow run is not waiting",
+    );
+  });
+
+  it("disappears once the run leaves waiting", async () => {
+    stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, waitingGate);
+    expect(screen.getByTestId("gate-card")).toBeInTheDocument();
+
+    act(() => {
+      mainSocket().emit("workflow_step", {
+        task_id: 1,
+        step: "confirm",
+        kind: "gate",
+        session: null,
+        status: "ok",
+      });
+      mainSocket().emit("task_updated", {
+        ...makeTask(),
+        workflow_status: "running",
+        workflow_step: "fix",
+      });
+    });
+
+    expect(screen.queryByTestId("gate-card")).not.toBeInTheDocument();
+  });
+
+  it("renders no gate card while the run is running", async () => {
+    stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, twoSessionSnapshots.workflows);
+    expect(screen.queryByTestId("gate-card")).not.toBeInTheDocument();
   });
 });

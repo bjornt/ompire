@@ -131,7 +131,7 @@ async def test_notify_tier_fires_a_notification(fake_notify_send) -> None:
     try:
         hub.publish(
             "status_changed",
-            {"task_id": 1, "from": "working", "to": "waiting-input", "reason": "pending question"},
+            {"task_id": 1, "session": "main", "from": "working", "to": "waiting-input", "reason": "pending question"},
         )
         await _wait_until(lambda: calls_log.exists() and calls_log.read_text())
         call = calls_log.read_text()
@@ -148,7 +148,7 @@ async def test_interrupt_tier_fires_critical_urgency(fake_notify_send) -> None:
     try:
         hub.publish(
             "status_changed",
-            {"task_id": 1, "from": "working", "to": "failed", "reason": "process exited with code 1"},
+            {"task_id": 1, "session": "main", "from": "working", "to": "failed", "reason": "process exited with code 1"},
         )
         await _wait_until(lambda: calls_log.exists() and calls_log.read_text())
         assert "--urgency critical" in calls_log.read_text()
@@ -162,7 +162,10 @@ async def test_silent_and_badge_tiers_fire_nothing(fake_notify_send) -> None:
     notifier = await _make_notifier(hub)
     try:
         for to in ("starting", "working", "idle", "retrying"):
-            hub.publish("status_changed", {"task_id": 1, "from": None, "to": to, "reason": "x"})
+            hub.publish(
+                "status_changed",
+                {"task_id": 1, "session": "main", "from": None, "to": to, "reason": "x"},
+            )
         await asyncio.sleep(0.1)
         assert not calls_log.exists() or calls_log.read_text() == ""
     finally:
@@ -177,7 +180,7 @@ async def test_open_action_launches_the_task_url(fake_notify_send, fake_xdg_open
     try:
         hub.publish(
             "status_changed",
-            {"task_id": 42, "from": "working", "to": "waiting-approval", "reason": "sudo gate"},
+            {"task_id": 42, "session": "main", "from": "working", "to": "waiting-approval", "reason": "sudo gate"},
         )
         await _wait_until(lambda: fake_xdg_open.exists() and fake_xdg_open.read_text())
         assert fake_xdg_open.read_text().strip() == "http://0.0.0.0:9999/tasks/42"
@@ -192,19 +195,19 @@ async def test_tier_change_supersedes_prior_notification(fake_notify_send) -> No
     try:
         hub.publish(
             "status_changed",
-            {"task_id": 1, "from": "working", "to": "stalled", "reason": "no frames for 300s"},
+            {"task_id": 1, "session": "main", "from": "working", "to": "stalled", "reason": "no frames for 300s"},
         )
         await _wait_until(lambda: calls_log.exists() and calls_log.read_text())
         hub.publish(
             "status_changed",
-            {"task_id": 1, "from": "stalled", "to": "failed", "reason": "process exited with code 1"},
+            {"task_id": 1, "session": "main", "from": "stalled", "to": "failed", "reason": "process exited with code 1"},
         )
         await _wait_until(lambda: calls_log.read_text().count("\n") >= 2)
         calls = calls_log.read_text().splitlines()
         assert "--urgency normal" in calls[0]
         assert "--urgency critical" in calls[-1]
         # Exactly one active entry for the task even after the supersede.
-        assert notifier.snapshot() == {1: {"tier": "interrupt", "status": "failed", "reason": "process exited with code 1"}}
+        assert notifier.snapshot() == {1: {"tier": "interrupt", "status": "failed", "reason": "process exited with code 1", "session": "main"}}
     finally:
         await notifier.stop()
 
@@ -216,7 +219,7 @@ async def test_renotify_ages_unanswered_attention(fake_notify_send) -> None:
     try:
         hub.publish(
             "status_changed",
-            {"task_id": 1, "from": "working", "to": "waiting-input", "reason": "pending question"},
+            {"task_id": 1, "session": "main", "from": "working", "to": "waiting-input", "reason": "pending question"},
         )
         await _wait_until(lambda: calls_log.exists() and len(calls_log.read_text().splitlines()) >= 1)
         await _wait_until(
@@ -236,12 +239,12 @@ async def test_answering_cancels_renotify(fake_notify_send) -> None:
     try:
         hub.publish(
             "status_changed",
-            {"task_id": 1, "from": "working", "to": "waiting-input", "reason": "pending question"},
+            {"task_id": 1, "session": "main", "from": "working", "to": "waiting-input", "reason": "pending question"},
         )
         await _wait_until(lambda: calls_log.exists() and calls_log.read_text())
         hub.publish(
             "status_changed",
-            {"task_id": 1, "from": "waiting-input", "to": "working", "reason": "operator answered"},
+            {"task_id": 1, "session": "main", "from": "waiting-input", "to": "working", "reason": "operator answered"},
         )
         first_count = len(calls_log.read_text().splitlines())
         await asyncio.sleep(RENOTIFY * 3)
@@ -258,7 +261,7 @@ async def test_attention_events_broadcast(fake_notify_send) -> None:
     try:
         hub.publish(
             "status_changed",
-            {"task_id": 7, "from": "working", "to": "waiting-approval", "reason": "sudo gate"},
+            {"task_id": 7, "session": "main", "from": "working", "to": "waiting-approval", "reason": "sudo gate"},
         )
         async with asyncio.timeout(5):
             while True:
@@ -270,11 +273,12 @@ async def test_attention_events_broadcast(fake_notify_send) -> None:
             "tier": "interrupt",
             "status": "waiting-approval",
             "reason": "sudo gate",
+            "session": "main",
         }
 
         hub.publish(
             "status_changed",
-            {"task_id": 7, "from": "waiting-approval", "to": "working", "reason": "operator answered"},
+            {"task_id": 7, "session": "main", "from": "waiting-approval", "to": "working", "reason": "operator answered"},
         )
         async with asyncio.timeout(5):
             while True:
@@ -295,7 +299,7 @@ async def test_missing_notify_send_degrades_to_badges(monkeypatch: pytest.Monkey
         assert notifier.capable is False
         hub.publish(
             "status_changed",
-            {"task_id": 1, "from": "working", "to": "failed", "reason": "process exited with code 1"},
+            {"task_id": 1, "session": "main", "from": "working", "to": "failed", "reason": "process exited with code 1"},
         )
         async with asyncio.timeout(5):
             while True:
@@ -304,7 +308,7 @@ async def test_missing_notify_send_degrades_to_badges(monkeypatch: pytest.Monkey
                     break
         assert event.payload["task_id"] == 1
         assert notifier.snapshot() == {
-            1: {"tier": "interrupt", "status": "failed", "reason": "process exited with code 1"}
+            1: {"tier": "interrupt", "status": "failed", "reason": "process exited with code 1", "session": "main"}
         }
     finally:
         await notifier.stop()
@@ -329,7 +333,7 @@ async def test_server_without_actions_capability_fires_plain_notification(
 
         hub.publish(
             "status_changed",
-            {"task_id": 1, "from": "working", "to": "waiting-input", "reason": "pending question"},
+            {"task_id": 1, "session": "main", "from": "working", "to": "waiting-input", "reason": "pending question"},
         )
         await _wait_until(lambda: calls_log.exists() and calls_log.read_text())
         call = calls_log.read_text()
@@ -348,12 +352,12 @@ async def test_disabled_by_config_degrades_to_badges(fake_notify_send) -> None:
         assert notifier.capable is False
         hub.publish(
             "status_changed",
-            {"task_id": 1, "from": "working", "to": "waiting-approval", "reason": "sudo gate"},
+            {"task_id": 1, "session": "main", "from": "working", "to": "waiting-approval", "reason": "sudo gate"},
         )
         await asyncio.sleep(0.1)
         assert not calls_log.exists() or calls_log.read_text() == ""
         assert notifier.snapshot() == {
-            1: {"tier": "interrupt", "status": "waiting-approval", "reason": "sudo gate"}
+            1: {"tier": "interrupt", "status": "waiting-approval", "reason": "sudo gate", "session": "main"}
         }
     finally:
         await notifier.stop()
@@ -369,7 +373,7 @@ async def test_clear_task_drops_entry_and_broadcasts(fake_notify_send) -> None:
     try:
         hub.publish(
             "status_changed",
-            {"task_id": 3, "from": "idle", "to": "failed", "reason": "process exited with code 1"},
+            {"task_id": 3, "session": "main", "from": "idle", "to": "failed", "reason": "process exited with code 1"},
         )
         await _wait_until(lambda: 3 in notifier.snapshot())
 
@@ -384,4 +388,142 @@ async def test_clear_task_drops_entry_and_broadcasts(fake_notify_send) -> None:
                     return
     finally:
         await notifier.stop()
-  # noqa: E501
+
+
+async def test_workflow_gate_wait_raises_notify_attention(fake_notify_send) -> None:
+    """A `workflow_step` gate wait is a task-level attention source with no
+    session (workflow-engine D-7): notify tier, `session: None`, and the
+    gate's message as the reason."""
+    _, calls_log = fake_notify_send
+    hub = EventHub()
+    queue = hub.subscribe()
+    notifier = await _make_notifier(hub)
+    try:
+        hub.publish(
+            "workflow_step",
+            {
+                "task_id": 5,
+                "step": "review-gate",
+                "kind": "gate",
+                "session": None,
+                "status": "waiting",
+                "message": "waiting for gate approval",
+            },
+        )
+        async with asyncio.timeout(5):
+            while True:
+                event = await queue.get()
+                if event.type == "attention":
+                    break
+        assert event.payload == {
+            "task_id": 5,
+            "tier": "notify",
+            "status": "waiting",
+            "reason": "waiting for gate approval",
+            "session": None,
+        }
+        assert notifier.snapshot() == {
+            5: {
+                "tier": "notify",
+                "status": "waiting",
+                "reason": "waiting for gate approval",
+                "session": None,
+            }
+        }
+        # Notify tier fires a real desktop notification too.
+        await _wait_until(lambda: calls_log.exists() and calls_log.read_text())
+        assert "--urgency normal" in calls_log.read_text()
+    finally:
+        await notifier.stop()
+
+
+async def test_workflow_gate_resolution_clears_attention(fake_notify_send) -> None:
+    """The gate finishing (`ok`/`failed`) clears the None-sourced gate entry."""
+    hub = EventHub()
+    queue = hub.subscribe()
+    notifier = await _make_notifier(hub)
+    try:
+        hub.publish(
+            "workflow_step",
+            {
+                "task_id": 5,
+                "step": "review-gate",
+                "kind": "gate",
+                "session": None,
+                "status": "waiting",
+                "message": "waiting for gate approval",
+            },
+        )
+        await _wait_until(lambda: 5 in notifier.snapshot())
+
+        hub.publish(
+            "workflow_step",
+            {"task_id": 5, "step": "review-gate", "kind": "gate", "session": None, "status": "ok"},
+        )
+        async with asyncio.timeout(5):
+            while True:
+                event = await queue.get()
+                if event.type == "attention_cleared":
+                    break
+        assert event.payload == {"task_id": 5}
+        assert notifier.snapshot() == {}
+    finally:
+        await notifier.stop()
+
+
+async def test_cross_session_worst_tier_wins(fake_notify_send) -> None:
+    """One published entry per task = the worst tier across the task's
+    session sources (workflow-engine D-7): an interrupt-tier failure in one
+    session supersedes a notify-tier wait in another; a lower-tier source
+    changing underneath the published entry must not re-fire; and when the
+    worst source clears, the worst remaining source becomes the entry."""
+    _, calls_log = fake_notify_send
+    hub = EventHub()
+    # Long re-notify interval: this test asserts exact notification counts.
+    notifier = await _make_notifier(hub, renotify_interval=60)
+    try:
+        hub.publish(
+            "status_changed",
+            {"task_id": 1, "session": "main", "from": "working", "to": "waiting-input", "reason": "pending question"},
+        )
+        await _wait_until(lambda: calls_log.exists() and len(calls_log.read_text().splitlines()) >= 1)
+        assert notifier.snapshot() == {
+            1: {"tier": "notify", "status": "waiting-input", "reason": "pending question", "session": "main"}
+        }
+
+        # A second session failing (interrupt) supersedes the published entry.
+        hub.publish(
+            "status_changed",
+            {"task_id": 1, "session": "review", "from": "working", "to": "failed", "reason": "process exited with code 1"},
+        )
+        await _wait_until(lambda: len(calls_log.read_text().splitlines()) >= 2)
+        calls = calls_log.read_text().splitlines()
+        assert "--urgency normal" in calls[0]
+        assert "--urgency critical" in calls[-1]
+        assert notifier.snapshot() == {
+            1: {"tier": "interrupt", "status": "failed", "reason": "process exited with code 1", "session": "review"}
+        }
+
+        # The lower-tier source moving underneath (still notify tier) must
+        # NOT re-fire: the published interrupt entry is unchanged.
+        hub.publish(
+            "status_changed",
+            {"task_id": 1, "session": "main", "from": "waiting-input", "to": "stalled", "reason": "no frames for 300s"},
+        )
+        await asyncio.sleep(0.1)
+        assert len(calls_log.read_text().splitlines()) == 2
+        assert notifier.snapshot()[1]["status"] == "failed"
+
+        # The interrupt source superseded away (retried back to working): the
+        # worst remaining source — main's notify-tier stall — is published.
+        hub.publish(
+            "status_changed",
+            {"task_id": 1, "session": "review", "from": "failed", "to": "working", "reason": "operator retried"},
+        )
+        await _wait_until(lambda: len(calls_log.read_text().splitlines()) >= 3)
+        assert "--urgency normal" in calls_log.read_text().splitlines()[-1]
+        assert notifier.snapshot() == {
+            1: {"tier": "notify", "status": "stalled", "reason": "no frames for 300s", "session": "main"}
+        }
+    finally:
+        await notifier.stop()

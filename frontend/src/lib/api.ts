@@ -61,34 +61,52 @@ export function getTaskDetail(id: number): Promise<TaskDetail> {
   return request<TaskDetail>("GET", `/api/tasks/${id}`);
 }
 
-/** Composer modes — each proxies to the live agent (agent-interaction).
- * `interrupt` aborts the current turn and re-prompts (`abort_and_prompt`). */
-export function steerAgent(id: number, message: string): Promise<unknown> {
-  return request("POST", `/api/tasks/${id}/agent/steer`, { message });
+/** Session-scoped agent endpoints (workflow-engine design D-1): every agent
+ * interaction addresses one of the task's declared sessions. Session names
+ * are slug-format; encode defensively anyway. */
+function sessionAgentUrl(id: number, session: string, op: string): string {
+  return `/api/tasks/${id}/sessions/${encodeURIComponent(session)}/agent/${op}`;
 }
 
-export function followUpAgent(id: number, message: string): Promise<unknown> {
-  return request("POST", `/api/tasks/${id}/agent/follow-up`, { message });
+/** Composer modes — each proxies to the session's live agent
+ * (agent-interaction). `interrupt` aborts the current turn and re-prompts
+ * (`abort_and_prompt`). */
+export function steerAgent(id: number, session: string, message: string): Promise<unknown> {
+  return request("POST", sessionAgentUrl(id, session, "steer"), { message });
 }
 
-export function interruptAgent(id: number, message: string): Promise<unknown> {
-  return request("POST", `/api/tasks/${id}/agent/interrupt`, { message });
+export function followUpAgent(id: number, session: string, message: string): Promise<unknown> {
+  return request("POST", sessionAgentUrl(id, session, "follow-up"), { message });
 }
 
-export function getAgentState(id: number): Promise<AgentStateData> {
-  return request<AgentStateData>("GET", `/api/tasks/${id}/agent/state`);
+export function interruptAgent(id: number, session: string, message: string): Promise<unknown> {
+  return request("POST", sessionAgentUrl(id, session, "interrupt"), { message });
 }
 
-export function getAgentStats(id: number): Promise<AgentStatsData> {
-  return request<AgentStatsData>("GET", `/api/tasks/${id}/agent/stats`);
+export function getAgentState(id: number, session: string): Promise<AgentStateData> {
+  return request<AgentStateData>("GET", sessionAgentUrl(id, session, "state"));
 }
 
-/** Answers a task's pending ask/approval question (ask-approvals capability). */
+export function getAgentStats(id: number, session: string): Promise<AgentStatsData> {
+  return request<AgentStatsData>("GET", sessionAgentUrl(id, session, "stats"));
+}
+
+/** Answers a session's pending ask/approval question (ask-approvals capability). */
 export function answerAgent(
   id: number,
+  session: string,
   answer: { question_id: string; selections?: string[]; text?: string; approved?: boolean },
 ): Promise<unknown> {
-  return request("POST", `/api/tasks/${id}/agent/answer`, answer);
+  return request("POST", sessionAgentUrl(id, session, "answer"), answer);
+}
+
+/** Resumes a workflow run parked at a gate (workflow-engine capability);
+ * 409 when the run has already moved on. */
+export function resumeWorkflow(
+  id: number,
+  note?: string,
+): Promise<{ task_id: number; workflow: string; step: string | null }> {
+  return request("POST", `/api/tasks/${id}/workflow/resume`, { note: note ?? null });
 }
 
 /** Start an llmvet review for an idle task (review capability). */

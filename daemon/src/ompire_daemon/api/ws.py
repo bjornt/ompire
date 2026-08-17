@@ -21,6 +21,7 @@ from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.registry.projects import list_projects
 from ompire_daemon.registry.tasks import list_tasks
 from ompire_daemon.registry.templates import list_templates
+from ompire_daemon.registry.workflows import list_step_records
 from ompire_daemon.review import ReviewManager
 from ompire_daemon.ship import ShipManager
 
@@ -61,10 +62,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     projects_payload = [asdict(p) for p in list_projects(engine)]
     templates_payload = [asdict(t) for t in list_templates(engine)]
     tasks_payload = [asdict(t) for t in list_tasks(engine)]
-    # Session statuses ride separately from task rows (design D-4); JSON
-    # object keys are strings, so task ids are stringified here.
+    # Session statuses ride separately from task rows (design D-4), nested
+    # task → session (workflow-engine design D-7); JSON object keys are
+    # strings, so task ids are stringified here.
     sessions_payload = {
-        str(task_id): info for task_id, info in websocket.app.state.sessions.snapshot().items()
+        str(task_id): per_session
+        for task_id, per_session in websocket.app.state.sessions.snapshot().items()
+    }
+    # Per-task workflow run state (workflow-engine capability): the task's
+    # workflow fields plus its step-record history.
+    workflows_payload = {
+        str(task.id): {
+            "name": task.workflow_name,
+            "status": task.workflow_status,
+            "step": task.workflow_step,
+            "steps": [asdict(record) for record in list_step_records(engine, task.id)],
+        }
+        for task in list_tasks(engine)
+        if task.workflow_status is not None or task.workflow_name
     }
     # Active attention entries (design: a reconnecting client sees them
     # without replaying `attention` events).
@@ -93,6 +108,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             "templates": templates_payload,
             "tasks": tasks_payload,
             "sessions": sessions_payload,
+            "workflows": workflows_payload,
             "attention": attention_payload,
             "reviews": reviews_payload,
             "ships": ships_payload,
@@ -132,19 +148,23 @@ async def _receive_until_disconnect(websocket: WebSocket) -> None:
             return
 
 
-@router.websocket("/api/ws/agents/{task_id}")
-async def agent_websocket_endpoint(websocket: WebSocket, task_id: int) -> None:
-    """Per-agent event channel: replay the ring buffer, then stream live
-    (design D-5). Same no-commands rule as the main socket."""
+@router.websocket("/api/ws/agents/{task_id}/{session}")
+async def agent_websocket_endpoint(websocket: WebSocket, task_id: int, session: str) -> None:
+    """Per-session agent event channel: replay the ring buffer, then stream
+    live (design D-5; workflow-engine design D-1 addresses sessions
+    `(task_id, session)`). Same no-commands rule as the main socket."""
     if not check_ws_token(websocket):
         await websocket.close(code=1008)
         return
 
     supervisor: AgentSupervisor = websocket.app.state.agents
-    handle = supervisor.get(task_id)
+    handle = supervisor.get(task_id, session)
     if handle is None:
         await websocket.accept()
-        await websocket.close(code=NO_LIVE_AGENT_CLOSE_CODE, reason=f"no live agent for task {task_id}")
+        await websocket.close(
+            code=NO_LIVE_AGENT_CLOSE_CODE,
+            reason=f"no live agent for task {task_id} session {session!r}",
+        )
         return
 
     await websocket.accept()

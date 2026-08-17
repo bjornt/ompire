@@ -105,7 +105,7 @@ def demo_project_and_task(review_client: TestClient, auth_headers: dict[str, str
     while time.monotonic() < deadline:
         with client.websocket_connect(f"/api/ws?token={client.app.state.auth_token}") as ws:
             snapshot = ws.receive_json()
-            session = snapshot["payload"]["sessions"].get(str(task_id))
+            session = snapshot["payload"]["sessions"].get(str(task_id), {}).get("main")
             if session and session["status"] == "idle":
                 return task_id
         time.sleep(0.05)
@@ -280,8 +280,8 @@ class TestReviewRestGuards:
         task_id = r.json()["id"]
         # Manually seed an idle session without a live agent.
         sessions = client.app.state.sessions
-        sessions.recovering(task_id)
-        sessions.session_recovered(task_id)
+        sessions.recovering(task_id, 'main')
+        sessions.session_recovered(task_id, 'main')
         r = client.post(f"/api/tasks/{task_id}/review", headers=auth_headers)
         assert r.status_code == 409
         assert "no live agent" in r.json()["detail"]
@@ -375,7 +375,9 @@ class TestReviewManagerLifecycle:
                     prompt="hello",
                     error=None,
                     workshop_id=None,
-                    session_id=None,
+                    workflow_name="single-step",
+                    workflow_status=None,
+                    workflow_step=None,
                     spawn_completed_at=None,
                     created_at=now,
                     updated_at=now,
@@ -383,8 +385,8 @@ class TestReviewManagerLifecycle:
             )
             task_id = result.inserted_primary_key[0]
         task = get_task(engine, task_id)
-        app.state.sessions.recovering(task_id)
-        app.state.sessions.session_recovered(task_id)
+        app.state.sessions.recovering(task_id, 'main')
+        app.state.sessions.session_recovered(task_id, 'main')
 
         state = await reviews.start_review(task)
         assert state.status == "open"
@@ -400,7 +402,7 @@ class TestReviewManagerLifecycle:
         assert final.status == "approved"
         assert len(final.iterations) == 1
         assert final.iterations[0].outcome == "approved"
-        session = app.state.sessions.get(task_id)
+        session = app.state.sessions.get(task_id, "main")
         assert session is not None
         assert session.status == "idle"
 
@@ -459,7 +461,9 @@ class TestReviewManagerLifecycle:
                     prompt="hello",
                     error=None,
                     workshop_id=None,
-                    session_id=None,
+                    workflow_name="single-step",
+                    workflow_status=None,
+                    workflow_step=None,
                     spawn_completed_at=None,
                     created_at=now,
                     updated_at=now,
@@ -467,8 +471,8 @@ class TestReviewManagerLifecycle:
             )
             task_id = result.inserted_primary_key[0]
         task = get_task(engine, task_id)
-        app.state.sessions.recovering(task_id)
-        app.state.sessions.session_recovered(task_id)
+        app.state.sessions.recovering(task_id, 'main')
+        app.state.sessions.session_recovered(task_id, 'main')
 
         await reviews.start_review(task)
         # Wait for fake llmvet (exit 130) to finish.
@@ -483,7 +487,7 @@ class TestReviewManagerLifecycle:
         assert final.status == "aborted"
         assert len(final.iterations) == 1
         assert final.iterations[0].outcome == "aborted"
-        session = app.state.sessions.get(task_id)
+        session = app.state.sessions.get(task_id, "main")
         assert session is not None
         assert session.status == "idle"
 
@@ -542,7 +546,9 @@ class TestReviewManagerLifecycle:
                     prompt="hello",
                     error=None,
                     workshop_id=None,
-                    session_id=None,
+                    workflow_name="single-step",
+                    workflow_status=None,
+                    workflow_step=None,
                     spawn_completed_at=None,
                     created_at=now,
                     updated_at=now,
@@ -550,8 +556,8 @@ class TestReviewManagerLifecycle:
             )
             task_id = result.inserted_primary_key[0]
         task = get_task(engine, task_id)
-        app.state.sessions.recovering(task_id)
-        app.state.sessions.session_recovered(task_id)
+        app.state.sessions.recovering(task_id, 'main')
+        app.state.sessions.session_recovered(task_id, 'main')
 
         await reviews.start_review(task)
         deadline = asyncio.get_event_loop().time() + 5

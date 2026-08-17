@@ -111,6 +111,14 @@ class ReviewManager:
         self._port_lock = asyncio.Lock()
         self._event_task: asyncio.Task | None = None
 
+    @staticmethod
+    def _primary_session(task: Task) -> str:
+        """Review attaches to the task's workflow-declared primary session
+        (workflow-engine design D-8)."""
+        from ompire_daemon.workflows import get_workflow
+
+        return get_workflow(task.workflow_name).primary
+
     def start(self) -> None:
         """Start the hub event consumer; idempotent. Must be called from a
         running event loop (app lifespan)."""
@@ -293,7 +301,8 @@ class ReviewManager:
             state.url = url
             state.port = port
 
-        self._sessions.review_opened(task_id, f"llmvet review on {url}")
+        primary = self._primary_session(task)
+        self._sessions.review_opened(task_id, primary, f"llmvet review on {url}")
         self._hub.publish("review_started", {"task_id": task_id, "url": url, "port": port})
 
         watcher = asyncio.create_task(self._watch_review(task_id, task, port))
@@ -367,6 +376,7 @@ class ReviewManager:
             logger.exception("llmvet spawn failed for task %d", task_id)
             await self._finalize(
                 task_id,
+                task,
                 outcome="error",
                 stderr=f"failed to launch llmvet: {exc}",
                 close_session=True,
@@ -380,10 +390,10 @@ class ReviewManager:
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
         code = process.returncode
-        await self._interpret_exit(task_id, code, stdout, stderr)
+        await self._interpret_exit(task_id, task, code, stdout, stderr)
 
     async def _interpret_exit(
-        self, task_id: int, code: int, stdout: str, stderr: str
+        self, task_id: int, task: Task, code: int, stdout: str, stderr: str
     ) -> None:
         state = self._reviews.get(task_id)
         if state is None:
@@ -393,6 +403,7 @@ class ReviewManager:
             if not stdout.strip():
                 await self._finalize(
                     task_id,
+                    task,
                     outcome="approved",
                     comment_count=0,
                     close_session=True,
@@ -410,10 +421,12 @@ class ReviewManager:
                 "review_iteration",
                 {"task_id": task_id, "iteration": self._iteration_payload(iteration)},
             )
-            handle = self._agents.get(task_id)
+            # Comments loop back to the primary session (workflow-engine D-8).
+            handle = self._agents.get(task_id, self._primary_session(task))
             if handle is None or handle.returncode is not None:
                 await self._finalize(
                     task_id,
+                    task,
                     outcome="error",
                     stderr="no live agent to receive review comments",
                     close_session=False,
@@ -424,6 +437,7 @@ class ReviewManager:
             except (AgentGoneError, RequestFailedError) as exc:
                 await self._finalize(
                     task_id,
+                    task,
                     outcome="error",
                     stderr=f"failed to send review comments to agent: {exc}",
                     close_session=False,
@@ -433,6 +447,7 @@ class ReviewManager:
         if code == 130:
             await self._finalize(
                 task_id,
+                task,
                 outcome="aborted",
                 close_session=True,
             )
@@ -440,6 +455,7 @@ class ReviewManager:
 
         await self._finalize(
             task_id,
+            task,
             outcome="error",
             stderr=stderr if stderr.strip() else f"llmvet exited with code {code}",
             close_session=True,
@@ -448,6 +464,7 @@ class ReviewManager:
     async def _finalize(
         self,
         task_id: int,
+        task: Task,
         *,
         outcome: str,
         comment_count: int | None = None,
@@ -468,7 +485,9 @@ class ReviewManager:
         )
         self._hub.publish("review_finished", {"task_id": task_id, "status": outcome})
         if close_session:
-            self._sessions.review_closed(task_id, f"review {outcome}")
+            self._sessions.review_closed(
+                task_id, self._primary_session(task), f"review {outcome}"
+            )
 
     @staticmethod
     def _iteration_payload(iteration: ReviewIteration) -> dict[str, Any]:
@@ -480,8 +499,9 @@ class ReviewManager:
         }
 
     async def _consume_events(self) -> None:
-        """Watch for agent exits while a review is open and tear down the
-        review: exit always wins over review (design D-2)."""
+        """Watch for the reviewed (primary) session's exit while a review is
+        open and tear down the review: exit always wins over review (design
+        D-2). Other sessions of the task failing does not touch the review."""
         queue = self._hub.subscribe()
         try:
             while True:
@@ -492,18 +512,31 @@ class ReviewManager:
                 if payload.get("to") != "failed":
                     continue
                 task_id = payload.get("task_id")
-                if not isinstance(task_id, int):
+                session = payload.get("session")
+                if not isinstance(task_id, int) or not isinstance(session, str):
                     continue
                 if task_id not in self._processes:
                     continue
+                task = self._task(task_id)
+                if task is None or session != self._primary_session(task):
+                    continue
                 logger.info(
-                    "agent for task %d failed while review was open; cancelling review",
+                    "primary session for task %d failed while review was open; "
+                    "cancelling review",
                     task_id,
                 )
                 with contextlib.suppress(ReviewError):
                     await self.cancel_review(task_id)
         finally:
             self._hub.unsubscribe(queue)
+
+    def _task(self, task_id: int) -> Task | None:
+        from ompire_daemon.registry.tasks import get_task
+
+        try:
+            return get_task(self._engine, task_id)
+        except Exception:  # noqa: BLE001 — purged mid-review; nothing to cancel against
+            return None
 
     def _pop_watcher(self, task_id: int, task: asyncio.Task) -> None:
         if self._watchers.get(task_id) is task:

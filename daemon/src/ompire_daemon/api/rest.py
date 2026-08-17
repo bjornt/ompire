@@ -17,7 +17,7 @@ from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.review import ReviewAlreadyOpenError, ReviewError, ReviewManager
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
-from ompire_daemon.ship import ShipManager
+from ompire_daemon.ship import ShipError, ShipManager
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
@@ -67,6 +67,13 @@ from ompire_daemon.registry.templates import (
 )
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.spawn import run_spawn_pipeline
+from ompire_daemon.workflows import (
+    UnknownWorkflowNameError,
+    Workflow,
+    WorkflowNotWaitingError,
+    WorkflowRunner,
+    get_workflow,
+)
 from ompire_daemon.workshop import WorkshopRemoveError, remove_workshop, workshop_status
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_bearer_token)])
@@ -413,7 +420,9 @@ class TaskOut(BaseModel):
     prompt: str
     error: str | None
     workshop_id: str | None
-    session_id: str | None
+    workflow_name: str
+    workflow_status: str | None
+    workflow_step: str | None
     pr_url: str | None
     pr_state: str | None
     pr_merged_at: str | None
@@ -473,6 +482,7 @@ async def spawn_task_route(
             branch=branch,
             clone_path=str(clone_path),
             prompt=body.prompt,
+            workflow_name=template.workflow,
         )
     except DuplicateTaskError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -484,8 +494,7 @@ async def spawn_task_route(
             events,
             config,
             task.id,
-            request.app.state.agents,
-            request.app.state.sessions,
+            request.app.state.workflow_runner,
             model_override=body.model,
             thinking_override=body.thinking,
         )
@@ -547,8 +556,10 @@ async def cleanup_task_route(
 
 
 # --- Agent control surface --------------------------------------------------
-# Start and prompt are the spawn pipeline's job now (design D-5); stop stays
-# as the manual kill switch, feeding the tracker's operator-stop reason.
+# Start and prompt are the workflow engine's job now (workflow-engine design
+# D-4); stop stays as the manual kill switch, feeding the tracker's
+# operator-stop reason. Everything session-scoped is addressed
+# `/tasks/{id}/sessions/{name}/agent/*` (design D-1).
 
 
 def _supervisor(request: Request) -> AgentSupervisor:
@@ -562,28 +573,55 @@ def _require_task(engine: Engine, task_id: int) -> Task:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
 
-@router.post("/tasks/{task_id}/agent/stop")
+def _workflow_for(task: Task) -> Workflow:
+    """The task's registered workflow definition; 409 if its name is no
+    longer registered (e.g. a workflow removed while tasks reference it)."""
+    try:
+        return get_workflow(task.workflow_name)
+    except UnknownWorkflowNameError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
+def _require_declared_session(task: Task, session: str) -> None:
+    """404 on a session the task's workflow does not declare (design D-1)."""
+    workflow = _workflow_for(task)
+    if session not in workflow.sessions:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"task {task.id} workflow {workflow.name!r} declares no session {session!r}",
+        )
+
+
+def _primary_session(task: Task) -> str:
+    """The workflow-declared primary session (design D-8): the target of
+    task-scoped operations that mean "the agent" (review, ship)."""
+    return _workflow_for(task).primary
+
+
+@router.post("/tasks/{task_id}/sessions/{session}/agent/stop")
 async def stop_agent_route(
     task_id: int,
+    session: str,
     engine: Engine = Depends(_engine),
     supervisor: AgentSupervisor = Depends(_supervisor),
     sessions: SessionTracker = Depends(_sessions),
 ) -> dict[str, object]:
-    _require_task(engine, task_id)
+    task = _require_task(engine, task_id)
+    _require_declared_session(task, session)
     # Flag before the kill so the exit lands as "stopped by operator", not a
     # crash (design D-2); cleared again if there was nothing to stop.
-    sessions.expect_operator_stop(task_id)
+    sessions.expect_operator_stop(task_id, session)
     try:
-        await supervisor.stop(task_id)
+        await supervisor.stop(task_id, session)
     except NoLiveAgentError as exc:
-        sessions.clear_operator_stop(task_id)
+        sessions.clear_operator_stop(task_id, session)
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    return {"task_id": task_id, "agent": "stopped"}
+    return {"task_id": task_id, "session": session, "agent": "stopped"}
 
 
 # --- Agent interaction: thin proxies over the live AgentHandle (design D-1) ---
-# Composer actions and status reads for a task's live agent. `interrupt` maps
-# to the RPC `abort_and_prompt`; the message field name mirrors `prompt`
+# Composer actions and status reads for a session's live agent. `interrupt`
+# maps to the RPC `abort_and_prompt`; the message field name mirrors `prompt`
 # (`message`) — verified against real omp in this change's verification task.
 
 
@@ -591,10 +629,14 @@ class AgentMessage(BaseModel):
     message: str
 
 
-def _require_live_agent(supervisor: AgentSupervisor, task_id: int) -> AgentHandle:
-    handle = supervisor.get(task_id)
+def _require_live_agent(
+    supervisor: AgentSupervisor, task_id: int, session: str
+) -> AgentHandle:
+    handle = supervisor.get(task_id, session)
     if handle is None:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(NoLiveAgentError(task_id)))
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, str(NoLiveAgentError(task_id, session))
+        )
     return handle
 
 
@@ -616,43 +658,49 @@ async def _agent_request(
         ) from exc
 
 
-@router.post("/tasks/{task_id}/agent/steer")
+@router.post("/tasks/{task_id}/sessions/{session}/agent/steer")
 async def steer_agent_route(
     task_id: int,
+    session: str,
     body: AgentMessage,
     engine: Engine = Depends(_engine),
     supervisor: AgentSupervisor = Depends(_supervisor),
 ) -> dict[str, object]:
-    _require_task(engine, task_id)
-    handle = _require_live_agent(supervisor, task_id)
+    task = _require_task(engine, task_id)
+    _require_declared_session(task, session)
+    handle = _require_live_agent(supervisor, task_id, session)
     return await _agent_request(handle, "steer", message=body.message)
 
 
-@router.post("/tasks/{task_id}/agent/follow-up")
+@router.post("/tasks/{task_id}/sessions/{session}/agent/follow-up")
 async def follow_up_agent_route(
     task_id: int,
+    session: str,
     body: AgentMessage,
     engine: Engine = Depends(_engine),
     supervisor: AgentSupervisor = Depends(_supervisor),
 ) -> dict[str, object]:
-    _require_task(engine, task_id)
-    handle = _require_live_agent(supervisor, task_id)
+    task = _require_task(engine, task_id)
+    _require_declared_session(task, session)
+    handle = _require_live_agent(supervisor, task_id, session)
     return await _agent_request(handle, "follow_up", message=body.message)
 
 
-@router.post("/tasks/{task_id}/agent/interrupt")
+@router.post("/tasks/{task_id}/sessions/{session}/agent/interrupt")
 async def interrupt_agent_route(
     task_id: int,
+    session: str,
     body: AgentMessage,
     engine: Engine = Depends(_engine),
     supervisor: AgentSupervisor = Depends(_supervisor),
     sessions: SessionTracker = Depends(_sessions),
 ) -> dict[str, object]:
-    _require_task(engine, task_id)
-    handle = _require_live_agent(supervisor, task_id)
+    task = _require_task(engine, task_id)
+    _require_declared_session(task, session)
+    handle = _require_live_agent(supervisor, task_id, session)
     # Any pending question is moot once the turn is aborted (design D-6); the
     # abort's own agent_start/agent_end then drives state normally.
-    sessions.clear_pending(task_id)
+    sessions.clear_pending(task_id, session)
     return await _agent_request(handle, "abort_and_prompt", message=body.message)
 
 
@@ -687,54 +735,83 @@ def _answer_reply_payload(body: AgentAnswer) -> dict[str, object]:
     return {"cancelled": True}
 
 
-@router.post("/tasks/{task_id}/agent/answer")
+@router.post("/tasks/{task_id}/sessions/{session}/agent/answer")
 async def answer_agent_route(
     task_id: int,
+    session: str,
     body: AgentAnswer,
     engine: Engine = Depends(_engine),
     supervisor: AgentSupervisor = Depends(_supervisor),
     sessions: SessionTracker = Depends(_sessions),
 ) -> dict[str, object]:
-    _require_task(engine, task_id)
-    handle = _require_live_agent(supervisor, task_id)
-    pending = sessions.pending(task_id)
+    task = _require_task(engine, task_id)
+    _require_declared_session(task, session)
+    handle = _require_live_agent(supervisor, task_id, session)
+    pending = sessions.pending(task_id, session)
     if pending is None or pending.id != body.question_id:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"task {task_id} has no pending question {body.question_id!r}",
+            f"task {task_id} session {session!r} has no pending question {body.question_id!r}",
         )
     await handle.respond_ui_request(body.question_id, _answer_reply_payload(body))
     # Optimistic clear (design D-5): omp sends no distinct "answer accepted"
     # frame, so the card disappears on send and the fan-out corrects any
     # surprise (e.g. a re-posted question arrives as a fresh question_posted).
-    sessions.answer_pending(task_id)
-    return {"task_id": task_id, "question_id": body.question_id, "answered": True}
+    sessions.answer_pending(task_id, session)
+    return {"task_id": task_id, "session": session, "question_id": body.question_id, "answered": True}
 
 
-@router.get("/tasks/{task_id}/agent/state")
+@router.get("/tasks/{task_id}/sessions/{session}/agent/state")
 async def agent_state_route(
     task_id: int,
+    session: str,
     engine: Engine = Depends(_engine),
     supervisor: AgentSupervisor = Depends(_supervisor),
 ) -> dict[str, object]:
-    _require_task(engine, task_id)
-    handle = _require_live_agent(supervisor, task_id)
+    task = _require_task(engine, task_id)
+    _require_declared_session(task, session)
+    handle = _require_live_agent(supervisor, task_id, session)
     # Pass the agent's `data` through untouched (isStreaming, queuedMessageCount,
     # todos, context usage, model); the daemon never reinterprets its meaning.
     response = await _agent_request(handle, "get_state")
     return response.get("data") or {}
 
 
-@router.get("/tasks/{task_id}/agent/stats")
+@router.get("/tasks/{task_id}/sessions/{session}/agent/stats")
 async def agent_stats_route(
     task_id: int,
+    session: str,
     engine: Engine = Depends(_engine),
     supervisor: AgentSupervisor = Depends(_supervisor),
 ) -> dict[str, object]:
-    _require_task(engine, task_id)
-    handle = _require_live_agent(supervisor, task_id)
+    task = _require_task(engine, task_id)
+    _require_declared_session(task, session)
+    handle = _require_live_agent(supervisor, task_id, session)
     response = await _agent_request(handle, "get_session_stats")
     return response.get("data") or {}
+
+
+# --- Workflow gates (workflow-engine capability) ----------------------------
+
+
+class WorkflowResumeBody(BaseModel):
+    note: str | None = None
+
+
+@router.post("/tasks/{task_id}/workflow/resume")
+async def resume_workflow_route(
+    task_id: int,
+    body: WorkflowResumeBody,
+    request: Request,
+    engine: Engine = Depends(_engine),
+) -> dict[str, object]:
+    task = _require_task(engine, task_id)
+    runner: WorkflowRunner = request.app.state.workflow_runner
+    try:
+        runner.resume_gate(task.id, note=body.note)
+    except WorkflowNotWaitingError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    return {"task_id": task.id, "workflow": "resumed", "step": task.workflow_step}
 
 
 @router.post("/tasks/{task_id}/review")
@@ -750,16 +827,18 @@ async def start_review_route(
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
-    session = sessions.get(task_id)
-    if session is None or session.status != "idle":
+    # Review gates on the workflow's primary session (workflow-engine D-8).
+    primary = _primary_session(task)
+    session_info = sessions.get(task_id, primary)
+    if session_info is None or session_info.status != "idle":
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"task {task_id} session is not idle",
+            f"task {task_id} session {primary!r} is not idle",
         )
-    if supervisor.get(task_id) is None:
+    if supervisor.get(task_id, primary) is None:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"task {task_id} has no live agent",
+            f"task {task_id} session {primary!r} has no live agent",
         )
 
     try:
@@ -842,7 +921,8 @@ async def draft_ship_route(
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
-    _require_live_agent(supervisor, task_id)
+    # Ship-draft prompts the workflow's primary session (workflow-engine D-8).
+    _require_live_agent(supervisor, task_id, _primary_session(task))
 
     try:
         state = await ships.draft(task)

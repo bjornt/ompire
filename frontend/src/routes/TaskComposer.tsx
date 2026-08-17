@@ -11,7 +11,7 @@ import type { SessionStatus } from "../types";
 
 type Mode = "steer" | "follow-up" | "interrupt";
 
-const SEND: Record<Mode, (id: number, message: string) => Promise<unknown>> = {
+const SEND: Record<Mode, (id: number, session: string, message: string) => Promise<unknown>> = {
   steer: steerAgent,
   "follow-up": followUpAgent,
   interrupt: interruptAgent,
@@ -30,11 +30,14 @@ function modeEnabled(mode: Mode, streaming: boolean): boolean {
 
 export function TaskComposer({
   taskId,
+  session,
   hasLiveAgent,
   isStreaming,
   sessionStatus,
 }: {
   taskId: number;
+  /** Session the composer addresses (workflow-engine design D-1). */
+  session: string;
   hasLiveAgent: boolean;
   isStreaming: boolean | null;
   sessionStatus: SessionStatus | null;
@@ -62,7 +65,7 @@ export function TaskComposer({
     setBusy(true);
     setError(null);
     try {
-      await SEND[mode](taskId, message.trim());
+      await SEND[mode](taskId, session, message.trim());
       setMessage("");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));

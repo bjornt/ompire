@@ -26,6 +26,7 @@ class MockWebSocket {
     templates?: unknown[];
     tasks: unknown[];
     sessions?: unknown;
+    workflows?: unknown;
     attention?: unknown;
     reviews?: unknown;
     ships?: unknown;
@@ -77,6 +78,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     pr_url: null,
     pr_state: null,
     pr_merged_at: null,
+    workflow_name: "single-step",
+    workflow_status: null,
+    workflow_step: null,
     created_at: "2026-07-18T00:00:00Z",
     updated_at: "2026-07-18T00:01:00Z",
     ...overrides,
@@ -94,6 +98,7 @@ async function renderAt(
     templates?: unknown[];
     tasks: unknown[];
     sessions?: unknown;
+    workflows?: unknown;
     attention?: unknown;
     reviews?: unknown;
     ships?: unknown;
@@ -383,6 +388,68 @@ describe("SpawnView", () => {
     );
     expect(screen.getByText("see it on the dashboard")).toBeInTheDocument();
   });
+
+  it("keeps reporting workflow_step events as rows in the same progress list", async () => {
+    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+    const user = userEvent.setup();
+    const spawned = makeTask({ spawn_completed_at: null });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
+    );
+
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await user.type(screen.getByLabelText("Prompt"), "fix it");
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+
+    act(() => {
+      socket().emit("task_created", spawned);
+      for (const step of ["fetch", "clone", "branch", "workshop", "agent", "prompt"]) {
+        socket().emit("spawn_step", { task_id: 1, step, status: "started" });
+        socket().emit("spawn_step", { task_id: 1, step, status: "ok" });
+      }
+      socket().emit("task_updated", { ...spawned, spawn_completed_at: "t1" });
+      // The spawn pipeline hands off to the workflow run.
+      socket().emit("workflow_step", {
+        task_id: 1,
+        step: "work",
+        kind: "agent",
+        session: "main",
+        status: "started",
+      });
+      socket().emit("task_updated", {
+        ...spawned,
+        spawn_completed_at: "t1",
+        workflow_status: "running",
+        workflow_step: "work",
+      });
+    });
+
+    const progress = screen.getByTestId("spawn-progress");
+    const row = within(progress).getByTestId("workflow-step-work");
+    expect(row).toHaveAttribute("data-step-status", "running");
+    expect(row).toHaveTextContent("work");
+    expect(row).toHaveTextContent("agent · session main");
+    // The pipeline rows above are untouched.
+    expect(progress.querySelectorAll("[data-step-status]")).toHaveLength(7);
+
+    act(() => {
+      socket().emit("workflow_step", {
+        task_id: 1,
+        step: "work",
+        kind: "agent",
+        session: "main",
+        status: "failed",
+        error: "agent exited with code 1",
+      });
+    });
+
+    const failedRow = within(progress).getByTestId("workflow-step-work");
+    expect(failedRow).toHaveAttribute("data-step-status", "failed");
+    expect(
+      within(progress).getByTestId("stderr-workflow-work"),
+    ).toHaveTextContent("agent exited with code 1");
+  });
 });
 
 describe("TasksView cards", () => {
@@ -462,7 +529,7 @@ describe("TasksView session status", () => {
     await renderAt("/tasks", {
       projects: [project],
       tasks: [makeTask()],
-      sessions: { "1": { status: "working", reason: "agent_start frame", since: "t0" } },
+      sessions: { "1": { main: { status: "working", reason: "agent_start frame", since: "t0" } } },
     });
 
     const card = screen.getByTestId("task-card-1");
@@ -476,12 +543,13 @@ describe("TasksView session status", () => {
     await renderAt("/tasks", {
       projects: [project],
       tasks: [makeTask()],
-      sessions: { "1": { status: "working", reason: "agent_start frame", since: "t0" } },
+      sessions: { "1": { main: { status: "working", reason: "agent_start frame", since: "t0" } } },
     });
 
     act(() => {
       socket().emit("status_changed", {
         task_id: 1,
+        session: "main",
         from: "working",
         to: "idle",
         reason: "agent_end, queue empty after 2.0s",
@@ -499,7 +567,7 @@ describe("TasksView session status", () => {
       projects: [project],
       tasks: [makeTask()],
       sessions: {
-        "1": { status: "failed", reason: "process exited with code 137", since: "t0" },
+        "1": { main: { status: "failed", reason: "process exited with code 137", since: "t0" } },
       },
     });
 
@@ -525,7 +593,7 @@ describe("TasksView session status", () => {
       projects: [project],
       tasks: [makeTask()],
       sessions: {
-        "1": { status: "stalled", reason: "no frames for 300s", since: "t0" },
+        "1": { main: { status: "stalled", reason: "no frames for 300s", since: "t0" } },
       },
     });
 
@@ -544,7 +612,7 @@ describe("TasksView session status", () => {
       projects: [project],
       tasks: [makeTask()],
       sessions: {
-        "1": { status: "retrying", reason: "auto_retry_start: HTTP 429", since: "t0" },
+        "1": { main: { status: "retrying", reason: "auto_retry_start: HTTP 429", since: "t0" } },
       },
       attention: {},
     });
@@ -562,18 +630,19 @@ describe("TasksView session status", () => {
       projects: [project],
       tasks: [makeTask()],
       sessions: {
-        "1": { status: "working", reason: "agent_start frame", since: "t0" },
+        "1": { main: { status: "working", reason: "agent_start frame", since: "t0" } },
       },
     });
 
     act(() => {
       socket().emit("stats", {
         task_id: 1,
+        session: "main",
         context_pct: 85,
         tokens: { input: 1200, output: 340 },
         cost: 0.0123,
       });
-      socket().emit("advisory", { task_id: 1, kind: "context-high", context_pct: 85 });
+      socket().emit("advisory", { task_id: 1, session: "main", kind: "context-high", context_pct: 85 });
     });
 
     const stats = screen.getByTestId("card-stats-1");
@@ -588,12 +657,12 @@ describe("TasksView session status", () => {
       projects: [project],
       tasks: [makeTask()],
       sessions: {
-        "1": { status: "idle", reason: "agent_end, queue empty after 2.0s", since: "t0" },
+        "1": { main: { status: "idle", reason: "agent_end, queue empty after 2.0s", since: "t0" } },
       },
     });
 
     act(() => {
-      socket().emit("advisory", { task_id: 1, kind: "maybe-waiting" });
+      socket().emit("advisory", { task_id: 1, session: "main", kind: "maybe-waiting" });
     });
 
     expect(screen.getByTestId("maybe-waiting-1")).toHaveTextContent(
@@ -603,11 +672,12 @@ describe("TasksView session status", () => {
     act(() => {
       socket().emit("status_changed", {
         task_id: 1,
+        session: "main",
         from: "idle",
         to: "working",
         reason: "agent_start frame",
       });
-      socket().emit("advisory_cleared", { task_id: 1, kind: "maybe-waiting" });
+      socket().emit("advisory_cleared", { task_id: 1, session: "main", kind: "maybe-waiting" });
     });
 
     expect(screen.queryByTestId("maybe-waiting-1")).not.toBeInTheDocument();
@@ -622,13 +692,13 @@ describe("TasksView session status", () => {
         makeTask({ id: 3, slug: "third", branch: "bjornt/third", state: "failed", error: "x" }),
       ],
       sessions: {
-        "1": { status: "working", reason: "agent_start frame", since: "t0" },
-        "2": { status: "failed", reason: "process exited with code 137", since: "t0" },
-        "3": { status: "failed", reason: "stopped by operator", since: "t0" },
+        "1": { main: { status: "working", reason: "agent_start frame", since: "t0" } },
+        "2": { main: { status: "failed", reason: "process exited with code 137", since: "t0" } },
+        "3": { main: { status: "failed", reason: "stopped by operator", since: "t0" } },
       },
       attention: {
-        "2": { tier: "interrupt", status: "failed", reason: "process exited with code 137" },
-        "3": { tier: "interrupt", status: "failed", reason: "stopped by operator" },
+        "2": { tier: "interrupt", status: "failed", reason: "process exited with code 137", session: "main" },
+        "3": { tier: "interrupt", status: "failed", reason: "stopped by operator", session: "main" },
       },
     });
 
@@ -641,7 +711,7 @@ describe("TasksView session status", () => {
     await renderAt("/tasks", {
       projects: [project],
       tasks: [makeTask()],
-      sessions: { "1": { status: "working", reason: "agent_start frame", since: "t0" } },
+      sessions: { "1": { main: { status: "working", reason: "agent_start frame", since: "t0" } } },
       attention: {},
     });
     expect(screen.getByText("0 need you")).toBeInTheDocument();
@@ -649,6 +719,7 @@ describe("TasksView session status", () => {
     act(() => {
       socket().emit("status_changed", {
         task_id: 1,
+        session: "main",
         from: "working",
         to: "waiting-input",
         reason: "pending question",
@@ -658,6 +729,7 @@ describe("TasksView session status", () => {
         tier: "notify",
         status: "waiting-input",
         reason: "pending question",
+        session: "main",
       });
     });
     expect(screen.getByText("1 need you")).toBeInTheDocument();
@@ -666,6 +738,7 @@ describe("TasksView session status", () => {
     act(() => {
       socket().emit("status_changed", {
         task_id: 1,
+        session: "main",
         from: "waiting-input",
         to: "working",
         reason: "operator answered the pending question",
@@ -692,6 +765,7 @@ describe("TasksView session status", () => {
         tier: "interrupt",
         status: "failed",
         reason: "process exited with code 1",
+        session: "main",
       });
     });
     expect(icon()?.getAttribute("href")).toMatch(/^data:image\/svg\+xml/);
@@ -727,10 +801,12 @@ describe("TasksView session status", () => {
       tasks: [makeTask()],
       sessions: {
         "1": {
-          status: "waiting-input",
-          reason: "pending question 'ask-ui-1'",
-          since: "t0",
-          question: askQuestion,
+          main: {
+            status: "waiting-input",
+            reason: "pending question 'ask-ui-1'",
+            since: "t0",
+            question: askQuestion,
+          },
         },
       },
     });
@@ -744,7 +820,7 @@ describe("TasksView session status", () => {
     await user.click(recommended);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/tasks/1/agent/answer",
+      "/api/tasks/1/sessions/main/agent/answer",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({ question_id: "ask-ui-1", selections: ["both"] }),
@@ -761,28 +837,32 @@ describe("TasksView session status", () => {
       ],
       sessions: {
         "1": {
-          status: "waiting-input",
-          reason: "pending question",
-          since: "t0",
-          question: {
-            id: "ask-ui-2",
-            kind: "ask",
-            questions: [
-              {
-                prompt: "Pick one or more",
-                options: [{ value: "a", label: "A", description: null }],
-                multi: true,
-                recommended: null,
-                allowsOther: false,
-              },
-            ],
+          main: {
+            status: "waiting-input",
+            reason: "pending question",
+            since: "t0",
+            question: {
+              id: "ask-ui-2",
+              kind: "ask",
+              questions: [
+                {
+                  prompt: "Pick one or more",
+                  options: [{ value: "a", label: "A", description: null }],
+                  multi: true,
+                  recommended: null,
+                  allowsOther: false,
+                },
+              ],
+            },
           },
         },
         "2": {
-          status: "waiting-approval",
-          reason: "pending approval",
-          since: "t0",
-          question: { id: "approval-ui-1", kind: "approval", questions: [] },
+          main: {
+            status: "waiting-approval",
+            reason: "pending approval",
+            since: "t0",
+            question: { id: "approval-ui-1", kind: "approval", questions: [] },
+          },
         },
       },
     });
@@ -799,21 +879,24 @@ describe("TasksView session status", () => {
       tasks: [makeTask()],
       sessions: {
         "1": {
-          status: "waiting-input",
-          reason: "pending question",
-          since: "t0",
-          question: askQuestion,
+          main: {
+            status: "waiting-input",
+            reason: "pending question",
+            since: "t0",
+            question: askQuestion,
+          },
         },
       },
     });
     expect(screen.getByTestId("quick-answer-1")).toBeInTheDocument();
 
     act(() => {
-      socket().emit("question_resolved", { task_id: 1, question_id: "ask-ui-1" });
+      socket().emit("question_resolved", { task_id: 1, session: "main", question_id: "ask-ui-1" });
     });
     act(() => {
       socket().emit("status_changed", {
         task_id: 1,
+        session: "main",
         from: "waiting-input",
         to: "working",
         reason: "operator answered the pending question",
@@ -832,17 +915,207 @@ describe("TasksView session status", () => {
         makeTask({ id: 3, slug: "third", branch: "bjornt/third" }),
       ],
       sessions: {
-        "1": { status: "waiting-input", reason: "pending question", since: "t0" },
-        "2": { status: "waiting-approval", reason: "pending approval", since: "t0" },
-        "3": { status: "working", reason: "agent_start frame", since: "t0" },
+        "1": { main: { status: "waiting-input", reason: "pending question", since: "t0" } },
+        "2": { main: { status: "waiting-approval", reason: "pending approval", since: "t0" } },
+        "3": { main: { status: "working", reason: "agent_start frame", since: "t0" } },
       },
       attention: {
-        "1": { tier: "notify", status: "waiting-input", reason: "pending question" },
-        "2": { tier: "interrupt", status: "waiting-approval", reason: "pending approval" },
+        "1": { tier: "notify", status: "waiting-input", reason: "pending question", session: "main" },
+        "2": { tier: "interrupt", status: "waiting-approval", reason: "pending approval", session: "main" },
       },
     });
 
     expect(screen.getByText("2 need you")).toBeInTheDocument();
+  });
+});
+
+describe("TasksView workflow pills", () => {
+  function stepRecord(overrides: Record<string, unknown>) {
+    return {
+      task_id: 1,
+      seq: 1,
+      step: "work",
+      kind: "agent",
+      session: "main",
+      status: "running",
+      outcome: null,
+      error: null,
+      prompted_at: null,
+      started_at: "t0",
+      finished_at: null,
+      ...overrides,
+    };
+  }
+
+  it("prefixes the pill with the current step while an agent step runs", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask({ workflow_status: "running", workflow_step: "work" })],
+      sessions: {
+        "1": { main: { status: "working", reason: "agent_start frame", since: "t0" } },
+      },
+      workflows: {
+        "1": { name: "single-step", status: "running", step: "work", steps: [stepRecord({})] },
+      },
+    });
+
+    const card = screen.getByTestId("task-card-1");
+    expect(card.querySelector(".statePill.live")).toHaveTextContent("work: working");
+    // Tier styling and the slide bar still follow the session status.
+    expect(screen.getByTestId("slide-bar-1")).toBeInTheDocument();
+  });
+
+  it("reads '<step>: waiting-input' with the waiting tier when the step's session asks", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask({ workflow_status: "running", workflow_step: "validate" })],
+      sessions: {
+        "1": {
+          main: {
+            status: "waiting-input",
+            reason: "pending question 'ask-1'",
+            since: "t0",
+            question: {
+              id: "ask-1",
+              kind: "ask",
+              questions: [
+                {
+                  prompt: "Widen?",
+                  options: [{ value: "y", label: "Yes", description: null }],
+                  multi: false,
+                  recommended: null,
+                  allowsOther: false,
+                },
+              ],
+            },
+          },
+        },
+      },
+      workflows: {
+        "1": {
+          name: "reproduce-and-fix",
+          status: "running",
+          step: "validate",
+          steps: [stepRecord({ step: "validate" })],
+        },
+      },
+    });
+
+    expect(screen.getByTestId("task-card-1")).toHaveTextContent("validate: waiting-input");
+  });
+
+  it("reads '<step>: running' for command steps", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask({ workflow_status: "running", workflow_step: "build" })],
+      sessions: {
+        "1": { main: { status: "idle", reason: "queue empty", since: "t0" } },
+      },
+      workflows: {
+        "1": {
+          name: "build-and-fix",
+          status: "running",
+          step: "build",
+          steps: [
+            stepRecord({ step: "work", status: "ok", finished_at: "t1" }),
+            stepRecord({ seq: 2, step: "build", kind: "command", session: null }),
+          ],
+        },
+      },
+    });
+
+    const pill = screen.getByTestId("workflow-pill-1");
+    expect(pill).toHaveTextContent("build: running");
+    expect(pill.className).toContain("live");
+  });
+
+  it("reads '<step>: waiting' with notify styling while parked at a gate", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask({ workflow_status: "waiting", workflow_step: "confirm" })],
+      sessions: {
+        "1": { main: { status: "idle", reason: "queue empty", since: "t0" } },
+      },
+      workflows: {
+        "1": {
+          name: "reproduce-and-fix",
+          status: "waiting",
+          step: "confirm",
+          steps: [
+            stepRecord({ step: "fix", status: "ok", finished_at: "t1" }),
+            stepRecord({
+              seq: 2,
+              step: "confirm",
+              kind: "gate",
+              session: null,
+              status: "waiting",
+              outcome: { message: "Ship it?" },
+            }),
+          ],
+        },
+      },
+    });
+
+    const pill = screen.getByTestId("workflow-pill-1");
+    expect(pill).toHaveTextContent("confirm: waiting");
+    expect(pill.className).toContain("notify");
+  });
+
+  it("renders the bare session status once the run completes", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask({ workflow_status: "complete", workflow_step: "work" })],
+      sessions: {
+        "1": { main: { status: "idle", reason: "queue empty", since: "t0" } },
+      },
+      workflows: {
+        "1": {
+          name: "single-step",
+          status: "complete",
+          step: "work",
+          steps: [stepRecord({ status: "ok", finished_at: "t1" })],
+        },
+      },
+    });
+
+    const pill = screen.getByTestId("task-card-1").querySelector(".statePill.neutral");
+    expect(pill).toHaveTextContent("idle");
+    expect(pill).not.toHaveTextContent("work:");
+  });
+
+  it("fails the card with the step error on the pill when the workflow fails", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask({ workflow_status: "failed", workflow_step: "build" })],
+      sessions: {
+        "1": { main: { status: "idle", reason: "queue empty", since: "t0" } },
+      },
+      workflows: {
+        "1": {
+          name: "build-and-fix",
+          status: "failed",
+          step: "build",
+          steps: [
+            stepRecord({ step: "work", status: "ok", finished_at: "t1" }),
+            stepRecord({
+              seq: 2,
+              step: "build",
+              kind: "command",
+              session: null,
+              status: "failed",
+              error: "exit code 2",
+              finished_at: "t2",
+            }),
+          ],
+        },
+      },
+    });
+
+    const card = screen.getByTestId("task-card-1");
+    expect(card.className).toContain("failed");
+    const pill = screen.getByTestId("workflow-failed-pill-1");
+    expect(pill).toHaveTextContent("build: failed");
+    expect(pill).toHaveAttribute("title", "exit code 2");
   });
 });
 
@@ -912,7 +1185,7 @@ describe("Review capability (TasksView)", () => {
       projects: [project],
       tasks: [makeTask()],
       sessions: {
-        "1": { status: "reviewing", reason: "llmvet review on http://127.0.0.1:7180", since: "t0" },
+        "1": { main: { status: "reviewing", reason: "llmvet review on http://127.0.0.1:7180", since: "t0" } },
       },
       reviews: {
         "1": {
@@ -937,7 +1210,7 @@ describe("Review capability (TasksView)", () => {
       projects: [project],
       tasks: [makeTask()],
       sessions: {
-        "1": { status: "idle", reason: "agent_end", since: "t0" },
+        "1": { main: { status: "idle", reason: "agent_end", since: "t0" } },
       },
     });
     const user = userEvent.setup();
@@ -965,7 +1238,7 @@ describe("ShipFlowView", () => {
       projects: [project],
       tasks: [makeTask()],
       sessions: {
-        "1": { status: "reviewing", reason: "llmvet review", since: "t0" },
+        "1": { main: { status: "reviewing", reason: "llmvet review", since: "t0" } },
       },
       gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
       reviews: {

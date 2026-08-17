@@ -4,15 +4,22 @@ import { ContextRing } from "../components/ContextRing";
 import { answerAgent, cleanupTask, startReview } from "../lib/api";
 import { confirmCleanup, prLinkLabel } from "../lib/cleanup";
 import { formatTokensCost } from "../lib/advisories";
-import { isSpawning } from "../lib/daemonReducer";
+import {
+  currentStepRecord,
+  defaultSessionName,
+  isSpawning,
+  workflowActive,
+} from "../lib/daemonReducer";
 import { useDaemonState } from "../lib/daemonSocket";
 import type {
+  AdvisoryKind,
   AdvisoryPayload,
   PendingQuestion,
   ReviewState,
   SessionInfo,
   StatsPayload,
   Task,
+  WorkflowState,
 } from "../types";
 import "./TasksView.css";
 
@@ -25,14 +32,22 @@ function fitsInlineQuickAnswer(question: PendingQuestion): boolean {
   return !q.multi && q.options.length > 0;
 }
 
-function QuickAnswer({ taskId, question }: { taskId: number; question: PendingQuestion }) {
+function QuickAnswer({
+  taskId,
+  session,
+  question,
+}: {
+  taskId: number;
+  session: string;
+  question: PendingQuestion;
+}) {
   const [busy, setBusy] = useState(false);
   const q = question.questions[0];
 
   async function answer(value: string) {
     setBusy(true);
     try {
-      await answerAgent(taskId, { question_id: question.id, selections: [value] });
+      await answerAgent(taskId, session, { question_id: question.id, selections: [value] });
     } finally {
       setBusy(false);
     }
@@ -73,12 +88,23 @@ export function formatElapsed(fromIso: string, now: Date = new Date()): string {
 /** The session pill with SPEC D4 tier styling (per the Tasks.dc.html mockup):
  * working/starting breathe quietly, idle/retrying are bordered quiet badges,
  * stalled is the notify tier (amber), failed is the interrupt tier — with
- * the transition reason accessible on the pill. */
-function SessionPill({ session, review }: { session: SessionInfo; review?: ReviewState }) {
+ * the transition reason accessible on the pill. While the task's workflow
+ * run is in flight the pill is step-prefixed (`<step>: <status>`, tasks
+ * spec); after completion it renders the bare session status as before. */
+function SessionPill({
+  session,
+  review,
+  prefix,
+}: {
+  session: SessionInfo;
+  review?: ReviewState;
+  prefix?: string | null;
+}) {
+  const label = prefix ? `${prefix}: ${session.status}` : session.status;
   if (session.status === "failed") {
     return (
       <span className="statePill failed" title={session.reason}>
-        {session.status}
+        {label}
       </span>
     );
   }
@@ -86,7 +112,7 @@ function SessionPill({ session, review }: { session: SessionInfo; review?: Revie
     return (
       <span className="statePill notify" title={session.reason}>
         <span className="notifyDot" />
-        {session.status}
+        {label}
       </span>
     );
   }
@@ -94,7 +120,7 @@ function SessionPill({ session, review }: { session: SessionInfo; review?: Revie
     return (
       <span className="statePill review" title={session.reason}>
         <span className="notifyDot" />
-        {session.status}
+        {label}
         {review && (
           <a
             className="reviewPillLink"
@@ -113,40 +139,71 @@ function SessionPill({ session, review }: { session: SessionInfo; review?: Revie
     return (
       <span className="statePill neutral" title={session.reason}>
         <span className="ringDot" />
-        {session.status}
+        {label}
       </span>
     );
   }
   return (
     <span className="statePill live" title={session.reason}>
       <span className="breathingDot" />
-      {session.status}
+      {label}
     </span>
   );
 }
 
+/** The pill a card shows during an active workflow run (tasks spec): agent
+ * steps prefix the underlying session status; command/decision steps read
+ * `<step>: running`; a parked gate reads `<step>: waiting` with notify-tier
+ * styling. Returns null when the run isn't active — the bare session pill
+ * renders exactly as before workflows. */
+function workflowPill(
+  workflow: WorkflowState | undefined,
+): { label: string; tier: "notify" | "live" } | null {
+  if (!workflowActive(workflow) || workflow?.step == null) return null;
+  const kind = currentStepRecord(workflow)?.kind;
+  if (kind === "gate") return { label: `${workflow.step}: waiting`, tier: "notify" };
+  if (kind === "command" || kind === "decision")
+    return { label: `${workflow.step}: running`, tier: "live" };
+  return null; // agent step (or no record yet): the session pill carries the prefix
+}
+
 function TaskCard({
   task,
-  session,
+  sessions,
+  workflow,
   stats,
   advisories,
   review,
 }: {
   task: Task;
-  session: SessionInfo | undefined;
-  stats: StatsPayload | undefined;
-  advisories: Partial<Record<"context-high" | "maybe-waiting", AdvisoryPayload>> | undefined;
+  sessions: Record<string, SessionInfo> | undefined;
+  workflow: WorkflowState | undefined;
+  stats: Record<string, StatsPayload> | undefined;
+  advisories: Record<string, Partial<Record<AdvisoryKind, AdvisoryPayload>>> | undefined;
   review: ReviewState | undefined;
 }) {
   const [showError, setShowError] = useState(false);
   const spawning = isSpawning(task);
+  // The card reports on the workflow's relevant session (tasks spec): the
+  // current step's session while the run is in flight, else the primary.
+  const sessionName = defaultSessionName(sessions, workflow);
+  const session = sessions?.[sessionName];
+  const runPill = workflowPill(workflow);
+  const stepPrefix = workflowActive(workflow) ? workflow?.step : null;
   const sessionFailed = session?.status === "failed";
-  const failed = task.state === "failed" || sessionFailed;
+  const failedStep =
+    workflow?.status === "failed"
+      ? [...workflow.steps].reverse().find((record) => record.status === "failed")
+      : undefined;
+  const failed = task.state === "failed" || sessionFailed || workflow?.status === "failed";
   const stalled = session?.status === "stalled";
-  const animating = session?.status === "working" || session?.status === "starting";
-  const contextHigh = advisories?.["context-high"];
-  const maybeWaiting = advisories?.["maybe-waiting"];
-  const tokensCost = formatTokensCost(stats);
+  const animating =
+    session?.status === "working" ||
+    session?.status === "starting" ||
+    runPill?.tier === "live";
+  const contextHigh = advisories?.[sessionName]?.["context-high"];
+  const maybeWaiting = advisories?.[sessionName]?.["maybe-waiting"];
+  const tokensCost = formatTokensCost(stats?.[sessionName]);
   const [startingReview, setStartingReview] = useState(false);
 
   async function onReview() {
@@ -174,8 +231,21 @@ function TaskCard({
       <div className="cardTop">
         <span className="cardProject">{task.project_name}</span>
         <span className="cardSpacer" />
-        {session ? (
-          <SessionPill session={session} review={review} />
+        {workflow?.status === "failed" && !sessionFailed ? (
+          <span
+            className="statePill failed"
+            title={failedStep?.error ?? undefined}
+            data-testid={`workflow-failed-pill-${task.id}`}
+          >
+            {failedStep ? `${failedStep.step}: failed` : "workflow failed"}
+          </span>
+        ) : runPill ? (
+          <span className={`statePill ${runPill.tier}`} data-testid={`workflow-pill-${task.id}`}>
+            {runPill.tier === "notify" ? <span className="notifyDot" /> : <span className="breathingDot" />}
+            {runPill.label}
+          </span>
+        ) : session ? (
+          <SessionPill session={session} review={review} prefix={stepPrefix} />
         ) : (
           <span className={`statePill ${failed ? "failed" : spawning ? "spawning" : "neutral"}`}>
             {spawning && <span className="pillDot" />}
@@ -236,7 +306,7 @@ function TaskCard({
       )}
       {session?.status === "waiting-input" &&
         (session.question && fitsInlineQuickAnswer(session.question) ? (
-          <QuickAnswer taskId={task.id} question={session.question} />
+          <QuickAnswer taskId={task.id} session={sessionName} question={session.question} />
         ) : (
           <div className="quickAnswerDefer" data-testid={`quick-answer-defer-${task.id}`}>
             Open task detail to answer.
@@ -284,7 +354,7 @@ function TaskCard({
 }
 
 export function TasksView() {
-  const { tasks, projects, sessions, stats, advisories, reviews } = useDaemonState();
+  const { tasks, projects, sessions, workflows, stats, advisories, reviews } = useDaemonState();
   const [searchParams] = useSearchParams();
   // Project filter (projects-view capability): the Projects card's
   // active-tasks pill lands here via `?project=<name>`.
@@ -328,7 +398,8 @@ export function TasksView() {
             <TaskCard
               key={task.id}
               task={task}
-              session={sessions[task.id]}
+              sessions={sessions[task.id]}
+              workflow={workflows[task.id]}
               stats={stats[task.id]}
               advisories={advisories[task.id]}
               review={reviews[task.id]}

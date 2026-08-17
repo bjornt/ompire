@@ -37,12 +37,20 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0007"
+    assert version == "0008"
     assert "projects" in tables
     assert "tasks" in tables
     assert "templates" in tables
+    assert "task_sessions" in tables
+    assert "workflow_step_records" in tables
     assert "pr_url" in task_columns
     assert "template_name" in task_columns
+    # Workflow run state lives on the task row (workflow-engine capability).
+    assert "workflow_name" in task_columns
+    assert "workflow_status" in task_columns
+    assert "workflow_step" in task_columns
+    # Session identity moved to task_sessions (per-session rows).
+    assert "session_id" not in task_columns
     # The per-project spawn defaults moved to templates (SPEC Decision 6).
     assert "base_branch" not in project_columns
     assert "branch_pattern" not in project_columns
@@ -67,7 +75,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0007"
+    assert version == "0008"
     assert row == "demo"
 
 
@@ -122,7 +130,7 @@ def test_0007_seeds_templates_and_drops_project_columns(tmp_path: Path) -> None:
     engine = make_engine(db_path)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "0007"
+        assert version == "0008"
 
         templates = conn.execute(
             text(
@@ -145,6 +153,133 @@ def test_0007_seeds_templates_and_drops_project_columns(tmp_path: Path) -> None:
             text("SELECT project_name, slug, template_name FROM tasks")
         ).one()
         assert task == ("demo", "old-fix", None)
+
+
+def _land_at_0007_with_tasks(db_path: Path) -> None:
+    """Upgrade to 0007, then seed one live spawn-completed task with a session
+    id, one live mid-spawn task (never completed), one failed task with a
+    session id, and one archived task with a session id."""
+    from alembic import command
+
+    command.upgrade(_alembic_cfg(db_path), "0007")
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO projects (name, title, upstream_url, fork_url, checkout_path) "
+                "VALUES ('demo', 'Demo', 'https://example.com/demo', NULL, '/tmp/demo')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO tasks (project_name, template_name, slug, branch, clone_path, "
+                "state, prompt, error, workshop_id, session_id, pr_url, spawn_completed_at, "
+                "created_at, updated_at) VALUES "
+                "('demo', 'demo', 'live-fix', 'ompire/live-fix', '/tmp/tasks/demo/live-fix', "
+                "'created', 'fix it', NULL, 'ws-1', 'omp-session-1', NULL, "
+                "'2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00', "
+                "'2026-08-01T00:00:00+00:00'), "
+                "('demo', 'demo', 'mid-spawn', 'ompire/mid-spawn', '/tmp/tasks/demo/mid-spawn', "
+                "'created', 'fix it', NULL, NULL, NULL, NULL, NULL, "
+                "'2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00'), "
+                "('demo', 'demo', 'failed-task', 'ompire/failed-task', '/tmp/tasks/demo/failed-task', "
+                "'failed', 'fix it', 'boom', 'ws-2', 'omp-session-2', NULL, "
+                "'2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00', "
+                "'2026-08-01T00:00:00+00:00'), "
+                "('demo', 'demo', 'archived-task', 'ompire/archived-task', "
+                "'/tmp/tasks/demo/archived-task', 'archived', 'fix it', NULL, 'ws-3', "
+                "'omp-session-3', NULL, '2026-08-01T00:00:00+00:00', "
+                "'2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00')"
+            )
+        )
+
+
+def test_0008_backfills_sessions_and_legacy_workflow_runs(tmp_path: Path) -> None:
+    """Design D-5: live tasks' session ids become session `main` rows; legacy
+    live (spawn-completed, created) tasks become `single-step`/`complete` with
+    one ok `work` record so the engine never re-drives them."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0007_with_tasks(db_path)
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    engine = make_engine(db_path)
+    with engine.connect() as conn:
+        version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+        assert version == "0008"
+
+        sessions = conn.execute(
+            text("SELECT task_id, name, omp_session_id FROM task_sessions ORDER BY task_id")
+        ).all()
+        task_ids = {
+            row[0]: row[1]
+            for row in conn.execute(text("SELECT slug, id FROM tasks"))
+        }
+        live_id = task_ids["live-fix"]
+        # Live tasks with a session id are backfilled; failed ones too (they
+        # are live rows), archived ones are not.
+        assert (live_id, "main", "omp-session-1") in sessions
+        assert (task_ids["failed-task"], "main", "omp-session-2") in sessions
+        assert not any(s[0] == task_ids["archived-task"] for s in sessions)
+        assert not any(s[0] == task_ids["mid-spawn"] for s in sessions)
+
+        records = conn.execute(
+            text(
+                "SELECT task_id, seq, step, kind, session, status FROM workflow_step_records"
+            )
+        ).all()
+        # Only the spawn-completed live task gets the synthetic ok record.
+        assert records == [(live_id, 1, "work", "agent", "main", "ok")]
+
+        runs = {
+            row[0]: (row[1], row[2])
+            for row in conn.execute(
+                text("SELECT slug, workflow_name, workflow_status FROM tasks")
+            )
+        }
+        assert runs["live-fix"] == ("single-step", "complete")
+        assert runs["mid-spawn"] == ("single-step", None)
+        assert runs["failed-task"] == ("single-step", None)
+        assert runs["archived-task"] == ("single-step", None)
+
+        task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
+        assert "session_id" not in task_columns
+
+
+def test_0008_downgrade_restores_session_id(tmp_path: Path) -> None:
+    """The downgrade re-adds `tasks.session_id` from each task's `main`
+    session row (documented data loss for non-`main` sessions and step
+    history)."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0007_with_tasks(db_path)
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    from alembic import command
+
+    command.downgrade(_alembic_cfg(db_path), "0007")
+
+    engine = make_engine(db_path)
+    with engine.connect() as conn:
+        version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+        assert version == "0007"
+        task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
+        assert "session_id" in task_columns
+        assert "workflow_name" not in task_columns
+        rows = {
+            row[0]: row[1]
+            for row in conn.execute(text("SELECT slug, session_id FROM tasks"))
+        }
+        assert rows["live-fix"] == "omp-session-1"
+        assert rows["failed-task"] == "omp-session-2"
+        # Archived tasks were not backfilled into task_sessions: nothing to
+        # restore (their clones are deleted anyway).
+        assert rows["archived-task"] is None
+        tables = {
+            row[0]
+            for row in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
+        }
+        assert "task_sessions" not in tables
+        assert "workflow_step_records" not in tables
 
 
 def test_0007_downgrade_restores_project_columns(tmp_path: Path) -> None:
@@ -183,13 +318,17 @@ def test_0007_downgrade_restores_project_columns(tmp_path: Path) -> None:
 
 
 def test_migration_0004_session_id_upgrade_downgrade_roundtrip(tmp_path: Path) -> None:
+    """0004 added `tasks.session_id`; 0008 moved session identity to
+    `task_sessions`. Downgrading to 0003 still drops the old column;
+    re-upgrading to 0007 restores it, and 0008 moves it off again."""
     db_path = tmp_path / "ompire.db"
     upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
 
     engine = make_engine(db_path)
     with engine.connect() as conn:
         columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
-    assert "session_id" in columns
+    # At head, session identity lives on task_sessions, not the task row.
+    assert "session_id" not in columns
     assert "pr_url" in columns
 
     from alembic import command
@@ -205,12 +344,20 @@ def test_migration_0004_session_id_upgrade_downgrade_roundtrip(tmp_path: Path) -
     assert version == "0003"
     assert "session_id" not in columns
 
-    # Back to head: the column returns and existing rows survive the round trip.
-    command.upgrade(cfg, "head")
+    # 0007 has the column back; head drops it again (into task_sessions).
+    command.upgrade(cfg, "0007")
     with engine.connect() as conn:
         columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
     assert "session_id" in columns
-    assert "pr_url" in columns
+    command.upgrade(cfg, "head")
+    with engine.connect() as conn:
+        columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
+        tables = {
+            row[0]
+            for row in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
+        }
+    assert "session_id" not in columns
+    assert "task_sessions" in tables
 
 
 @pytest.fixture

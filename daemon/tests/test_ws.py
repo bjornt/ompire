@@ -18,6 +18,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
             "templates",
             "tasks",
             "sessions",
+            "workflows",
             "attention",
             "reviews",
             "ships",
@@ -27,6 +28,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         assert payload["templates"] == []
         assert payload["tasks"] == []
         assert payload["sessions"] == {}
+        assert payload["workflows"] == {}
         assert payload["attention"] == {}
         assert payload["reviews"] == {}
         assert payload["ships"] == {}
@@ -124,30 +126,62 @@ def test_task_events_and_snapshot(
             json={"template_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
         )
         assert response.status_code == 202
+        task_id = response.json()["id"]
 
         created = ws.receive_json()
         assert created["type"] == "task_created"
         assert created["payload"]["slug"] == "fix-bug"
         assert created["payload"]["branch"] == "ompire/fix-bug"
+        # Tasks carry workflow run state, never a session id (the engine owns
+        # sessions now).
+        assert "session_id" not in created["payload"]
+        assert created["payload"]["workflow_name"] == "single-step"
 
-        # Drain until the pipeline settles: spawn_step/status_changed events,
-        # an interim task_updated once the session id is captured (design
-        # D-2, crash-recovery capability), then the completing task_updated.
+        # Drain until the pipeline settles. `spawn_step` covers the four
+        # workspace steps only (fetch/clone/branch/workshop); session spawn
+        # and the prompt are the workflow engine's `workflow_step` events
+        # afterwards, and run-state changes arrive as task_updated.
         steps = []
         while True:
             event = ws.receive_json()
             if event["type"] == "task_updated" and event["payload"]["spawn_completed_at"] is not None:
                 break
-            assert event["type"] in ("spawn_step", "status_changed", "task_updated")
+            assert event["type"] in ("spawn_step", "status_changed", "task_updated", "workflow_step")
             if event["type"] == "spawn_step":
                 steps.append((event["payload"]["step"], event["payload"]["status"]))
         assert ("clone", "ok") in steps
-        assert ("agent", "ok") in steps
-        assert ("prompt", "ok") in steps
+        assert ("workshop", "ok") in steps
+
+        # The workflow engine runs the single-step `work` step on the `main`
+        # session to completion once the fake omp's burst idles.
+        workflow_events = []
+        while True:
+            event = ws.receive_json()
+            if event["type"] == "workflow_step" and event["payload"]["task_id"] == task_id:
+                workflow_events.append(event["payload"])
+            if (
+                event["type"] == "task_updated"
+                and event["payload"]["id"] == task_id
+                and event["payload"]["workflow_status"] == "complete"
+            ):
+                break
+        assert [(e["step"], e["kind"], e["session"], e["status"]) for e in workflow_events] == [
+            ("work", "agent", "main", "started"),
+            ("work", "agent", "main", "ok"),
+        ]
 
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         snapshot = ws.receive_json()
         assert [t["slug"] for t in snapshot["payload"]["tasks"]] == ["fix-bug"]
+        # The workflows map carries the run: name/status/step plus the
+        # step-record history.
+        workflow = snapshot["payload"]["workflows"][str(task_id)]
+        assert workflow["name"] == "single-step"
+        assert workflow["status"] == "complete"
+        assert workflow["step"] is None
+        assert [(s["step"], s["kind"], s["session"], s["status"]) for s in workflow["steps"]] == [
+            ("work", "agent", "main", "ok")
+        ]
 
 
 def test_snapshot_carries_session_statuses(
@@ -166,15 +200,26 @@ def test_snapshot_carries_session_statuses(
         # The fake omp's burst ends quietly: wait for the idle transition.
         while True:
             event = ws.receive_json()
-            if event["type"] == "status_changed" and event["payload"]["to"] == "idle":
+            if (
+                event["type"] == "status_changed"
+                and event["payload"]["task_id"] == task_id
+                and event["payload"]["to"] == "idle"
+            ):
+                assert event["payload"]["session"] == "main"
                 break
 
-    # A reconnect sees the current status without replaying events.
+    # A reconnect sees the current status without replaying events, nested
+    # task → session.
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         snapshot = ws.receive_json()
-        session = snapshot["payload"]["sessions"][str(task_id)]
+        session = snapshot["payload"]["sessions"][str(task_id)]["main"]
         assert session["status"] == "idle"
         assert "queue empty" in session["reason"]
         assert session["since"]
 
-    assert client.post(f"/api/tasks/{task_id}/agent/stop", headers=auth_headers).status_code == 200
+    assert (
+        client.post(
+            f"/api/tasks/{task_id}/sessions/main/agent/stop", headers=auth_headers
+        ).status_code
+        == 200
+    )

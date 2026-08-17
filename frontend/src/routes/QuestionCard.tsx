@@ -9,7 +9,16 @@ import type { PendingQuestion } from "../types";
  * approve/deny card. Submitting calls the answer endpoint; the card is
  * unmounted by the caller once `question_resolved` clears it from state. */
 
-export function QuestionCard({ taskId, question }: { taskId: number; question: PendingQuestion }) {
+export function QuestionCard({
+  taskId,
+  session,
+  question,
+}: {
+  taskId: number;
+  /** Session whose pending question this card answers (workflow-engine). */
+  session: string;
+  question: PendingQuestion;
+}) {
   const [selections, setSelections] = useState<Record<number, string[]>>({});
   const [otherText, setOtherText] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState(false);
@@ -19,7 +28,7 @@ export function QuestionCard({ taskId, question }: { taskId: number; question: P
     setBusy(true);
     setError(null);
     try {
-      await answerAgent(taskId, { question_id: question.id, approved });
+      await answerAgent(taskId, session, { question_id: question.id, approved });
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -84,7 +93,7 @@ export function QuestionCard({ taskId, question }: { taskId: number; question: P
         .map((t) => t.trim())
         .filter(Boolean)
         .join("\n");
-      await answerAgent(taskId, {
+      await answerAgent(taskId, session, {
         question_id: question.id,
         ...(allSelections.length > 0 ? { selections: allSelections } : {}),
         ...(combinedOther ? { text: combinedOther } : {}),

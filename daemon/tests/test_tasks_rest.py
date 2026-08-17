@@ -306,8 +306,16 @@ def test_cleanup_clears_attention_entry(
     task = _spawn(client, auth_headers)
     _wait_settled(client, auth_headers, task["id"])
 
+    # The workflow engine spawns the `main` session lazily after the
+    # workspace steps, so wait for it to be tracked before failing it —
+    # failing a never-tracked session is a no-op by design.
+    deadline = time.monotonic() + 10
+    while app.state.sessions.get(task["id"], "main") is None:
+        assert time.monotonic() < deadline, "main session never tracked"
+        time.sleep(0.05)
+
     # Drive the session into a notifying tier through the public tracker API.
-    app.state.sessions.spawn_step_failed(task["id"], "boom")
+    app.state.sessions.session_start_failed(task["id"], "main", "boom")
     # The notifier consumes the hub from the app's loop — give it a moment.
     deadline = time.monotonic() + 5
     while task["id"] not in app.state.notifications.snapshot():

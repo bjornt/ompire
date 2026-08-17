@@ -67,7 +67,12 @@ tasks = Table(
     Column("prompt", Text, nullable=False),
     Column("error", Text, nullable=True),
     Column("workshop_id", String, nullable=True),
-    Column("session_id", String, nullable=True),
+    # Workflow run state (workflow-engine capability): name denormalized from
+    # the template at creation; status/step NULL for legacy rows and whenever
+    # no run is active.
+    Column("workflow_name", String, nullable=False, server_default="single-step"),
+    Column("workflow_status", String, nullable=True),
+    Column("workflow_step", String, nullable=True),
     Column("pr_url", String, nullable=True),
     Column("pr_state", String, nullable=True),
     Column("pr_merged_at", String, nullable=True),
@@ -82,6 +87,38 @@ tasks = Table(
         unique=True,
         sqlite_where=text("state != 'archived'"),
     ),
+)
+
+
+# Named omp sessions per task (workflow-engine capability): identity for
+# `omp --resume` is per (task, session), not per task.
+task_sessions = Table(
+    "task_sessions",
+    metadata,
+    Column("task_id", Integer, ForeignKey("tasks.id"), primary_key=True),
+    Column("name", String, primary_key=True),
+    Column("omp_session_id", String, nullable=True),
+    Column("spawned_at", String, nullable=False),
+)
+
+# One row per executed workflow step; identity is (task_id, seq) because loops
+# revisit step names. `prompted_at` marks an agent step's prompt as sent, so
+# restart recovery can tell "never prompted" (send fresh) from "turn lost"
+# (resume-nudge) — see the workflow-engine design's recovery rules.
+workflow_step_records = Table(
+    "workflow_step_records",
+    metadata,
+    Column("task_id", Integer, ForeignKey("tasks.id"), primary_key=True),
+    Column("seq", Integer, primary_key=True),
+    Column("step", String, nullable=False),
+    Column("kind", String, nullable=False),
+    Column("session", String, nullable=True),
+    Column("status", String, nullable=False),
+    Column("outcome_json", Text, nullable=True),
+    Column("error", Text, nullable=True),
+    Column("prompted_at", String, nullable=True),
+    Column("started_at", String, nullable=False),
+    Column("finished_at", String, nullable=True),
 )
 
 

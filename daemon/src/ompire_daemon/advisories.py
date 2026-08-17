@@ -77,9 +77,10 @@ class AdvisorySampler:
         self._hub = hub
         self._throttle = stats_throttle_interval
         self._threshold = context_advisory_threshold
-        self._last_sampled_at: dict[int, float] = {}
-        self._context_high: set[int] = set()
-        self._maybe_waiting: set[int] = set()
+        # Keyed (task_id, session) like the tracker (workflow-engine D-1).
+        self._last_sampled_at: dict[tuple[int, str], float] = {}
+        self._context_high: set[tuple[int, str]] = set()
+        self._maybe_waiting: set[tuple[int, str]] = set()
         self._queue: asyncio.Queue | None = None
         self._run_task: asyncio.Task | None = None
 
@@ -113,36 +114,47 @@ class AdvisorySampler:
             if event.type != "status_changed":
                 continue
             task_id = event.payload.get("task_id")
+            session = event.payload.get("session")
             to_status = event.payload.get("to")
-            if isinstance(task_id, int) and isinstance(to_status, str):
-                self._clear_maybe_waiting_if_left_idle(task_id, to_status)
+            if (
+                isinstance(task_id, int)
+                and isinstance(session, str)
+                and isinstance(to_status, str)
+            ):
+                self._clear_maybe_waiting_if_left_idle(task_id, session, to_status)
 
     def clear_task(self, task_id: int) -> None:
         """Drop per-task bookkeeping (task cleanup/purge, mirroring
         `SessionTracker.discard`)."""
-        self._last_sampled_at.pop(task_id, None)
-        self._context_high.discard(task_id)
-        self._maybe_waiting.discard(task_id)
+        for key in [key for key in self._last_sampled_at if key[0] == task_id]:
+            self._last_sampled_at.pop(key, None)
+        for key in [key for key in self._context_high if key[0] == task_id]:
+            self._context_high.discard(key)
+        for key in [key for key in self._maybe_waiting if key[0] == task_id]:
+            self._maybe_waiting.discard(key)
 
     # --- sampling (invoked via the tracker hooks, or directly in tests) ------
 
-    async def sample_turn_end(self, task_id: int, handle: AgentHandle) -> None:
+    async def sample_turn_end(self, task_id: int, session: str, handle: AgentHandle) -> None:
         """Throttled `get_state`/`get_session_stats` sample at a turn
         boundary (design D-5): broadcasts `stats` and updates the
         `context-high` advisory. A failed sample is logged and skipped —
         it must never disrupt the session's idle transition, which the
         tracker drives independently of this hook."""
+        key = (task_id, session)
         now = time.monotonic()
-        last = self._last_sampled_at.get(task_id)
+        last = self._last_sampled_at.get(key)
         if last is not None and now - last < self._throttle:
             return
         try:
             state_response = await handle.request("get_state")
             stats_response = await handle.request("get_session_stats")
         except Exception as exc:  # noqa: BLE001 — sampling must never disrupt idle
-            logger.warning("advisory stats sample failed for task %d: %s", task_id, exc)
+            logger.warning(
+                "advisory stats sample failed for task %d session %s: %s", task_id, session, exc
+            )
             return
-        self._last_sampled_at[task_id] = now
+        self._last_sampled_at[key] = now
 
         state_data = state_response.get("data")
         state_data = state_data if isinstance(state_data, dict) else {}
@@ -154,6 +166,7 @@ class AdvisorySampler:
             "stats",
             {
                 "task_id": task_id,
+                "session": session,
                 "context_pct": context_pct,
                 "tokens": {
                     "input": stats_data.get("inputTokens"),
@@ -162,24 +175,35 @@ class AdvisorySampler:
                 "cost": stats_data.get("totalCostUsd"),
             },
         )
-        self._update_context_advisory(task_id, context_pct)
+        self._update_context_advisory(task_id, session, context_pct)
 
-    def _update_context_advisory(self, task_id: int, context_pct: float | None) -> None:
+    def _update_context_advisory(
+        self, task_id: int, session: str, context_pct: float | None
+    ) -> None:
         if context_pct is None:
             return
+        key = (task_id, session)
         over = context_pct >= self._threshold
-        was_over = task_id in self._context_high
+        was_over = key in self._context_high
         if over and not was_over:
-            self._context_high.add(task_id)
+            self._context_high.add(key)
             self._hub.publish(
                 "advisory",
-                {"task_id": task_id, "kind": "context-high", "context_pct": context_pct},
+                {
+                    "task_id": task_id,
+                    "session": session,
+                    "kind": "context-high",
+                    "context_pct": context_pct,
+                },
             )
         elif not over and was_over:
-            self._context_high.discard(task_id)
-            self._hub.publish("advisory_cleared", {"task_id": task_id, "kind": "context-high"})
+            self._context_high.discard(key)
+            self._hub.publish(
+                "advisory_cleared",
+                {"task_id": task_id, "session": session, "kind": "context-high"},
+            )
 
-    async def sample_idle_entered(self, task_id: int, handle: AgentHandle) -> None:
+    async def sample_idle_entered(self, task_id: int, session: str, handle: AgentHandle) -> None:
         """`get_last_assistant_text` + question heuristic on idle entry
         (design D-6). **`get_last_assistant_text`'s RPC shape is unverified
         against live omp** (dogfood verification point, same pattern as the
@@ -188,16 +212,26 @@ class AdvisorySampler:
         try:
             response = await handle.request("get_last_assistant_text")
         except Exception as exc:  # noqa: BLE001 — a decoration must never disrupt idle
-            logger.warning("maybe-waiting sample failed for task %d: %s", task_id, exc)
+            logger.warning(
+                "maybe-waiting sample failed for task %d session %s: %s", task_id, session, exc
+            )
             return
         data = response.get("data")
         text = data.get("text") if isinstance(data, dict) else None
         if not isinstance(text, str) or not _looks_like_a_question(text):
             return
-        self._maybe_waiting.add(task_id)
-        self._hub.publish("advisory", {"task_id": task_id, "kind": "maybe-waiting"})
+        self._maybe_waiting.add((task_id, session))
+        self._hub.publish(
+            "advisory", {"task_id": task_id, "session": session, "kind": "maybe-waiting"}
+        )
 
-    def _clear_maybe_waiting_if_left_idle(self, task_id: int, to_status: str) -> None:
-        if to_status != "idle" and task_id in self._maybe_waiting:
-            self._maybe_waiting.discard(task_id)
-            self._hub.publish("advisory_cleared", {"task_id": task_id, "kind": "maybe-waiting"})
+    def _clear_maybe_waiting_if_left_idle(
+        self, task_id: int, session: str, to_status: str
+    ) -> None:
+        key = (task_id, session)
+        if to_status != "idle" and key in self._maybe_waiting:
+            self._maybe_waiting.discard(key)
+            self._hub.publish(
+                "advisory_cleared",
+                {"task_id": task_id, "session": session, "kind": "maybe-waiting"},
+            )

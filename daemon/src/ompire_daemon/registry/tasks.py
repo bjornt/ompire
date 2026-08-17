@@ -14,7 +14,7 @@ from pathlib import Path
 from sqlalchemy import Engine
 from sqlalchemy.exc import IntegrityError
 
-from ompire_daemon.db import tasks
+from ompire_daemon.db import task_sessions, tasks, workflow_step_records
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 MAX_SLUG_LENGTH = 64
@@ -70,7 +70,9 @@ class Task:
     prompt: str
     error: str | None
     workshop_id: str | None
-    session_id: str | None
+    workflow_name: str
+    workflow_status: str | None
+    workflow_step: str | None
     pr_url: str | None
     pr_state: str | None
     pr_merged_at: str | None
@@ -114,7 +116,9 @@ def _row_to_task(row) -> Task:  # noqa: ANN001
         prompt=row.prompt,
         error=row.error,
         workshop_id=row.workshop_id,
-        session_id=row.session_id,
+        workflow_name=row.workflow_name,
+        workflow_status=row.workflow_status,
+        workflow_step=row.workflow_step,
         pr_url=row.pr_url,
         pr_state=row.pr_state,
         pr_merged_at=row.pr_merged_at,
@@ -133,6 +137,7 @@ def create_task(
     clone_path: str,
     prompt: str,
     template_name: str | None = None,
+    workflow_name: str = "single-step",
 ) -> Task:
     validate_task_slug(slug)
     now = _now_iso()
@@ -149,7 +154,9 @@ def create_task(
                     prompt=prompt,
                     error=None,
                     workshop_id=None,
-                    session_id=None,
+                    workflow_name=workflow_name,
+                    workflow_status=None,
+                    workflow_step=None,
                     pr_url=None,
                     spawn_completed_at=None,
                     created_at=now,
@@ -207,10 +214,6 @@ def mark_workshop_launched(engine: Engine, task_id: int, workshop_id: str) -> Ta
     return _update(engine, task_id, workshop_id=workshop_id)
 
 
-def mark_session_id(engine: Engine, task_id: int, session_id: str) -> Task:
-    return _update(engine, task_id, session_id=session_id)
-
-
 def mark_pr_url(engine: Engine, task_id: int, url: str) -> Task:
     return _update(engine, task_id, pr_url=url)
 
@@ -233,19 +236,25 @@ def purge_task(engine: Engine, task_id: int) -> None:
     task = get_task(engine, task_id)
     if task.state != "archived":
         raise TaskNotArchivedError(task_id, task.state)
+    # Child rows go first: session rows and step records are history keyed by
+    # task id (workflow-engine capability).
     with engine.begin() as conn:
+        conn.execute(workflow_step_records.delete().where(workflow_step_records.c.task_id == task_id))
+        conn.execute(task_sessions.delete().where(task_sessions.c.task_id == task_id))
         conn.execute(tasks.delete().where(tasks.c.id == task_id))
 
 
 def reconcile_startup(engine: Engine) -> tuple[list[Task], list[Task]]:
     """Classify every `created` task per the startup reconciliation matrix
     (crash-recovery capability, design D-4), as far as the registry alone can
-    tell: a spawn that never completed, or one that completed with no
-    recorded session id, is unresumable and marked `failed` here. A
-    spawn-completed task with a session id still needs its container's
-    presence checked (async, `workshop_status`) before it can be recovered or
-    failed as `fail-missing-container` — those are returned as candidates for
-    the caller to finish classifying.
+    tell: a spawn that never completed is unresumable and marked `failed`
+    here. Every spawn-completed task is a recovery candidate — sessions are
+    lazily spawned (workflow-engine capability), so a task may legitimately
+    have no recorded session identity (a command-only workflow, or a run
+    that failed before its first agent step); "no session id" is no longer a
+    failure cause. Candidates still need their container's presence checked
+    (async, `workshop_status`) before they can be recovered or failed as
+    `fail-missing-container` — the caller finishes classifying.
 
     Returns `(failed, candidates)`.
     """
@@ -259,8 +268,6 @@ def reconcile_startup(engine: Engine) -> tuple[list[Task], list[Task]]:
             failed.append(
                 mark_failed(engine, task.id, "daemon restarted during spawn; pipeline did not complete")
             )
-        elif task.session_id is None:
-            failed.append(mark_failed(engine, task.id, "no session id recorded; cannot resume"))
         else:
             candidates.append(task)
     return failed, candidates

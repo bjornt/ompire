@@ -2,9 +2,15 @@ import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useAgentChannel } from "../lib/agentChannel";
 import { isStreaming, useAgentStatus } from "../lib/agentStatus";
-import { getTaskDetail } from "../lib/api";
+import { getTaskDetail, resumeWorkflow } from "../lib/api";
+import {
+  currentStepRecord,
+  defaultSessionName,
+  taskSessionNames,
+  workflowActive,
+} from "../lib/daemonReducer";
 import { useDaemonState } from "../lib/daemonSocket";
-import type { SessionInfo, TaskDetail, WorkshopStatus } from "../types";
+import type { SessionInfo, StepRecord, TaskDetail, WorkflowState, WorkshopStatus } from "../types";
 import { formatElapsed } from "./TasksView";
 import { QuestionCard } from "./QuestionCard";
 import { TaskComposer } from "./TaskComposer";
@@ -12,14 +18,171 @@ import { TaskStatusStrip } from "./TaskStatusStrip";
 import { TaskTranscript } from "./TaskTranscript";
 import "./TaskDetailView.css";
 
-/* Task detail: metadata panel + escape hatch, plus the single-session cockpit —
- * streaming transcript, composer, and status strip. A task has a live agent
- * while its session status is tracked and not `failed` (session-states keeps a
- * failed status after the child exits); the cockpit regions degrade to an
- * inactive/empty state when no agent is live rather than disappearing. */
+/* Task detail: metadata panel + escape hatch, plus the cockpit — streaming
+ * transcript, composer, and status strip, all following the selected session
+ * tab (workflow-engine design D-9). A session has a live agent while its
+ * status is tracked and not `failed` (session-states keeps a failed status
+ * after the child exits); the cockpit regions degrade to an inactive/empty
+ * state when no agent is live rather than disappearing. The workflow strip
+ * summarizes the run's executed steps and a gate card offers the resume
+ * action while the run is parked. Single-session workflows (single-step)
+ * hide the tab bar and render exactly the pre-workflow layout. */
 
 function hasLiveAgent(session: SessionInfo | null): boolean {
   return session !== null && session.status !== "failed";
+}
+
+/** The gate message a waiting step record carries in its outcome (persisted
+ * by the daemon so it survives restarts and reconnects). */
+function gateMessage(record: StepRecord | undefined): string | null {
+  const message = record?.outcome?.message;
+  return typeof message === "string" ? message : null;
+}
+
+/** One-line summary for a finished step's chip title: the outcome's summary
+ * (design D-3 outcome schema) or message, else the error. */
+function chipTitle(record: StepRecord): string | undefined {
+  if (record.error) return record.error;
+  const summary = record.outcome?.summary;
+  if (typeof summary === "string") return summary;
+  return gateMessage(record) ?? undefined;
+}
+
+/** Workflow strip (workflow-engine design D-9): one chip per executed step
+ * record in order, the in-flight step highlighted, a waiting gate chip
+ * pulsing notify-tier. */
+function WorkflowStrip({ workflow }: { workflow: WorkflowState }) {
+  const current = workflowActive(workflow) ? currentStepRecord(workflow) : undefined;
+  return (
+    <div className="panel workflowStrip" data-testid="workflow-strip">
+      <span className={`workflowRunStatus ${workflow.status ?? "none"}`} data-testid="workflow-run-status">
+        {workflow.name}
+        {workflow.status ? ` · ${workflow.status}` : ""}
+      </span>
+      <div className="workflowChips">
+        {workflow.steps.map((record) => {
+          const isCurrent = current !== undefined && record.seq === current.seq;
+          return (
+            <span
+              key={record.seq}
+              className={`workflowChip ${record.status}${isCurrent ? " current" : ""}`}
+              title={chipTitle(record)}
+              data-testid={`workflow-chip-${record.seq}`}
+            >
+              <span className={`chipDot ${record.kind}`} />
+              {record.step}
+              <span className="chipKind">{record.kind}</span>
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/** Gate card (workflow-engine design D-9): shown while the run is `waiting`
+ * at a gate; the operator message comes from the waiting step record's
+ * outcome, and Resume posts to the workflow resume endpoint with an optional
+ * note. A 409 (the run already moved on) surfaces inline; the card also
+ * disappears by itself once the run leaves `waiting`. */
+function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowState }) {
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const waiting = [...workflow.steps].reverse().find((r) => r.status === "waiting");
+  const message = gateMessage(waiting) ?? "Waiting at a workflow gate.";
+
+  async function resume() {
+    setBusy(true);
+    setError(null);
+    try {
+      await resumeWorkflow(taskId, note.trim() || undefined);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="panel gateCard" data-testid="gate-card">
+      <h2 className="panelTitle">
+        <span className="gateDot" /> Workflow waiting — {workflow.step}
+      </h2>
+      <div className="gateMessage" data-testid="gate-message">
+        {message}
+      </div>
+      <textarea
+        className="gateNote"
+        aria-label="Resume note"
+        placeholder="Optional note for the workflow (e.g. reviewed, looks good)…"
+        rows={2}
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+      />
+      {error && (
+        <div className="composerError" data-testid="gate-error">
+          {error}
+        </div>
+      )}
+      <div className="questionActions">
+        <button
+          type="button"
+          className="sendButton"
+          disabled={busy}
+          onClick={() => void resume()}
+          data-testid="gate-resume"
+        >
+          {busy ? "Resuming…" : "Resume"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Session tab bar (workflow-engine design D-9): one tab per known session,
+ * hidden for single-session workflows. A tab is disabled while its session
+ * is unspawned (no tracker entry), and shows a question dot when another
+ * session has a pending question. */
+function SessionTabs({
+  names,
+  taskSessions,
+  active,
+  onSelect,
+}: {
+  names: string[];
+  taskSessions: Record<string, SessionInfo> | null;
+  active: string;
+  onSelect: (name: string) => void;
+}) {
+  return (
+    <div className="sessionTabs" role="tablist" data-testid="session-tabs">
+      {names.map((name) => {
+        const info = taskSessions?.[name];
+        const selected = name === active;
+        const pendingElsewhere = !selected && info?.question !== undefined;
+        return (
+          <button
+            key={name}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            className={`sessionTab${selected ? " active" : ""}`}
+            disabled={!info}
+            title={info ? `${name}: ${info.status}` : `${name}: not started`}
+            data-testid={`session-tab-${name}`}
+            onClick={() => onSelect(name)}
+          >
+            <span className={`tabDot ${info?.status ?? "none"}`} />
+            {name}
+            {pendingElsewhere && (
+              <span className="tabQuestionDot" data-testid={`tab-question-${name}`} />
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 function workshopLabel(detail: TaskDetail): { text: string; status: WorkshopStatus | "none" } {
@@ -31,20 +194,30 @@ function workshopLabel(detail: TaskDetail): { text: string; status: WorkshopStat
 export function TaskDetailView() {
   const { id } = useParams();
   const taskId = Number(id);
-  const { tasks, sessions } = useDaemonState();
+  const { tasks, sessions, workflows } = useDaemonState();
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Tab selection is local UI state (design D-9); null means "follow the
+  // default" — the in-flight step's session, else the primary.
+  const [selected, setSelected] = useState<string | null>(null);
 
   // Live card data from the socket snapshot; derived workshop status needs
   // the detail fetch. Refetch when the socket's copy of the task changes.
   const liveTask = tasks.find((t) => t.id === taskId) ?? null;
-  const session = sessions[taskId] ?? null;
+  const taskSessions = sessions[taskId] ?? null;
+  const workflow = workflows[taskId] ?? null;
+  const sessionNames = taskSessionNames(taskSessions ?? undefined, workflow ?? undefined);
+  const activeName =
+    selected !== null && sessionNames.includes(selected)
+      ? selected
+      : defaultSessionName(taskSessions ?? undefined, workflow ?? undefined);
+  const session = taskSessions?.[activeName] ?? null;
   const live = hasLiveAgent(session);
 
   // The cockpit: transcript from the raw event channel, metrics polled at turn
-  // boundaries, both gated on there being a live agent.
-  const { transcript, turnEpoch } = useAgentChannel(taskId, live);
-  const status = useAgentStatus(taskId, live, turnEpoch);
+  // boundaries, both gated on there being a live agent for the selected tab.
+  const { transcript, turnEpoch } = useAgentChannel(taskId, activeName, live);
+  const status = useAgentStatus(taskId, activeName, live, turnEpoch);
 
   useEffect(() => {
     if (!Number.isInteger(taskId)) return;
@@ -95,6 +268,8 @@ export function TaskDetailView() {
           ← Tasks
         </Link>
       </div>
+
+      {workflow !== null && workflow.steps.length > 0 && <WorkflowStrip workflow={workflow} />}
 
       <div className="detailGrid">
         <div className="panel" data-testid="task-metadata">
@@ -153,12 +328,29 @@ export function TaskDetailView() {
 
       <TaskStatusStrip session={session} status={status} />
 
-      {session?.question && <QuestionCard taskId={taskId} question={session.question} />}
+      {workflow !== null && workflow.status === "waiting" && (
+        <GateCard taskId={taskId} workflow={workflow} />
+      )}
+
+      {session?.question && (
+        <QuestionCard taskId={taskId} session={activeName} question={session.question} />
+      )}
 
       <div className="cockpitGrid">
-        <TaskTranscript transcript={transcript} />
+        <div className="transcriptColumn">
+          {sessionNames.length > 1 && (
+            <SessionTabs
+              names={sessionNames}
+              taskSessions={taskSessions}
+              active={activeName}
+              onSelect={setSelected}
+            />
+          )}
+          <TaskTranscript transcript={transcript} />
+        </div>
         <TaskComposer
           taskId={taskId}
+          session={activeName}
           hasLiveAgent={live}
           isStreaming={isStreaming(status.state)}
           sessionStatus={session?.status ?? null}

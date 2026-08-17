@@ -15,13 +15,13 @@ from sqlalchemy.exc import IntegrityError
 
 from ompire_daemon.db import projects, tasks, templates
 from ompire_daemon.registry.projects import ProjectNotFoundError, validate_slug
+# The engine's registry is the source of truth for valid workflow names
+# (workflow-engine design D-2); no import cycle — workflows.py references
+# templates only under TYPE_CHECKING.
+from ompire_daemon.workflows import registered_workflows
 
 # Everything but the <slug> placeholder must be safe in a git ref name.
 _BRANCH_PATTERN_SAFE_RE = re.compile(r"^[A-Za-z0-9._/-]*$")
-
-# Workflows the daemon knows how to run; exactly `single-step` until the
-# real-workflows chunks (17/18) extend this.
-REGISTERED_WORKFLOWS = ("single-step",)
 
 WORKSHOP_ADDITIONS_SOURCES = ("project", "global")
 
@@ -68,7 +68,7 @@ class UnknownWorkflowError(ValueError):
     def __init__(self, workflow: str) -> None:
         super().__init__(
             f"unknown workflow {workflow!r}: registered workflows are "
-            f"{', '.join(REGISTERED_WORKFLOWS)}"
+            f"{', '.join(registered_workflows())}"
         )
         self.workflow = workflow
 
@@ -113,7 +113,7 @@ def validate_branch_pattern(pattern: str) -> None:
 
 
 def validate_workflow(workflow: str) -> None:
-    if workflow not in REGISTERED_WORKFLOWS:
+    if workflow not in registered_workflows():
         raise UnknownWorkflowError(workflow)
 
 

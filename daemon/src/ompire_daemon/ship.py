@@ -26,6 +26,7 @@ from ompire_daemon.registry.projects import Project, get_project
 from ompire_daemon.registry.tasks import Task, mark_pr_url
 from ompire_daemon.registry.templates import get_template
 from ompire_daemon.review import _run_git_output
+from ompire_daemon.sessions import wait_for_idle
 from ompire_daemon.spawn import Step, _run_step
 
 if TYPE_CHECKING:
@@ -177,20 +178,23 @@ class ShipManager:
     # --- public operations -------------------------------------------------
 
     async def draft(self, task: Task) -> ShipState:
-        """Ask the live agent for commit/PR text; on failure degrade to
-        manual entry via a `ship_draft` event with `source="manual"`.
+        """Ask the primary session's live agent for commit/PR text
+        (workflow-engine design D-8); on failure degrade to manual entry via
+        a `ship_draft` event with `source="manual"`.
         """
-        handle = self._agents.get(task.id)
+        from ompire_daemon.workflows import get_workflow
+
+        primary = get_workflow(task.workflow_name).primary
+        handle = self._agents.get(task.id, primary)
         if handle is None or handle.returncode is not None:
             raise NoLiveAgentError(task.id)
 
         self._set_state(task.id, status="drafting", draft=None, error=None)
 
-        queue = self._hub.subscribe()
         try:
             await handle.prompt(_DRAFT_PROMPT)
-            await self._wait_idle_from_queue(
-                queue, task.id, timeout=self._config.spawn_step_timeout
+            await wait_for_idle(
+                self._hub, task.id, primary, timeout=self._config.spawn_step_timeout
             )
 
             try:
@@ -227,8 +231,6 @@ class ShipManager:
                 task.id, status="error", draft=None, error=f"draft failed: {exc}"
             )
             return state
-        finally:
-            self._hub.unsubscribe(queue)
 
     def seed_commit(self, task_id: int) -> ShipState:
         """Synchronously seed the committing state for the REST route, which
@@ -616,27 +618,6 @@ class ShipManager:
         raise ShipError("gh pr create succeeded but printed no PR URL")
 
     # --- helpers ------------------------------------------------------------
-
-    async def _wait_idle_from_queue(
-        self, queue: asyncio.Queue, task_id: int, timeout: float
-    ) -> None:
-        deadline = asyncio.get_running_loop().time() + timeout
-        while True:
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                raise asyncio.TimeoutError
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=remaining)
-            except TimeoutError:
-                raise asyncio.TimeoutError from None
-            if event.type != "status_changed":
-                continue
-            payload = event.payload
-            if (
-                payload.get("task_id") == task_id
-                and payload.get("to") == "idle"
-            ):
-                return
 
     def _set_state(self, task_id: int, **kwargs: Any) -> ShipState:
         state = self._ships.get(task_id)

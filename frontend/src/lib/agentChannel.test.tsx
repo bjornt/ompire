@@ -22,8 +22,16 @@ class MockWebSocket {
   }
 }
 
-function Probe({ taskId, enabled }: { taskId: number; enabled: boolean }) {
-  const { connected } = useAgentChannel(taskId, enabled);
+function Probe({
+  taskId,
+  session,
+  enabled,
+}: {
+  taskId: number;
+  session: string;
+  enabled: boolean;
+}) {
+  const { connected } = useAgentChannel(taskId, session, enabled);
   return <div data-testid="connected">{String(connected)}</div>;
 }
 
@@ -40,7 +48,7 @@ describe("useAgentChannel reconnection", () => {
   });
 
   it("retries with backoff after a 4404 (no live agent yet) instead of giving up", () => {
-    render(<Probe taskId={1} enabled={true} />);
+    render(<Probe taskId={1} session="main" enabled={true} />);
     expect(MockWebSocket.instances).toHaveLength(1);
 
     // The daemon closes with 4404 because recovery/spawn hasn't registered a
@@ -59,7 +67,7 @@ describe("useAgentChannel reconnection", () => {
   });
 
   it("keeps retrying across repeated 4404s until the agent is actually live", () => {
-    render(<Probe taskId={1} enabled={true} />);
+    render(<Probe taskId={1} session="main" enabled={true} />);
 
     act(() => {
       MockWebSocket.instances[0].emitClose(4404);
@@ -79,7 +87,7 @@ describe("useAgentChannel reconnection", () => {
   });
 
   it("does not reconnect after code 1000 (agent exited, buffer flushed)", () => {
-    render(<Probe taskId={1} enabled={true} />);
+    render(<Probe taskId={1} session="main" enabled={true} />);
 
     act(() => {
       MockWebSocket.instances[0].emitClose(1000);
@@ -88,5 +96,24 @@ describe("useAgentChannel reconnection", () => {
       vi.advanceTimersByTime(10000);
     });
     expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it("connects to the session-scoped channel URL", () => {
+    render(<Probe taskId={7} session="reviewer" enabled={true} />);
+    expect(MockWebSocket.instances[0].url).toContain("/api/ws/agents/7/reviewer");
+  });
+
+  it("reconnects on the new session's channel when the tab switches", () => {
+    const { rerender } = render(<Probe taskId={1} session="main" enabled={true} />);
+    expect(MockWebSocket.instances[0].url).toContain("/api/ws/agents/1/main");
+
+    rerender(<Probe taskId={1} session="reviewer" enabled={true} />);
+    expect(MockWebSocket.instances).toHaveLength(2);
+    expect(MockWebSocket.instances[1].url).toContain("/api/ws/agents/1/reviewer");
+  });
+
+  it("opens no channel while disabled", () => {
+    render(<Probe taskId={1} session="main" enabled={false} />);
+    expect(MockWebSocket.instances).toHaveLength(0);
   });
 });

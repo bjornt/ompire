@@ -15,6 +15,7 @@ export interface AgentStatus {
 
 export function useAgentStatus(
   taskId: number,
+  session: string,
   enabled: boolean,
   turnEpoch: number,
 ): AgentStatus {
@@ -26,17 +27,19 @@ export function useAgentStatus(
       return;
     }
     let cancelled = false;
-    Promise.allSettled([getAgentState(taskId), getAgentStats(taskId)]).then(([state, stats]) => {
-      if (cancelled) return;
-      setStatus({
-        state: state.status === "fulfilled" ? state.value : null,
-        stats: stats.status === "fulfilled" ? stats.value : null,
-      });
-    });
+    Promise.allSettled([getAgentState(taskId, session), getAgentStats(taskId, session)]).then(
+      ([state, stats]) => {
+        if (cancelled) return;
+        setStatus({
+          state: state.status === "fulfilled" ? state.value : null,
+          stats: stats.status === "fulfilled" ? stats.value : null,
+        });
+      },
+    );
     return () => {
       cancelled = true;
     };
-  }, [taskId, enabled, turnEpoch]);
+  }, [taskId, session, enabled, turnEpoch]);
 
   return status;
 }

@@ -193,6 +193,9 @@ const task = {
   workshop_id: null,
   spawn_completed_at: null,
   pr_url: null,
+  workflow_name: "single-step",
+  workflow_status: null,
+  workflow_step: null,
   created_at: "2026-07-18T00:00:00Z",
   updated_at: "2026-07-18T00:00:00Z",
 };
@@ -269,7 +272,7 @@ describe("applyEnvelope session events", () => {
     payload: { projects: [], tasks: [], sessions: {} },
   });
 
-  it("loads sessions from the snapshot with numeric task-id keys", () => {
+  it("loads nested sessions from the snapshot with numeric task-id keys", () => {
     const state = applyEnvelope(initialDaemonState, {
       seq: 0,
       ts: "",
@@ -277,33 +280,66 @@ describe("applyEnvelope session events", () => {
       payload: {
         projects: [],
         tasks: [task],
-        sessions: { "1": { status: "working", reason: "agent_start frame", since: "t0" } },
+        sessions: {
+          "1": {
+            main: { status: "working", reason: "agent_start frame", since: "t0" },
+            reviewer: { status: "idle", reason: "queue empty", since: "t0" },
+          },
+        },
       },
     });
     expect(state.sessions[1]).toEqual({
-      status: "working",
-      reason: "agent_start frame",
-      since: "t0",
+      main: { status: "working", reason: "agent_start frame", since: "t0" },
+      reviewer: { status: "idle", reason: "queue empty", since: "t0" },
     });
   });
 
-  it("upserts on status_changed using the envelope timestamp", () => {
+  it("upserts on status_changed per session using the envelope timestamp", () => {
     let state = applyEnvelope(empty, {
       seq: 1,
       ts: "t1",
       type: "status_changed",
-      payload: { task_id: 1, from: null, to: "starting", reason: "agent spawned" },
+      payload: { task_id: 1, session: "main", from: null, to: "starting", reason: "agent spawned" },
     });
     state = applyEnvelope(state, {
       seq: 2,
       ts: "t2",
       type: "status_changed",
-      payload: { task_id: 1, from: "starting", to: "working", reason: "agent_start frame" },
+      payload: {
+        task_id: 1,
+        session: "main",
+        from: "starting",
+        to: "working",
+        reason: "agent_start frame",
+      },
     });
     expect(state.sessions[1]).toEqual({
-      status: "working",
-      reason: "agent_start frame",
-      since: "t2",
+      main: { status: "working", reason: "agent_start frame", since: "t2" },
+    });
+  });
+
+  it("tracks sessions of one task independently", () => {
+    let state = applyEnvelope(empty, {
+      seq: 1,
+      ts: "t1",
+      type: "status_changed",
+      payload: { task_id: 1, session: "reproducer", from: null, to: "working", reason: "fr" },
+    });
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "t2",
+      type: "status_changed",
+      payload: { task_id: 1, session: "coder", from: null, to: "starting", reason: "spawned" },
+    });
+    state = applyEnvelope(state, {
+      seq: 3,
+      ts: "t3",
+      type: "status_changed",
+      payload: { task_id: 1, session: "reproducer", from: "working", to: "idle", reason: "done" },
+    });
+    expect(state.sessions[1]).toEqual({
+      reproducer: { status: "idle", reason: "done", since: "t3" },
+      coder: { status: "starting", reason: "spawned", since: "t2" },
     });
   });
 
@@ -312,7 +348,13 @@ describe("applyEnvelope session events", () => {
       seq: 1,
       ts: "t1",
       type: "status_changed",
-      payload: { task_id: 1, from: null, to: "failed", reason: "process exited with code 137" },
+      payload: {
+        task_id: 1,
+        session: "main",
+        from: null,
+        to: "failed",
+        reason: "process exited with code 137",
+      },
     });
     state = applyEnvelope(state, { seq: 2, ts: "", type: "task_deleted", payload: { id: 1 } });
     expect(state.sessions).toEqual({});
@@ -342,35 +384,52 @@ describe("applyEnvelope session events", () => {
     ],
   };
 
-  it("upserts the pending question on question_posted", () => {
+  it("upserts the pending question on question_posted for the addressed session", () => {
     let state = applyEnvelope(empty, {
       seq: 1,
       ts: "t1",
       type: "status_changed",
-      payload: { task_id: 1, from: "working", to: "waiting-input", reason: "pending question" },
+      payload: {
+        task_id: 1,
+        session: "main",
+        from: "working",
+        to: "waiting-input",
+        reason: "pending question",
+      },
     });
     state = applyEnvelope(state, {
       seq: 2,
       ts: "t2",
       type: "question_posted",
-      payload: { task_id: 1, question },
+      payload: { task_id: 1, session: "main", question },
     });
     expect(state.sessions[1]).toEqual({
-      status: "waiting-input",
-      reason: "pending question",
-      since: "t1",
-      question,
+      main: { status: "waiting-input", reason: "pending question", since: "t1", question },
     });
   });
 
-  it("ignores question_posted for an untracked task", () => {
-    const state = applyEnvelope(empty, {
+  it("ignores question_posted for an untracked task or session", () => {
+    const unknown = applyEnvelope(empty, {
       seq: 1,
       ts: "t1",
       type: "question_posted",
-      payload: { task_id: 99, question },
+      payload: { task_id: 99, session: "main", question },
     });
-    expect(state.sessions).toEqual({});
+    expect(unknown.sessions).toEqual({});
+
+    let state = applyEnvelope(empty, {
+      seq: 1,
+      ts: "t1",
+      type: "status_changed",
+      payload: { task_id: 1, session: "main", from: null, to: "working", reason: "r" },
+    });
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "t2",
+      type: "question_posted",
+      payload: { task_id: 1, session: "reviewer", question },
+    });
+    expect(state.sessions[1]).toEqual({ main: { status: "working", reason: "r", since: "t1" } });
   });
 
   it("clears the pending question on question_resolved", () => {
@@ -378,24 +437,28 @@ describe("applyEnvelope session events", () => {
       seq: 1,
       ts: "t1",
       type: "status_changed",
-      payload: { task_id: 1, from: "working", to: "waiting-input", reason: "pending question" },
+      payload: {
+        task_id: 1,
+        session: "main",
+        from: "working",
+        to: "waiting-input",
+        reason: "pending question",
+      },
     });
     state = applyEnvelope(state, {
       seq: 2,
       ts: "t2",
       type: "question_posted",
-      payload: { task_id: 1, question },
+      payload: { task_id: 1, session: "main", question },
     });
     state = applyEnvelope(state, {
       seq: 3,
       ts: "t3",
       type: "question_resolved",
-      payload: { task_id: 1, question_id: question.id },
+      payload: { task_id: 1, session: "main", question_id: question.id },
     });
     expect(state.sessions[1]).toEqual({
-      status: "waiting-input",
-      reason: "pending question",
-      since: "t1",
+      main: { status: "waiting-input", reason: "pending question", since: "t1" },
     });
   });
 
@@ -404,13 +467,19 @@ describe("applyEnvelope session events", () => {
       seq: 1,
       ts: "t1",
       type: "status_changed",
-      payload: { task_id: 1, from: "working", to: "waiting-input", reason: "pending question" },
+      payload: {
+        task_id: 1,
+        session: "main",
+        from: "working",
+        to: "waiting-input",
+        reason: "pending question",
+      },
     });
     state = applyEnvelope(state, {
       seq: 2,
       ts: "t2",
       type: "question_posted",
-      payload: { task_id: 1, question },
+      payload: { task_id: 1, session: "main", question },
     });
     state = applyEnvelope(state, { seq: 3, ts: "", type: "task_deleted", payload: { id: 1 } });
     expect(state.sessions).toEqual({});
@@ -434,13 +503,21 @@ describe("applyEnvelope attention/advisory events", () => {
         projects: [],
         tasks: [task],
         sessions: {},
-        attention: { "1": { tier: "interrupt", status: "failed", reason: "process exited with code 1" } },
+        attention: {
+          "1": {
+            tier: "interrupt",
+            status: "failed",
+            reason: "process exited with code 1",
+            session: "main",
+          },
+        },
       },
     });
     expect(state.attention[1]).toEqual({
       tier: "interrupt",
       status: "failed",
       reason: "process exited with code 1",
+      session: "main",
     });
   });
 
@@ -459,9 +536,20 @@ describe("applyEnvelope attention/advisory events", () => {
       seq: 1,
       ts: "",
       type: "attention",
-      payload: { task_id: 1, tier: "notify", status: "stalled", reason: "no frames for 300s" },
+      payload: {
+        task_id: 1,
+        tier: "notify",
+        status: "stalled",
+        reason: "no frames for 300s",
+        session: "main",
+      },
     });
-    expect(state.attention[1]).toEqual({ tier: "notify", status: "stalled", reason: "no frames for 300s" });
+    expect(state.attention[1]).toEqual({
+      tier: "notify",
+      status: "stalled",
+      reason: "no frames for 300s",
+      session: "main",
+    });
 
     state = applyEnvelope(state, {
       seq: 2,
@@ -472,73 +560,109 @@ describe("applyEnvelope attention/advisory events", () => {
     expect(state.attention).toEqual({});
   });
 
-  it("drops attention/stats/advisories on task_deleted", () => {
+  it("drops attention/stats/advisories/workflows on task_deleted", () => {
     let state = applyEnvelope(empty, { seq: 1, ts: "", type: "task_created", payload: task });
     state = applyEnvelope(state, {
       seq: 2,
       ts: "",
       type: "attention",
-      payload: { task_id: 1, tier: "notify", status: "stalled", reason: "x" },
+      payload: { task_id: 1, tier: "notify", status: "stalled", reason: "x", session: "main" },
     });
     state = applyEnvelope(state, {
       seq: 3,
       ts: "",
       type: "stats",
-      payload: { task_id: 1, context_pct: 50, tokens: { input: 10, output: 5 }, cost: 0.01 },
+      payload: {
+        task_id: 1,
+        session: "main",
+        context_pct: 50,
+        tokens: { input: 10, output: 5 },
+        cost: 0.01,
+      },
     });
     state = applyEnvelope(state, {
       seq: 4,
       ts: "",
       type: "advisory",
-      payload: { task_id: 1, kind: "maybe-waiting" },
+      payload: { task_id: 1, session: "main", kind: "maybe-waiting" },
     });
-    state = applyEnvelope(state, { seq: 5, ts: "", type: "task_deleted", payload: { id: 1 } });
+    state = applyEnvelope(state, {
+      seq: 5,
+      ts: "",
+      type: "workflow_step",
+      payload: { task_id: 1, step: "work", kind: "agent", session: "main", status: "started" },
+    });
+    state = applyEnvelope(state, { seq: 6, ts: "", type: "task_deleted", payload: { id: 1 } });
     expect(state.attention).toEqual({});
     expect(state.stats).toEqual({});
     expect(state.advisories).toEqual({});
+    expect(state.workflows).toEqual({});
   });
 
-  it("upserts the latest stats sample per task", () => {
-    const state = applyEnvelope(empty, {
+  it("upserts the latest stats sample per task and session", () => {
+    let state = applyEnvelope(empty, {
       seq: 1,
       ts: "",
       type: "stats",
-      payload: { task_id: 1, context_pct: 42, tokens: { input: 1200, output: 340 }, cost: 0.0123 },
+      payload: {
+        task_id: 1,
+        session: "main",
+        context_pct: 42,
+        tokens: { input: 1200, output: 340 },
+        cost: 0.0123,
+      },
+    });
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "",
+      type: "stats",
+      payload: {
+        task_id: 1,
+        session: "reviewer",
+        context_pct: 10,
+        tokens: { input: 100, output: 40 },
+        cost: 0.001,
+      },
     });
     expect(state.stats[1]).toEqual({
-      task_id: 1,
-      context_pct: 42,
-      tokens: { input: 1200, output: 340 },
-      cost: 0.0123,
+      main: { task_id: 1, session: "main", context_pct: 42, tokens: { input: 1200, output: 340 }, cost: 0.0123 },
+      reviewer: {
+        task_id: 1,
+        session: "reviewer",
+        context_pct: 10,
+        tokens: { input: 100, output: 40 },
+        cost: 0.001,
+      },
     });
   });
 
-  it("tracks active advisories per task and kind, cleared independently", () => {
+  it("tracks active advisories per task, session, and kind, cleared independently", () => {
     let state = applyEnvelope(empty, {
       seq: 1,
       ts: "",
       type: "advisory",
-      payload: { task_id: 1, kind: "context-high", context_pct: 85 },
+      payload: { task_id: 1, session: "main", kind: "context-high", context_pct: 85 },
     });
     state = applyEnvelope(state, {
       seq: 2,
       ts: "",
       type: "advisory",
-      payload: { task_id: 1, kind: "maybe-waiting" },
+      payload: { task_id: 1, session: "reviewer", kind: "maybe-waiting" },
     });
     expect(state.advisories[1]).toEqual({
-      "context-high": { task_id: 1, kind: "context-high", context_pct: 85 },
-      "maybe-waiting": { task_id: 1, kind: "maybe-waiting" },
+      main: { "context-high": { task_id: 1, session: "main", kind: "context-high", context_pct: 85 } },
+      reviewer: { "maybe-waiting": { task_id: 1, session: "reviewer", kind: "maybe-waiting" } },
     });
 
     state = applyEnvelope(state, {
       seq: 3,
       ts: "",
       type: "advisory_cleared",
-      payload: { task_id: 1, kind: "context-high" },
+      payload: { task_id: 1, session: "main", kind: "context-high" },
     });
     expect(state.advisories[1]).toEqual({
-      "maybe-waiting": { task_id: 1, kind: "maybe-waiting" },
+      main: {},
+      reviewer: { "maybe-waiting": { task_id: 1, session: "reviewer", kind: "maybe-waiting" } },
     });
   });
 });
@@ -700,5 +824,232 @@ describe("applyEnvelope ship/gpg events", () => {
     });
     state = applyEnvelope(state, { seq: 1, ts: "", type: "task_deleted", payload: { id: 1 } });
     expect(state.ships).toEqual({});
+  });
+});
+
+describe("applyEnvelope workflow events", () => {
+  const stepRecord = {
+    task_id: 1,
+    seq: 1,
+    step: "work",
+    kind: "agent",
+    session: "main",
+    status: "running",
+    outcome: null,
+    error: null,
+    prompted_at: null,
+    started_at: "t0",
+    finished_at: null,
+  };
+
+  it("loads workflows from the snapshot with numeric task-id keys", () => {
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: {
+        projects: [],
+        tasks: [task],
+        workflows: {
+          "1": { name: "single-step", status: "running", step: "work", steps: [stepRecord] },
+        },
+      },
+    });
+    expect(state.workflows[1]).toEqual({
+      name: "single-step",
+      status: "running",
+      step: "work",
+      steps: [stepRecord],
+    });
+  });
+
+  it("tolerates a snapshot without a workflows map", () => {
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [] },
+    });
+    expect(state.workflows).toEqual({});
+  });
+
+  it("syncs the workflows slice from task_created/task_updated payloads", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 1,
+      ts: "",
+      type: "task_created",
+      payload: task,
+    });
+    expect(state.workflows[1]).toEqual({
+      name: "single-step",
+      status: null,
+      step: null,
+      steps: [],
+    });
+
+    const updated = { ...task, workflow_status: "waiting", workflow_step: "confirm" };
+    state = applyEnvelope(state, { seq: 2, ts: "", type: "task_updated", payload: updated });
+    expect(state.workflows[1]).toMatchObject({ status: "waiting", step: "confirm" });
+  });
+
+  it("appends a running record on workflow_step started and closes it on ok", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [task] },
+    });
+    state = applyEnvelope(state, {
+      seq: 1,
+      ts: "t1",
+      type: "workflow_step",
+      payload: { task_id: 1, step: "work", kind: "agent", session: "main", status: "started" },
+    });
+    expect(state.workflows[1]).toMatchObject({ status: "running", step: "work" });
+    expect(state.workflows[1].steps).toEqual([
+      {
+        task_id: 1,
+        seq: 1,
+        step: "work",
+        kind: "agent",
+        session: "main",
+        status: "running",
+        outcome: null,
+        error: null,
+        prompted_at: null,
+        started_at: "t1",
+        finished_at: null,
+      },
+    ]);
+
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "t2",
+      type: "workflow_step",
+      payload: { task_id: 1, step: "work", kind: "agent", session: "main", status: "ok" },
+    });
+    expect(state.workflows[1].steps).toHaveLength(1);
+    expect(state.workflows[1].steps[0]).toMatchObject({ status: "ok", finished_at: "t2" });
+  });
+
+  it("keeps the run status on ok and lets task_updated land terminal states", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [task] },
+    });
+    state = applyEnvelope(state, {
+      seq: 1,
+      ts: "t1",
+      type: "workflow_step",
+      payload: { task_id: 1, step: "work", kind: "agent", session: "main", status: "started" },
+    });
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "t2",
+      type: "workflow_step",
+      payload: { task_id: 1, step: "work", kind: "agent", session: "main", status: "ok" },
+    });
+    expect(state.workflows[1].status).toBe("running");
+
+    state = applyEnvelope(state, {
+      seq: 3,
+      ts: "t3",
+      type: "task_updated",
+      payload: { ...task, workflow_status: "complete", workflow_step: "work" },
+    });
+    expect(state.workflows[1].status).toBe("complete");
+    // The accumulated step records survive the payload-driven sync.
+    expect(state.workflows[1].steps).toHaveLength(1);
+  });
+
+  it("records the gate message in the waiting step's outcome", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [task] },
+    });
+    state = applyEnvelope(state, {
+      seq: 1,
+      ts: "t1",
+      type: "workflow_step",
+      payload: {
+        task_id: 1,
+        step: "confirm",
+        kind: "gate",
+        session: null,
+        status: "waiting",
+        message: "Review the reproducer output?",
+      },
+    });
+    expect(state.workflows[1].status).toBe("waiting");
+    expect(state.workflows[1].steps[0]).toMatchObject({
+      step: "confirm",
+      kind: "gate",
+      status: "waiting",
+      outcome: { message: "Review the reproducer output?" },
+      finished_at: null,
+    });
+  });
+
+  it("marks the matching record failed with its error", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [task] },
+    });
+    state = applyEnvelope(state, {
+      seq: 1,
+      ts: "t1",
+      type: "workflow_step",
+      payload: { task_id: 1, step: "work", kind: "agent", session: "main", status: "started" },
+    });
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "t2",
+      type: "workflow_step",
+      payload: {
+        task_id: 1,
+        step: "work",
+        kind: "agent",
+        session: "main",
+        status: "failed",
+        error: "agent exited with code 1",
+      },
+    });
+    expect(state.workflows[1].status).toBe("failed");
+    expect(state.workflows[1].steps[0]).toMatchObject({
+      status: "failed",
+      error: "agent exited with code 1",
+      finished_at: "t2",
+    });
+  });
+
+  it("appends a second record when a step name repeats (loop/retry)", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [task] },
+    });
+    for (const [seq, status] of [
+      [1, "started"],
+      [2, "ok"],
+      [3, "started"],
+    ] as const) {
+      state = applyEnvelope(state, {
+        seq,
+        ts: `t${seq}`,
+        type: "workflow_step",
+        payload: { task_id: 1, step: "work", kind: "agent", session: "main", status },
+      });
+    }
+    expect(state.workflows[1].steps.map((s) => [s.seq, s.status])).toEqual([
+      [1, "ok"],
+      [2, "running"],
+    ]);
   });
 });

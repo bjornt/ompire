@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useDaemonState } from "../lib/daemonSocket";
+import { defaultSessionName } from "../lib/daemonReducer";
 import { cleanupTask, draftShip, recheckGpg, shipCommit } from "../lib/api";
 import { confirmCleanup } from "../lib/cleanup";
 import { formatElapsed } from "./TasksView";
@@ -396,10 +397,13 @@ function CleanupStep({ task }: { task: Task }) {
 export function ShipFlowView() {
   const { id } = useParams();
   const taskId = Number(id);
-  const { tasks, sessions, reviews, ships, gpg } = useDaemonState();
+  const { tasks, sessions, workflows, reviews, ships, gpg } = useDaemonState();
 
   const task = tasks.find((t) => t.id === taskId);
-  const session = sessions[taskId];
+  // The ship flow acts on the workflow's relevant session (workflow-engine
+  // design D-9): the in-flight step's session, else the primary.
+  const taskSessions = sessions[taskId];
+  const session = taskSessions?.[defaultSessionName(taskSessions, workflows[taskId])];
   const review = reviews[taskId];
   const ship = ships[taskId];
 

@@ -42,15 +42,17 @@ class AgentStartError(Exception):
 
 
 class AgentAlreadyRunningError(Exception):
-    def __init__(self, task_id: int) -> None:
-        super().__init__(f"task {task_id} already has a live agent")
+    def __init__(self, task_id: int, session: str) -> None:
+        super().__init__(f"task {task_id} session {session!r} already has a live agent")
         self.task_id = task_id
+        self.session = session
 
 
 class NoLiveAgentError(Exception):
-    def __init__(self, task_id: int) -> None:
-        super().__init__(f"task {task_id} has no live agent")
+    def __init__(self, task_id: int, session: str) -> None:
+        super().__init__(f"task {task_id} session {session!r} has no live agent")
         self.task_id = task_id
+        self.session = session
 
 
 def build_agent_argv(
@@ -314,8 +316,9 @@ class AgentHandle:
 
 
 class AgentSupervisor:
-    """Task id → live AgentHandle (design D-1); in-memory only, no registry
-    writes — persistence questions belong to later chunks."""
+    """(Task id, session name) → live AgentHandle (workflow-engine design
+    D-1); in-memory only — session identity persists via the `task_sessions`
+    registry rows written by the workflow engine on lazy spawn."""
 
     def __init__(
         self, config: Config, hub: EventHub, tracker: SessionTracker | None = None
@@ -323,27 +326,29 @@ class AgentSupervisor:
         self._config = config
         self._hub = hub
         self._tracker = tracker
-        self._handles: dict[int, AgentHandle] = {}
+        self._handles: dict[tuple[int, str], AgentHandle] = {}
         self._waiters: set[asyncio.Task] = set()
         self._ask_timeout_verified: set[int] = set()
         # Set once by `shutdown()` (crash-recovery capability, design D-6):
         # tells the exit watcher these exits are graceful, not crashes.
         self._shutting_down = False
 
-    def get(self, task_id: int) -> AgentHandle | None:
-        return self._handles.get(task_id)
+    def get(self, task_id: int, session: str) -> AgentHandle | None:
+        return self._handles.get((task_id, session))
 
     async def start(
         self,
         task_id: int,
+        session: str,
         clone_path: str,
         *,
         resume: str | None = None,
         model: str | None = None,
         thinking: str | None = None,
     ) -> AgentHandle:
-        if task_id in self._handles:
-            raise AgentAlreadyRunningError(task_id)
+        key = (task_id, session)
+        if key in self._handles:
+            raise AgentAlreadyRunningError(task_id, session)
         if task_id not in self._ask_timeout_verified:
             await verify_ask_timeout(clone_path)
             self._ask_timeout_verified.add(task_id)
@@ -355,28 +360,28 @@ class AgentSupervisor:
             # resumed start is already seeded `starting` with a recovery
             # reason by the caller (crash-recovery design D-4) — don't
             # clobber it with this generic one.
-            self._tracker.agent_spawning(task_id)
+            self._tracker.agent_spawning(task_id, session)
         handle = await AgentHandle.start(
             argv,
             ready_timeout=self._config.agent_ready_timeout,
             ring_buffer_size=self._config.agent_ring_buffer_size,
         )
-        if task_id in self._handles:
+        if key in self._handles:
             # A concurrent start won the race while this one awaited spawn.
             await handle.kill()
-            raise AgentAlreadyRunningError(task_id)
-        self._handles[task_id] = handle
+            raise AgentAlreadyRunningError(task_id, session)
+        self._handles[key] = handle
         if self._tracker is not None:
-            self._tracker.watch(task_id, handle)
-        waiter = asyncio.create_task(self._watch(task_id, handle))
+            self._tracker.watch(task_id, session, handle)
+        waiter = asyncio.create_task(self._watch(task_id, session, handle))
         self._waiters.add(waiter)
         waiter.add_done_callback(self._waiters.discard)
         return handle
 
-    async def stop(self, task_id: int) -> None:
-        handle = self._handles.get(task_id)
+    async def stop(self, task_id: int, session: str) -> None:
+        handle = self._handles.get((task_id, session))
         if handle is None:
-            raise NoLiveAgentError(task_id)
+            raise NoLiveAgentError(task_id, session)
         await handle.kill()
 
     async def shutdown(self) -> None:
@@ -393,10 +398,10 @@ class AgentSupervisor:
             return_exceptions=True,
         )
 
-    async def _watch(self, task_id: int, handle: AgentHandle) -> None:
+    async def _watch(self, task_id: int, session: str, handle: AgentHandle) -> None:
         code = await handle.wait_exited()
-        if self._handles.get(task_id) is handle:
-            del self._handles[task_id]
+        if self._handles.get((task_id, session)) is handle:
+            del self._handles[(task_id, session)]
         if self._shutting_down:
             # A graceful-shutdown exit is not a crash (design D-6): no
             # tracker call, no event — the task stays `created` for the next
@@ -404,5 +409,7 @@ class AgentSupervisor:
             return
         # Interpretation first (session goes `failed`), then the raw fact.
         if self._tracker is not None:
-            self._tracker.agent_exited(task_id, code)
-        self._hub.publish("agent_exited", {"task_id": task_id, "exit_code": code})
+            self._tracker.agent_exited(task_id, session, code)
+        self._hub.publish(
+            "agent_exited", {"task_id": task_id, "session": session, "exit_code": code}
+        )

@@ -4,7 +4,7 @@ import { emptyTranscript, reduceFrame, type Transcript } from "./agentFrames";
 import { getDaemonToken } from "./token";
 
 /* Per-agent event-channel client (agent-event-stream): connects to
- * `/api/ws/agents/:taskId`, replays the daemon's ring buffer then follows live
+ * `/api/ws/agents/:taskId/:session`, replays the daemon's ring buffer then follows live
  * events, and reconnects while the agent is live (`enabled`). The daemon closes
  * the channel with code 1000 ("agent exited") once its buffer is flushed — that
  * one is terminal, since the stream is genuinely done and `enabled` will soon
@@ -28,16 +28,16 @@ import { getDaemonToken } from "./token";
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 10000;
 
-function agentWsUrl(taskId: number): string {
+function agentWsUrl(taskId: number, session: string): string {
   const base = import.meta.env.VITE_OMPIRE_DAEMON_WS_URL as string | undefined;
   if (base) {
     // Reuse the configured origin, swap the path to the per-agent channel.
     const url = new URL(base);
-    url.pathname = `/api/ws/agents/${taskId}`;
+    url.pathname = `/api/ws/agents/${taskId}/${session}`;
     return url.toString();
   }
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${window.location.host}/api/ws/agents/${taskId}`;
+  return `${protocol}//${window.location.host}/api/ws/agents/${taskId}/${session}`;
 }
 
 export interface AgentChannel {
@@ -48,9 +48,10 @@ export interface AgentChannel {
   turnEpoch: number;
 }
 
-/** Subscribe to a task's agent event channel while `enabled`. Disabled (no
- * live agent) tears the socket down and reports an empty, disconnected view. */
-export function useAgentChannel(taskId: number, enabled: boolean): AgentChannel {
+/** Subscribe to one session's agent event channel while `enabled`. Disabled
+ * (no live agent) tears the socket down and reports an empty, disconnected
+ * view. */
+export function useAgentChannel(taskId: number, session: string, enabled: boolean): AgentChannel {
   const [transcript, setTranscript] = useState<Transcript>(emptyTranscript);
   const [connected, setConnected] = useState(false);
   const [turnEpoch, setTurnEpoch] = useState(0);
@@ -71,7 +72,7 @@ export function useAgentChannel(taskId: number, enabled: boolean): AgentChannel 
 
     function connect() {
       const token = getDaemonToken();
-      const url = new URL(agentWsUrl(taskId));
+      const url = new URL(agentWsUrl(taskId, session));
       if (token) url.searchParams.set("token", token);
 
       const socket = new WebSocket(url.toString());
@@ -112,7 +113,7 @@ export function useAgentChannel(taskId: number, enabled: boolean): AgentChannel 
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
       socketRef.current?.close();
     };
-  }, [taskId, enabled]);
+  }, [taskId, session, enabled]);
 
   return { transcript, connected, turnEpoch };
 }

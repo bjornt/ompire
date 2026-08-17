@@ -50,6 +50,14 @@ export interface Task {
   pr_url: string | null;
   pr_state: PrState | null;
   pr_merged_at: string | null;
+  /** Workflow denormalized from the template at creation (workflow-engine
+   * capability). */
+  workflow_name: string;
+  /** Run status; null for tasks whose run hasn't started (or that predate
+   * workflows). */
+  workflow_status: WorkflowRunStatus | null;
+  /** Current step name; null when the run is not in flight. */
+  workflow_step: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -68,6 +76,55 @@ export interface SpawnStepPayload {
   step: SpawnStepName;
   status: "started" | "ok" | "failed";
   stderr?: string;
+}
+
+/** Workflow run lifecycle (workflow-engine capability). */
+export type WorkflowRunStatus = "running" | "waiting" | "complete" | "failed";
+
+export type StepKind = "agent" | "command" | "decision" | "gate";
+
+/** Persisted step-record status: the event stream's `started` lands as
+ * `running` on the record. */
+export type StepRecordStatus = "running" | "waiting" | "ok" | "failed";
+
+/** One executed workflow step (workflow-engine capability), as persisted by
+ * the daemon and replayed in the snapshot's `workflows` map. A waiting gate
+ * carries its operator message in `outcome.message`; the outcome schema
+ * (version/status/summary/artifacts, design D-3) is read defensively. */
+export interface StepRecord {
+  task_id: number;
+  seq: number;
+  step: string;
+  kind: StepKind;
+  session: string | null;
+  status: StepRecordStatus;
+  outcome: Record<string, unknown> | null;
+  error: string | null;
+  prompted_at: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
+/** A task's workflow run state (workflow-engine capability): the task row's
+ * persisted workflow fields plus its step-record history. */
+export interface WorkflowState {
+  name: string;
+  status: WorkflowRunStatus | null;
+  step: string | null;
+  steps: StepRecord[];
+}
+
+/** `workflow_step` event on the main socket: one step transition of a run.
+ * `message` is present on `waiting` (the gate's operator message), `error`
+ * on `failed`. */
+export interface WorkflowStepPayload {
+  task_id: number;
+  step: string;
+  kind: StepKind;
+  session: string | null;
+  status: "started" | "ok" | "failed" | "waiting";
+  error?: string;
+  message?: string;
 }
 
 /** SPEC Decision 4: core subset plus the `ask-approvals` waiting states,
@@ -97,6 +154,9 @@ export interface AttentionEntry {
   tier: AttentionTier;
   status: SessionStatus;
   reason: string;
+  /** The session that raised the entry; null for a workflow-gate wait
+   * (workflow-engine design D-7: attention stays one entry per task). */
+  session: string | null;
 }
 
 export interface AttentionPayload extends AttentionEntry {
@@ -111,6 +171,7 @@ export interface AttentionClearedPayload {
  * throttled per task at each turn boundary. */
 export interface StatsPayload {
   task_id: number;
+  session: string;
   context_pct: number | null;
   tokens: { input?: number; output?: number } | null;
   cost: number | null;
@@ -123,12 +184,14 @@ export type AdvisoryKind = "context-high" | "maybe-waiting";
  * only for `context-high`. */
 export interface AdvisoryPayload {
   task_id: number;
+  session: string;
   kind: AdvisoryKind;
   context_pct?: number;
 }
 
 export interface AdvisoryClearedPayload {
   task_id: number;
+  session: string;
   kind: AdvisoryKind;
 }
 
@@ -167,17 +230,20 @@ export interface SessionInfo {
 
 export interface QuestionPostedPayload {
   task_id: number;
+  session: string;
   question: PendingQuestion;
 }
 
 export interface QuestionResolvedPayload {
   task_id: number;
+  session: string;
   question_id: string;
 }
 
-/** GET /api/tasks/:id/agent/state — the agent's `get_state` `data`, passed
- * through untouched by the daemon. Field names beyond isStreaming/queued are
- * read defensively (this change's open SPEC question); unknown keys tolerated. */
+/** GET /api/tasks/:id/sessions/:name/agent/state — the agent's `get_state`
+ * `data`, passed through untouched by the daemon. Field names beyond
+ * isStreaming/queued are read defensively (this change's open SPEC
+ * question); unknown keys tolerated. */
 export interface AgentStateData {
   isStreaming?: boolean;
   queuedMessageCount?: number;
@@ -187,7 +253,8 @@ export interface AgentStateData {
   [key: string]: unknown;
 }
 
-/** GET /api/tasks/:id/agent/stats — the agent's `get_session_stats` `data`. */
+/** GET /api/tasks/:id/sessions/:name/agent/stats — the agent's
+ * `get_session_stats` `data`. */
 export interface AgentStatsData {
   inputTokens?: number;
   outputTokens?: number;
@@ -197,6 +264,7 @@ export interface AgentStatsData {
 
 export interface StatusChangedPayload {
   task_id: number;
+  session: string;
   from: SessionStatus | null;
   to: SessionStatus;
   reason: string;
@@ -291,8 +359,13 @@ export interface SnapshotPayload {
   projects: Project[];
   templates: Template[];
   tasks: Task[];
-  /** Keyed by task id (JSON object keys arrive as strings). */
-  sessions: Record<string, SessionInfo>;
+  /** Nested task id → session name → info (workflow-engine design D-7; JSON
+   * object keys arrive as strings). */
+  sessions: Record<string, Record<string, SessionInfo>>;
+  /** Per-task workflow run state, keyed by task id (JSON object keys arrive
+   * as strings); absent from snapshots emitted before the workflow-engine
+   * chunk. */
+  workflows?: Record<string, WorkflowState>;
   /** Active attention entries, keyed by task id (JSON object keys arrive as
    * strings); absent from snapshots emitted before this chunk. */
   attention?: Record<string, AttentionEntry>;

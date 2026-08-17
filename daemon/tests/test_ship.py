@@ -640,7 +640,7 @@ async def test_draft_via_agent_publishes_draft(
         PR body
         """
     )
-    agents._handles[task.id] = FakeAgentHandle(draft_text)
+    agents._handles[(task.id, "main")] = FakeAgentHandle(draft_text)
 
     queue = hub.subscribe()
 
@@ -656,6 +656,7 @@ async def test_draft_via_agent_publishes_draft(
             "status_changed",
             {
                 "task_id": task.id,
+                "session": "main",
                 "from": "working",
                 "to": "idle",
                 "reason": "test",

@@ -29,6 +29,7 @@ from ompire_daemon.review import ReviewManager
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import ShipManager
 from ompire_daemon.static import DEFAULT_FRONTEND_DIST, mount_frontend
+from ompire_daemon.workflows import WorkflowRunner
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.config,
             agents,
             app.state.sessions,
+            app.state.workflow_runner,
             app.state.recoverable_tasks,
         )
     )
@@ -71,6 +73,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await notifier.stop()
         await advisories.stop()
         await prwatch.stop()
+        # Cancel in-memory workflow runs before terminating agents: a run
+        # cancelled mid-step leaves its record `running` for the next
+        # startup's recovery (workflow-engine design D-6).
+        await app.state.workflow_runner.shutdown()
         await agents.shutdown()
         await reviews.shutdown()
 
@@ -123,6 +129,13 @@ def create_app(config: Config, *, frontend_dist: Path = DEFAULT_FRONTEND_DIST) -
         app.state.events, config.session_idle_debounce, config.stall_threshold
     )
     app.state.agents = AgentSupervisor(config, app.state.events, app.state.sessions)
+    app.state.workflow_runner = WorkflowRunner(
+        app.state.engine,
+        config,
+        app.state.events,
+        app.state.agents,
+        app.state.sessions,
+    )
     app.state.reviews = ReviewManager(
         config, app.state.engine, app.state.events, app.state.sessions, app.state.agents
     )

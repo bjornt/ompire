@@ -3,7 +3,7 @@ import { Link } from "react-router-dom";
 import { spawnTask } from "../lib/api";
 import { useDaemonState } from "../lib/daemonSocket";
 import { REGISTERED_WORKFLOWS, THINKING_LEVELS, templateCheckout } from "../lib/templates";
-import type { SpawnStepName, SpawnStepPayload, Task, ThinkingLevel } from "../types";
+import type { SpawnStepName, SpawnStepPayload, StepRecord, Task, ThinkingLevel } from "../types";
 import "./SpawnView.css";
 
 const PIPELINE_STEPS: { name: SpawnStepName; label: string; detail: (task: Task) => string }[] = [
@@ -33,8 +33,14 @@ function statusOf(steps: SpawnStepPayload[], name: SpawnStepName): StepStatus {
   return last.status;
 }
 
+/** A workflow step record maps onto the pipeline's visual row states; a
+ * parked gate reads as running (the row pulses like any in-flight step). */
+function workflowRowStatus(record: StepRecord): StepStatus {
+  return record.status === "waiting" ? "running" : record.status;
+}
+
 export function SpawnView() {
-  const { projects, templates, tasks, spawnProgress } = useDaemonState();
+  const { projects, templates, tasks, spawnProgress, workflows } = useDaemonState();
   const [templateName, setTemplateName] = useState("");
   const [slug, setSlug] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -54,6 +60,9 @@ export function SpawnView() {
 
   const spawnedTask = spawnedId === null ? null : tasks.find((t) => t.id === spawnedId) ?? null;
   const steps = spawnedId === null ? [] : spawnProgress[spawnedId] ?? [];
+  // Once the spawn pipeline hands off, the workflow run's `workflow_step`
+  // events keep reporting in the same inline list (task-spawn spec).
+  const workflowSteps = spawnedId === null ? [] : (workflows[spawnedId]?.steps ?? []);
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -217,7 +226,9 @@ export function SpawnView() {
                 const failed = stepStatus(steps, stepDef.name);
                 return (
                   <div className="step" key={stepDef.name} data-step-status={status}>
-                    {index < pipelineSteps.length - 1 && <span className="rail" />}
+                    {(index < pipelineSteps.length - 1 || workflowSteps.length > 0) && (
+                      <span className="rail" />
+                    )}
                     <span className={`bullet ${status}`}>
                       {status === "ok" ? "✓" : status === "failed" ? "✕" : index + 1}
                     </span>
@@ -227,6 +238,37 @@ export function SpawnView() {
                       {status === "failed" && failed?.stderr && (
                         <pre className="stderr" data-testid={`stderr-${stepDef.name}`}>
                           {failed.stderr}
+                        </pre>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+              {workflowSteps.map((record, index) => {
+                const status = workflowRowStatus(record);
+                return (
+                  <div
+                    className="step"
+                    key={`workflow-${record.seq}`}
+                    data-step-status={status}
+                    data-testid={`workflow-step-${record.step}`}
+                  >
+                    {index < workflowSteps.length - 1 && <span className="rail" />}
+                    <span className={`bullet ${status}`}>
+                      {status === "ok" ? "✓" : status === "failed" ? "✕" : "▸"}
+                    </span>
+                    <div className="stepBody">
+                      <div className={`stepLabel ${status}`}>
+                        {record.step}
+                        {record.status === "waiting" ? " — waiting at gate" : ""}
+                      </div>
+                      <div className="stepDetail">
+                        {record.kind}
+                        {record.session ? ` · session ${record.session}` : ""}
+                      </div>
+                      {record.status === "failed" && record.error && (
+                        <pre className="stderr" data-testid={`stderr-workflow-${record.step}`}>
+                          {record.error}
                         </pre>
                       )}
                     </div>

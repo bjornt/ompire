@@ -205,35 +205,36 @@ def supervisor(monkeypatch: pytest.MonkeyPatch):
 async def test_supervisor_start_get_stop(supervisor) -> None:
     sup, hub, _ = supervisor
     hub_queue = hub.subscribe()
-    handle = await sup.start(1, "/clone")
-    assert sup.get(1) is handle
+    handle = await sup.start(1, "main", "/clone")
+    assert sup.get(1, "main") is handle
     with pytest.raises(AgentAlreadyRunningError):
-        await sup.start(1, "/clone")
-    await sup.stop(1)
+        await sup.start(1, "main", "/clone")
+    await sup.stop(1, "main")
     event = await asyncio.wait_for(hub_queue.get(), timeout=5)
     assert event.type == "agent_exited"
     assert event.payload["task_id"] == 1
+    assert event.payload["session"] == "main"
     assert event.payload["exit_code"] != 0  # killed
     # The handle is dropped once the waiter has published.
     async with asyncio.timeout(5):
-        while sup.get(1) is not None:
+        while sup.get(1, "main") is not None:
             await asyncio.sleep(0.01)
 
 
 async def test_supervisor_stop_without_agent() -> None:
     sup = AgentSupervisor(Config(), EventHub())
     with pytest.raises(NoLiveAgentError):
-        await sup.stop(42)
+        await sup.stop(42, "main")
 
 
 async def test_supervisor_publishes_exit_code_on_crash(supervisor) -> None:
     sup, hub, scenario = supervisor
     scenario["name"] = "exit-after-ready"
     hub_queue = hub.subscribe()
-    await sup.start(2, "/clone")
+    await sup.start(2, "main", "/clone")
     event = await asyncio.wait_for(hub_queue.get(), timeout=5)
     assert event.type == "agent_exited"
-    assert event.payload == {"task_id": 2, "exit_code": 7}
+    assert event.payload == {"task_id": 2, "session": "main", "exit_code": 7}
 
 
 async def test_supervisor_resume_appends_resume_flag(monkeypatch) -> None:
@@ -253,9 +254,9 @@ async def test_supervisor_resume_appends_resume_flag(monkeypatch) -> None:
 
     monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
 
-    await sup.start(1, "/clone", resume="sess-abc")
+    await sup.start(1, "main", "/clone", resume="sess-abc")
     assert captured["resume"] == "sess-abc"
-    await sup.stop(1)
+    await sup.stop(1, "main")
 
 
 async def test_supervisor_threads_model_and_thinking(monkeypatch) -> None:
@@ -276,10 +277,10 @@ async def test_supervisor_threads_model_and_thinking(monkeypatch) -> None:
 
     monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
 
-    await sup.start(1, "/clone", model="fable-5", thinking="high")
+    await sup.start(1, "main", "/clone", model="fable-5", thinking="high")
     assert captured["model"] == "fable-5"
     assert captured["thinking"] == "high"
-    await sup.stop(1)
+    await sup.stop(1, "main")
 
 
 @pytest.fixture
@@ -306,29 +307,29 @@ def tracked_supervisor(monkeypatch: pytest.MonkeyPatch):
 
 async def test_supervisor_resume_does_not_clobber_recovering_reason(tracked_supervisor) -> None:
     sup, tracker, _, _ = tracked_supervisor
-    tracker.recovering(1)
+    tracker.recovering(1, "main")
 
-    await sup.start(1, "/clone", resume="sess-abc")
+    await sup.start(1, "main", "/clone", resume="sess-abc")
 
     # `agent_spawning`'s generic "agent spawned" reason is skipped for a
     # resume (design D-4): the recovery reason painted before the resume
     # call started is left in place until the caller drives it further.
-    assert tracker.get(1).status == "starting"
-    assert tracker.get(1).reason == "recovering after daemon restart"
-    await sup.stop(1)
+    assert tracker.get(1, "main").status == "starting"
+    assert tracker.get(1, "main").reason == "recovering after daemon restart"
+    await sup.stop(1, "main")
 
 
 async def test_supervisor_shutdown_terminates_without_marking_failed(tracked_supervisor) -> None:
     sup, tracker, hub, _ = tracked_supervisor
     hub_queue = hub.subscribe()
-    await sup.start(1, "/clone")
-    assert tracker.get(1).status == "starting"
+    await sup.start(1, "main", "/clone")
+    assert tracker.get(1, "main").status == "starting"
 
     await asyncio.wait_for(sup.shutdown(), timeout=5)
 
-    assert sup.get(1) is None
+    assert sup.get(1, "main") is None
     # No crash reported: no `agent_exited` event, no `failed` transition.
-    assert tracker.get(1).status == "starting"
+    assert tracker.get(1, "main").status == "starting"
     while not hub_queue.empty():
         event = hub_queue.get_nowait()
         assert event.type != "agent_exited"

@@ -25,8 +25,11 @@ import type {
   SpawnStepPayload,
   StatsPayload,
   StatusChangedPayload,
+  StepRecord,
   Task,
   Template,
+  WorkflowState,
+  WorkflowStepPayload,
 } from "../types";
 
 export interface DaemonState {
@@ -41,21 +44,26 @@ export interface DaemonState {
    * `spawn_step` events, never part of the snapshot — a reconnect drops it,
    * and the persisted task state is authoritative from then on. */
   spawnProgress: Record<number, SpawnStepPayload[]>;
-  /** Live session status per task id: loaded from the snapshot, upserted by
-   * `status_changed`, dropped with the task. */
-  sessions: Record<number, SessionInfo>;
+  /** Live session statuses per task id, then per session name
+   * (workflow-engine design D-7): loaded from the snapshot, upserted by the
+   * session-carrying `status_changed`, dropped with the task. */
+  sessions: Record<number, Record<string, SessionInfo>>;
+  /** Per-task workflow run state (workflow-engine capability): loaded from
+   * the snapshot, advanced by `workflow_step` events, and synced from the
+   * persisted workflow fields on `task_created`/`task_updated`. */
+  workflows: Record<number, WorkflowState>;
   /** Active daemon attention entries per task id (attention-notifications
    * capability): loaded from the snapshot, upserted by `attention`, dropped
    * by `attention_cleared`/the task's own deletion. The single seam
    * `countNeedsAttention` reads (design D-7). */
   attention: Record<number, AttentionEntry>;
-  /** Latest `stats` sample per task id (session-advisories capability):
-   * transient, never part of the snapshot — a reconnect waits for the next
-   * turn boundary. */
-  stats: Record<number, StatsPayload>;
-  /** Active advisory decorations per task id, keyed by kind
+  /** Latest `stats` sample per task id and session name
+   * (session-advisories capability): transient, never part of the snapshot —
+   * a reconnect waits for the next turn boundary. */
+  stats: Record<number, Record<string, StatsPayload>>;
+  /** Active advisory decorations per task id, then per session name and kind
    * (session-advisories capability): transient, never part of the snapshot. */
-  advisories: Record<number, Partial<Record<AdvisoryKind, AdvisoryPayload>>>;
+  advisories: Record<number, Record<string, Partial<Record<AdvisoryKind, AdvisoryPayload>>>>;
   /** Live/completed reviews per task id (review capability): loaded from the
    * snapshot, upserted by review events, dropped by review_finished and by
    * task deletion/cleanup. */
@@ -75,6 +83,7 @@ export const initialDaemonState: DaemonState = {
   tasks: [],
   spawnProgress: {},
   sessions: {},
+  workflows: {},
   attention: {},
   stats: {},
   advisories: {},
@@ -91,9 +100,13 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
   switch (envelope.type) {
     case "snapshot": {
       const payload = envelope.payload as SnapshotPayload;
-      const sessions: Record<number, SessionInfo> = {};
-      for (const [taskId, info] of Object.entries(payload.sessions ?? {})) {
-        sessions[Number(taskId)] = info;
+      const sessions: Record<number, Record<string, SessionInfo>> = {};
+      for (const [taskId, perSession] of Object.entries(payload.sessions ?? {})) {
+        sessions[Number(taskId)] = perSession;
+      }
+      const workflows: Record<number, WorkflowState> = {};
+      for (const [taskId, workflow] of Object.entries(payload.workflows ?? {})) {
+        workflows[Number(taskId)] = workflow;
       }
       const attention: Record<number, AttentionEntry> = {};
       for (const [taskId, entry] of Object.entries(payload.attention ?? {})) {
@@ -114,6 +127,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         tasks: payload.tasks,
         spawnProgress: {},
         sessions,
+        workflows,
         attention,
         stats: {},
         advisories: {},
@@ -163,19 +177,21 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
     }
     case "task_created": {
       const task = envelope.payload as Task;
-      return { ...state, tasks: [task, ...state.tasks] };
+      return { ...state, tasks: [task, ...state.tasks], workflows: syncWorkflow(state, task) };
     }
     case "task_updated": {
       const task = envelope.payload as Task;
       return {
         ...state,
         tasks: state.tasks.map((t) => (t.id === task.id ? task : t)),
+        workflows: syncWorkflow(state, task),
       };
     }
     case "task_deleted": {
       const { id } = envelope.payload as { id: number };
       const { [id]: _dropped, ...spawnProgress } = state.spawnProgress;
       const { [id]: _droppedSession, ...sessions } = state.sessions;
+      const { [id]: _droppedWorkflow, ...workflows } = state.workflows;
       const { [id]: _droppedAttention, ...attention } = state.attention;
       const { [id]: _droppedStats, ...stats } = state.stats;
       const { [id]: _droppedAdvisories, ...advisories } = state.advisories;
@@ -186,6 +202,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         tasks: state.tasks.filter((t) => t.id !== id),
         spawnProgress,
         sessions,
+        workflows,
         attention,
         stats,
         advisories,
@@ -202,36 +219,48 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       };
     }
     case "status_changed": {
-      const { task_id, to, reason } = envelope.payload as StatusChangedPayload;
+      const { task_id, session, to, reason } = envelope.payload as StatusChangedPayload;
+      const perSession = state.sessions[task_id] ?? {};
       return {
         ...state,
         sessions: {
           ...state.sessions,
-          [task_id]: { status: to, reason, since: envelope.ts },
+          [task_id]: {
+            ...perSession,
+            [session]: { status: to, reason, since: envelope.ts },
+          },
         },
       };
     }
     case "question_posted": {
-      const { task_id, question } = envelope.payload as QuestionPostedPayload;
-      const existing = state.sessions[task_id];
-      if (!existing) return state;
+      const { task_id, session, question } = envelope.payload as QuestionPostedPayload;
+      const perSession = state.sessions[task_id];
+      const existing = perSession?.[session];
+      if (!perSession || !existing) return state;
       return {
         ...state,
-        sessions: { ...state.sessions, [task_id]: { ...existing, question } },
+        sessions: {
+          ...state.sessions,
+          [task_id]: { ...perSession, [session]: { ...existing, question } },
+        },
       };
     }
     case "question_resolved": {
-      const { task_id } = envelope.payload as QuestionResolvedPayload;
-      const existing = state.sessions[task_id];
-      if (!existing?.question) return state;
+      const { task_id, session } = envelope.payload as QuestionResolvedPayload;
+      const perSession = state.sessions[task_id];
+      const existing = perSession?.[session];
+      if (!perSession || !existing?.question) return state;
       const { question: _dropped, ...rest } = existing;
-      return { ...state, sessions: { ...state.sessions, [task_id]: rest } };
-    }
-    case "attention": {
-      const { task_id, tier, status, reason } = envelope.payload as AttentionPayload;
       return {
         ...state,
-        attention: { ...state.attention, [task_id]: { tier, status, reason } },
+        sessions: { ...state.sessions, [task_id]: { ...perSession, [session]: rest } },
+      };
+    }
+    case "attention": {
+      const { task_id, tier, status, reason, session } = envelope.payload as AttentionPayload;
+      return {
+        ...state,
+        attention: { ...state.attention, [task_id]: { tier, status, reason, session } },
       };
     }
     case "attention_cleared": {
@@ -242,25 +271,40 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
     }
     case "stats": {
       const payload = envelope.payload as StatsPayload;
-      return { ...state, stats: { ...state.stats, [payload.task_id]: payload } };
+      const perSession = state.stats[payload.task_id] ?? {};
+      return {
+        ...state,
+        stats: {
+          ...state.stats,
+          [payload.task_id]: { ...perSession, [payload.session]: payload },
+        },
+      };
     }
     case "advisory": {
       const payload = envelope.payload as AdvisoryPayload;
-      const existing = state.advisories[payload.task_id] ?? {};
+      const perSession = state.advisories[payload.task_id] ?? {};
+      const existing = perSession[payload.session] ?? {};
       return {
         ...state,
         advisories: {
           ...state.advisories,
-          [payload.task_id]: { ...existing, [payload.kind]: payload },
+          [payload.task_id]: {
+            ...perSession,
+            [payload.session]: { ...existing, [payload.kind]: payload },
+          },
         },
       };
     }
     case "advisory_cleared": {
-      const { task_id, kind } = envelope.payload as AdvisoryClearedPayload;
-      const existing = state.advisories[task_id];
-      if (!existing?.[kind]) return state;
+      const { task_id, session, kind } = envelope.payload as AdvisoryClearedPayload;
+      const perSession = state.advisories[task_id];
+      const existing = perSession?.[session];
+      if (!perSession || !existing?.[kind]) return state;
       const { [kind]: _dropped, ...rest } = existing;
-      return { ...state, advisories: { ...state.advisories, [task_id]: rest } };
+      return {
+        ...state,
+        advisories: { ...state.advisories, [task_id]: { ...perSession, [session]: rest } },
+      };
     }
     case "review_started": {
       const { task_id, url, port } = envelope.payload as ReviewStartedPayload;
@@ -362,6 +406,78 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         },
       };
     }
+    case "workflow_step": {
+      const p = envelope.payload as WorkflowStepPayload;
+      const existing = state.workflows[p.task_id];
+      const steps = [...(existing?.steps ?? [])];
+      const nextSeq = steps.reduce((max, record) => Math.max(max, record.seq), 0) + 1;
+      if (p.status === "started") {
+        // Each execution appends a record daemon-side (append_step_record,
+        // seq = max+1) — a looped/retried step gets one record per run.
+        steps.push({
+          task_id: p.task_id,
+          seq: nextSeq,
+          step: p.step,
+          kind: p.kind,
+          session: p.session,
+          status: "running",
+          outcome: null,
+          error: null,
+          prompted_at: null,
+          started_at: envelope.ts,
+          finished_at: null,
+        });
+      } else {
+        // ok/failed/waiting close out the newest record for this step
+        // name+kind (a decision-escalation gate shares the decision's name,
+        // so kind disambiguates). Tolerate a terminal event whose `started`
+        // we never saw (e.g. joined mid-stream).
+        const idx = steps.findLastIndex((s) => s.step === p.step && s.kind === p.kind);
+        const outcome =
+          p.status === "waiting" && p.message !== undefined ? { message: p.message } : null;
+        const updated: StepRecord = {
+          task_id: p.task_id,
+          seq: idx >= 0 ? steps[idx].seq : nextSeq,
+          step: p.step,
+          kind: p.kind,
+          session: p.session,
+          status: p.status,
+          outcome: outcome ?? (idx >= 0 ? steps[idx].outcome : null),
+          error: p.status === "failed" ? (p.error ?? null) : idx >= 0 ? steps[idx].error : null,
+          prompted_at: idx >= 0 ? steps[idx].prompted_at : null,
+          started_at: idx >= 0 ? steps[idx].started_at : envelope.ts,
+          finished_at: p.status === "waiting" ? null : envelope.ts,
+        };
+        if (idx >= 0) steps[idx] = updated;
+        else steps.push(updated);
+      }
+      const runStatus =
+        p.status === "started"
+          ? "running"
+          : p.status === "waiting"
+            ? "waiting"
+            : p.status === "failed"
+              ? "failed"
+              : // An `ok` keeps the run's last known status; the paired
+                // task_updated lands the authoritative value (complete, or
+                // the next step's running).
+                (existing?.status ?? "running");
+      return {
+        ...state,
+        workflows: {
+          ...state.workflows,
+          [p.task_id]: {
+            name:
+              existing?.name ??
+              state.tasks.find((t) => t.id === p.task_id)?.workflow_name ??
+              "",
+            status: runStatus,
+            step: p.step,
+            steps,
+          },
+        },
+      };
+    }
     case "gpg_status": {
       const { status } = envelope.payload as GpgStatusPayload;
       return { ...state, gpg: status };
@@ -374,4 +490,67 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
 /** A task whose pipeline hasn't finished presents as "spawning" on cards. */
 export function isSpawning(task: Task): boolean {
   return task.state === "created" && task.spawn_completed_at === null;
+}
+
+/** Syncs the workflows slice from a task payload's persisted workflow fields
+ * (workflow-engine design D-9), keeping any step records already accumulated
+ * from the snapshot/`workflow_step` events. */
+function syncWorkflow(state: DaemonState, task: Task): Record<number, WorkflowState> {
+  const existing = state.workflows[task.id];
+  // Before a run starts the row carries only the workflow name; the daemon's
+  // snapshot still emits an entry per task, so mirror that here.
+  return {
+    ...state.workflows,
+    [task.id]: {
+      name: task.workflow_name,
+      status: task.workflow_status,
+      step: task.workflow_step,
+      steps: existing?.steps ?? [],
+    },
+  };
+}
+
+/** A run is in flight while `running` or parked `waiting` at a gate. */
+export function workflowActive(workflow: WorkflowState | undefined): boolean {
+  return workflow?.status === "running" || workflow?.status === "waiting";
+}
+
+/** Ordered session names for a task's tabs and cards (workflow-engine design
+ * D-9): workflow step order first (the first executed step's session is the
+ * primary), then any tracker-only sessions, defaulting to the single-step
+ * workflow's lone `main` session. The daemon doesn't expose a workflow's
+ * declared sessions before its steps run, so the list grows as records land. */
+export function taskSessionNames(
+  taskSessions: Record<string, SessionInfo> | undefined,
+  workflow: WorkflowState | undefined,
+): string[] {
+  const names: string[] = [];
+  for (const record of workflow?.steps ?? []) {
+    if (record.session !== null && !names.includes(record.session)) names.push(record.session);
+  }
+  for (const name of Object.keys(taskSessions ?? {})) {
+    if (!names.includes(name)) names.push(name);
+  }
+  if (names.length === 0) names.push("main");
+  return names;
+}
+
+/** The newest executed record for the run's current step, if any. */
+export function currentStepRecord(workflow: WorkflowState | undefined): StepRecord | undefined {
+  if (!workflow?.step) return undefined;
+  return [...workflow.steps].reverse().find((record) => record.step === workflow.step);
+}
+
+/** The session a task's surfaces focus by default (workflow-engine design
+ * D-9): the current step's session while the run is in flight, else the
+ * primary (first) session name. */
+export function defaultSessionName(
+  taskSessions: Record<string, SessionInfo> | undefined,
+  workflow: WorkflowState | undefined,
+): string {
+  if (workflowActive(workflow)) {
+    const current = currentStepRecord(workflow);
+    if (current?.session) return current.session;
+  }
+  return taskSessionNames(taskSessions, workflow)[0];
 }

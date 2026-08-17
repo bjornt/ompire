@@ -73,12 +73,13 @@ async def test_sample_turn_end_broadcasts_stats() -> None:
     handle = FakeHandle({"get_state": _state(42), "get_session_stats": _stats(100, 20, 0.01)})
 
     queue = hub.subscribe()
-    await sampler.sample_turn_end(1, handle)
+    await sampler.sample_turn_end(1, "main", handle)
 
     event = await queue.get()
     assert event.type == "stats"
     assert event.payload == {
         "task_id": 1,
+        "session": "main",
         "context_pct": 42,
         "tokens": {"input": 100, "output": 20},
         "cost": 0.01,
@@ -91,8 +92,8 @@ async def test_rapid_turns_are_throttled() -> None:
     handle = FakeHandle({"get_state": _state(10), "get_session_stats": _stats()})
     queue = hub.subscribe()
 
-    await sampler.sample_turn_end(1, handle)
-    await sampler.sample_turn_end(1, handle)  # within the throttle window
+    await sampler.sample_turn_end(1, "main", handle)
+    await sampler.sample_turn_end(1, "main", handle)  # within the throttle window
 
     stats_events = []
     with pytest.raises(asyncio.TimeoutError):
@@ -102,7 +103,7 @@ async def test_rapid_turns_are_throttled() -> None:
     assert len(stats_events) == 1
 
     await asyncio.sleep(THROTTLE)
-    await sampler.sample_turn_end(1, handle)
+    await sampler.sample_turn_end(1, "main", handle)
     event = await queue.get()
     assert event.type == "stats"
 
@@ -113,7 +114,7 @@ async def test_context_high_fires_once_and_rearms_after_dropping(monkeypatch: py
     queue = hub.subscribe()
 
     async def sample(pct: float) -> None:
-        await sampler.sample_turn_end(1, FakeHandle({"get_state": _state(pct), "get_session_stats": _stats()}))
+        await sampler.sample_turn_end(1, "main", FakeHandle({"get_state": _state(pct), "get_session_stats": _stats()}))
 
     await sample(50)  # below threshold: stats only
     event = await queue.get()
@@ -123,7 +124,7 @@ async def test_context_high_fires_once_and_rearms_after_dropping(monkeypatch: py
     assert (await queue.get()).type == "stats"
     advisory = await queue.get()
     assert advisory.type == "advisory"
-    assert advisory.payload == {"task_id": 1, "kind": "context-high", "context_pct": 85}
+    assert advisory.payload == {"task_id": 1, "session": "main", "kind": "context-high", "context_pct": 85}
 
     await sample(90)  # stays high: stats only, no re-advise
     assert (await queue.get()).type == "stats"
@@ -135,13 +136,13 @@ async def test_context_high_fires_once_and_rearms_after_dropping(monkeypatch: py
     assert (await queue.get()).type == "stats"
     cleared = await queue.get()
     assert cleared.type == "advisory_cleared"
-    assert cleared.payload == {"task_id": 1, "kind": "context-high"}
+    assert cleared.payload == {"task_id": 1, "session": "main", "kind": "context-high"}
 
     await sample(85)  # crosses again: re-fires
     assert (await queue.get()).type == "stats"
     advisory = await queue.get()
     assert advisory.type == "advisory"
-    assert advisory.payload == {"task_id": 1, "kind": "context-high", "context_pct": 85}
+    assert advisory.payload == {"task_id": 1, "session": "main", "kind": "context-high", "context_pct": 85}
 
 
 async def test_sample_failure_is_swallowed_and_broadcasts_nothing() -> None:
@@ -150,7 +151,7 @@ async def test_sample_failure_is_swallowed_and_broadcasts_nothing() -> None:
     handle = FakeHandle({"get_state": RuntimeError("boom"), "get_session_stats": _stats()})
     queue = hub.subscribe()
 
-    await sampler.sample_turn_end(1, handle)  # must not raise
+    await sampler.sample_turn_end(1, "main", handle)  # must not raise
 
     with pytest.raises(asyncio.TimeoutError):
         async with asyncio.timeout(0.05):
@@ -163,11 +164,11 @@ async def test_maybe_waiting_on_question_like_idle() -> None:
     handle = FakeHandle({"get_last_assistant_text": {"success": True, "data": {"text": "Widen the fix?"}}})
     queue = hub.subscribe()
 
-    await sampler.sample_idle_entered(1, handle)
+    await sampler.sample_idle_entered(1, "main", handle)
 
     event = await queue.get()
     assert event.type == "advisory"
-    assert event.payload == {"task_id": 1, "kind": "maybe-waiting"}
+    assert event.payload == {"task_id": 1, "session": "main", "kind": "maybe-waiting"}
 
 
 async def test_non_question_idle_does_not_advise() -> None:
@@ -178,7 +179,7 @@ async def test_non_question_idle_does_not_advise() -> None:
     )
     queue = hub.subscribe()
 
-    await sampler.sample_idle_entered(1, handle)
+    await sampler.sample_idle_entered(1, "main", handle)
 
     with pytest.raises(asyncio.TimeoutError):
         async with asyncio.timeout(0.05):
@@ -190,7 +191,7 @@ async def test_maybe_waiting_sample_failure_is_swallowed() -> None:
     sampler = AdvisorySampler(hub, stats_throttle_interval=THROTTLE, context_advisory_threshold=80)
     handle = FakeHandle({"get_last_assistant_text": RuntimeError("boom")})
 
-    await sampler.sample_idle_entered(1, handle)  # must not raise
+    await sampler.sample_idle_entered(1, "main", handle)  # must not raise
 
 
 async def test_maybe_waiting_clears_on_leaving_idle() -> None:
@@ -200,17 +201,20 @@ async def test_maybe_waiting_clears_on_leaving_idle() -> None:
     sampler.start()
     try:
         queue = hub.subscribe()
-        await sampler.sample_idle_entered(1, handle)
+        await sampler.sample_idle_entered(1, "main", handle)
         posted = await queue.get()
         assert posted.type == "advisory"
 
-        hub.publish("status_changed", {"task_id": 1, "from": "idle", "to": "working", "reason": "x"})
+        hub.publish(
+            "status_changed",
+            {"task_id": 1, "session": "main", "from": "idle", "to": "working", "reason": "x"},
+        )
         async with asyncio.timeout(5):
             while True:
                 cleared = await queue.get()
                 if cleared.type == "advisory_cleared":
                     break
-        assert cleared.payload == {"task_id": 1, "kind": "maybe-waiting"}
+        assert cleared.payload == {"task_id": 1, "session": "main", "kind": "maybe-waiting"}
     finally:
         await sampler.stop()
 
@@ -218,13 +222,15 @@ async def test_maybe_waiting_clears_on_leaving_idle() -> None:
 async def test_clear_task_drops_bookkeeping() -> None:
     hub = EventHub()
     sampler = AdvisorySampler(hub, stats_throttle_interval=0, context_advisory_threshold=80)
-    await sampler.sample_turn_end(1, FakeHandle({"get_state": _state(90), "get_session_stats": _stats()}))
-    assert 1 in sampler._context_high  # noqa: SLF001 — bookkeeping check
+    await sampler.sample_turn_end(
+        1, "main", FakeHandle({"get_state": _state(90), "get_session_stats": _stats()})
+    )
+    assert (1, "main") in sampler._context_high  # noqa: SLF001 — bookkeeping check
 
     sampler.clear_task(1)
 
-    assert 1 not in sampler._context_high  # noqa: SLF001
-    assert 1 not in sampler._last_sampled_at  # noqa: SLF001
+    assert (1, "main") not in sampler._context_high  # noqa: SLF001
+    assert (1, "main") not in sampler._last_sampled_at  # noqa: SLF001
 
 
 @pytest.fixture
@@ -252,7 +258,7 @@ def tracked(monkeypatch: pytest.MonkeyPatch):
 async def test_turn_end_hook_fires_through_real_tracker(tracked) -> None:
     supervisor, tracker, hub, sampler = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "/clone")
+    handle = await supervisor.start(1, "main", "/clone")
     await handle.prompt("hi")
 
     async with asyncio.timeout(5):
@@ -261,6 +267,7 @@ async def test_turn_end_hook_fires_through_real_tracker(tracked) -> None:
             if event.type == "stats":
                 break
     assert event.payload["task_id"] == 1
+    assert event.payload["session"] == "main"
     assert event.payload["tokens"] == {"input": 1200, "output": 340}
 
-    await supervisor.stop(1)
+    await supervisor.stop(1, "main")
