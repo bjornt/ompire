@@ -949,10 +949,10 @@ async def commit_ship_route(
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
-    if body.mode != "squash":
+    if body.mode not in ("squash", "retain"):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"ship mode {body.mode!r} is not supported; only 'squash' is available",
+            f"ship mode {body.mode!r} is not supported; only 'squash' or 'retain' are available",
         )
 
     existing = ships.get(task_id)
@@ -972,10 +972,18 @@ async def commit_ship_route(
             },
         )
 
-    ships.seed_commit(task.id)
+    if body.mode == "retain":
+        try:
+            await ships.check_retain_preconditions(task)
+        except ShipError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+    ships.seed_commit(task.id, mode=body.mode)
 
     job = asyncio.create_task(
-        ships.commit_and_ship(task, body.message, body.pr_title, body.pr_body)
+        ships.commit_and_ship(
+            task, body.message, body.pr_title, body.pr_body, mode=body.mode
+        )
     )
     jobs: set[asyncio.Task] = request.app.state.spawn_jobs
     jobs.add(job)

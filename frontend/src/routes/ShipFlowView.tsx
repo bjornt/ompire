@@ -122,8 +122,10 @@ function CommitStep({
   const gpgCached = gpg?.state === "cached";
   const gpgLocked = gpg?.state === "locked";
   const busy = ship?.status === "drafting" || ship?.status === "committing";
-  const canCommit = gpgCached && !busy && mode === "squash" && message.trim().length > 0;
+  const canCommit =
+    gpgCached && !busy && (mode === "retain" || message.trim().length > 0);
   const unlockCommand = gpg?.key ? `echo | gpg --clearsign -u ${gpg.key} >/dev/null` : "";
+  const retainSelected = mode === "retain";
 
   async function onRedraft() {
     setRedrafting(true);
@@ -181,16 +183,16 @@ function CommitStep({
           />
           Squash
         </label>
-        <label className="modeOption" title="Retain-and-rewrite mode is planned for ROADMAP #19">
+        <label className="modeOption">
           <input
             type="radio"
             name={`commit-mode-${taskId}`}
             value="retain"
             checked={mode === "retain"}
             onChange={() => setMode("retain")}
-            disabled
+            disabled={busy}
           />
-          Retain <span className="modeHint">#19</span>
+          Retain
         </label>
       </div>
 
@@ -200,13 +202,18 @@ function CommitStep({
           <textarea
             rows={4}
             value={message}
-            disabled={busy}
+            disabled={busy || retainSelected}
             onChange={(e) => {
               setMessage(e.target.value);
               setTouched((t) => ({ ...t, message: true }));
             }}
             data-testid="commit-message"
           />
+          {retainSelected && (
+            <span className="fieldHint" data-testid="retain-message-hint">
+              Per-commit messages are retained in this mode.
+            </span>
+          )}
         </label>
         <label>
           PR title

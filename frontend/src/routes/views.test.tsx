@@ -1379,6 +1379,98 @@ describe("ShipFlowView", () => {
     await renderAt("/ship/999", { projects: [project], tasks: [makeTask()] });
     expect(screen.getByTestId("ship-flow-not-found")).toHaveTextContent("Task not found");
   });
+
+  it("selects retain mode and disables the commit message field", async () => {
+    const user = userEvent.setup();
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      ships: {
+        "1": {
+          status: "drafted",
+          mode: "squash",
+          draft: {
+            commit_message: "draft commit",
+            pr_title: "draft title",
+            pr_body: "draft body",
+            source: "agent",
+          },
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t0",
+        },
+      },
+    });
+
+    const retainRadio = screen.getByRole("radio", { name: /Retain/i });
+    expect(retainRadio).not.toBeDisabled();
+
+    await user.click(retainRadio);
+    expect(screen.getByTestId("commit-message")).toBeDisabled();
+    expect(screen.getByTestId("retain-message-hint")).toHaveTextContent(
+      "Per-commit messages are retained",
+    );
+    expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled();
+  });
+
+  it("posts ship commit with retain mode", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () =>
+        Promise.resolve({
+          status: "committing",
+          draft: null,
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t1",
+        }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      ships: {
+        "1": {
+          status: "drafted",
+          mode: "squash",
+          draft: {
+            commit_message: "draft commit",
+            pr_title: "draft title",
+            pr_body: "draft body",
+            source: "agent",
+          },
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t0",
+        },
+      },
+    });
+
+    await user.click(screen.getByRole("radio", { name: /Retain/i }));
+    await user.click(screen.getByTestId("sign-commit-button"));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/1/ship/commit",
+      expect.objectContaining({
+        method: "POST",
+        body: expect.stringContaining("retain"),
+      }),
+    );
+    const body = JSON.parse(fetchMock.mock.calls[fetchMock.mock.calls.length - 1][1].body as string);
+    expect(body).toEqual({
+      message: "draft commit",
+      pr_title: "draft title",
+      pr_body: "draft body",
+      mode: "retain",
+    });
+  });
 });
 
 describe("Chrome GPG chip", () => {

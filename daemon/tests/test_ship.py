@@ -458,7 +458,292 @@ async def test_commit_failure_restores_head_and_cleans_ref(
     assert result.returncode != 0
 
 
-# --- push routing ---------------------------------------------------------
+async def test_commit_and_ship_retain_rewrites_range(
+    tmp_root, engine, ships, gpg, monkeypatch
+):
+    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+
+    origin = tmp_root / "origin.git"
+    project, task = _make_project_and_task(
+        engine, tmp_root, upstream_url="git@github.com:owner/repo.git"
+    )
+
+    bin_dir = tmp_root / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    _write_script(
+        bin_dir,
+        "gh",
+        "#!/bin/sh\necho 'https://github.com/owner/repo/pull/42'\n",
+    )
+    monkeypatch.setenv(
+        "PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+    )
+
+    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _setup_signing_gpg(Path(task.clone_path), bin_dir)
+    # Clean up the working tree so retain mode accepts the clone.
+    _run_git(Path(task.clone_path), "add", "file3.txt")
+    _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
+
+    clone = Path(task.clone_path)
+    pre = subprocess.run(
+        ["git", "-C", str(clone), "log", "--format=%T %s", "origin/main..HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip().splitlines()
+
+    real_ensure = ships._ensure_ship_remote
+    seen_urls: list[str] = []
+
+    async def ensure_local(clone_path, url, timeout):
+        seen_urls.append(url)
+        return await real_ensure(clone_path, str(origin), timeout)
+
+    monkeypatch.setattr(ships, "_ensure_ship_remote", ensure_local)
+
+    state = await ships.commit_and_ship(
+        task,
+        message="ignored in retain",
+        pr_title="Final PR",
+        pr_body="Body text",
+        mode="retain",
+    )
+
+    assert state.status == "shipped", state.error
+    assert state.mode == "retain"
+    assert state.commit_sha is not None
+    assert state.pr_url == "https://github.com/owner/repo/pull/42"
+    assert seen_urls == ["git@github.com:owner/repo.git"]
+
+    # Same number of commits and same trees/subjects.
+    post = subprocess.run(
+        ["git", "-C", str(clone), "log", "--format=%T %s", "origin/main..HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip().splitlines()
+    assert len(post) == len(pre)
+    assert post == pre
+
+    # Every commit operator-authored and well-signed.
+    authors = subprocess.run(
+        ["git", "-C", str(clone), "log", "--format=%an|%ae|%cn|%ce|%G?", "origin/main..HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip().splitlines()
+    for line in authors:
+        an, ae, cn, ce, sig = line.split("|")
+        assert an == "Test User"
+        assert ae == "test@example.com"
+        assert cn == "Test User"
+        assert ce == "test@example.com"
+        assert sig in ("G", "U")
+
+
+async def test_commit_and_ship_retain_refuses_dirty_tree(
+    tmp_root, engine, ships, gpg, monkeypatch
+):
+    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+
+    origin = tmp_root / "origin.git"
+    project, task = _make_project_and_task(engine, tmp_root)
+
+    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+
+    state = await ships.commit_and_ship(
+        task,
+        message="m",
+        pr_title="t",
+        pr_body="b",
+        mode="retain",
+    )
+
+    assert state.status == "error"
+    assert "dirty" in state.error.lower()
+
+
+async def test_commit_and_ship_retain_refuses_merge_commits(
+    tmp_root, engine, ships, gpg, monkeypatch
+):
+    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+
+    origin = tmp_root / "origin.git"
+    project, task = _make_project_and_task(engine, tmp_root)
+
+    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _run_git(Path(task.clone_path), "add", "file3.txt")
+    _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
+
+    clone = Path(task.clone_path)
+    _run_git(clone, "checkout", "-b", "side")
+    (clone / "side.txt").write_text("side\n", encoding="utf-8")
+    _run_git(clone, "add", ".")
+    _run_git(clone, "commit", "-m", "side commit")
+    _run_git(clone, "checkout", "ompire/task-1")
+    _run_git(clone, "merge", "--no-ff", "side", "-m", "merge side")
+
+    state = await ships.commit_and_ship(
+        task,
+        message="m",
+        pr_title="t",
+        pr_body="b",
+        mode="retain",
+    )
+
+    assert state.status == "error"
+    assert "merge" in state.error.lower()
+
+
+async def test_commit_and_ship_retain_refuses_empty_range(
+    tmp_root, engine, ships, gpg, monkeypatch
+):
+    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+
+    origin = tmp_root / "origin.git"
+    project, task = _make_project_and_task(engine, tmp_root)
+
+    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    # Drop the uncommitted change and reset the branch to main.
+    (Path(task.clone_path) / "file3.txt").unlink()
+    _run_git(Path(task.clone_path), "checkout", "main")
+    _run_git(Path(task.clone_path), "checkout", "-B", "ompire/task-1")
+
+    state = await ships.commit_and_ship(
+        task,
+        message="m",
+        pr_title="t",
+        pr_body="b",
+        mode="retain",
+    )
+
+    assert state.status == "error"
+    assert state.commit_sha is None
+
+
+async def test_commit_and_ship_retain_amend_failure_restores_head(
+    tmp_root, engine, ships, gpg, monkeypatch
+):
+    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+
+    origin = tmp_root / "origin.git"
+    project, task = _make_project_and_task(engine, tmp_root)
+
+    tmp_root.joinpath("bin").mkdir(exist_ok=True)
+    fake_gpg = _write_script(
+        tmp_root / "bin",
+        "fake-gpg-fail",
+        "#!/bin/sh\necho 'signing failed' >&2\nexit 2\n",
+    )
+    monkeypatch.setenv(
+        "PATH", f"{tmp_root / 'bin'}{os.pathsep}{os.environ['PATH']}"
+    )
+
+    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _setup_signing_gpg(Path(task.clone_path), tmp_root / "bin")
+    _run_git(Path(task.clone_path), "add", "file3.txt")
+    _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
+    # Swap to failing gpg so the rebase amend fails mid-range.
+    _run_git(Path(task.clone_path), "config", "gpg.program", str(fake_gpg))
+
+    orig_sha = subprocess.run(
+        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    state = await ships.commit_and_ship(
+        task,
+        message="Will fail",
+        pr_title="Title",
+        pr_body="Body",
+        mode="retain",
+    )
+
+    assert state.status == "error"
+    assert state.commit_sha is None
+
+    # HEAD restored to original and tree is clean.
+    head_sha = subprocess.run(
+        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert head_sha == orig_sha
+
+    status = subprocess.run(
+        ["git", "-C", task.clone_path, "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert status == ""
+
+    # No rebase in progress and ref cleaned up.
+    assert not (Path(task.clone_path) / ".git" / "rebase-merge").exists()
+    assert not (Path(task.clone_path) / ".git" / "rebase-apply").exists()
+    result = subprocess.run(
+        ["git", "-C", task.clone_path, "rev-parse", "--verify", "refs/ompire/ship-orig"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+
+
+async def test_commit_and_ship_retain_verification_failure_restores_head(
+    tmp_root, engine, ships, gpg, monkeypatch
+):
+    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+
+    origin = tmp_root / "origin.git"
+    project, task = _make_project_and_task(engine, tmp_root)
+
+    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _setup_signing_gpg(Path(task.clone_path), tmp_root / "bin")
+    _run_git(Path(task.clone_path), "add", "file3.txt")
+    _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
+
+    from ompire_daemon import ship as ship_module
+    real_run = ship_module._run_git_output
+
+    async def fake_sigs(argv, cwd, timeout, step_name):
+        if step_name == "ship-retain-sigs":
+            return "G\nX\n"
+        return await real_run(argv, cwd, timeout, step_name)
+
+    monkeypatch.setattr(ship_module, "_run_git_output", fake_sigs)
+
+    orig_sha = subprocess.run(
+        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+    state = await ships.commit_and_ship(
+        task,
+        message="m",
+        pr_title="t",
+        pr_body="b",
+        mode="retain",
+    )
+
+    assert state.status == "error"
+    assert "signature" in state.error.lower()
+
+    head_sha = subprocess.run(
+        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert head_sha == orig_sha
+
+
+# --- push routing ----------------------------------------------------------
 
 
 async def test_push_and_pr_routes_to_fork(
@@ -710,7 +995,7 @@ def test_commit_route_409_gpg_locked(client, auth_header, engine, tmp_root, app,
     assert data["detail"]["gpg"]["state"] == "locked"
 
 
-def test_commit_route_409_non_squash_mode(
+def test_commit_route_409_unsupported_mode(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
     project, task = _make_project_and_task(engine, tmp_root)
@@ -722,10 +1007,115 @@ def test_commit_route_409_non_squash_mode(
             "message": "m",
             "pr_title": "t",
             "pr_body": "b",
+            "mode": "merge",
+        },
+    )
+    assert response.status_code == 409
+
+
+def test_commit_route_409_retain_dirty_tree(
+    client, auth_header, engine, tmp_root, app, monkeypatch
+):
+    project, task = _make_project_and_task(engine, tmp_root)
+    monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
+    origin = tmp_root / "origin.git"
+    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+
+    response = client.post(
+        f"/api/tasks/{task.id}/ship/commit",
+        headers=auth_header,
+        json={
+            "message": "m",
+            "pr_title": "t",
+            "pr_body": "b",
             "mode": "retain",
         },
     )
     assert response.status_code == 409
+    assert "dirty" in response.json()["detail"].lower()
+
+
+def test_commit_route_409_retain_merge_commits(
+    client, auth_header, engine, tmp_root, app, monkeypatch
+):
+    project, task = _make_project_and_task(engine, tmp_root)
+    monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
+    origin = tmp_root / "origin.git"
+    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _run_git(Path(task.clone_path), "add", "file3.txt")
+    _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
+
+    clone = Path(task.clone_path)
+    _run_git(clone, "checkout", "-b", "side")
+    (clone / "side.txt").write_text("side\n", encoding="utf-8")
+    _run_git(clone, "add", ".")
+    _run_git(clone, "commit", "-m", "side commit")
+    _run_git(clone, "checkout", "ompire/task-1")
+    _run_git(clone, "merge", "--no-ff", "side", "-m", "merge side")
+
+    response = client.post(
+        f"/api/tasks/{task.id}/ship/commit",
+        headers=auth_header,
+        json={
+            "message": "m",
+            "pr_title": "t",
+            "pr_body": "b",
+            "mode": "retain",
+        },
+    )
+    assert response.status_code == 409
+    assert "merge" in response.json()["detail"].lower()
+
+
+def test_commit_route_409_retain_empty_range(
+    client, auth_header, engine, tmp_root, app, monkeypatch
+):
+    project, task = _make_project_and_task(engine, tmp_root)
+    monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
+    origin = tmp_root / "origin.git"
+    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    (Path(task.clone_path) / "file3.txt").unlink()
+    _run_git(Path(task.clone_path), "checkout", "main")
+    _run_git(Path(task.clone_path), "checkout", "-B", "ompire/task-1")
+
+    response = client.post(
+        f"/api/tasks/{task.id}/ship/commit",
+        headers=auth_header,
+        json={
+            "message": "m",
+            "pr_title": "t",
+            "pr_body": "b",
+            "mode": "retain",
+        },
+    )
+    assert response.status_code == 409
+    assert "no commits" in response.json()["detail"].lower()
+
+
+def test_commit_route_accepts_retain_mode(
+    client, auth_header, engine, tmp_root, app, monkeypatch
+):
+    project, task = _make_project_and_task(engine, tmp_root)
+    monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
+    origin = tmp_root / "origin.git"
+    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _run_git(Path(task.clone_path), "add", "file3.txt")
+    _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
+
+    response = client.post(
+        f"/api/tasks/{task.id}/ship/commit",
+        headers=auth_header,
+        json={
+            "message": "m",
+            "pr_title": "t",
+            "pr_body": "b",
+            "mode": "retain",
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "committing"
+    assert data["mode"] == "retain"
 
 
 def test_commit_route_409_when_ship_in_flight(

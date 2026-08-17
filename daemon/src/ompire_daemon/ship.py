@@ -232,11 +232,11 @@ class ShipManager:
             )
             return state
 
-    def seed_commit(self, task_id: int) -> ShipState:
+    def seed_commit(self, task_id: int, mode: str = "squash") -> ShipState:
         """Synchronously seed the committing state for the REST route, which
         then backgrounds `commit_and_ship`.
         """
-        state = self._set_state(task_id, status="committing", error=None)
+        state = self._set_state(task_id, status="committing", error=None, mode=mode)
         self._hub.publish(
             "ship_step",
             {"task_id": task_id, "step": "commit", "status": "started"},
@@ -244,15 +244,23 @@ class ShipManager:
         return state
 
     async def commit_and_ship(
-        self, task: Task, message: str, pr_title: str, pr_body: str
+        self,
+        task: Task,
+        message: str,
+        pr_title: str,
+        pr_body: str,
+        mode: str = "squash",
     ) -> ShipState:
-        """Squash, sign, push, and open a PR for `task`."""
+        """Sign, push, and open a PR for `task` in `squash` or `retain` mode."""
         status = await self._gpg.probe()
         if status.state != "cached":
             raise GpgLockedError(status)
 
+        if mode not in ("squash", "retain"):
+            raise ShipError(f"ship mode {mode!r} is not supported")
+
         existing = self._ships.get(task.id)
-        self._set_state(task.id, status="committing", error=None)
+        self._set_state(task.id, status="committing", error=None, mode=mode)
         if existing is None or existing.status != "committing":
             self._hub.publish(
                 "ship_step",
@@ -268,19 +276,24 @@ class ShipManager:
             await self._fetch(clone_path, timeout)
             await self._save_ship_orig(clone_path, timeout)
             base = await self._merge_base(clone_path, base_branch, timeout)
-            await self._soft_reset(clone_path, base, timeout)
-            try:
-                sha = await self._commit(clone_path, message, timeout)
-            except Exception:
-                await self._restore_ship_orig(clone_path, timeout)
-                raise
-            finally:
-                await self._delete_ship_orig(clone_path, timeout)
+            if mode == "squash":
+                sha, commit_count = await self._squash_commit(
+                    clone_path, base, message, timeout
+                )
+            else:
+                sha, commit_count = await self._retain_rewrite(
+                    task, clone_path, base, timeout
+                )
 
             self._set_state(task.id, commit_sha=sha)
             self._hub.publish(
                 "ship_step",
-                {"task_id": task.id, "step": "commit", "status": "ok", "detail": sha},
+                {
+                    "task_id": task.id,
+                    "step": "commit",
+                    "status": "ok",
+                    "detail": {"sha": sha, "count": commit_count},
+                },
             )
         except Exception as exc:  # noqa: BLE001
             message = f"commit failed: {exc}"
@@ -296,6 +309,8 @@ class ShipManager:
             )
             self._hub.publish("ship_finished", {"task_id": task.id, "status": "error"})
             return self._ships[task.id]
+        finally:
+            await self._delete_ship_orig(clone_path, timeout)
 
         self._set_state(task.id, status="pushing")
         try:
@@ -436,6 +451,164 @@ class ShipManager:
             return sha
         finally:
             await asyncio.to_thread(Path(msg_path).unlink)
+
+    async def _squash_commit(
+        self, clone_path: str, base: str, message: str, timeout: int
+    ) -> tuple[str, int]:
+        """Soft-reset to merge-base and create one signed operator commit."""
+        await self._soft_reset(clone_path, base, timeout)
+        try:
+            sha = await self._commit(clone_path, message, timeout)
+        except Exception:
+            await self._restore_ship_orig(clone_path, timeout)
+            raise
+        return sha, 1
+
+    async def check_retain_preconditions(self, task: Task) -> None:
+        """Fast preflight for retain mode; raises ShipError on 409 conditions."""
+        clone_path = task.clone_path
+        timeout = self._config.spawn_step_timeout
+        base_branch = self._base_branch(task)
+        await self._fetch(clone_path, timeout)
+        base = await self._merge_base(clone_path, base_branch, timeout)
+        await self._assert_retain_preconditions(clone_path, base, timeout)
+
+    async def _assert_retain_preconditions(
+        self, clone_path: str, base: str, timeout: int
+    ) -> None:
+        stdout, stderr, code = await _run_command(
+            ["git", "-C", clone_path, "status", "--porcelain"],
+            clone_path,
+            timeout,
+        )
+        if code != 0:
+            raise ShipError(f"git status failed: {stderr}")
+        if stdout.strip():
+            raise ShipError("working tree is dirty; commit or stash changes before retain mode")
+
+        range_commits = (
+            await _run_git_output(
+                ["git", "-C", clone_path, "rev-list", f"{base}..HEAD"],
+                clone_path,
+                timeout,
+                "ship-retain-rev-list",
+            )
+        ).strip()
+        if not range_commits:
+            raise ShipError("no commits to retain")
+
+        merges = (
+            await _run_git_output(
+                ["git", "-C", clone_path, "rev-list", "--merges", f"{base}..HEAD"],
+                clone_path,
+                timeout,
+                "ship-retain-merges",
+            )
+        ).strip()
+        if merges:
+            raise ShipError("range contains merge commits; use squash mode")
+
+    async def _retain_rewrite(
+        self, task: Task, clone_path: str, base: str, timeout: int
+    ) -> tuple[str, int]:
+        """Rewrite merge-base..HEAD in place with operator-authored signed commits."""
+        await self._assert_retain_preconditions(clone_path, base, timeout)
+
+        range_commits = (
+            await _run_git_output(
+                ["git", "-C", clone_path, "rev-list", f"{base}..HEAD"],
+                clone_path,
+                timeout,
+                "ship-retain-count",
+            )
+        ).strip()
+        pre_count = len(range_commits.splitlines())
+
+        name = await self._git_config(clone_path, "user.name")
+        email = await self._git_config(clone_path, "user.email")
+
+        argv = ["git", "-C", clone_path, "-c", "sequence.editor=true"]
+        if name:
+            argv += ["-c", f"user.name={name}"]
+        if email:
+            argv += ["-c", f"user.email={email}"]
+        argv += [
+            "rebase",
+            base,
+            "--keep-empty",
+            "--empty=keep",
+            "--exec",
+            "git commit --amend --no-edit --reset-author -S",
+        ]
+
+        try:
+            await _run_step(Step("ship-retain-rebase", argv, timeout))
+        except Exception:
+            await self._retain_restore(clone_path, timeout)
+            raise
+
+        post_count_str = await _run_git_output(
+            ["git", "-C", clone_path, "rev-list", "--count", f"{base}..HEAD"],
+            clone_path,
+            timeout,
+            "ship-retain-post-count",
+        )
+        post_count = int(post_count_str.strip())
+        if post_count != pre_count:
+            await self._retain_restore(clone_path, timeout)
+            raise ShipError(
+                f"retain rewrite changed commit count: {post_count} != {pre_count}"
+            )
+
+        sigs = (
+            await _run_git_output(
+                ["git", "-C", clone_path, "log", "--format=%G?", f"{base}..HEAD"],
+                clone_path,
+                timeout,
+                "ship-retain-sigs",
+            )
+        ).strip().splitlines()
+        bad = [s for s in sigs if s not in ("G", "U")]
+        if bad:
+            await self._retain_restore(clone_path, timeout)
+            raise ShipError("retain rewrite produced commits without good signatures")
+
+        sha = (
+            await _run_git_output(
+                ["git", "-C", clone_path, "rev-parse", "HEAD"],
+                clone_path,
+                timeout,
+                "ship-retain-sha",
+            )
+        ).strip()
+        if not sha:
+            raise ShipError("could not read commit sha after retain rewrite")
+        return sha, post_count
+
+    async def _retain_restore(self, clone_path: str, timeout: int) -> None:
+        """Abort an in-progress rebase and restore the pre-ship HEAD."""
+        clone = Path(clone_path)
+        for state_dir in (
+            clone / ".git" / "rebase-merge",
+            clone / ".git" / "rebase-apply",
+        ):
+            if state_dir.exists():
+                await _run_step(
+                    Step(
+                        "ship-retain-abort",
+                        ["git", "-C", clone_path, "rebase", "--abort"],
+                        timeout,
+                    )
+                )
+                break
+        await _run_step(
+            Step(
+                "ship-retain-restore",
+                ["git", "-C", clone_path, "reset", "--hard", _SHIP_GIT_REF],
+                timeout,
+            )
+        )
+        await self._delete_ship_orig(clone_path, timeout)
 
     async def _git_config(self, clone_path: str, key: str) -> str | None:
         try:

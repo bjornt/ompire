@@ -170,6 +170,12 @@
   color: var(--faint);
 }
 
+.fieldHint {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
 .commitFields {
   display: flex;
   flex-direction: column;
