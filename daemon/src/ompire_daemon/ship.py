@@ -24,6 +24,7 @@ from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.registry.projects import Project, get_project
 from ompire_daemon.registry.tasks import Task, mark_pr_url
+from ompire_daemon.registry.templates import get_template
 from ompire_daemon.review import _run_git_output
 from ompire_daemon.spawn import Step, _run_step
 
@@ -257,13 +258,14 @@ class ShipManager:
             )
 
         project = self._project(task)
+        base_branch = self._base_branch(task)
         clone_path = task.clone_path
         timeout = self._config.spawn_step_timeout
 
         try:
             await self._fetch(clone_path, timeout)
             await self._save_ship_orig(clone_path, timeout)
-            base = await self._merge_base(clone_path, project.base_branch, timeout)
+            base = await self._merge_base(clone_path, base_branch, timeout)
             await self._soft_reset(clone_path, base, timeout)
             try:
                 sha = await self._commit(clone_path, message, timeout)
@@ -295,7 +297,7 @@ class ShipManager:
 
         self._set_state(task.id, status="pushing")
         try:
-            pr_url = await self._push_and_pr(task, project, pr_title, pr_body)
+            pr_url = await self._push_and_pr(task, project, base_branch, pr_title, pr_body)
         except Exception as exc:  # noqa: BLE001
             message = f"push/PR failed: {exc}"
             self._set_state(task.id, status="error", error=message)
@@ -326,6 +328,14 @@ class ShipManager:
 
     def _project(self, task: Task) -> Project:
         return get_project(self._engine, task.project_name)
+
+    def _base_branch(self, task: Task) -> str:
+        """`<base>` for the squash/PR: the task's template base branch
+        (templates capability, design D-3). Tasks that predate templates
+        (null `template_name`) fall back to `main`."""
+        if task.template_name is None:
+            return "main"
+        return get_template(self._engine, task.template_name).base_branch
 
     async def _fetch(self, clone_path: str, timeout: int) -> None:
         await _run_step(
@@ -457,11 +467,10 @@ class ShipManager:
         )
 
     async def _push_and_pr(
-        self, task: Task, project: Project, pr_title: str, pr_body: str
+        self, task: Task, project: Project, base_branch: str, pr_title: str, pr_body: str
     ) -> str:
         clone_path = task.clone_path
         branch = task.branch
-        base_branch = project.base_branch
 
         if project.fork_url:
             remote_url = project.fork_url

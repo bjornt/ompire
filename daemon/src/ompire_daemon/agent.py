@@ -54,19 +54,30 @@ class NoLiveAgentError(Exception):
 
 
 def build_agent_argv(
-    clone_path: str, agent_env: Mapping[str, str], *, resume: str | None = None
+    clone_path: str,
+    agent_env: Mapping[str, str],
+    *,
+    resume: str | None = None,
+    model: str | None = None,
+    thinking: str | None = None,
 ) -> list[str]:
     """The spike's spawn recipe (design D-2): sessions ON (no `--no-session`),
     no `-s` flag (nonexistent), credentials via an `env` prefix inside the
     container (design D-3). `resume` appends `--resume <session-id>`
     (crash-recovery capability, design D-1/D-3) — a bare session id, not a
     file path, confirmed against the omp source (see the
-    `omp-rpc-field-assumptions` memory note)."""
+    `omp-rpc-field-assumptions` memory note). `model`/`thinking` append
+    `--model`/`--thinking` only when set (templates capability; both flags
+    verified against omp v17.2.12); unset means omp's defaults."""
     argv = [
         "workshop", "exec", "-p", clone_path, "--",
         "env", *[f"{key}={value}" for key, value in agent_env.items()],
         "omp", "--mode", "rpc-ui", "--no-title",
     ]
+    if model is not None:
+        argv += ["--model", model]
+    if thinking is not None:
+        argv += ["--thinking", thinking]
     if resume is not None:
         argv += ["--resume", resume]
     return argv
@@ -323,14 +334,22 @@ class AgentSupervisor:
         return self._handles.get(task_id)
 
     async def start(
-        self, task_id: int, clone_path: str, *, resume: str | None = None
+        self,
+        task_id: int,
+        clone_path: str,
+        *,
+        resume: str | None = None,
+        model: str | None = None,
+        thinking: str | None = None,
     ) -> AgentHandle:
         if task_id in self._handles:
             raise AgentAlreadyRunningError(task_id)
         if task_id not in self._ask_timeout_verified:
             await verify_ask_timeout(clone_path)
             self._ask_timeout_verified.add(task_id)
-        argv = build_agent_argv(clone_path, self._config.agent_env, resume=resume)
+        argv = build_agent_argv(
+            clone_path, self._config.agent_env, resume=resume, model=model, thinking=thinking
+        )
         if self._tracker is not None and resume is None:
             # `starting` covers the spawn and ready handshake (design D-2). A
             # resumed start is already seeded `starting` with a recovery

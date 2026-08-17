@@ -62,6 +62,7 @@ class ClonePathOutsideRootError(ValueError):
 class Task:
     id: int
     project_name: str
+    template_name: str | None
     slug: str
     branch: str
     clone_path: str
@@ -71,6 +72,8 @@ class Task:
     workshop_id: str | None
     session_id: str | None
     pr_url: str | None
+    pr_state: str | None
+    pr_merged_at: str | None
     spawn_completed_at: str | None
     created_at: str
     updated_at: str
@@ -103,6 +106,7 @@ def _row_to_task(row) -> Task:  # noqa: ANN001
     return Task(
         id=row.id,
         project_name=row.project_name,
+        template_name=row.template_name,
         slug=row.slug,
         branch=row.branch,
         clone_path=row.clone_path,
@@ -112,6 +116,8 @@ def _row_to_task(row) -> Task:  # noqa: ANN001
         workshop_id=row.workshop_id,
         session_id=row.session_id,
         pr_url=row.pr_url,
+        pr_state=row.pr_state,
+        pr_merged_at=row.pr_merged_at,
         spawn_completed_at=row.spawn_completed_at,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -126,6 +132,7 @@ def create_task(
     branch: str,
     clone_path: str,
     prompt: str,
+    template_name: str | None = None,
 ) -> Task:
     validate_task_slug(slug)
     now = _now_iso()
@@ -134,6 +141,7 @@ def create_task(
             result = conn.execute(
                 tasks.insert().values(
                     project_name=project_name,
+                    template_name=template_name,
                     slug=slug,
                     branch=branch,
                     clone_path=clone_path,
@@ -168,6 +176,19 @@ def list_tasks(engine: Engine) -> list[Task]:
     return [_row_to_task(row) for row in rows]
 
 
+def list_pr_pollable_tasks(engine: Engine) -> list[Task]:
+    """Tasks the PR watcher polls (merge-poll capability, design D-2): shipped
+    (have a `pr_url`), not archived, and not yet in a terminal PR state."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            tasks.select()
+            .where(tasks.c.pr_url.isnot(None))
+            .where(tasks.c.state != "archived")
+            .where(tasks.c.pr_state.is_(None) | (tasks.c.pr_state == "open"))
+        ).all()
+    return [_row_to_task(row) for row in rows]
+
+
 def _update(engine: Engine, task_id: int, **values) -> Task:  # noqa: ANN003
     with engine.begin() as conn:
         result = conn.execute(
@@ -192,6 +213,12 @@ def mark_session_id(engine: Engine, task_id: int, session_id: str) -> Task:
 
 def mark_pr_url(engine: Engine, task_id: int, url: str) -> Task:
     return _update(engine, task_id, pr_url=url)
+
+
+def mark_pr_state(
+    engine: Engine, task_id: int, pr_state: str, merged_at: str | None = None
+) -> Task:
+    return _update(engine, task_id, pr_state=pr_state, pr_merged_at=merged_at)
 
 
 def mark_failed(engine: Engine, task_id: int, error: str) -> Task:

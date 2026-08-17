@@ -2,7 +2,8 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { spawnTask } from "../lib/api";
 import { useDaemonState } from "../lib/daemonSocket";
-import type { SpawnStepName, SpawnStepPayload, Task } from "../types";
+import { REGISTERED_WORKFLOWS, THINKING_LEVELS, templateCheckout } from "../lib/templates";
+import type { SpawnStepName, SpawnStepPayload, Task, ThinkingLevel } from "../types";
 import "./SpawnView.css";
 
 const PIPELINE_STEPS: { name: SpawnStepName; label: string; detail: (task: Task) => string }[] = [
@@ -33,28 +34,42 @@ function statusOf(steps: SpawnStepPayload[], name: SpawnStepName): StepStatus {
 }
 
 export function SpawnView() {
-  const { projects, tasks, spawnProgress } = useDaemonState();
-  const [projectName, setProjectName] = useState("");
+  const { projects, templates, tasks, spawnProgress } = useDaemonState();
+  const [templateName, setTemplateName] = useState("");
   const [slug, setSlug] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [model, setModel] = useState("");
+  const [thinking, setThinking] = useState<ThinkingLevel | "">("");
   const [spawnedId, setSpawnedId] = useState<number | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  const project = projects.find((p) => p.name === projectName) ?? projects[0];
+  const template = templates.find((t) => t.name === templateName) ?? templates[0];
   const branchPreview = useMemo(() => {
-    if (!project || !slug) return null;
-    return project.branch_pattern.replace("<slug>", slug);
-  }, [project, slug]);
+    if (!template || !slug) return null;
+    return template.branch_pattern.replace("<slug>", slug);
+  }, [template, slug]);
+  const workflowLabel = template
+    ? (REGISTERED_WORKFLOWS.find((w) => w.name === template.workflow)?.label ?? template.workflow)
+    : null;
 
   const spawnedTask = spawnedId === null ? null : tasks.find((t) => t.id === spawnedId) ?? null;
   const steps = spawnedId === null ? [] : spawnProgress[spawnedId] ?? [];
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
-    if (!project) return;
+    if (!template) return;
     setSubmitError(null);
+    // Empty overrides are omitted from the POST so the daemon falls back to
+    // the template value, then to the omp default (task-spawn capability).
+    const modelOverride = model.trim();
     try {
-      const task = await spawnTask({ project_name: project.name, slug, prompt });
+      const task = await spawnTask({
+        template_name: template.name,
+        slug,
+        prompt,
+        ...(modelOverride ? { model: modelOverride } : {}),
+        ...(thinking ? { thinking } : {}),
+      });
       setSpawnedId(task.id);
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : String(error));
@@ -73,23 +88,38 @@ export function SpawnView() {
           <h2 className="panelTitle">New task</h2>
 
           <div className="field">
-            <label htmlFor="spawn-project">Project</label>
+            <label htmlFor="spawn-template">Project template</label>
             <select
-              id="spawn-project"
-              value={project?.name ?? ""}
-              onChange={(e) => setProjectName(e.target.value)}
+              id="spawn-template"
+              value={template?.name ?? ""}
+              onChange={(e) => setTemplateName(e.target.value)}
+              data-testid="spawn-template"
             >
-              {projects.length === 0 ? (
-                <option value="">no projects registered</option>
+              {templates.length === 0 ? (
+                <option value="">no templates registered</option>
               ) : (
-                projects.map((p) => (
-                  <option key={p.name} value={p.name}>
-                    {p.name} — {p.checkout_path} · base {p.base_branch}
+                templates.map((t) => (
+                  <option key={t.name} value={t.name}>
+                    {t.name} — {templateCheckout(t, projects)} · base {t.base_branch} ·{" "}
+                    {t.model ?? "omp default"} · wf:{t.workflow}
                   </option>
                 ))
               )}
             </select>
+            <div className="hint">
+              Preamble, workshop additions, omp settings and the workflow come from the template.{" "}
+              <Link to="/settings">Edit templates</Link>
+            </div>
           </div>
+
+          {template && workflowLabel && (
+            <div className="field">
+              <span className="fieldLabel">Workflow — from template</span>
+              <div className="workflowBlock" data-testid="workflow-block">
+                {workflowLabel}
+              </div>
+            </div>
+          )}
 
           <div className="field">
             <label htmlFor="spawn-slug">Task slug</label>
@@ -101,15 +131,15 @@ export function SpawnView() {
               onChange={(e) => setSlug(e.target.value)}
               placeholder="fix-the-bug"
             />
-            {branchPreview && project && (
+            {branchPreview && template && (
               <>
                 <div>
                   <span className="branchPreview" data-testid="branch-preview">
-                    branch: {branchPreview} · off origin/{project.base_branch}
+                    branch: {branchPreview} · off origin/{template.base_branch}
                   </span>
                 </div>
                 <div className="hint">
-                  clone → <code>~/tasks/{project.name}/{slug}</code>
+                  clone → <code>~/tasks/{template.project_name}/{slug}</code>
                 </div>
               </>
             )}
@@ -127,7 +157,40 @@ export function SpawnView() {
             />
           </div>
 
-          <button className="primary" type="submit" disabled={!project || !slug}>
+          {template && (
+            <div className="overrideGrid">
+              <div className="field">
+                <label htmlFor="spawn-model">Model override</label>
+                <input
+                  id="spawn-model"
+                  className="mono"
+                  type="text"
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder={`template default (${template.model ?? "omp default"})`}
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="spawn-thinking">Thinking</label>
+                <select
+                  id="spawn-thinking"
+                  value={thinking}
+                  onChange={(e) => setThinking(e.target.value as ThinkingLevel | "")}
+                >
+                  <option value="">
+                    template default ({template.thinking ?? "omp default"})
+                  </option>
+                  {THINKING_LEVELS.map((level) => (
+                    <option key={level} value={level}>
+                      {level}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
+
+          <button className="primary" type="submit" disabled={!template || !slug}>
             Spawn task
           </button>
           {submitError && (

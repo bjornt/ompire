@@ -246,8 +246,6 @@ def _make_project_and_task(
         upstream_url=upstream_url,
         fork_url=fork_url,
         checkout_path=str(checkout_dir),
-        base_branch="main",
-        default_branch_pattern="ompire/<slug>",
         default_checkout_root=tmp_root / "proj",
     )
     clone_path = tmp_root / "tasks" / "myproject" / "task-1"
@@ -501,7 +499,7 @@ async def test_push_and_pr_routes_to_fork(
     ships._set_state(task.id, status="committing")
     ships._set_state(task.id, commit_sha="abc123")
     url = await ships._push_and_pr(
-        task, project, pr_title="Title", pr_body="Body"
+        task, project, "main", pr_title="Title", pr_body="Body"
     )
 
     assert url == "https://github.com/upowner/uprepo/pull/7"
@@ -539,7 +537,7 @@ async def test_push_and_pr_routes_to_upstream_without_fork(
 
     ships._set_state(task.id, status="committing")
     ships._set_state(task.id, commit_sha="abc123")
-    url = await ships._push_and_pr(task, project, pr_title="Title", pr_body="Body")
+    url = await ships._push_and_pr(task, project, "main", pr_title="Title", pr_body="Body")
 
     assert url == "https://github.com/upowner/uprepo/pull/9"
     assert pushed == [("git@github.com:upowner/uprepo.git", "ompire/task-1")]

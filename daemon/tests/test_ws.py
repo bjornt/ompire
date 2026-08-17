@@ -15,6 +15,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         payload = message["payload"]
         assert payload.keys() == {
             "projects",
+            "templates",
             "tasks",
             "sessions",
             "attention",
@@ -23,6 +24,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
             "gpg",
         }
         assert payload["projects"] == []
+        assert payload["templates"] == []
         assert payload["tasks"] == []
         assert payload["sessions"] == {}
         assert payload["attention"] == {}
@@ -46,6 +48,43 @@ def test_mutation_broadcast(client: TestClient, auth_token: str, auth_headers: d
         assert event["type"] == "project_created"
         assert event["payload"]["name"] == "ompire"
         assert event["seq"] > snapshot["seq"]
+
+
+def test_template_events_and_snapshot(
+    client: TestClient, auth_token: str, auth_headers: dict[str, str]
+) -> None:
+    client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={"name": "demo", "title": "Demo", "upstream_url": "https://example.com/demo.git"},
+    )
+
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        snapshot = ws.receive_json()
+        assert snapshot["payload"]["templates"] == []
+
+        response = client.post(
+            "/api/templates",
+            headers=auth_headers,
+            json={"name": "demo", "project_name": "demo"},
+        )
+        assert response.status_code == 201
+
+        event = ws.receive_json()
+        assert event["type"] == "template_created"
+        assert event["payload"]["name"] == "demo"
+        assert event["payload"]["base_branch"] == "main"
+        assert event["seq"] > snapshot["seq"]
+
+        deleted = client.delete("/api/templates/demo", headers=auth_headers)
+        assert deleted.status_code == 200
+        event = ws.receive_json()
+        assert event["type"] == "template_deleted"
+        assert event["payload"] == {"name": "demo"}
+
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        snapshot = ws.receive_json()
+        assert snapshot["payload"]["templates"] == []
 
 
 def test_reconnect_gets_fresh_snapshot(
@@ -73,18 +112,8 @@ def test_ws_requires_valid_token(client: TestClient) -> None:
 
 
 def test_task_events_and_snapshot(
-    client: TestClient, auth_token: str, auth_headers: dict[str, str], git_checkout
+    client: TestClient, auth_token: str, auth_headers: dict[str, str], demo_template: dict
 ) -> None:
-    client.post(
-        "/api/projects",
-        headers=auth_headers,
-        json={
-            "name": "demo",
-            "title": "Demo",
-            "upstream_url": "https://example.com/demo.git",
-            "checkout_path": str(git_checkout),
-        },
-    )
 
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         ws.receive_json()  # snapshot
@@ -92,7 +121,7 @@ def test_task_events_and_snapshot(
         response = client.post(
             "/api/tasks",
             headers=auth_headers,
-            json={"project_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
+            json={"template_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
         )
         assert response.status_code == 202
 
@@ -122,25 +151,15 @@ def test_task_events_and_snapshot(
 
 
 def test_snapshot_carries_session_statuses(
-    client: TestClient, auth_token: str, auth_headers: dict[str, str], git_checkout
+    client: TestClient, auth_token: str, auth_headers: dict[str, str], demo_template: dict
 ) -> None:
-    client.post(
-        "/api/projects",
-        headers=auth_headers,
-        json={
-            "name": "demo",
-            "title": "Demo",
-            "upstream_url": "https://example.com/demo.git",
-            "checkout_path": str(git_checkout),
-        },
-    )
 
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         ws.receive_json()  # snapshot
         response = client.post(
             "/api/tasks",
             headers=auth_headers,
-            json={"project_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
+            json={"template_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
         )
         assert response.status_code == 202
         task_id = response.json()["id"]

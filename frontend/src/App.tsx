@@ -5,7 +5,8 @@ import { TasksView } from "./routes/TasksView";
 import { TaskDetailView } from "./routes/TaskDetailView";
 import { ShipFlowView } from "./routes/ShipFlowView";
 import { SpawnView } from "./routes/SpawnView";
-import { StubPage } from "./routes/StubPage";
+import { ProjectsView } from "./routes/ProjectsView";
+import { SettingsView } from "./routes/SettingsView";
 
 export function App() {
   return (
@@ -16,10 +17,10 @@ export function App() {
             <Route path="/" element={<Navigate to="/tasks" replace />} />
             <Route path="/tasks" element={<TasksView />} />
             <Route path="/tasks/:id" element={<TaskDetailView />} />
-            <Route path="/projects" element={<StubPage title="Projects" />} />
+            <Route path="/projects" element={<ProjectsView />} />
             <Route path="/spawn" element={<SpawnView />} />
             <Route path="/ship/:id" element={<ShipFlowView />} />
-            <Route path="/settings" element={<StubPage title="Templates & settings" />} />
+            <Route path="/settings" element={<SettingsView />} />
           </Route>
         </Routes>
       </BrowserRouter>

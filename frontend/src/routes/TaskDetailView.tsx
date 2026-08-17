@@ -113,6 +113,8 @@ export function TaskDetailView() {
             <dt>spawned</dt>
             <dd>
               {new Date(detail.created_at).toLocaleString()} · {formatElapsed(detail.created_at)} ago
+              {/* Tasks that predate templates have a null template_name — no annotation. */}
+              {detail.template_name !== null && ` · template ${detail.template_name}`}
             </dd>
             {detail.error && (
               <>

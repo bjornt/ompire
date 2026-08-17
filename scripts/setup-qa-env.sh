@@ -346,8 +346,8 @@ api_daemon() { # api_daemon METHOD PATH [JSON]
 	curl "${args[@]}" "$DAEMON_URL$path"
 }
 
-payload=$(jq -n --arg n "$NAME" --arg t "$REPO" --arg u "$SSH_URL" --arg c "$CHECKOUT" --arg b "$BASE_BRANCH" \
-	'{name: $n, title: $t, upstream_url: $u, checkout_path: $c, base_branch: $b}')
+payload=$(jq -n --arg n "$NAME" --arg t "$REPO" --arg u "$SSH_URL" --arg c "$CHECKOUT" \
+	'{name: $n, title: $t, upstream_url: $u, checkout_path: $c}')
 if ! api_daemon POST /api/projects "$payload" >/dev/null 2>&1; then
 	# most likely a duplicate — verify the existing registration matches
 	existing=$(api_daemon GET "/api/projects/$NAME" 2>/dev/null || true)
@@ -355,7 +355,20 @@ if ! api_daemon POST /api/projects "$payload" >/dev/null 2>&1; then
 	[ "$got" = "$SSH_URL" ] || die "project '$NAME' already registered with a different upstream ($got)"
 	log "project: '$NAME' already registered"
 else
-	log "project: registered '$NAME' ($SSH_URL, base $BASE_BRANCH)"
+	log "project: registered '$NAME' ($SSH_URL)"
+fi
+
+# Spawn is template-driven (templates capability): ensure a default template
+# carrying the repo's real default branch exists alongside the project.
+tpl_payload=$(jq -n --arg n "$NAME" --arg b "$BASE_BRANCH" \
+	'{name: $n, project_name: $n, base_branch: $b}')
+if ! api_daemon POST /api/templates "$tpl_payload" >/dev/null 2>&1; then
+	existing_tpl=$(api_daemon GET "/api/templates/$NAME" 2>/dev/null || true)
+	got_tpl=$(jq -r '.project_name // empty' <<<"$existing_tpl" 2>/dev/null)
+	[ "$got_tpl" = "$NAME" ] || die "template '$NAME' already exists for a different project ($got_tpl)"
+	log "template: '$NAME' already registered"
+else
+	log "template: registered '$NAME' (base $BASE_BRANCH)"
 fi
 
 # ---- 10. smoke ------------------------------------------------------------

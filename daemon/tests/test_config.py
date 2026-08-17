@@ -202,6 +202,21 @@ def test_invalid_renotify_interval_fails_fast(tmp_path: Path) -> None:
         load_config(config_path)
 
 
+def test_invalid_pr_poll_interval_fails_fast(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("pr_poll_interval = 0\n")
+
+    with pytest.raises(ConfigError, match="pr_poll_interval"):
+        load_config(config_path)
+
+
+def test_pr_poll_interval_parses(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text("pr_poll_interval = 30\n")
+
+    assert load_config(config_path).pr_poll_interval == 30.0
+
+
 def test_invalid_context_advisory_threshold_fails_fast(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text("context_advisory_threshold = 101\n")

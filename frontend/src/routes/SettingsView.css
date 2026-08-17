@@ -1,0 +1,171 @@
+/* Settings view, pixel-matched to the left column of
+ * design/handoff/Settings.dc.html (the right column — notifications,
+ * watchdogs, daemon panel — is ROADMAP chunk 20 and slots into
+ * .settingsGrid). Shared primitives (.headerRow, .subline, .spacer, .empty,
+ * .panel, .panelTitle, .submitError) come from TasksView.css/SpawnView.css
+ * and the form classes (.formField, .fieldLabel, .fieldHint, .formGrid,
+ * .formActions, .primaryButton, .ghostButton, .removeButton) from
+ * ProjectsView.css — single conventions, one bundle. */
+
+.settingsGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .settingsGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.settingsColumn {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.templatesEmpty {
+  min-height: 0;
+  padding: 24px 16px;
+}
+
+/* Template list rows */
+
+.templateList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.templateRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface2);
+  font-size: 12.5px;
+}
+
+.templateRow.editing {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface2));
+}
+
+.templateName {
+  font-family: var(--mono);
+  font-weight: 700;
+}
+
+.templateSummary {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 11px;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.editToggle,
+.editingToggle {
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.editToggle {
+  border: 1px solid transparent;
+  background: none;
+  color: var(--muted);
+}
+
+.editToggle:hover {
+  color: var(--text);
+  border-color: var(--line);
+}
+
+.editingToggle {
+  border: 1px solid var(--line);
+  background: var(--surface2);
+  color: var(--text);
+}
+
+.editingToggle:hover {
+  border-color: var(--faint);
+}
+
+.newTemplateButton {
+  border: 1px solid var(--line);
+  background: var(--surface2);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 11.5px;
+  color: var(--text);
+  line-height: 1.5;
+  white-space: nowrap;
+  margin-top: 12px;
+}
+
+.newTemplateButton:hover {
+  border-color: var(--faint);
+}
+
+/* Editor card */
+
+.templateEditor form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.formGridPair {
+  grid-template-columns: 1fr 1fr;
+}
+
+@media (max-width: 700px) {
+  .formGridPair {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ProjectsView.css styles .formField input; the template editor also has
+ * selects and a textarea — same treatment, per the mockup's uniform
+ * input/select/textarea rule. */
+.templateEditor .formField select,
+.templateEditor .formField textarea {
+  font-size: 12.5px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface2);
+  color: var(--text);
+}
+
+.templateEditor .formField input.mono,
+.templateEditor .formField textarea.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.templateEditor .formField textarea {
+  resize: vertical;
+}
+
+.derivedNote {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--faint);
+  overflow-wrap: anywhere;
+}
+
+.fieldNote {
+  font-size: 11px;
+  color: var(--faint);
+}

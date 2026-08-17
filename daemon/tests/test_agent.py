@@ -130,6 +130,26 @@ def test_build_agent_argv_no_resume_by_default() -> None:
     assert "--resume" not in argv
 
 
+def test_build_agent_argv_model_and_thinking() -> None:
+    argv = build_agent_argv("/clones/t1", {}, model="fable-5", thinking="high")
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "fable-5"
+    assert "--thinking" in argv
+    assert argv[argv.index("--thinking") + 1] == "high"
+
+
+def test_build_agent_argv_omits_unset_model_thinking() -> None:
+    argv = build_agent_argv("/clones/t1", {})
+    assert "--model" not in argv
+    assert "--thinking" not in argv
+
+
+def test_build_agent_argv_model_only() -> None:
+    argv = build_agent_argv("/clones/t1", {}, model="fable-5")
+    assert "--model" in argv
+    assert "--thinking" not in argv
+
+
 async def test_read_session_id_from_get_state() -> None:
     handle = await start_fake()
     session_id = await handle.read_session_id()
@@ -170,7 +190,7 @@ def supervisor(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, env, resume=None: fake_omp_argv(scenario["name"]),
+        lambda clone, env, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -222,7 +242,7 @@ async def test_supervisor_resume_appends_resume_flag(monkeypatch) -> None:
     sup = AgentSupervisor(config, hub)
     captured = {}
 
-    def fake_build(clone, env, resume=None):  # noqa: ANN001
+    def fake_build(clone, env, resume=None, model=None, thinking=None):  # noqa: ANN001
         captured["resume"] = resume
         return fake_omp_argv("happy")
 
@@ -238,6 +258,30 @@ async def test_supervisor_resume_appends_resume_flag(monkeypatch) -> None:
     await sup.stop(1)
 
 
+async def test_supervisor_threads_model_and_thinking(monkeypatch) -> None:
+    hub = EventHub()
+    config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100)
+    sup = AgentSupervisor(config, hub)
+    captured = {}
+
+    def fake_build(clone, env, resume=None, model=None, thinking=None):  # noqa: ANN001
+        captured["model"] = model
+        captured["thinking"] = thinking
+        return fake_omp_argv("happy")
+
+    monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
+
+    async def no_preflight(clone_path: str) -> None:
+        return None
+
+    monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
+
+    await sup.start(1, "/clone", model="fable-5", thinking="high")
+    assert captured["model"] == "fable-5"
+    assert captured["thinking"] == "high"
+    await sup.stop(1)
+
+
 @pytest.fixture
 def tracked_supervisor(monkeypatch: pytest.MonkeyPatch):
     """Like `supervisor`, but wired to a real `SessionTracker` so recovery's
@@ -247,7 +291,7 @@ def tracked_supervisor(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, env, resume=None: fake_omp_argv(scenario["name"]),
+        lambda clone, env, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
     )
 
     async def no_preflight(clone_path: str) -> None:

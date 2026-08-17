@@ -5,6 +5,7 @@ containers)."""
 from __future__ import annotations
 
 import subprocess
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from ompire_daemon.registry.tasks import (
     create_task,
     get_task,
 )
+from ompire_daemon.registry.templates import create_template
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.spawn import run_spawn_pipeline
 
@@ -47,24 +49,44 @@ def pipeline(app):
     tracker = SessionTracker(hub, idle_debounce=0.1)
     supervisor = AgentSupervisor(config, hub, tracker)
 
-    async def run(engine, task_id: int, project, run_config: Config | None = None):  # noqa: ANN001
+    async def run(engine, task_id: int, run_config: Config | None = None, **overrides):  # noqa: ANN001
         await run_spawn_pipeline(
-            engine, hub, run_config or config, task_id, project, supervisor, tracker
+            engine, hub, run_config or config, task_id, supervisor, tracker, **overrides
         )
 
     return run, hub, tracker, supervisor
 
 
-def _make_project(engine, checkout: Path, *, base_branch: str = "main"):  # noqa: ANN001, ANN202
+def _make_project(engine, checkout: Path):  # noqa: ANN001, ANN202
     return create_project(
         engine,
         name="demo",
         title="Demo",
         upstream_url="https://example.com/demo.git",
         checkout_path=str(checkout),
-        base_branch=base_branch,
-        default_branch_pattern="ompire/<slug>",
         default_checkout_root=checkout.parent,
+    )
+
+
+def _make_template(
+    engine,  # noqa: ANN001
+    checkout: Path,
+    *,
+    base_branch: str = "main",
+    preamble: str = "",
+    model: str | None = None,
+    thinking: str | None = None,
+):
+    _make_project(engine, checkout)
+    return create_template(
+        engine,
+        name="demo",
+        project_name="demo",
+        base_branch=base_branch,
+        branch_pattern="ompire/<slug>",
+        preamble=preamble,
+        model=model,
+        thinking=thinking,
     )
 
 
@@ -73,6 +95,7 @@ def _make_task(engine, config: Config, *, prompt: str = "fix the bug"):  # noqa:
     return create_task(
         engine,
         project_name="demo",
+        template_name="demo",
         slug="fix-bug",
         branch="ompire/fix-bug",
         clone_path=str(clone_path),
@@ -96,10 +119,10 @@ async def test_successful_pipeline(app, git_checkout: Path, fake_my_workshop, pi
     )
     queue = hub.subscribe()
 
-    project = _make_project(engine, git_checkout)
+    _make_template(engine, git_checkout)
     task = _make_task(engine, config)
 
-    await run(engine, task.id, project, config)
+    await run(engine, task.id, config)
 
     clone = Path(task.clone_path)
     assert (clone / ".git").is_dir()
@@ -151,10 +174,10 @@ async def test_empty_prompt_skips_prompt_step(
     )
     queue = hub.subscribe()
 
-    project = _make_project(engine, git_checkout)
+    _make_template(engine, git_checkout)
     task = _make_task(engine, config, prompt="")
 
-    await run(engine, task.id, project, config)
+    await run(engine, task.id, config)
 
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "created"
@@ -182,10 +205,10 @@ async def test_agent_step_failure_marks_task_failed(
     fake_workshop_cli.write_text(FAKE_WORKSHOP_SCRIPT.replace(" happy", " crash"))
     queue = hub.subscribe()
 
-    project = _make_project(engine, git_checkout)
+    _make_template(engine, git_checkout)
     task = _make_task(engine, config)
 
-    await run(engine, task.id, project, config)
+    await run(engine, task.id, config)
 
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "failed"
@@ -218,10 +241,10 @@ async def test_session_id_capture_failure_leaves_it_null_and_spawn_succeeds(
     fake_workshop_cli.write_text(FAKE_WORKSHOP_SCRIPT.replace(" happy", " get-state-fails"))
     queue = hub.subscribe()
 
-    project = _make_project(engine, git_checkout)
+    _make_template(engine, git_checkout)
     task = _make_task(engine, config)
 
-    await run(engine, task.id, project, config)
+    await run(engine, task.id, config)
 
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "created"
@@ -247,11 +270,11 @@ async def test_prompt_step_failure_marks_task_failed(
         app.state.config,
         my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
     )
-    project = _make_project(engine, git_checkout)
+    _make_template(engine, git_checkout)
     # The magic "fail" prompt makes fake omp answer success: false, "boom".
     task = _make_task(engine, config, prompt="fail")
 
-    await run(engine, task.id, project, config)
+    await run(engine, task.id, config)
 
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "failed"
@@ -266,10 +289,10 @@ async def test_step_failure_captures_stderr(app, git_checkout: Path, pipeline) -
     run, hub, _, _ = pipeline
     queue = hub.subscribe()
 
-    project = _make_project(engine, git_checkout, base_branch="no-such-branch")
+    _make_template(engine, git_checkout, base_branch="no-such-branch")
     task = _make_task(engine, app.state.config)
 
-    await run(engine, task.id, project)
+    await run(engine, task.id)
 
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "failed"
@@ -291,11 +314,11 @@ async def test_leftover_directory_fails(app, git_checkout: Path, pipeline) -> No
     run, hub, _, _ = pipeline
     queue = hub.subscribe()
 
-    project = _make_project(engine, git_checkout)
+    _make_template(engine, git_checkout)
     task = _make_task(engine, app.state.config)
     Path(task.clone_path).mkdir(parents=True)
 
-    await run(engine, task.id, project)
+    await run(engine, task.id)
 
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "failed"
@@ -315,10 +338,10 @@ async def test_workshop_step_failure(app, git_checkout: Path, fake_my_workshop, 
     )
     queue = hub.subscribe()
 
-    project = _make_project(engine, git_checkout)
+    _make_template(engine, git_checkout)
     task = _make_task(engine, config)
 
-    await run(engine, task.id, project, config)
+    await run(engine, task.id, config)
 
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "failed"
@@ -342,10 +365,10 @@ async def test_workshop_step_timeout(app, git_checkout: Path, fake_my_workshop, 
         workshop_step_timeout=1,
     )
 
-    project = _make_project(engine, git_checkout)
+    _make_template(engine, git_checkout)
     task = _make_task(engine, config)
 
-    await run(engine, task.id, project, config)
+    await run(engine, task.id, config)
 
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "failed"
@@ -363,10 +386,10 @@ async def test_workshop_lock_missing_after_success(
     )
     queue = hub.subscribe()
 
-    project = _make_project(engine, git_checkout)
+    _make_template(engine, git_checkout)
     task = _make_task(engine, config)
 
-    await run(engine, task.id, project, config)
+    await run(engine, task.id, config)
 
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "failed"
@@ -387,11 +410,231 @@ async def test_workshop_tool_missing(app, git_checkout: Path, pipeline) -> None:
         my_workshop_command=("/no/such/my-workshop",),
     )
 
-    project = _make_project(engine, git_checkout)
+    _make_template(engine, git_checkout)
     task = _make_task(engine, config)
 
-    await run(engine, task.id, project, config)
+    await run(engine, task.id, config)
 
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "failed"
     assert "cannot exec" in (refreshed.error or "")
+
+
+# --- Template-driven spawn (templates capability) ---------------------------
+
+
+async def test_template_missing_at_pipeline_start_fails_before_git(
+    app, git_checkout: Path, fake_my_workshop, pipeline  # noqa: ANN001
+) -> None:
+    engine = app.state.engine
+    run, hub, tracker, _ = pipeline
+    config: Config = replace(
+        app.state.config,
+        my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
+    )
+    queue = hub.subscribe()
+
+    _make_template(engine, git_checkout)
+    task = _make_task(engine, config)
+    # The template disappears between the 202 and pipeline start (raw delete:
+    # the REST guard blocks this once the task row exists — the race needs
+    # the row gone underneath a live task, e.g. a DB restore).
+    from ompire_daemon.db import templates as templates_table
+
+    with engine.begin() as conn:
+        conn.execute(templates_table.delete().where(templates_table.c.name == "demo"))
+
+    await run(engine, task.id, config)
+
+    refreshed = get_task(engine, task.id)
+    assert refreshed.state == "failed"
+    assert "template" in (refreshed.error or "")
+    assert "'demo'" in (refreshed.error or "")
+    # No clone ever happened: the failure lands before any git command, and
+    # no spawn_step events are published.
+    assert not Path(task.clone_path).exists()
+    drained = _drain(queue)
+    assert not [e for e in drained if e.type == "spawn_step"]
+    # No session entry was ever seeded (the agent step never ran).
+    assert tracker.get(task.id) is None
+
+
+async def test_preamble_prepended_to_prompt(
+    app, git_checkout: Path, fake_my_workshop, pipeline  # noqa: ANN001
+) -> None:
+    engine = app.state.engine
+    run, _, _, supervisor = pipeline
+    config: Config = replace(
+        app.state.config,
+        my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
+    )
+
+    _make_template(engine, git_checkout, preamble="You are on team omega.")
+    task = _make_task(engine, config, prompt="fix the bug")
+
+    await run(engine, task.id, config)
+
+    refreshed = get_task(engine, task.id)
+    assert refreshed.state == "created"
+
+    # The fake omp echoes the prompt back in its `message_start` user event,
+    # fanned out on the agent handle's ring buffer (not the hub). Subscribe
+    # after the agent starts: the prompt's ack completes the step while the
+    # echoed frames are still in flight, so drain the live queue instead of
+    # racing the ring buffer.
+    handle = supervisor.get(task.id)
+    assert handle is not None
+    queue = handle.subscribe()
+    async with asyncio.timeout(5):
+        while True:
+            event = await queue.get()
+            if (
+                event.type == "message_start"
+                and event.payload.get("message", {}).get("role") == "user"
+            ):
+                text = event.payload["message"]["content"][0]["text"]
+                break
+    assert text == "You are on team omega.\n\nfix the bug"
+    await supervisor.stop(task.id)
+
+
+async def test_empty_preamble_sends_prompt_unchanged(
+    app, git_checkout: Path, fake_my_workshop, pipeline  # noqa: ANN001
+) -> None:
+    engine = app.state.engine
+    run, _, _, supervisor = pipeline
+    config: Config = replace(
+        app.state.config,
+        my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
+    )
+
+    _make_template(engine, git_checkout, preamble="")
+    task = _make_task(engine, config, prompt="fix the bug")
+
+    await run(engine, task.id, config)
+
+    handle = supervisor.get(task.id)
+    assert handle is not None
+    queue = handle.subscribe()
+    async with asyncio.timeout(5):
+        while True:
+            event = await queue.get()
+            if (
+                event.type == "message_start"
+                and event.payload.get("message", {}).get("role") == "user"
+            ):
+                text = event.payload["message"]["content"][0]["text"]
+                break
+    assert text == "fix the bug"
+    await supervisor.stop(task.id)
+
+
+async def test_preamble_alone_never_prompts(
+    app, git_checkout: Path, fake_my_workshop, pipeline  # noqa: ANN001
+) -> None:
+    engine = app.state.engine
+    run, hub, _, supervisor = pipeline
+    config: Config = replace(
+        app.state.config,
+        my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
+    )
+    queue = hub.subscribe()
+
+    _make_template(engine, git_checkout, preamble="You are on team omega.")
+    task = _make_task(engine, config, prompt="")
+
+    await run(engine, task.id, config)
+
+    refreshed = get_task(engine, task.id)
+    assert refreshed.state == "created"
+    steps = [p["step"] for e in _drain(queue) if e.type == "spawn_step" for p in [e.payload]]
+    assert "prompt" not in steps
+    await supervisor.stop(task.id)
+
+
+def _argv_capturing_workshop(fake_workshop_cli: Path, argv_file: Path) -> None:  # noqa: ANN001
+    """Like the conftest fake, but records the rpc-ui spawn argv to a file."""
+    from tests.conftest import FAKE_OMP
+
+    fake_workshop_cli.write_text(
+        f"""#!/bin/sh
+case "$*" in
+  *"config get ask.timeout"*) echo 0 ;;
+  *"--mode rpc-ui"*)
+    printf '%s\\n' "$*" > {argv_file}
+    exec {__import__("sys").executable} -u {FAKE_OMP} happy ;;
+  *) exit 0 ;;
+esac
+"""
+    )
+
+
+async def test_template_model_thinking_on_agent_argv(
+    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, tmp_path: Path, pipeline  # noqa: ANN001
+) -> None:
+    engine = app.state.engine
+    run, _, _, supervisor = pipeline
+    config: Config = replace(
+        app.state.config,
+        my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
+    )
+    argv_file = tmp_path / "argv.txt"
+    _argv_capturing_workshop(fake_workshop_cli, argv_file)
+
+    _make_template(engine, git_checkout, model="fable-5", thinking="medium")
+    task = _make_task(engine, config)
+
+    await run(engine, task.id, config)
+
+    argv = argv_file.read_text()
+    assert "--model fable-5" in argv
+    assert "--thinking medium" in argv
+    await supervisor.stop(task.id)
+
+
+async def test_overrides_beat_template_values(
+    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, tmp_path: Path, pipeline  # noqa: ANN001
+) -> None:
+    engine = app.state.engine
+    run, _, _, supervisor = pipeline
+    config: Config = replace(
+        app.state.config,
+        my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
+    )
+    argv_file = tmp_path / "argv.txt"
+    _argv_capturing_workshop(fake_workshop_cli, argv_file)
+
+    _make_template(engine, git_checkout, model="fable-5", thinking="medium")
+    task = _make_task(engine, config)
+
+    await run(engine, task.id, config, model_override="zephyr-9", thinking_override="high")
+
+    argv = argv_file.read_text()
+    assert "--model zephyr-9" in argv
+    assert "--thinking high" in argv
+    assert "fable-5" not in argv
+    assert "medium" not in argv
+    await supervisor.stop(task.id)
+
+
+async def test_template_defaults_omit_flags(
+    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, tmp_path: Path, pipeline  # noqa: ANN001
+) -> None:
+    engine = app.state.engine
+    run, _, _, supervisor = pipeline
+    config: Config = replace(
+        app.state.config,
+        my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
+    )
+    argv_file = tmp_path / "argv.txt"
+    _argv_capturing_workshop(fake_workshop_cli, argv_file)
+
+    _make_template(engine, git_checkout)  # null model/thinking
+    task = _make_task(engine, config)
+
+    await run(engine, task.id, config)
+
+    argv = argv_file.read_text()
+    assert "--model" not in argv
+    assert "--thinking" not in argv
+    await supervisor.stop(task.id)

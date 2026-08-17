@@ -49,14 +49,13 @@ const project = {
   upstream_url: "https://example.com/maas.git",
   fork_url: null,
   checkout_path: "/home/op/proj/maas",
-  base_branch: "master",
-  branch_pattern: "bjornt/<slug>",
 };
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
     id: 1,
     project_name: "maas",
+    template_name: "maas",
     slug: "fix-bug",
     branch: "bjornt/fix-bug",
     clone_path: "/home/op/tasks/maas/fix-bug",
@@ -66,6 +65,8 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     workshop_id: "ws-maas-fix-bug",
     spawn_completed_at: "2026-07-18T00:01:00Z",
     pr_url: null,
+    pr_state: null,
+    pr_merged_at: null,
     created_at: "2026-07-18T00:00:00Z",
     updated_at: "2026-07-18T00:01:00Z",
     ...overrides,

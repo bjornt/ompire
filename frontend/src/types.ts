@@ -4,15 +4,41 @@ export interface Project {
   upstream_url: string;
   fork_url: string | null;
   checkout_path: string;
+}
+
+/** Thinking levels omp accepts (`--thinking`, verified against omp
+ * v17.2.12); null on a template or unset on a spawn override means the omp
+ * default. */
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "auto";
+
+/** SPEC Decision 6 setup template: everything spawn needs. Checkout path and
+ * remotes come from the referenced project (Decision 9), never stored here. */
+export interface Template {
+  name: string;
+  project_name: string;
   base_branch: string;
   branch_pattern: string;
+  workflow: string;
+  workshop_additions: "project" | "global";
+  model: string | null;
+  thinking: ThinkingLevel | null;
+  preamble: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export type TaskState = "created" | "failed" | "archived";
 
+/** Durable polled PR state (merge-poll capability): null until the first
+ * successful poll; terminal states are never polled again. */
+export type PrState = "open" | "merged" | "closed";
+
 export interface Task {
   id: number;
   project_name: string;
+  /** Template this task was spawned from; null for tasks that predate
+   * templates (templates capability). */
+  template_name: string | null;
   slug: string;
   branch: string;
   clone_path: string;
@@ -22,6 +48,8 @@ export interface Task {
   workshop_id: string | null;
   spawn_completed_at: string | null;
   pr_url: string | null;
+  pr_state: PrState | null;
+  pr_merged_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -261,6 +289,7 @@ export interface GpgStatusPayload {
 
 export interface SnapshotPayload {
   projects: Project[];
+  templates: Template[];
   tasks: Task[];
   /** Keyed by task id (JSON object keys arrive as strings). */
   sessions: Record<string, SessionInfo>;

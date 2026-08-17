@@ -32,8 +32,24 @@ projects = Table(
     Column("upstream_url", String, nullable=False),
     Column("fork_url", String, nullable=True),
     Column("checkout_path", String, nullable=False),
+)
+
+# SPEC Decision 6/9: spawn configuration lives on templates; checkout path and
+# remotes come from the referenced project. model/thinking NULL = omp default.
+templates = Table(
+    "templates",
+    metadata,
+    Column("name", String, primary_key=True),
+    Column("project_name", String, ForeignKey("projects.name"), nullable=False),
     Column("base_branch", String, nullable=False, server_default="main"),
-    Column("branch_pattern", String, nullable=False, server_default="ompire/<slug>"),
+    Column("branch_pattern", String, nullable=False),
+    Column("workflow", String, nullable=False, server_default="single-step"),
+    Column("workshop_additions", String, nullable=False, server_default="project"),
+    Column("model", String, nullable=True),
+    Column("thinking", String, nullable=True),
+    Column("preamble", Text, nullable=False, server_default=""),
+    Column("created_at", String, nullable=False),
+    Column("updated_at", String, nullable=False),
 )
 
 tasks = Table(
@@ -41,6 +57,9 @@ tasks = Table(
     metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("project_name", String, ForeignKey("projects.name"), nullable=False),
+    # Plain column, no FK: pre-existing rows stay NULL, and archived rows keep
+    # the name as history even after the template is deleted.
+    Column("template_name", String, nullable=True),
     Column("slug", String, nullable=False),
     Column("branch", String, nullable=False),
     Column("clone_path", String, nullable=False),
@@ -50,6 +69,8 @@ tasks = Table(
     Column("workshop_id", String, nullable=True),
     Column("session_id", String, nullable=True),
     Column("pr_url", String, nullable=True),
+    Column("pr_state", String, nullable=True),
+    Column("pr_merged_at", String, nullable=True),
     Column("spawn_completed_at", String, nullable=True),
     Column("created_at", String, nullable=False),
     Column("updated_at", String, nullable=False),

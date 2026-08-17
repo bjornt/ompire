@@ -1,4 +1,15 @@
-import type { AgentStateData, AgentStatsData, GpgStatus, ReviewState, ShipState, Task, TaskDetail } from "../types";
+import type {
+  AgentStateData,
+  AgentStatsData,
+  GpgStatus,
+  Project,
+  ReviewState,
+  ShipState,
+  Task,
+  TaskDetail,
+  Template,
+  ThinkingLevel,
+} from "../types";
 import { getDaemonToken } from "./token";
 
 /** Minimal authenticated REST client. Commands go over REST, events come
@@ -28,10 +39,16 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return (await response.json()) as T;
 }
 
+/** Spawn is template-driven (task-spawn capability): the daemon resolves the
+ * template, denormalizes its project onto the task, and derives the branch
+ * from the template's pattern. `model`/`thinking` are per-spawn overrides —
+ * omitted entirely when unset so the template value (or omp default) wins. */
 export function spawnTask(input: {
-  project_name: string;
+  template_name: string;
   slug: string;
   prompt: string;
+  model?: string;
+  thinking?: ThinkingLevel;
 }): Promise<Task> {
   return request<Task>("POST", "/api/tasks", input);
 }
@@ -105,4 +122,58 @@ export function shipCommit(
 /** Force a fresh gpg-agent cache probe (ship capability). */
 export function recheckGpg(): Promise<GpgStatus> {
   return request<GpgStatus>("POST", "/api/gpg/recheck");
+}
+
+/** Project CRUD (projects capability). `newName` on update triggers the
+ * guarded rename — the daemon 409s while any task row references it. */
+export function createProject(input: {
+  name: string;
+  title: string;
+  upstream_url: string;
+  fork_url: string | null;
+}): Promise<Project> {
+  return request<Project>("POST", "/api/projects", input);
+}
+
+export function updateProject(
+  name: string,
+  input: {
+    title: string;
+    upstream_url: string;
+    fork_url: string | null;
+    checkout_path: string;
+    new_name?: string;
+  },
+): Promise<Project> {
+  return request<Project>("PUT", `/api/projects/${encodeURIComponent(name)}`, input);
+}
+
+export function deleteProject(name: string): Promise<{ deleted: string }> {
+  return request("DELETE", `/api/projects/${encodeURIComponent(name)}`);
+}
+
+/** Template CRUD (templates capability). The list itself arrives via the
+ * WebSocket snapshot — these are commands only; render results from daemon
+ * state, not from these return values. */
+export interface TemplateInput {
+  project_name: string;
+  base_branch: string;
+  branch_pattern: string;
+  workflow: string;
+  workshop_additions: "project" | "global";
+  model: string | null;
+  thinking: ThinkingLevel | null;
+  preamble: string;
+}
+
+export function createTemplate(input: TemplateInput & { name: string }): Promise<Template> {
+  return request<Template>("POST", "/api/templates", input);
+}
+
+export function updateTemplate(name: string, input: TemplateInput): Promise<Template> {
+  return request<Template>("PUT", `/api/templates/${encodeURIComponent(name)}`, input);
+}
+
+export function deleteTemplate(name: string): Promise<{ deleted: string }> {
+  return request("DELETE", `/api/templates/${encodeURIComponent(name)}`);
 }

@@ -26,11 +26,16 @@ import type {
   StatsPayload,
   StatusChangedPayload,
   Task,
+  Template,
 } from "../types";
 
 export interface DaemonState {
   connectionState: ConnectionState;
   projects: Project[];
+  /** Template registry (templates capability), keyed by name like projects:
+   * loaded from the snapshot, upserted by `template_created`/
+   * `template_updated`, dropped by `template_deleted`. */
+  templates: Template[];
   tasks: Task[];
   /** Transient per-task spawn pipeline progress, keyed by task id. Fed by
    * `spawn_step` events, never part of the snapshot — a reconnect drops it,
@@ -66,6 +71,7 @@ export interface DaemonState {
 export const initialDaemonState: DaemonState = {
   connectionState: "connecting",
   projects: [],
+  templates: [],
   tasks: [],
   spawnProgress: {},
   sessions: {},
@@ -104,6 +110,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       return {
         ...state,
         projects: payload.projects,
+        templates: payload.templates ?? [],
         tasks: payload.tasks,
         spawnProgress: {},
         sessions,
@@ -126,9 +133,33 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         projects: state.projects.map((p) => (p.name === project.name ? project : p)),
       };
     }
+    case "project_renamed": {
+      // Renames change the key `project_updated` matches on, so they carry
+      // the old name alongside the new payload (projects capability).
+      const { old_name, project } = envelope.payload as { old_name: string; project: Project };
+      return {
+        ...state,
+        projects: state.projects.map((p) => (p.name === old_name ? project : p)),
+      };
+    }
     case "project_deleted": {
       const { name } = envelope.payload as { name: string };
       return { ...state, projects: state.projects.filter((p) => p.name !== name) };
+    }
+    case "template_created": {
+      const template = envelope.payload as Template;
+      return { ...state, templates: [...state.templates, template] };
+    }
+    case "template_updated": {
+      const template = envelope.payload as Template;
+      return {
+        ...state,
+        templates: state.templates.map((t) => (t.name === template.name ? template : t)),
+      };
+    }
+    case "template_deleted": {
+      const { name } = envelope.payload as { name: string };
+      return { ...state, templates: state.templates.filter((t) => t.name !== name) };
     }
     case "task_created": {
       const task = envelope.payload as Task;

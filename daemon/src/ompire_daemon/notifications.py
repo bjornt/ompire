@@ -241,6 +241,14 @@ class AttentionNotifier:
         if had_entry:
             self._hub.publish("attention_cleared", {"task_id": task_id})
 
+    def clear_task(self, task_id: int) -> None:
+        """Drop any attention entry on task cleanup/purge. A discarded session
+        emits no further `status_changed` (the tracker ignores late events),
+        so without this the entry — e.g. the interrupt-tier `failed` the agent
+        exit races in during workshop removal — would demand attention forever.
+        """
+        self._leave(task_id)
+
     def _fire(self, task_id: int, tier: str, status: str, reason: str) -> None:
         task = asyncio.create_task(self._notify_send(task_id, tier, status, reason))
         self._notify_tasks[task_id] = task

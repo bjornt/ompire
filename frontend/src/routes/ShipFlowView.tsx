@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useDaemonState } from "../lib/daemonSocket";
-import { draftShip, recheckGpg, shipCommit } from "../lib/api";
-import type { GpgStatus, ReviewIteration, ReviewState, SessionInfo, ShipState } from "../types";
+import { cleanupTask, draftShip, recheckGpg, shipCommit } from "../lib/api";
+import { confirmCleanup } from "../lib/cleanup";
+import { formatElapsed } from "./TasksView";
+import type { GpgStatus, ReviewIteration, ReviewState, SessionInfo, ShipState, Task } from "../types";
 import "./ShipFlowView.css";
 
 function StepIcon({
@@ -85,28 +87,6 @@ function ReviewStep({
       {session?.status === "reviewing" && (
         <p className="stepHint">Review is open. Use the link to reopen the llmvet UI.</p>
       )}
-    </div>
-  );
-}
-
-function InertStep({
-  index,
-  title,
-  hint,
-  testid,
-}: {
-  index: number;
-  title: string;
-  hint: string;
-  testid: string;
-}) {
-  return (
-    <div className="shipStep inert" data-testid={testid}>
-      <div className="stepHeader">
-        <StepIcon index={index} active={false} done={false} error={false} />
-        <span className="stepTitle">{title}</span>
-      </div>
-      <p className="stepHint">{hint}</p>
     </div>
   );
 }
@@ -353,6 +333,66 @@ function PushPrStep({
   );
 }
 
+function CleanupStep({ task }: { task: Task }) {
+  const [busy, setBusy] = useState(false);
+  const archived = task.state === "archived";
+  // Cleanup gating (merge-poll capability, design D-4): the grace period is
+  // the open-PR window itself — the step offers no action until the PR
+  // resolves, then always behind the shared destructive-action confirmation.
+  const ready =
+    !archived && (task.pr_state === "merged" || task.pr_state === "closed");
+
+  async function onCleanup() {
+    if (!confirmCleanup(task)) return;
+    setBusy(true);
+    try {
+      await cleanupTask(task.id);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  let hint: string;
+  if (archived) hint = `Cleaned up ${formatElapsed(task.updated_at)} ago — workshop removed, clone deleted.`;
+  else if (!task.pr_url) hint = "Cleanup unlocks once this task has shipped a PR.";
+  else if (task.pr_state === "merged")
+    hint = `Merged ${formatElapsed(task.pr_merged_at ?? task.updated_at)} ago — ready for cleanup.`;
+  else if (task.pr_state === "closed") hint = "PR closed without merging — cleanup is your call.";
+  else hint = "On merge: workshop remove + delete clone. Awaiting merge · cleanup deferred.";
+
+  return (
+    <div
+      className={`shipStep ${!task.pr_url && !archived ? "inert" : ""} ${ready ? "stepOpen" : ""}`}
+      data-testid="ship-step-cleanup"
+    >
+      <div className="stepHeader">
+        <StepIcon index={4} active={ready} done={archived} error={false} />
+        <span className="stepTitle">Cleanup</span>
+        {task.pr_state === "closed" && !archived && (
+          <span className="stepStatusBadge closed">closed</span>
+        )}
+        {task.pr_state === "merged" && !archived && (
+          <span className="stepStatusBadge merged">merged</span>
+        )}
+      </div>
+      <p className="stepHint" data-testid="cleanup-hint">
+        {hint}
+      </p>
+      {ready && (
+        <button
+          type="button"
+          className="cleanupAction"
+          disabled={busy}
+          onClick={() => void onCleanup()}
+          data-testid="cleanup-ship-button"
+        >
+          {busy ? "Cleaning up…" : "Clean up"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function ShipFlowView() {
   const { id } = useParams();
   const taskId = Number(id);
@@ -389,12 +429,7 @@ export function ShipFlowView() {
         <ReviewStep session={session} review={review} />
         <CommitStep taskId={taskId} ship={ship} gpg={gpg} />
         <PushPrStep ship={ship} prUrl={task.pr_url} />
-        <InertStep
-          index={4}
-          title="Cleanup"
-          hint="Remove the workshop container and archive the task after merge. (Coming later.)"
-          testid="ship-step-cleanup"
-        />
+        <CleanupStep task={task} />
       </div>
     </>
   );

@@ -23,6 +23,9 @@ DEFAULT_LLMVET_COMMAND = ("llmvet",)
 DEFAULT_REVIEW_PORT_RANGE = (7180, 7280)
 DEFAULT_GPG_SIGNING_KEY: str | None = None
 DEFAULT_GH_COMMAND = ("gh",)
+# Interval between PR-state poll ticks (merge-poll capability, design D-2):
+# serial `gh pr view` calls for shipped, not-yet-terminal PRs.
+DEFAULT_PR_POLL_INTERVAL = 60
 # Workshop launch includes SDK installs; the spike measured 7.34s warm-cache
 # and cold starts are slower still, so this is deliberately much larger than
 # the git-step timeout.
@@ -77,6 +80,7 @@ _KNOWN_KEYS = {
     "recovery_concurrency",
     "gpg_signing_key",
     "gh_command",
+    "pr_poll_interval",
 }
 
 
@@ -112,6 +116,7 @@ class Config:
     recovery_concurrency: int = DEFAULT_RECOVERY_CONCURRENCY
     gpg_signing_key: str | None = DEFAULT_GPG_SIGNING_KEY
     gh_command: tuple[str, ...] = DEFAULT_GH_COMMAND
+    pr_poll_interval: float = DEFAULT_PR_POLL_INTERVAL
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -352,6 +357,17 @@ def load_config(path: Path | None = None) -> Config:
             f"got {recovery_concurrency!r}"
         )
 
+    pr_poll_interval = data.get("pr_poll_interval", DEFAULT_PR_POLL_INTERVAL)
+    if (
+        not isinstance(pr_poll_interval, (int, float))
+        or isinstance(pr_poll_interval, bool)
+        or pr_poll_interval <= 0
+    ):
+        raise ConfigError(
+            f"config key 'pr_poll_interval' must be a positive number, "
+            f"got {pr_poll_interval!r}"
+        )
+
     return Config(
         port=port,
         bind=bind,
@@ -377,6 +393,7 @@ def load_config(path: Path | None = None) -> Config:
         recovery_concurrency=recovery_concurrency,
         gpg_signing_key=gpg_signing_key,
         gh_command=gh_command,
+        pr_poll_interval=float(pr_poll_interval),
     )
 
 

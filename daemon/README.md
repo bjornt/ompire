@@ -99,10 +99,13 @@ notifications_enabled = true       # set false to disable desktop notifications 
 
 ```toml
 gpg_signing_key = "your@key.id"  # key id/email passed to `git commit -S`; when unset the daemon falls back to `git config user.signingkey`
-gh_command = ["gh"]              # command invoked for `gh pr create` (argument list, no shell)
+gh_command = ["gh"]              # command invoked for `gh pr create` / `gh pr view` (argument list, no shell)
+pr_poll_interval = 60            # seconds between PR-state polls of shipped, unresolved PRs (must be > 0)
 ```
 
 `gpg_signing_key` is optional; when absent the daemon reads `git config user.signingkey` to discover the signing key. The GPG lock state is probed via `gpg-connect-agent KEYINFO --no-ask <keygrip>` and exposed as a shared condition used by both the chrome chip and the ship commit gate.
+
+Once a task ships a PR, a background watcher polls `gh pr view <pr-url> --json state,mergedAt` every `pr_poll_interval` seconds until the PR reaches a terminal state (`merged`/`closed`), persisting `pr_state`/`pr_merged_at` on the task row and broadcasting `task_updated`. Post-merge cleanup is never automatic: the Ship Flow Cleanup step unlocks once the PR resolves and always asks for confirmation.
 
 ### Review keys
 

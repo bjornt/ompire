@@ -36,8 +36,6 @@ def project(engine: Engine, tmp_path: Path):  # noqa: ANN001, ANN201
         title="Demo",
         upstream_url="https://example.com/demo.git",
         checkout_path=str(tmp_path / "checkout"),
-        base_branch="main",
-        default_branch_pattern="ompire/<slug>",
         default_checkout_root=tmp_path,
     )
 

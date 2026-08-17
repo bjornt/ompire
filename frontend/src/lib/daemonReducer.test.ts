@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { applyEnvelope, initialDaemonState } from "./daemonReducer";
-import type { Envelope, Project } from "../types";
+import type { Envelope, Project, Template } from "../types";
 
 const project: Project = {
   name: "maas",
@@ -8,8 +8,20 @@ const project: Project = {
   upstream_url: "https://example.com/maas.git",
   fork_url: null,
   checkout_path: "/home/op/proj/maas",
+};
+
+const template: Template = {
+  name: "maas",
+  project_name: "maas",
   base_branch: "master",
   branch_pattern: "bjornt/<slug>",
+  workflow: "single-step",
+  workshop_additions: "project",
+  model: null,
+  thinking: null,
+  preamble: "",
+  created_at: "2026-07-18T00:00:00Z",
+  updated_at: "2026-07-18T00:00:00Z",
 };
 
 describe("applyEnvelope", () => {
@@ -18,11 +30,22 @@ describe("applyEnvelope", () => {
       seq: 0,
       ts: "2026-07-18T00:00:00Z",
       type: "snapshot",
-      payload: { projects: [project], tasks: [] },
+      payload: { projects: [project], templates: [template], tasks: [] },
     };
     const next = applyEnvelope(initialDaemonState, envelope);
     expect(next.projects).toEqual([project]);
+    expect(next.templates).toEqual([template]);
     expect(next.tasks).toEqual([]);
+  });
+
+  it("tolerates a snapshot without a templates list", () => {
+    const next = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [] },
+    });
+    expect(next.templates).toEqual([]);
   });
 
   it("applies project_created as a delta", () => {
@@ -58,6 +81,23 @@ describe("applyEnvelope", () => {
     expect(next.projects).toEqual([updated]);
   });
 
+  it("applies project_renamed by old name", () => {
+    const start = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [project], tasks: [] },
+    });
+    const renamed = { ...project, name: "maas-ng" };
+    const next = applyEnvelope(start, {
+      seq: 1,
+      ts: "",
+      type: "project_renamed",
+      payload: { old_name: project.name, project: renamed },
+    });
+    expect(next.projects).toEqual([renamed]);
+  });
+
   it("applies project_deleted by name", () => {
     const start = applyEnvelope(initialDaemonState, {
       seq: 0,
@@ -72,6 +112,55 @@ describe("applyEnvelope", () => {
       payload: { name: project.name },
     });
     expect(next.projects).toEqual([]);
+  });
+
+  it("applies template_created as a delta", () => {
+    const start = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], templates: [], tasks: [] },
+    });
+    const next = applyEnvelope(start, {
+      seq: 1,
+      ts: "",
+      type: "template_created",
+      payload: template,
+    });
+    expect(next.templates).toEqual([template]);
+  });
+
+  it("applies template_updated by name", () => {
+    const start = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], templates: [template], tasks: [] },
+    });
+    const updated = { ...template, preamble: "Run pytest from the repo root." };
+    const next = applyEnvelope(start, {
+      seq: 1,
+      ts: "",
+      type: "template_updated",
+      payload: updated,
+    });
+    expect(next.templates).toEqual([updated]);
+  });
+
+  it("applies template_deleted by name", () => {
+    const start = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], templates: [template], tasks: [] },
+    });
+    const next = applyEnvelope(start, {
+      seq: 1,
+      ts: "",
+      type: "template_deleted",
+      payload: { name: template.name },
+    });
+    expect(next.templates).toEqual([]);
   });
 
   it("ignores unknown event types", () => {
@@ -94,6 +183,7 @@ describe("applyEnvelope", () => {
 const task = {
   id: 1,
   project_name: "maas",
+  template_name: "maas",
   slug: "fix-bug",
   branch: "bjornt/fix-bug",
   clone_path: "/home/op/tasks/maas/fix-bug",

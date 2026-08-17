@@ -22,7 +22,7 @@ from sqlalchemy import Engine
 from ompire_daemon.agent import AgentStartError, AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.registry.projects import Project
+from ompire_daemon.registry.projects import Project, get_project
 from ompire_daemon.registry.tasks import (
     Task,
     get_task,
@@ -31,6 +31,7 @@ from ompire_daemon.registry.tasks import (
     mark_spawn_completed,
     mark_workshop_launched,
 )
+from ompire_daemon.registry.templates import Template, TemplateNotFoundError, get_template
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.sessions import SessionTracker
 
@@ -80,7 +81,7 @@ async def _run_step(step: Step) -> str:
     return stderr
 
 
-def _git_steps(config: Config, project: Project, task: Task) -> list[Step]:
+def _git_steps(config: Config, project: Project, template: Template, task: Task) -> list[Step]:
     clone_path = task.clone_path
     git_timeout = config.spawn_step_timeout
     return [
@@ -89,7 +90,7 @@ def _git_steps(config: Config, project: Project, task: Task) -> list[Step]:
         Step("clone", ["git", "clone", project.checkout_path, clone_path], git_timeout),
         Step(
             "branch",
-            ["git", "-C", clone_path, "checkout", "-b", task.branch, f"origin/{project.base_branch}"],
+            ["git", "-C", clone_path, "checkout", "-b", task.branch, f"origin/{template.base_branch}"],
             git_timeout,
         ),
     ]
@@ -118,11 +119,34 @@ async def run_spawn_pipeline(
     events: EventHub,
     config: Config,
     task_id: int,
-    project: Project,
     supervisor: AgentSupervisor,
     tracker: SessionTracker,
+    *,
+    model_override: str | None = None,
+    thinking_override: str | None = None,
 ) -> None:
     task = get_task(engine, task_id)
+
+    # Resolve the template ONCE at pipeline start (design D-3): base branch,
+    # branch pattern, and the project (hence checkout and remotes) all come
+    # from it. A template deleted between the 202 and this point fails the
+    # task with a clear error, before any git command runs.
+    assert task.template_name is not None  # guaranteed by the spawn route
+    try:
+        template = get_template(engine, task.template_name)
+    except TemplateNotFoundError:
+        stderr = f"template {task.template_name!r} no longer exists; cannot spawn"
+        failed = mark_failed(engine, task_id, stderr)
+        tracker.spawn_step_failed(task_id, "template missing at pipeline start")
+        events.publish("task_updated", asdict(failed))
+        return
+    project = get_project(engine, template.project_name)
+    # Effective omp settings: spawn-time override ?? template value ?? omitted
+    # (omp default). Overrides are spawn-time only — never persisted.
+    effective_model = model_override if model_override is not None else template.model
+    effective_thinking = (
+        thinking_override if thinking_override is not None else template.thinking
+    )
 
     if Path(task.clone_path).exists():
         # Crash residue from an earlier spawn: fail loudly, never reuse.
@@ -154,7 +178,12 @@ async def run_spawn_pipeline(
         # The ask-timeout preflight and ready handshake live in the
         # supervisor; the ready timeout bounds the whole start (design D-5).
         try:
-            handle = await supervisor.start(task_id, task.clone_path)
+            handle = await supervisor.start(
+                task_id,
+                task.clone_path,
+                model=effective_model,
+                thinking=effective_thinking,
+            )
         except AgentStartError as exc:
             detail = str(exc) if not exc.stderr else f"{exc}\n{exc.stderr}"
             raise StepFailedError("agent", detail) from exc
@@ -168,6 +197,15 @@ async def run_spawn_pipeline(
             updated = mark_session_id(engine, task_id, session_id)
             events.publish("task_updated", asdict(updated))
 
+    # The prompt step sends preamble + blank line + prompt when the template
+    # has a preamble (design D-3); an empty stored prompt still skips the
+    # step entirely — a preamble alone never prompts.
+    effective_prompt = (
+        f"{template.preamble}\n\n{task.prompt}"
+        if task.prompt and template.preamble
+        else task.prompt
+    )
+
     async def run_prompt() -> None:
         handle = supervisor.get(task_id)
         if handle is None:
@@ -175,7 +213,9 @@ async def run_spawn_pipeline(
         try:
             # The ack is a receipt ("queued"), not turn completion (spike
             # finding): the step is done once omp has accepted the prompt.
-            await asyncio.wait_for(handle.prompt(task.prompt), timeout=config.spawn_step_timeout)
+            await asyncio.wait_for(
+                handle.prompt(effective_prompt), timeout=config.spawn_step_timeout
+            )
         except TimeoutError:
             raise StepFailedError(
                 "prompt", f"no ack within {config.spawn_step_timeout}s"
@@ -190,7 +230,8 @@ async def run_spawn_pipeline(
         return run
 
     steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
-        (step.name, subprocess_runner(step)) for step in _git_steps(config, project, task)
+        (step.name, subprocess_runner(step))
+        for step in _git_steps(config, project, template, task)
     ]
     steps.append(("workshop", run_workshop))
     steps.append(("agent", run_agent))

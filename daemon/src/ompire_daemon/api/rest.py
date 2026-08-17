@@ -14,6 +14,7 @@ from pydantic import BaseModel, field_validator
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
 from ompire_daemon.gpg import GpgProbe
+from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.review import ReviewAlreadyOpenError, ReviewError, ReviewManager
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.ship import ShipManager
@@ -22,7 +23,7 @@ from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.registry.projects import (
     DuplicateProjectError,
-    InvalidBranchPatternError,
+    InvalidSlugError,
     Project,
     ProjectHasReferencingTasksError,
     ProjectNotFoundError,
@@ -47,6 +48,23 @@ from ompire_daemon.registry.tasks import (
     purge_task,
     validate_task_slug,
 )
+from ompire_daemon.registry.templates import (
+    DuplicateTemplateError,
+    InvalidBranchPatternError,
+    InvalidThinkingLevelError,
+    InvalidWorkshopAdditionsError,
+    Template,
+    TemplateHasReferencingTasksError,
+    TemplateNotFoundError,
+    UnknownTemplateProjectError,
+    UnknownWorkflowError,
+    create_template,
+    delete_template,
+    get_template,
+    list_templates,
+    update_template,
+    validate_thinking,
+)
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.spawn import run_spawn_pipeline
 from ompire_daemon.workshop import WorkshopRemoveError, remove_workshop, workshop_status
@@ -60,8 +78,6 @@ class ProjectCreate(BaseModel):
     upstream_url: str
     fork_url: str | None = None
     checkout_path: str | None = None
-    base_branch: str = "main"
-    branch_pattern: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -75,8 +91,14 @@ class ProjectUpdate(BaseModel):
     upstream_url: str
     fork_url: str | None = None
     checkout_path: str
-    base_branch: str
-    branch_pattern: str
+    new_name: str | None = None
+
+    @field_validator("new_name")
+    @classmethod
+    def _validate_new_name(cls, value: str | None) -> str | None:
+        if value is not None:
+            validate_slug(value)
+        return value
 
 
 class ProjectOut(BaseModel):
@@ -85,8 +107,6 @@ class ProjectOut(BaseModel):
     upstream_url: str
     fork_url: str | None
     checkout_path: str
-    base_branch: str
-    branch_pattern: str
 
     model_config = {"from_attributes": True}
 
@@ -109,6 +129,10 @@ def _sessions(request: Request) -> SessionTracker:
 
 def _advisories(request: Request) -> AdvisorySampler:
     return request.app.state.advisories
+
+
+def _notifications(request: Request) -> AttentionNotifier:
+    return request.app.state.notifications
 
 
 def _reviews(request: Request) -> ReviewManager:
@@ -143,13 +167,8 @@ def create_project_route(
             upstream_url=body.upstream_url,
             fork_url=body.fork_url,
             checkout_path=body.checkout_path,
-            base_branch=body.base_branch,
-            branch_pattern=body.branch_pattern,
-            default_branch_pattern=config.default_branch_pattern,
             default_checkout_root=config.checkout_root,
         )
-    except InvalidBranchPatternError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except DuplicateProjectError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     events.publish("project_created", asdict(project))
@@ -179,14 +198,21 @@ def update_project_route(
             upstream_url=body.upstream_url,
             fork_url=body.fork_url,
             checkout_path=body.checkout_path,
-            base_branch=body.base_branch,
-            branch_pattern=body.branch_pattern,
+            new_name=body.new_name,
         )
-    except InvalidBranchPatternError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except ProjectNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    events.publish("project_updated", asdict(project))
+    except DuplicateProjectError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except ProjectHasReferencingTasksError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    renamed = body.new_name is not None and body.new_name != name
+    if renamed:
+        # Keyed-by-name consumers can't match a renamed payload via
+        # `project_updated`; the rename event carries the old key.
+        events.publish("project_renamed", {"old_name": name, "project": asdict(project)})
+    else:
+        events.publish("project_updated", asdict(project))
     return project
 
 
@@ -204,10 +230,163 @@ def delete_project_route(
     return {"deleted": name}
 
 
-class TaskCreate(BaseModel):
+# --- Templates --------------------------------------------------------------
+# SPEC Decision 6: spawn configuration lives on templates; projects carry
+# only identity/checkout/remotes (Decision 9).
+
+
+class TemplateCreate(BaseModel):
+    name: str
     project_name: str
+    base_branch: str = "main"
+    branch_pattern: str | None = None
+    workflow: str = "single-step"
+    workshop_additions: str = "project"
+    model: str | None = None
+    thinking: str | None = None
+    preamble: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        validate_slug(value)
+        return value
+
+
+class TemplateUpdate(BaseModel):
+    project_name: str
+    base_branch: str
+    branch_pattern: str
+    workflow: str
+    workshop_additions: str
+    model: str | None = None
+    thinking: str | None = None
+    preamble: str = ""
+
+
+class TemplateOut(BaseModel):
+    name: str
+    project_name: str
+    base_branch: str
+    branch_pattern: str
+    workflow: str
+    workshop_additions: str
+    model: str | None
+    thinking: str | None
+    preamble: str
+    created_at: str
+    updated_at: str
+
+    model_config = {"from_attributes": True}
+
+
+def _template_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, TemplateNotFoundError):
+        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    if isinstance(exc, (DuplicateTemplateError, TemplateHasReferencingTasksError)):
+        return HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    # InvalidSlugError rides FastAPI's request validation (field_validator);
+    # the rest are registry-level 422s.
+    return HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+
+
+@router.get("/templates", response_model=list[TemplateOut])
+def list_templates_route(engine: Engine = Depends(_engine)) -> list[Template]:
+    return list_templates(engine)
+
+
+@router.post("/templates", response_model=TemplateOut, status_code=status.HTTP_201_CREATED)
+def create_template_route(
+    body: TemplateCreate,
+    engine: Engine = Depends(_engine),
+    config: Config = Depends(_config),
+    events: EventHub = Depends(_events),
+) -> Template:
+    try:
+        template = create_template(
+            engine,
+            name=body.name,
+            project_name=body.project_name,
+            base_branch=body.base_branch,
+            branch_pattern=body.branch_pattern or config.default_branch_pattern,
+            workflow=body.workflow,
+            workshop_additions=body.workshop_additions,
+            model=body.model,
+            thinking=body.thinking,
+            preamble=body.preamble,
+        )
+    except (
+        InvalidBranchPatternError,
+        InvalidThinkingLevelError,
+        InvalidWorkshopAdditionsError,
+        UnknownTemplateProjectError,
+        UnknownWorkflowError,
+        DuplicateTemplateError,
+    ) as exc:
+        raise _template_error(exc) from exc
+    events.publish("template_created", asdict(template))
+    return template
+
+
+@router.get("/templates/{name}", response_model=TemplateOut)
+def get_template_route(name: str, engine: Engine = Depends(_engine)) -> Template:
+    try:
+        return get_template(engine, name)
+    except TemplateNotFoundError as exc:
+        raise _template_error(exc) from exc
+
+
+@router.put("/templates/{name}", response_model=TemplateOut)
+def update_template_route(
+    name: str,
+    body: TemplateUpdate,
+    engine: Engine = Depends(_engine),
+    events: EventHub = Depends(_events),
+) -> Template:
+    try:
+        template = update_template(
+            engine,
+            name,
+            project_name=body.project_name,
+            base_branch=body.base_branch,
+            branch_pattern=body.branch_pattern,
+            workflow=body.workflow,
+            workshop_additions=body.workshop_additions,
+            model=body.model,
+            thinking=body.thinking,
+            preamble=body.preamble,
+        )
+    except (
+        TemplateNotFoundError,
+        InvalidBranchPatternError,
+        InvalidThinkingLevelError,
+        InvalidWorkshopAdditionsError,
+        UnknownTemplateProjectError,
+        UnknownWorkflowError,
+    ) as exc:
+        raise _template_error(exc) from exc
+    events.publish("template_updated", asdict(template))
+    return template
+
+
+@router.delete("/templates/{name}")
+def delete_template_route(
+    name: str, engine: Engine = Depends(_engine), events: EventHub = Depends(_events)
+) -> dict[str, str]:
+    try:
+        delete_template(engine, name)
+    except (TemplateNotFoundError, TemplateHasReferencingTasksError) as exc:
+        raise _template_error(exc) from exc
+    events.publish("template_deleted", {"name": name})
+    return {"deleted": name}
+
+
+class TaskCreate(BaseModel):
+    template_name: str
     slug: str
     prompt: str
+    model: str | None = None
+    thinking: str | None = None
 
     @field_validator("slug")
     @classmethod
@@ -215,10 +394,18 @@ class TaskCreate(BaseModel):
         validate_task_slug(value)
         return value
 
+    @field_validator("thinking")
+    @classmethod
+    def _validate_thinking(cls, value: str | None) -> str | None:
+        if value is not None:
+            validate_thinking(value)
+        return value
+
 
 class TaskOut(BaseModel):
     id: int
     project_name: str
+    template_name: str | None
     slug: str
     branch: str
     clone_path: str
@@ -228,6 +415,8 @@ class TaskOut(BaseModel):
     workshop_id: str | None
     session_id: str | None
     pr_url: str | None
+    pr_state: str | None
+    pr_merged_at: str | None
     spawn_completed_at: str | None
     created_at: str
     updated_at: str
@@ -264,20 +453,22 @@ async def spawn_task_route(
     events: EventHub = Depends(_events),
 ) -> Task:
     try:
-        project = get_project(engine, body.project_name)
-    except ProjectNotFoundError as exc:
+        template = get_template(engine, body.template_name)
+    except TemplateNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    project = get_project(engine, template.project_name)
 
     try:
         clone_path = clone_path_for(config.task_dir_root, project.name, body.slug)
     except ClonePathOutsideRootError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
-    branch = project.branch_pattern.replace("<slug>", body.slug)
+    branch = template.branch_pattern.replace("<slug>", body.slug)
     try:
         task = create_task(
             engine,
             project_name=project.name,
+            template_name=template.name,
             slug=body.slug,
             branch=branch,
             clone_path=str(clone_path),
@@ -293,9 +484,10 @@ async def spawn_task_route(
             events,
             config,
             task.id,
-            project,
             request.app.state.agents,
             request.app.state.sessions,
+            model_override=body.model,
+            thinking_override=body.thinking,
         )
     )
     # Keep a reference so the job isn't garbage-collected mid-pipeline.
@@ -315,6 +507,7 @@ async def cleanup_task_route(
     advisories: AdvisorySampler = Depends(_advisories),
     reviews: ReviewManager = Depends(_reviews),
     ships: ShipManager = Depends(_ships),
+    notifications: AttentionNotifier = Depends(_notifications),
 ) -> Task:
     try:
         task = get_task(engine, task_id)
@@ -348,6 +541,7 @@ async def cleanup_task_route(
     archived = mark_archived(engine, task_id)
     sessions.discard(task_id)
     advisories.clear_task(task_id)
+    notifications.clear_task(task_id)
     events.publish("task_updated", asdict(archived))
     return archived
 
@@ -727,6 +921,7 @@ def purge_task_route(
     advisories: AdvisorySampler = Depends(_advisories),
     reviews: ReviewManager = Depends(_reviews),
     ships: ShipManager = Depends(_ships),
+    notifications: AttentionNotifier = Depends(_notifications),
 ) -> dict[str, int]:
     try:
         purge_task(engine, task_id)
@@ -738,5 +933,6 @@ def purge_task_route(
     ships.drop_ship(task_id)
     sessions.discard(task_id)
     advisories.clear_task(task_id)
+    notifications.clear_task(task_id)
     events.publish("task_deleted", {"id": task_id})
     return {"deleted": task_id}

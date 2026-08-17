@@ -18,27 +18,11 @@ from ompire_daemon.registry.tasks import (
 )
 
 
-@pytest.fixture
-def demo_project(client: TestClient, auth_headers: dict[str, str], git_checkout: Path) -> dict:
-    response = client.post(
-        "/api/projects",
-        headers=auth_headers,
-        json={
-            "name": "demo",
-            "title": "Demo",
-            "upstream_url": "https://example.com/demo.git",
-            "checkout_path": str(git_checkout),
-        },
-    )
-    assert response.status_code == 201
-    return response.json()
-
-
 def _spawn(client: TestClient, auth_headers: dict, slug: str = "fix-bug") -> dict:
     response = client.post(
         "/api/tasks",
         headers=auth_headers,
-        json={"project_name": "demo", "slug": slug, "prompt": "fix it"},
+        json={"template_name": "demo", "slug": slug, "prompt": "fix it"},
     )
     assert response.status_code == 202, response.text
     return response.json()
@@ -55,7 +39,7 @@ def _wait_settled(client: TestClient, auth_headers: dict, task_id: int, timeout:
 
 
 def test_spawn_creates_clone_and_branch(
-    client: TestClient, auth_headers: dict, demo_project: dict
+    client: TestClient, auth_headers: dict, demo_template: dict
 ) -> None:
     task = _spawn(client, auth_headers)
     assert task["state"] == "created"
@@ -66,28 +50,73 @@ def test_spawn_creates_clone_and_branch(
     assert (Path(settled["clone_path"]) / ".git").is_dir()
 
 
-def test_invalid_slug_rejected(client: TestClient, auth_headers: dict, demo_project: dict) -> None:
+def test_invalid_slug_rejected(client: TestClient, auth_headers: dict, demo_template: dict) -> None:
     for bad in ["Fix-Bug", "../escape", "a/b", "dots.are.bad", "-leading", "x" * 65]:
         response = client.post(
             "/api/tasks",
             headers=auth_headers,
-            json={"project_name": "demo", "slug": bad, "prompt": "p"},
+            json={"template_name": "demo", "slug": bad, "prompt": "p"},
         )
         assert response.status_code == 422, bad
     assert client.get("/api/tasks", headers=auth_headers).json() == []
 
 
-def test_unknown_project_404(client: TestClient, auth_headers: dict) -> None:
+def test_unknown_template_404(client: TestClient, auth_headers: dict) -> None:
     response = client.post(
         "/api/tasks",
         headers=auth_headers,
-        json={"project_name": "nope", "slug": "s", "prompt": "p"},
+        json={"template_name": "nope", "slug": "s", "prompt": "p"},
     )
     assert response.status_code == 404
+    # No task row is created for an unknown template.
+    assert client.get("/api/tasks", headers=auth_headers).json() == []
+
+
+def test_spawn_records_template_name_and_derives_branch(
+    client: TestClient, auth_headers: dict, demo_template: dict
+) -> None:
+    task = _spawn(client, auth_headers)
+    assert task["template_name"] == "demo"
+    assert task["project_name"] == "demo"
+    assert task["branch"] == "ompire/fix-bug"
+    _wait_settled(client, auth_headers, task["id"])
+
+
+def test_invalid_thinking_override_rejected(
+    client: TestClient, auth_headers: dict, demo_template: dict
+) -> None:
+    response = client.post(
+        "/api/tasks",
+        headers=auth_headers,
+        json={"template_name": "demo", "slug": "s", "prompt": "p", "thinking": "galaxy"},
+    )
+    assert response.status_code == 422
+    assert client.get("/api/tasks", headers=auth_headers).json() == []
+
+
+def test_overrides_accepted_but_not_persisted(
+    client: TestClient, auth_headers: dict, demo_template: dict
+) -> None:
+    response = client.post(
+        "/api/tasks",
+        headers=auth_headers,
+        json={
+            "template_name": "demo",
+            "slug": "fix-bug",
+            "prompt": "fix it",
+            "model": "fable-5",
+            "thinking": "high",
+        },
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert "model" not in body
+    assert "thinking" not in body
+    _wait_settled(client, auth_headers, body["id"])
 
 
 def test_duplicate_live_slug_rejected(
-    client: TestClient, auth_headers: dict, demo_project: dict
+    client: TestClient, auth_headers: dict, demo_template: dict
 ) -> None:
     first = _spawn(client, auth_headers)
     _wait_settled(client, auth_headers, first["id"])
@@ -95,13 +124,13 @@ def test_duplicate_live_slug_rejected(
     duplicate = client.post(
         "/api/tasks",
         headers=auth_headers,
-        json={"project_name": "demo", "slug": "fix-bug", "prompt": "again"},
+        json={"template_name": "demo", "slug": "fix-bug", "prompt": "again"},
     )
     assert duplicate.status_code == 409
 
 
 def test_slug_reusable_after_archive(
-    client: TestClient, auth_headers: dict, demo_project: dict
+    client: TestClient, auth_headers: dict, demo_template: dict
 ) -> None:
     first = _spawn(client, auth_headers)
     _wait_settled(client, auth_headers, first["id"])
@@ -115,7 +144,7 @@ def test_slug_reusable_after_archive(
 
 
 def test_cleanup_deletes_clone_and_is_idempotent(
-    client: TestClient, auth_headers: dict, demo_project: dict
+    client: TestClient, auth_headers: dict, demo_template: dict
 ) -> None:
     task = _spawn(client, auth_headers)
     settled = _wait_settled(client, auth_headers, task["id"])
@@ -132,7 +161,7 @@ def test_cleanup_deletes_clone_and_is_idempotent(
 
 
 def test_spawn_records_workshop_id(
-    client: TestClient, auth_headers: dict, demo_project: dict
+    client: TestClient, auth_headers: dict, demo_template: dict
 ) -> None:
     task = _spawn(client, auth_headers)
     settled = _wait_settled(client, auth_headers, task["id"])
@@ -140,7 +169,7 @@ def test_spawn_records_workshop_id(
 
 
 def test_detail_reports_workshop_status(
-    client: TestClient, auth_headers: dict, demo_project: dict
+    client: TestClient, auth_headers: dict, demo_template: dict
 ) -> None:
     task = _spawn(client, auth_headers)
     _wait_settled(client, auth_headers, task["id"])
@@ -151,7 +180,7 @@ def test_detail_reports_workshop_status(
 
 
 def test_cleanup_aborts_when_workshop_remove_fails(
-    client: TestClient, auth_headers: dict, demo_project: dict, fake_workshop_cli: Path
+    client: TestClient, auth_headers: dict, demo_template: dict, fake_workshop_cli: Path
 ) -> None:
     task = _spawn(client, auth_headers)
     settled = _wait_settled(client, auth_headers, task["id"])
@@ -174,7 +203,7 @@ def test_cleanup_aborts_when_workshop_remove_fails(
 
 
 def test_cleanup_refuses_path_outside_task_root(
-    app, client: TestClient, auth_headers: dict, demo_project: dict, tmp_path: Path
+    app, client: TestClient, auth_headers: dict, demo_template: dict, tmp_path: Path
 ) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -192,7 +221,7 @@ def test_cleanup_refuses_path_outside_task_root(
 
 
 def test_purge_requires_archived(
-    app, client: TestClient, auth_headers: dict, demo_project: dict
+    app, client: TestClient, auth_headers: dict, demo_template: dict
 ) -> None:
     task = _spawn(client, auth_headers)
     _wait_settled(client, auth_headers, task["id"])
@@ -207,7 +236,7 @@ def test_purge_requires_archived(
 
 
 def test_project_delete_blocked_until_tasks_purged(
-    client: TestClient, auth_headers: dict, demo_project: dict
+    client: TestClient, auth_headers: dict, demo_template: dict
 ) -> None:
     task = _spawn(client, auth_headers)
     _wait_settled(client, auth_headers, task["id"])
@@ -218,6 +247,11 @@ def test_project_delete_blocked_until_tasks_purged(
     assert "fix-bug" in blocked.json()["detail"]
 
     client.delete(f"/api/tasks/{task['id']}", headers=auth_headers)
+    # The seeded template still references the project: delete it to unblock.
+    still_blocked = client.delete("/api/projects/demo", headers=auth_headers)
+    assert still_blocked.status_code == 409
+    assert "demo" in still_blocked.json()["detail"]
+    client.delete("/api/templates/demo", headers=auth_headers)
     unblocked = client.delete("/api/projects/demo", headers=auth_headers)
     assert unblocked.status_code == 200
 
@@ -261,3 +295,26 @@ def test_reconciliation_on_restart(tmp_path: Path, git_checkout: Path) -> None:
     task = get_task(restarted.state.engine, interrupted.id)
     assert task.state == "failed"
     assert "restarted" in (task.error or "")
+
+
+def test_cleanup_clears_attention_entry(
+    client: TestClient, auth_headers: dict, demo_template: dict, app
+) -> None:
+    """Regression (merge-poll dogfood): the agent exit during workshop removal
+    lands `failed` (interrupt tier); cleanup must not leave that attention
+    entry behind once the task is gone."""
+    task = _spawn(client, auth_headers)
+    _wait_settled(client, auth_headers, task["id"])
+
+    # Drive the session into a notifying tier through the public tracker API.
+    app.state.sessions.spawn_step_failed(task["id"], "boom")
+    # The notifier consumes the hub from the app's loop — give it a moment.
+    deadline = time.monotonic() + 5
+    while task["id"] not in app.state.notifications.snapshot():
+        assert time.monotonic() < deadline, "notifier never recorded the entry"
+        time.sleep(0.05)
+
+    response = client.post(f"/api/tasks/{task['id']}/cleanup", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert task["id"] not in app.state.notifications.snapshot()

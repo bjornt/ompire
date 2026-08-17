@@ -38,8 +38,6 @@ def engine_project(app, git_checkout: Path):  # noqa: ANN001, ANN201
         title="Demo",
         upstream_url="https://example.com/demo.git",
         checkout_path=str(git_checkout),
-        base_branch="main",
-        default_branch_pattern="ompire/<slug>",
         default_checkout_root=git_checkout.parent,
     )
     return engine, project
@@ -105,7 +103,7 @@ async def test_run_recovery_resumes_with_resume_argv_and_no_reprompt(
 
     captured_resume = {}
 
-    def fake_build(clone, env, resume=None):  # noqa: ANN001
+    def fake_build(clone, env, resume=None, model=None, thinking=None):  # noqa: ANN001
         captured_resume["value"] = resume
         return fake_omp_argv("happy")
 
@@ -142,7 +140,7 @@ async def test_run_recovery_failure_marks_task_and_session_failed(
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, env, resume=None: fake_omp_argv("crash"),
+        lambda clone, env, resume=None, model=None, thinking=None: fake_omp_argv("crash"),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -216,10 +214,16 @@ def test_shutdown_then_restart_resumes_without_reprompt(
                 "checkout_path": str(git_checkout),
             },
         )
+        tpl = client.post(
+            "/api/templates",
+            headers=headers,
+            json={"name": "demo", "project_name": "demo"},
+        )
+        assert tpl.status_code == 201
         response = client.post(
             "/api/tasks",
             headers=headers,
-            json={"project_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
+            json={"template_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
         )
         assert response.status_code == 202
         task_id = response.json()["id"]

@@ -22,6 +22,7 @@ from ompire_daemon.events import EventHub
 from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.notifications import AttentionNotifier
+from ompire_daemon.prwatch import PrWatcher
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
 from ompire_daemon.registry.tasks import list_tasks
 from ompire_daemon.review import ReviewManager
@@ -38,12 +39,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     advisories: AdvisorySampler = app.state.advisories
     agents: AgentSupervisor = app.state.agents
     reviews: ReviewManager = app.state.reviews
-    ships: ShipManager = app.state.ships
+    prwatch: PrWatcher = app.state.prwatch
     gpg: GpgProbe = app.state.gpg
     await notifier.probe()
     notifier.start()
     advisories.start()
     reviews.start()
+    prwatch.start()
     # Prime the shared GPG lock condition before the first snapshot.
     await gpg.probe()
     # Slow (real container-side omp startups): runs in the background so it
@@ -68,6 +70,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await recovery_job
         await notifier.stop()
         await advisories.stop()
+        await prwatch.stop()
         await agents.shutdown()
         await reviews.shutdown()
 
@@ -144,6 +147,7 @@ def create_app(config: Config, *, frontend_dist: Path = DEFAULT_FRONTEND_DIST) -
         stats_throttle_interval=config.stats_throttle_interval,
         context_advisory_threshold=config.context_advisory_threshold,
     )
+    app.state.prwatch = PrWatcher(config, app.state.engine, app.state.events)
     app.state.advisories.register(app.state.sessions)
 
     # Before any snapshot is served: restore any clone left parked by a

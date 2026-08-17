@@ -20,6 +20,7 @@ from ompire_daemon.events import EventHub
 from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.registry.projects import list_projects
 from ompire_daemon.registry.tasks import list_tasks
+from ompire_daemon.registry.templates import list_templates
 from ompire_daemon.review import ReviewManager
 from ompire_daemon.ship import ShipManager
 
@@ -58,6 +59,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     seq = itertools.count()
     projects_payload = [asdict(p) for p in list_projects(engine)]
+    templates_payload = [asdict(t) for t in list_templates(engine)]
     tasks_payload = [asdict(t) for t in list_tasks(engine)]
     # Session statuses ride separately from task rows (design D-4); JSON
     # object keys are strings, so task ids are stringified here.
@@ -88,6 +90,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         "snapshot",
         {
             "projects": projects_payload,
+            "templates": templates_payload,
             "tasks": tasks_payload,
             "sessions": sessions_payload,
             "attention": attention_payload,

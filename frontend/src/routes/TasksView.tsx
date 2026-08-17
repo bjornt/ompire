@@ -1,7 +1,8 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import { ContextRing } from "../components/ContextRing";
 import { answerAgent, cleanupTask, startReview } from "../lib/api";
+import { confirmCleanup, prLinkLabel } from "../lib/cleanup";
 import { formatTokensCost } from "../lib/advisories";
 import { isSpawning } from "../lib/daemonReducer";
 import { useDaemonState } from "../lib/daemonSocket";
@@ -159,13 +160,7 @@ function TaskCard({
   }
 
   async function onCleanup() {
-    const workshopLine = task.workshop_id
-      ? `\n…and removes the workshop container:\n${task.workshop_id}`
-      : "";
-    const confirmed = window.confirm(
-      `Clean up ${task.project_name}/${task.slug}?\n\nThis deletes the clone directory:\n${task.clone_path}${workshopLine}`,
-    );
-    if (!confirmed) return;
+    if (!confirmCleanup(task)) return;
     await cleanupTask(task.id);
   }
 
@@ -290,7 +285,18 @@ function TaskCard({
 
 export function TasksView() {
   const { tasks, projects, sessions, stats, advisories, reviews } = useDaemonState();
-  const visible = tasks.filter((t) => t.state !== "archived");
+  const [searchParams] = useSearchParams();
+  // Project filter (projects-view capability): the Projects card's
+  // active-tasks pill lands here via `?project=<name>`.
+  const projectFilter = searchParams.get("project");
+  const visible = tasks.filter(
+    (t) => t.state !== "archived" && (projectFilter === null || t.project_name === projectFilter),
+  );
+  // Shipped rows (merge-poll capability, design D-5): every task with a
+  // pr_url, live or archived, most-recently-updated first.
+  const shipped = tasks
+    .filter((t) => t.pr_url && (projectFilter === null || t.project_name === projectFilter))
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
 
   return (
     <>
@@ -298,6 +304,12 @@ export function TasksView() {
         <h1>Tasks</h1>
         <span className="subline">
           {visible.length} tasks · {projects.length} projects · attention first, then recency
+          {projectFilter !== null && (
+            <>
+              {" · project: "}
+              <strong data-testid="project-filter-label">{projectFilter}</strong>
+            </>
+          )}
         </span>
         <span className="spacer" />
         <Link className="spawnButton" to="/spawn">
@@ -305,7 +317,7 @@ export function TasksView() {
         </Link>
       </div>
 
-      {visible.length === 0 ? (
+      {visible.length === 0 && shipped.length === 0 ? (
         <div className="empty" data-testid="tasks-empty-state">
           <strong>No tasks yet</strong>
           <span>Spawn one to get an agent working on something.</span>
@@ -324,6 +336,60 @@ export function TasksView() {
           ))}
         </div>
       )}
+
+      {shipped.length > 0 && (
+        <section className="shippedSection" data-testid="shipped-section">
+          <div className="shippedHeader">
+            <span>Shipped</span>
+            <span className="shippedCount">{shipped.length} recent</span>
+            <span className="shippedRule" />
+          </div>
+          <div className="shippedRows">
+            {shipped.map((task) => (
+              <ShippedRow key={task.id} task={task} />
+            ))}
+          </div>
+        </section>
+      )}
     </>
+  );
+}
+
+/** One collapsed shipped row per the Tasks.dc.html mockup: green pill,
+ * project/slug, PR link `repo#N · state`, cleanup-state note. Live rows
+ * link to the Ship Flow view (where the cleanup action lives); archived
+ * rows are inert — the task is gone. */
+function ShippedRow({ task }: { task: Task }) {
+  const prUrl = task.pr_url as string; // guaranteed by the filter above
+  const prState = task.pr_state ?? "open"; // unpollled PRs render as open
+  const label = prLinkLabel(prUrl) ?? prUrl.replace("https://", "");
+  const archived = task.state === "archived";
+
+  let note: string;
+  if (archived) note = `cleaned up ${formatElapsed(task.updated_at)} ago`;
+  else if (task.pr_state === "merged") note = "merged · ready for cleanup";
+  else if (task.pr_state === "closed") note = "PR closed unmerged";
+  else note = "awaiting merge · cleanup deferred";
+
+  return (
+    <div className="shippedRow" data-testid={`shipped-row-${task.id}`}>
+      <span className="shippedPill">
+        <span className="shippedDot" />
+        shipped
+      </span>
+      {archived ? (
+        <span className="shippedSlug">
+          {task.project_name}/{task.slug}
+        </span>
+      ) : (
+        <Link className="shippedSlug" to={`/ship/${task.id}`} data-testid={`shipped-link-${task.id}`}>
+          {task.project_name}/{task.slug}
+        </Link>
+      )}
+      <a className="shippedPr" href={prUrl} target="_blank" rel="noreferrer">
+        {label} · {prState}
+      </a>
+      <span className="shippedNote">{note}</span>
+    </div>
   );
 }

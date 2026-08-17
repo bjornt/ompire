@@ -357,3 +357,31 @@ async def test_disabled_by_config_degrades_to_badges(fake_notify_send) -> None:
         }
     finally:
         await notifier.stop()
+
+
+async def test_clear_task_drops_entry_and_broadcasts(fake_notify_send) -> None:
+    """Cleanup/purge path (merge-poll dogfood finding): a discarded session
+    emits no further status_changed, so the notifier needs the explicit
+    clear — otherwise the entry outlives the task forever."""
+    hub = EventHub()
+    queue = hub.subscribe()
+    notifier = await _make_notifier(hub)
+    try:
+        hub.publish(
+            "status_changed",
+            {"task_id": 3, "from": "idle", "to": "failed", "reason": "process exited with code 1"},
+        )
+        await _wait_until(lambda: 3 in notifier.snapshot())
+
+        notifier.clear_task(3)
+
+        assert 3 not in notifier.snapshot()
+        async with asyncio.timeout(5):
+            while True:
+                event = await queue.get()
+                if event.type == "attention_cleared":
+                    assert event.payload == {"task_id": 3}
+                    return
+    finally:
+        await notifier.stop()
+  # noqa: E501

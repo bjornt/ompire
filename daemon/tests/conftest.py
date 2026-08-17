@@ -1,5 +1,6 @@
 import os
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from ompire_daemon.app import create_app
 from ompire_daemon.config import Config
+from ompire_daemon.registry.templates import create_template
 
 FAKE_OMP = Path(__file__).parent / "fake_omp.py"
 
@@ -106,3 +108,27 @@ def git_checkout(tmp_path: Path) -> Path:
     git("remote", "add", "origin", str(upstream), cwd=checkout)
     git("push", "origin", "main", cwd=checkout)
     return checkout
+
+
+@pytest.fixture
+def demo_template(client: TestClient, auth_headers: dict[str, str], git_checkout: Path) -> dict:
+    """Project `demo` on the git checkout plus a same-named template — the
+    minimum a REST spawn needs (mirrors git_checkout's fixture style)."""
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "demo",
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+            "checkout_path": str(git_checkout),
+        },
+    )
+    assert response.status_code == 201
+    template = create_template(
+        client.app.state.engine,
+        name="demo",
+        project_name="demo",
+        branch_pattern="ompire/<slug>",
+    )
+    return asdict(template)

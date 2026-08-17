@@ -33,12 +33,32 @@
   margin-bottom: 14px;
 }
 
-.field label {
+.field label,
+.field .fieldLabel {
   display: block;
   font-size: 11.5px;
   font-weight: 600;
   color: var(--muted);
   margin-bottom: 4px;
+}
+
+/* Read-only workflow echo of the selected template (task-spawn capability);
+ * real multi-step workflows arrive with ROADMAP chunk 17. */
+.workflowBlock {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--faint);
+  padding: 3px 0;
+}
+
+.overrideGrid {
+  display: flex;
+  gap: 12px;
+}
+
+.overrideGrid .field {
+  flex: 1;
+  min-width: 0;
 }
 
 .field .mono {

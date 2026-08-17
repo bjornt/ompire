@@ -52,20 +52,17 @@ describe("App", () => {
     expect(tasksLink.className).toContain("navLinkActive");
   });
 
-  it("navigates to each stub route and renders its placeholder inside chrome", async () => {
+  it("renders the real Settings view (not a stub) inside chrome", async () => {
     await renderAppWithEmptySnapshot();
     const user = userEvent.setup();
 
-    for (const [label, title] of [
-      ["Projects", "Projects"],
-      ["Templates & settings", "Templates & settings"],
-    ] as const) {
-      await user.click(screen.getByRole("link", { name: label }));
-      expect(await screen.findByTestId("stub-page")).toHaveTextContent(title);
-      expect(screen.getByTestId("chrome-header")).toBeInTheDocument();
-      const navLink = screen.getByRole("link", { name: label });
-      expect(navLink.className).toContain("navLinkActive");
-    }
+    const header = screen.getByTestId("chrome-header");
+    await user.click(within(header).getByRole("link", { name: "Templates & settings" }));
+    expect(await screen.findByTestId("templates-empty-state")).toBeInTheDocument();
+    expect(screen.queryByTestId("stub-page")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chrome-header")).toBeInTheDocument();
+    const navLink = screen.getByRole("link", { name: "Templates & settings" });
+    expect(navLink.className).toContain("navLinkActive");
   });
 
   it("renders the real Spawn view (not a stub) inside chrome", async () => {
@@ -75,6 +72,17 @@ describe("App", () => {
     const header = screen.getByTestId("chrome-header");
     await user.click(within(header).getByRole("link", { name: "Spawn task" }));
     expect(await screen.findByTestId("spawn-form")).toBeInTheDocument();
+    expect(screen.queryByTestId("stub-page")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chrome-header")).toBeInTheDocument();
+  });
+
+  it("renders the real Projects view (not a stub) inside chrome", async () => {
+    await renderAppWithEmptySnapshot();
+    const user = userEvent.setup();
+
+    const header = screen.getByTestId("chrome-header");
+    await user.click(within(header).getByRole("link", { name: "Projects" }));
+    expect(await screen.findByTestId("projects-empty-state")).toBeInTheDocument();
     expect(screen.queryByTestId("stub-page")).not.toBeInTheDocument();
     expect(screen.getByTestId("chrome-header")).toBeInTheDocument();
   });

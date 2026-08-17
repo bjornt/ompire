@@ -1,0 +1,265 @@
+/* Projects view, pixel-matched to design/handoff/Projects.dc.html.
+ * Shared primitives (.headerRow, .subline, .spacer, .empty, .submitError)
+ * come from TasksView.css / SpawnView.css — single conventions, one bundle. */
+
+.projectsMain {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.primaryButton {
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  border-radius: 6px;
+  padding: 4px 11px;
+  font-size: 12px;
+  color: var(--on-hue);
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.primaryButton:hover {
+  filter: brightness(1.08);
+}
+
+.primaryButton:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ghostButton {
+  border: 1px solid var(--line);
+  background: none;
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.ghostButton:hover {
+  color: var(--text);
+  border-color: var(--faint);
+}
+
+/* New project form */
+
+.newProject {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 16px 18px;
+  margin: 0 0 14px;
+}
+
+.newProjectTitle {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 12px;
+}
+
+.newProject form,
+.editPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.formGrid {
+  display: grid;
+  gap: 10px 14px;
+}
+
+.formGridNameTitle {
+  grid-template-columns: 1fr 2fr;
+}
+
+.formGridUrls {
+  grid-template-columns: 1fr 1fr;
+}
+
+@media (max-width: 700px) {
+  .formGridNameTitle,
+  .formGridUrls {
+    grid-template-columns: 1fr;
+  }
+}
+
+.formField {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.fieldLabel {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.fieldHint {
+  font-weight: 400;
+  color: var(--faint);
+}
+
+.formField input {
+  font-size: 12.5px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface2);
+  color: var(--text);
+}
+
+.formField input.mono {
+  font-family: var(--mono);
+}
+
+.formField input.urlInput {
+  font-size: 12px;
+}
+
+.formField input:disabled {
+  background: var(--surface);
+  color: var(--faint);
+}
+
+.formActions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.cliHint {
+  font-size: 11.5px;
+  color: var(--faint);
+  font-family: var(--mono);
+}
+
+/* Project cards */
+
+.projectList {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.projectCard {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.projectCardHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  flex-wrap: wrap;
+}
+
+.projectName {
+  font-family: var(--mono);
+  font-size: 13.5px;
+  font-weight: 700;
+}
+
+.projectTitle {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.activeTasksPill {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 2px 9px;
+  white-space: nowrap;
+}
+
+.activeTasksPill:hover {
+  color: var(--text);
+  border-color: var(--faint);
+  text-decoration: none;
+}
+
+.editButton {
+  border: 1px solid var(--line);
+  background: var(--surface2);
+  border-radius: 6px;
+  padding: 2px 9px;
+  font-size: 11.5px;
+}
+
+.editButton:hover {
+  border-color: var(--faint);
+}
+
+.projectMeta {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 14px;
+  padding: 0 16px 12px;
+  font-size: 12px;
+}
+
+.metaLabel {
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.7;
+}
+
+.metaValue {
+  font-family: var(--mono);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.noForkNote {
+  color: var(--faint);
+}
+
+/* Edit panel */
+
+.editPanel {
+  border-top: 1px solid var(--line-soft);
+  background: var(--surface2);
+  padding: 14px 16px;
+}
+
+.editPanel .formField input {
+  background: var(--surface);
+}
+
+.renameNote {
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.renameNote code {
+  font-family: var(--mono);
+}
+
+.removeButton {
+  border: 1px solid transparent;
+  background: none;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--red);
+}
+
+.removeButton:hover {
+  border-color: var(--line);
+}

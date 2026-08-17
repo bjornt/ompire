@@ -22,8 +22,8 @@ from sqlalchemy import Engine
 
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.registry.projects import Project, get_project
 from ompire_daemon.registry.tasks import Task
+from ompire_daemon.registry.templates import get_template
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.spawn import Step, _run_step
 
@@ -187,8 +187,13 @@ class ReviewManager:
 
     # --- reset dance --------------------------------------------------------
 
-    def _project(self, task: Task) -> Project:
-        return get_project(self._engine, task.project_name)
+    def _base_branch(self, task: Task) -> str:
+        """`<base>` for the reset dance: the task's template base branch
+        (templates capability, design D-3). Tasks that predate templates
+        (null `template_name`) fall back to `main`."""
+        if task.template_name is None:
+            return "main"
+        return get_template(self._engine, task.template_name).base_branch
 
     async def _fetch(self, clone_path: str, timeout: int) -> None:
         await _run_step(
@@ -269,13 +274,13 @@ class ReviewManager:
             raise ReviewAlreadyOpenError(task_id)
 
         port = await self._allocate_port()
-        project = self._project(task)
+        base_branch = self._base_branch(task)
         clone_path = task.clone_path
         timeout = self._config.spawn_step_timeout
 
         await self._fetch(clone_path, timeout)
         await self._save_review_orig(clone_path)
-        await self._reset_to_merge_base(clone_path, project.base_branch)
+        await self._reset_to_merge_base(clone_path, base_branch)
 
         url = f"http://127.0.0.1:{port}"
         state = self._reviews.get(task_id)
