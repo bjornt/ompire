@@ -355,6 +355,23 @@ export interface GpgStatusPayload {
   status: GpgStatus;
 }
 
+/** Effective daemon settings map (daemon-settings capability). Values are
+ * booleans for tier prefs or numbers for intervals/thresholds. */
+export type DaemonSettings = Record<string, boolean | number>;
+
+export interface SettingsChangedPayload {
+  settings: DaemonSettings;
+}
+
+export interface DaemonInfo {
+  bind: string;
+  port: number;
+  version: string;
+  config_path: string;
+  data_dir: string;
+  audit_log_path: string | null;
+}
+
 export interface SnapshotPayload {
   projects: Project[];
   templates: Template[];
@@ -378,6 +395,8 @@ export interface SnapshotPayload {
   /** Current GPG signing-key cache state; absent from snapshots emitted before
    * the ship chunk. */
   gpg?: GpgStatus;
+  /** Effective daemon settings (daemon-settings capability). */
+  settings?: DaemonSettings;
 }
 
 export interface Envelope<T = unknown> {

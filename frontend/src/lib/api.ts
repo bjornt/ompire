@@ -1,6 +1,8 @@
 import type {
   AgentStateData,
   AgentStatsData,
+  DaemonInfo,
+  DaemonSettings,
   GpgStatus,
   Project,
   ReviewState,
@@ -194,4 +196,42 @@ export function updateTemplate(name: string, input: TemplateInput): Promise<Temp
 
 export function deleteTemplate(name: string): Promise<{ deleted: string }> {
   return request("DELETE", `/api/templates/${encodeURIComponent(name)}`);
+}
+
+/** Settings CRUD (daemon-settings capability). The effective map and
+ * provenance come from GET; PUT persists overrides and broadcasts
+ * `settings_changed`; DELETE reverts one override to its lower layer. */
+export interface SettingsResponse {
+  settings: DaemonSettings;
+  provenance: Record<string, "default" | "config" | "override">;
+}
+
+export function getSettings(): Promise<SettingsResponse> {
+  return request<SettingsResponse>("GET", "/api/settings");
+}
+
+export function updateSettings(changes: DaemonSettings): Promise<SettingsResponse> {
+  return request<SettingsResponse>("PUT", "/api/settings", changes);
+}
+
+export function deleteSetting(key: string): Promise<SettingsResponse> {
+  return request<SettingsResponse>("DELETE", `/api/settings/${encodeURIComponent(key)}`);
+}
+
+/** Daemon info (daemon-settings capability): read-only identity/paths. */
+export function getDaemonInfo(): Promise<DaemonInfo> {
+  return request<DaemonInfo>("GET", "/api/daemon/info");
+}
+
+/** Token show/rotate (daemon-settings capability). */
+export interface TokenResponse {
+  token: string;
+}
+
+export function getToken(): Promise<TokenResponse> {
+  return request<TokenResponse>("GET", "/api/settings/token");
+}
+
+export function rotateToken(): Promise<TokenResponse> {
+  return request<TokenResponse>("POST", "/api/settings/token/rotate");
 }

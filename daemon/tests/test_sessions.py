@@ -458,6 +458,27 @@ async def test_exit_during_stall_still_fails(tracked_stall) -> None:
     assert tracker.get(1, "main").status == "failed"
 
 
+async def test_new_stall_threshold_applies_to_new_arms_only(tracked) -> None:
+    supervisor, tracker, hub, _ = tracked
+    queue = hub.subscribe()
+    handle1 = await supervisor.start(1, "main", "/clone")
+    await handle1.prompt("no-end")
+    await wait_for_status(queue, "working")
+
+    # The first session's watchdog is sleeping under the original threshold.
+    tracker.set_stall_threshold(FAST_STALL_THRESHOLD)
+
+    handle2 = await supervisor.start(2, "main", "/clone")
+    await handle2.prompt("no-end")
+    await wait_for_status(queue, "stalled", timeout=FAST_STALL_THRESHOLD * 5)
+    assert tracker.get(2, "main").status == "stalled"
+    # The in-flight watchdog for the first session keeps its old deadline.
+    assert tracker.get(1, "main").status == "working"
+
+    await supervisor.stop(1, "main")
+    await supervisor.stop(2, "main")
+
+
 async def test_auto_retry_start_and_end_transitions(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()

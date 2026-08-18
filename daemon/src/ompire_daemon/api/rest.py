@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import secrets
 import shutil
 from dataclasses import asdict
+from importlib.metadata import version as package_version
 from pathlib import Path
+from typing import Any
 
-from sqlalchemy import Engine
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, status
 from pydantic import BaseModel, field_validator
+from sqlalchemy import Engine
+
+from ompire_daemon import auth
+from ompire_daemon.registry.settings import SettingsStore, SettingsValidationError
 
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
@@ -127,6 +134,10 @@ def _config(request: Request) -> Config:
     return request.app.state.config
 
 
+def _settings(request: Request) -> SettingsStore:
+    return request.app.state.settings_store
+
+
 def _events(request: Request) -> EventHub:
     return request.app.state.events
 
@@ -153,6 +164,33 @@ def _ships(request: Request) -> ShipManager:
 
 def _gpg(request: Request) -> GpgProbe:
     return request.app.state.gpg
+
+
+def _apply_settings_live(
+    settings: dict[str, Any],
+    events: EventHub,
+    notifications: AttentionNotifier,
+    advisories: AdvisorySampler,
+    sessions: SessionTracker,
+) -> None:
+    """Push a new effective settings map to every live consumer and broadcast
+    the change to WebSocket clients."""
+    notifications.apply_settings(settings)
+    advisories.set_threshold(settings["context_advisory_threshold"])
+    sessions.set_stall_threshold(settings["stall_threshold"])
+    events.publish("settings_changed", {"settings": settings})
+
+
+async def _close_all_ws(connections: set[WebSocket]) -> None:
+    """Close every tracked WebSocket with policy-violation code 1008."""
+    for ws in list(connections):
+        try:
+            await ws.close(code=1008, reason="token rotated")
+        except Exception:  # noqa: BLE001 — best-effort close
+            pass
+
+
+logger = logging.getLogger(__name__)
 
 
 @router.get("/projects", response_model=list[ProjectOut])
@@ -1028,3 +1066,100 @@ def purge_task_route(
     notifications.clear_task(task_id)
     events.publish("task_deleted", {"id": task_id})
     return {"deleted": task_id}
+
+
+# --- Settings / daemon info / token (daemon-settings capability) ----------
+
+
+class SettingsOut(BaseModel):
+    settings: dict[str, Any]
+    provenance: dict[str, str]
+
+
+@router.get("/settings", response_model=SettingsOut)
+def get_settings_route(settings_store: SettingsStore = Depends(_settings)) -> SettingsOut:
+    result = settings_store.get()
+    return SettingsOut(settings=result.settings, provenance=result.provenance)
+
+
+@router.put("/settings", response_model=SettingsOut)
+def update_settings_route(
+    body: dict[str, Any],
+    settings_store: SettingsStore = Depends(_settings),
+    events: EventHub = Depends(_events),
+    notifications: AttentionNotifier = Depends(_notifications),
+    advisories: AdvisorySampler = Depends(_advisories),
+    sessions: SessionTracker = Depends(_sessions),
+) -> SettingsOut:
+    try:
+        result = settings_store.update(body)
+    except SettingsValidationError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"{exc.key}: {exc.message}",
+        ) from exc
+    _apply_settings_live(result.settings, events, notifications, advisories, sessions)
+    return SettingsOut(settings=result.settings, provenance=result.provenance)
+
+
+@router.delete("/settings/{key}", response_model=SettingsOut)
+def delete_settings_route(
+    key: str,
+    settings_store: SettingsStore = Depends(_settings),
+    events: EventHub = Depends(_events),
+    notifications: AttentionNotifier = Depends(_notifications),
+    advisories: AdvisorySampler = Depends(_advisories),
+    sessions: SessionTracker = Depends(_sessions),
+) -> SettingsOut:
+    deleted = settings_store.delete(key)
+    if not deleted:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"setting {key!r} is unknown or has no override to delete",
+        )
+    result = settings_store.get()
+    _apply_settings_live(result.settings, events, notifications, advisories, sessions)
+    return SettingsOut(settings=result.settings, provenance=result.provenance)
+
+
+class DaemonInfoOut(BaseModel):
+    bind: str
+    port: int
+    version: str
+    config_path: str
+    data_dir: str
+    audit_log_path: str | None
+
+
+@router.get("/daemon/info", response_model=DaemonInfoOut)
+def daemon_info_route(
+    request: Request,
+    config: Config = Depends(_config),
+) -> DaemonInfoOut:
+    data_dir = config.data_dir
+    audit_path = data_dir / "audit.log"
+    audit_log_path = str(audit_path) if audit_path.is_file() else None
+    return DaemonInfoOut(
+        bind=config.bind,
+        port=config.port,
+        version=package_version("ompire-daemon"),
+        config_path=str(request.app.state.config_path),
+        data_dir=str(data_dir),
+        audit_log_path=audit_log_path,
+    )
+
+
+@router.get("/settings/token", response_model=dict[str, str])
+def get_token_route(request: Request) -> dict[str, str]:
+    return {"token": request.app.state.auth_token}
+
+
+@router.post("/settings/token/rotate", response_model=dict[str, str])
+async def rotate_token_route(request: Request) -> dict[str, str]:
+    data_dir = request.app.state.config.data_dir
+    new_token = secrets.token_urlsafe(32)
+    auth.write_token_file(auth.token_path_for(data_dir), new_token)
+    request.app.state.auth_token = new_token
+    await _close_all_ws(request.app.state.ws_connections)
+    logger.info("auth token rotated")
+    return {"token": new_token}

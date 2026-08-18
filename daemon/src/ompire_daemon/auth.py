@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 from pathlib import Path
@@ -15,6 +16,36 @@ def token_path_for(data_dir: Path) -> Path:
     return data_dir / TOKEN_FILENAME
 
 
+def write_token_file(path: Path, token: str, *, exclusive: bool = False) -> None:
+    """Atomically write `token` to `path` with owner-only (0600) mode.
+
+    Creates a sibling temp file in the same directory, then uses `os.replace`
+    so the visible path is never in a partially-written state. The temp file
+    is created with mode 0600; `os.replace` preserves the destination's mode
+    on some systems, so the temp is set restrictively explicitly.
+
+    `exclusive=True` adds `O_EXCL` (fail if the final path already exists),
+    suitable for first-run creation. Rotation uses the default non-exclusive
+    behaviour.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if exclusive:
+        flags |= os.O_EXCL
+    fd = os.open(tmp_path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            tmp_path.unlink()
+        raise
+
+
 def load_or_create_token(data_dir: Path) -> str:
     """Return the daemon's auth token, generating it on first run.
 
@@ -25,15 +56,12 @@ def load_or_create_token(data_dir: Path) -> str:
     if path.exists():
         return path.read_text().strip()
 
-    data_dir.mkdir(parents=True, exist_ok=True)
     token = secrets.token_urlsafe(32)
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        write_token_file(path, token, exclusive=True)
     except FileExistsError:
         # Lost a first-run race to another process; use what it wrote.
         return path.read_text().strip()
-    with os.fdopen(fd, "w") as f:
-        f.write(token)
     return token
 
 

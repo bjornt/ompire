@@ -527,3 +527,127 @@ async def test_cross_session_worst_tier_wins(fake_notify_send) -> None:
         }
     finally:
         await notifier.stop()
+
+
+# --- daemon-settings capability: per-tier prefs and live renotify ----------
+
+
+async def test_desktop_pref_off_suppresses_notification(fake_notify_send) -> None:
+    _, calls_log = fake_notify_send
+    hub = EventHub()
+    queue = hub.subscribe()
+    notifier = await _make_notifier(hub)
+    try:
+        notifier.apply_settings({"tier.notify.desktop": False})
+        hub.publish(
+            "status_changed",
+            {"task_id": 1, "session": "main", "from": "working", "to": "waiting-input", "reason": "pending question"},
+        )
+        async with asyncio.timeout(5):
+            while True:
+                event = await queue.get()
+                if event.type == "attention":
+                    break
+        assert event.payload["task_id"] == 1
+        await asyncio.sleep(0.1)
+        assert not calls_log.exists() or calls_log.read_text() == ""
+    finally:
+        await notifier.stop()
+
+
+async def test_sound_pref_selects_urgency(fake_notify_send) -> None:
+    configure, calls_log = fake_notify_send
+    configure(echo_open=False)
+    hub = EventHub()
+    notifier = await _make_notifier(hub)
+    try:
+        # interrupt normally has sound on -> critical
+        hub.publish(
+            "status_changed",
+            {"task_id": 1, "session": "main", "from": "working", "to": "failed", "reason": "crash"},
+        )
+        await _wait_until(lambda: calls_log.exists() and calls_log.read_text())
+        assert "--urgency critical" in calls_log.read_text()
+
+        # turn interrupt sound off: next interrupt-tier transition is normal
+        notifier.apply_settings({"tier.interrupt.sound": False})
+        hub.publish(
+            "status_changed",
+            {"task_id": 2, "session": "main", "from": "working", "to": "waiting-approval", "reason": "sudo"},
+        )
+        await _wait_until(lambda: len(calls_log.read_text().splitlines()) >= 2)
+        lines = calls_log.read_text().splitlines()
+        assert "--urgency normal" in lines[-1]
+    finally:
+        await notifier.stop()
+
+
+async def test_badge_tier_broadcasts_without_fire(fake_notify_send) -> None:
+    _, calls_log = fake_notify_send
+    hub = EventHub()
+    queue = hub.subscribe()
+    notifier = await _make_notifier(hub)
+    try:
+        hub.publish(
+            "status_changed",
+            {"task_id": 1, "session": "main", "from": "working", "to": "idle", "reason": "turn ended"},
+        )
+        async with asyncio.timeout(5):
+            while True:
+                event = await queue.get()
+                if event.type == "attention":
+                    break
+        assert event.payload == {
+            "task_id": 1,
+            "tier": "badge",
+            "status": "idle",
+            "reason": "turn ended",
+            "session": "main",
+        }
+        await asyncio.sleep(0.1)
+        assert not calls_log.exists() or calls_log.read_text() == ""
+        assert notifier.snapshot()[1]["tier"] == "badge"
+    finally:
+        await notifier.stop()
+
+
+async def test_renotify_interval_zero_cancels_pending_timers(fake_notify_send) -> None:
+    _, calls_log = fake_notify_send
+    hub = EventHub()
+    notifier = await _make_notifier(hub)
+    try:
+        hub.publish(
+            "status_changed",
+            {"task_id": 1, "session": "main", "from": "working", "to": "waiting-input", "reason": "pending question"},
+        )
+        await _wait_until(lambda: calls_log.exists() and len(calls_log.read_text().splitlines()) >= 1)
+
+        notifier.apply_settings({"renotify_interval": 0})
+        await asyncio.sleep(RENOTIFY * 3)
+        assert len(calls_log.read_text().splitlines()) == 1
+    finally:
+        await notifier.stop()
+
+
+async def test_renotify_rearms_from_now_on_interval_change(fake_notify_send) -> None:
+    """Changing interval re-arms outstanding timers from the moment of change,
+    not by firing immediately (never-cancel semantics)."""
+    _, calls_log = fake_notify_send
+    hub = EventHub()
+    notifier = await _make_notifier(hub)
+    try:
+        hub.publish(
+            "status_changed",
+            {"task_id": 1, "session": "main", "from": "working", "to": "waiting-input", "reason": "pending question"},
+        )
+        await _wait_until(lambda: calls_log.exists() and len(calls_log.read_text().splitlines()) >= 1)
+
+        # Wait until just before the original timer would fire, then change
+        # interval to a much longer one. If we cancelled and re-armed from
+        # now, no second fire should happen within the old interval.
+        await asyncio.sleep(RENOTIFY * 0.7)
+        notifier.apply_settings({"renotify_interval": RENOTIFY * 10})
+        await asyncio.sleep(RENOTIFY * 2)
+        assert len(calls_log.read_text().splitlines()) == 1
+    finally:
+        await notifier.stop()

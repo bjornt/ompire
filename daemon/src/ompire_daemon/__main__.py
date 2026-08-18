@@ -7,7 +7,7 @@ import sys
 import uvicorn
 
 from ompire_daemon.app import create_app
-from ompire_daemon.config import ConfigError, load_config
+from ompire_daemon.config import DEFAULT_CONFIG_PATH, ConfigError, load_config
 
 
 def main() -> None:
@@ -17,7 +17,7 @@ def main() -> None:
         print(f"ompire-daemon: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
-    app = create_app(config)
+    app = create_app(config, config_path=DEFAULT_CONFIG_PATH)
     uvicorn.run(app, host=config.bind, port=config.port)
 
 

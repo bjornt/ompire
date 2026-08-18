@@ -233,6 +233,12 @@ class SessionTracker:
         self._turn_end_hooks: list[Callable[[int, str, AgentHandle], Awaitable[None]]] = []
         self._idle_entered_hooks: list[Callable[[int, str, AgentHandle], Awaitable[None]]] = []
 
+    def set_stall_threshold(self, seconds: float) -> None:
+        """Update the stall watchdog threshold. Applies only to timers armed
+        after this call; timers already sleeping keep their original deadline
+        (design D-2)."""
+        self._stall_threshold = seconds
+
     def add_turn_end_hook(self, hook: Callable[[int, str, AgentHandle], Awaitable[None]]) -> None:
         self._turn_end_hooks.append(hook)
 
@@ -716,9 +722,12 @@ class SessionTracker:
 
     def _arm_watchdog(self, key: tuple[int, str]) -> None:
         """(Re)arm the stall watchdog, mirroring `_start_debounce` (design
-        D-4): armed on entering/staying `working`, cancelled otherwise."""
+        D-4): armed on entering/staying `working`, cancelled otherwise.
+        The threshold value is captured at arm time so a later settings
+        change does not alter in-flight deadlines."""
         self._cancel_watchdog(key)
-        task = asyncio.create_task(self._watchdog_fire(key))
+        threshold = self._stall_threshold
+        task = asyncio.create_task(self._watchdog_fire(key, threshold))
         self._watchdogs[key] = task
         task.add_done_callback(lambda t: self._pop_if_current(self._watchdogs, key, t))
 
@@ -736,14 +745,14 @@ class SessionTracker:
         else:
             self._cancel_watchdog(key)
 
-    async def _watchdog_fire(self, key: tuple[int, str]) -> None:
-        await asyncio.sleep(self._stall_threshold)
+    async def _watchdog_fire(self, key: tuple[int, str], threshold: float) -> None:
+        await asyncio.sleep(threshold)
         task_id, session = key
         self._transition(
             task_id,
             session,
             "stalled",
-            f"no frames for {self._stall_threshold:.0f}s",
+            f"no frames for {threshold:.0f}s",
             allow_from={"working"},
         )
 

@@ -6,6 +6,7 @@ import type {
   AttentionEntry,
   AttentionPayload,
   ConnectionState,
+  DaemonSettings,
   Envelope,
   GpgStatus,
   GpgStatusPayload,
@@ -17,6 +18,7 @@ import type {
   ReviewStartedPayload,
   ReviewState,
   SessionInfo,
+  SettingsChangedPayload,
   ShipDraftPayload,
   ShipFinishedPayload,
   ShipState,
@@ -74,6 +76,9 @@ export interface DaemonState {
   /** Current GPG signing-key cache state (ship capability): loaded from the
    * snapshot, upserted by gpg_status events. */
   gpg: GpgStatus | null;
+  /** Effective daemon settings (daemon-settings capability): loaded from the
+   * snapshot, replaced by `settings_changed` events. */
+  settings: DaemonSettings;
 }
 
 export const initialDaemonState: DaemonState = {
@@ -90,6 +95,7 @@ export const initialDaemonState: DaemonState = {
   reviews: {},
   ships: {},
   gpg: null,
+  settings: {},
 };
 
 /** Applies one envelope from the daemon's WebSocket. `snapshot` is a full
@@ -134,6 +140,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         reviews,
         ships,
         gpg: payload.gpg ?? null,
+        settings: payload.settings ?? {},
       };
     }
     case "project_created": {
@@ -268,6 +275,10 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       if (!(task_id in state.attention)) return state;
       const { [task_id]: _dropped, ...attention } = state.attention;
       return { ...state, attention };
+    }
+    case "settings_changed": {
+      const { settings } = envelope.payload as SettingsChangedPayload;
+      return { ...state, settings };
     }
     case "stats": {
       const payload = envelope.payload as StatsPayload;

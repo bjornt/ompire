@@ -55,8 +55,8 @@ function gpgChip(gpg: GpgStatus | null): { dot: string; label: string; title: st
 }
 
 export function Chrome() {
-  const { connectionState, tasks, attention, gpg } = useDaemonState();
-  const needsYou = countNeedsAttention(tasks, attention);
+  const { connectionState, tasks, attention, gpg, settings } = useDaemonState();
+  const needsYou = countNeedsAttention(tasks, attention, settings);
   const daemonChip = DAEMON_CHIP_BY_STATE[connectionState];
   const signingChip = gpgChip(gpg);
 

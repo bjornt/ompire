@@ -1053,3 +1053,45 @@ describe("applyEnvelope workflow events", () => {
     ]);
   });
 });
+
+describe("applyEnvelope daemon settings events", () => {
+  it("loads settings from the snapshot", () => {
+    const settings = {
+      renotify_interval: 300,
+      "tier.badge.badge": true,
+    };
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [], settings },
+    });
+    expect(state.settings).toEqual(settings);
+  });
+
+  it("defaults to an empty settings map when the snapshot omits settings", () => {
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [] },
+    });
+    expect(state.settings).toEqual({});
+  });
+
+  it("replaces settings on settings_changed", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [], settings: { stall_threshold: 300 } },
+    });
+    state = applyEnvelope(state, {
+      seq: 1,
+      ts: "",
+      type: "settings_changed",
+      payload: { settings: { renotify_interval: 600 } },
+    });
+    expect(state.settings).toEqual({ renotify_interval: 600 });
+  });
+});

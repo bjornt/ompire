@@ -1,13 +1,26 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   createTemplate,
   deleteTemplate,
+  getDaemonInfo,
+  getSettings,
+  getToken,
+  rotateToken,
+  updateSettings,
   updateTemplate,
   type TemplateInput,
 } from "../lib/api";
+import { setDaemonToken } from "../lib/token";
 import { useDaemonState } from "../lib/daemonSocket";
 import { REGISTERED_WORKFLOWS, THINKING_LEVELS, templateCheckout } from "../lib/templates";
-import type { Project, Template, ThinkingLevel } from "../types";
+import type {
+  AttentionTier,
+  DaemonInfo,
+  DaemonSettings,
+  Project,
+  Template,
+  ThinkingLevel,
+} from "../types";
 import "./SettingsView.css";
 
 function errorText(error: unknown): string {
@@ -15,6 +28,277 @@ function errorText(error: unknown): string {
 }
 
 type EditorState = { mode: "create" } | { mode: "edit"; name: string };
+
+type Provenance = Record<string, "default" | "config" | "override">;
+
+const RENOTIFY_OPTIONS: { label: string; value: number }[] = [
+  { label: "3 minutes", value: 180 },
+  { label: "5 minutes", value: 300 },
+  { label: "10 minutes", value: 600 },
+  { label: "Never", value: 0 },
+];
+
+const TIER_ROWS: { tier: AttentionTier; hint: string }[] = [
+  { tier: "interrupt", hint: "needs you now" },
+  { tier: "notify", hint: "needs you soon" },
+  { tier: "badge", hint: "counts in the tab" },
+  { tier: "silent", hint: "no alert" },
+];
+
+const TIER_KIND_LABELS: Record<string, string> = {
+  desktop: "Desktop",
+  sound: "Sound",
+  badge: "Tab badge",
+};
+
+function capitalize(s: string): string {
+  return (s[0]?.toUpperCase() ?? "") + s.slice(1);
+}
+
+function OverrideTag({
+  provenance,
+  settingKey,
+  testId,
+}: {
+  provenance: Provenance;
+  settingKey: string;
+  testId: string;
+}) {
+  if (provenance[settingKey] !== "override") return null;
+  return (
+    <span className="overrideTag" data-testid={`override-${testId}`}>
+      override
+    </span>
+  );
+}
+
+function TierMatrix({
+  settings,
+  provenance,
+  onChange,
+}: {
+  settings: DaemonSettings;
+  provenance: Provenance;
+  onChange: (key: string, value: boolean) => void;
+}) {
+  return (
+    <div className="tierMatrix" data-testid="tier-matrix">
+      {TIER_ROWS.map(({ tier, hint }) => (
+        <div key={tier} className="tierRow" data-testid={`tier-row-${tier}`}>
+          <div className="tierRowMeta">
+            <span
+              className={`tierPill tierPill${capitalize(tier)}`}
+              data-testid={`tier-pill-${tier}`}
+            >
+              {tier}
+            </span>
+            <span className="tierHint">{hint}</span>
+          </div>
+          <div className="tierChecks">
+            {(["desktop", "sound", "badge"] as const).map((kind) => {
+              const key = `tier.${tier}.${kind}`;
+              const checked = Boolean(settings[key]);
+              const testId = `tier-${tier}-${kind}`;
+              return (
+                <label key={kind} className="checkButton" data-testid={`check-button-${testId}`}>
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => onChange(key, !checked)}
+                    data-testid={testId}
+                  />
+                  <span>{TIER_KIND_LABELS[kind]}</span>
+                  <OverrideTag provenance={provenance} settingKey={key} testId={testId} />
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function WatchdogInputs({
+  settings,
+  provenance,
+  onChange,
+}: {
+  settings: DaemonSettings;
+  provenance: Provenance;
+  onChange: (key: string, value: number) => void;
+}) {
+  const stallSetting = typeof settings.stall_threshold === "number" ? settings.stall_threshold : 300;
+  const contextSetting =
+    typeof settings.context_advisory_threshold === "number"
+      ? settings.context_advisory_threshold
+      : 80;
+
+  const [stall, setStall] = useState(String(stallSetting));
+  const [context, setContext] = useState(String(contextSetting));
+
+  useEffect(() => {
+    setStall(String(stallSetting));
+  }, [stallSetting]);
+
+  useEffect(() => {
+    setContext(String(contextSetting));
+  }, [contextSetting]);
+
+  function commitStall() {
+    const n = Number.parseInt(stall, 10);
+    if (!Number.isNaN(n) && n >= 0) onChange("stall_threshold", n);
+  }
+
+  function commitContext() {
+    const n = Number.parseInt(context, 10);
+    if (!Number.isNaN(n) && n >= 0 && n <= 100) onChange("context_advisory_threshold", n);
+  }
+
+  return (
+    <div className="watchdogGrid">
+      <label className="formField">
+        <span className="fieldLabel">
+          Stall threshold{" "}
+          <span className="fieldHint">seconds before a session is considered stalled</span>
+          <OverrideTag provenance={provenance} settingKey="stall_threshold" testId="stall-threshold" />
+        </span>
+        <input
+          type="number"
+          className="mono"
+          min={0}
+          value={stall}
+          onChange={(e) => setStall(e.target.value)}
+          onBlur={commitStall}
+          data-testid="stall-threshold"
+        />
+      </label>
+
+      <label className="formField">
+        <span className="fieldLabel">
+          Context advisory threshold{" "}
+          <span className="fieldHint">percent at which to surface context load</span>
+          <OverrideTag
+            provenance={provenance}
+            settingKey="context_advisory_threshold"
+            testId="context-advisory-threshold"
+          />
+        </span>
+        <input
+          type="number"
+          className="mono"
+          min={0}
+          max={100}
+          value={context}
+          onChange={(e) => setContext(e.target.value)}
+          onBlur={commitContext}
+          data-testid="context-advisory-threshold"
+        />
+      </label>
+    </div>
+  );
+}
+
+function maskToken(token: string): string {
+  if (token.length <= 8) return token;
+  const prefix = token.startsWith("ompire_tok_") ? "ompire_tok_" : "";
+  const secret = prefix ? token.slice(prefix.length) : token;
+  const first = secret.slice(0, 4);
+  const last = secret.slice(-4);
+  const filler = "•".repeat(Math.max(secret.length - 8, 4));
+  return `${prefix}${first}${filler}${last}`;
+}
+
+function DaemonPanel() {
+  const [info, setInfo] = useState<DaemonInfo | null>(null);
+  const [token, setToken] = useState<string | null>(null);
+
+  useEffect(() => {
+    getDaemonInfo().then((i) => setInfo(i)).catch(() => {});
+    getToken().then((res) => setToken(res.token)).catch(() => {});
+  }, []);
+
+  async function copyToken() {
+    if (!token) return;
+    try {
+      await navigator.clipboard.writeText(token);
+    } catch {
+      // Ignore missing clipboard permission.
+    }
+  }
+
+  async function rotate() {
+    if (
+      !window.confirm(
+        "Rotating the daemon token will invalidate the old token immediately. Any other client using it will be disconnected. Continue?",
+      )
+    ) {
+      return;
+    }
+    const res = await rotateToken();
+    setDaemonToken(res.token);
+    setToken(res.token);
+  }
+
+  return (
+    <>
+      {info && (
+        <div className="daemonInfoGrid">
+          <div className="daemonInfoRow" data-testid="daemon-info-bind">
+            <span>Bind</span>
+            <code>{info.bind}</code>
+          </div>
+          <div className="daemonInfoRow" data-testid="daemon-info-port">
+            <span>Port</span>
+            <code>{info.port}</code>
+          </div>
+          <div className="daemonInfoRow" data-testid="daemon-info-version">
+            <span>Version</span>
+            <code>{info.version}</code>
+          </div>
+          <div className="daemonInfoRow" data-testid="daemon-info-config-path">
+            <span>Config path</span>
+            <code>{info.config_path}</code>
+          </div>
+          <div className="daemonInfoRow" data-testid="daemon-info-data-dir">
+            <span>Data dir</span>
+            <code>{info.data_dir}</code>
+          </div>
+          {info.audit_log_path !== null && info.audit_log_path !== undefined && (
+            <div className="daemonInfoRow" data-testid="daemon-info-audit-log-path">
+              <span>Audit log</span>
+              <code>{info.audit_log_path}</code>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="tokenRow">
+        <code className="tokenValue" data-testid="daemon-token">
+          {token ? maskToken(token) : "••••"}
+        </code>
+        <div className="tokenActions">
+          <button
+            type="button"
+            className="ghostButton"
+            onClick={() => void copyToken()}
+            data-testid="copy-daemon-token"
+          >
+            Copy
+          </button>
+          <button
+            type="button"
+            className="ghostButton"
+            onClick={() => void rotate()}
+            data-testid="rotate-daemon-token"
+          >
+            Rotate
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
 
 function TemplateRow({
   template,
@@ -315,11 +599,35 @@ function TemplateEditor({
 }
 
 export function SettingsView() {
-  const { projects, templates } = useDaemonState();
+  const { projects, templates, settings } = useDaemonState();
+  const [provenance, setProvenance] = useState<Provenance>({});
   const [editor, setEditor] = useState<EditorState | null>(null);
-  const sorted = [...templates].sort((a, b) => a.name.localeCompare(b.name));
+
+  useEffect(() => {
+    getSettings()
+      .then((res) => setProvenance(res.provenance ?? {}))
+      .catch(() => {});
+  }, []);
+
+  const sorted = useMemo(
+    () => [...templates].sort((a, b) => a.name.localeCompare(b.name)),
+    [templates],
+  );
   const editingTemplate =
     editor?.mode === "edit" ? templates.find((t) => t.name === editor.name) : undefined;
+
+  async function putSetting(key: string, value: boolean | number) {
+    try {
+      const res = await updateSettings({ [key]: value });
+      setProvenance(res.provenance ?? {});
+    } catch {
+      // The control state comes from the daemon's settings_changed event; if
+      // the PUT fails we leave the UI as-is and let the next broadcast sync it.
+    }
+  }
+
+  const renotify =
+    typeof settings.renotify_interval === "number" ? settings.renotify_interval : 300;
 
   return (
     <div className="settingsMain">
@@ -328,8 +636,6 @@ export function SettingsView() {
         <span className="subline">what spawn needs, and how attention reaches you</span>
       </div>
 
-      {/* Two-column grid per the mockup; the right column (notifications,
-       * watchdogs, daemon panel) is ROADMAP chunk 20 and slots in here. */}
       <div className="settingsGrid">
         <div className="settingsColumn">
           <section className="panel" data-testid="templates-panel">
@@ -383,6 +689,49 @@ export function SettingsView() {
               onClose={() => setEditor(null)}
             />
           )}
+        </div>
+
+        <div className="settingsColumn">
+          <section className="panel" data-testid="notifications-panel">
+            <h2 className="panelTitle">Notifications · per attention tier</h2>
+            <TierMatrix settings={settings} provenance={provenance} onChange={putSetting} />
+          </section>
+
+          <section className="panel" data-testid="renotify-panel">
+            <h2 className="panelTitle">Re-notify</h2>
+            <label className="formField">
+              <span className="fieldLabel">
+                Re-notify interval
+                <OverrideTag
+                  provenance={provenance}
+                  settingKey="renotify_interval"
+                  testId="renotify-interval"
+                />
+              </span>
+              <select
+                value={renotify}
+                onChange={(e) => putSetting("renotify_interval", Number(e.target.value))}
+                data-testid="renotify-interval"
+              >
+                {RENOTIFY_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+              <span className="fieldHint">How long to wait before reminding you again</span>
+            </label>
+          </section>
+
+          <section className="panel" data-testid="watchdogs-panel">
+            <h2 className="panelTitle">Watchdogs &amp; thresholds</h2>
+            <WatchdogInputs settings={settings} provenance={provenance} onChange={putSetting} />
+          </section>
+
+          <section className="panel" data-testid="daemon-panel">
+            <h2 className="panelTitle">Daemon</h2>
+            <DaemonPanel />
+          </section>
         </div>
       </div>
     </div>

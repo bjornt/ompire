@@ -121,6 +121,15 @@ workflow_step_records = Table(
     Column("finished_at", String, nullable=True),
 )
 
+# Settings store (daemon-settings capability, design D-1): UI-editable
+# overrides persisted as JSON-encoded scalar values, layered over config.toml.
+settings = Table(
+    "settings",
+    metadata,
+    Column("key", String, primary_key=True),
+    Column("value", Text, nullable=False),
+)
+
 
 def db_path_for(data_dir: Path) -> Path:
     return data_dir / "ompire.db"

@@ -37,12 +37,13 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0008"
+    assert version == "0009"
     assert "projects" in tables
     assert "tasks" in tables
     assert "templates" in tables
     assert "task_sessions" in tables
     assert "workflow_step_records" in tables
+    assert "settings" in tables
     assert "pr_url" in task_columns
     assert "template_name" in task_columns
     # Workflow run state lives on the task row (workflow-engine capability).
@@ -75,7 +76,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0008"
+    assert version == "0009"
     assert row == "demo"
 
 
@@ -130,7 +131,7 @@ def test_0007_seeds_templates_and_drops_project_columns(tmp_path: Path) -> None:
     engine = make_engine(db_path)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "0008"
+        assert version == "0009"
 
         templates = conn.execute(
             text(
@@ -206,7 +207,7 @@ def test_0008_backfills_sessions_and_legacy_workflow_runs(tmp_path: Path) -> Non
     engine = make_engine(db_path)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "0008"
+        assert version == "0009"
 
         sessions = conn.execute(
             text("SELECT task_id, name, omp_session_id FROM task_sessions ORDER BY task_id")

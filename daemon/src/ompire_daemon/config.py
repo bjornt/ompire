@@ -5,6 +5,7 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 DEFAULT_CONFIG_PATH = Path("~/.config/ompire/config.toml").expanduser()
 
@@ -95,6 +96,12 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class Config:
+    # Source values from the operator's config.toml for keys the daemon
+    # exposes through the layered settings store. Empty when the daemon is
+    # constructed from defaults/tests; populated by load_config when a file
+    # exists. Not compared so Config() == Config() regardless of source.
+    config_source: dict[str, Any] = field(default_factory=dict, compare=False)
+
     port: int = DEFAULT_PORT
     bind: str = DEFAULT_BIND
     data_dir: Path = DEFAULT_DATA_DIR
@@ -380,7 +387,16 @@ def load_config(path: Path | None = None) -> Config:
             f"got {pr_poll_interval!r}"
         )
 
+    config_source: dict[str, Any] = {}
+    if "renotify_interval" in data:
+        config_source["renotify_interval"] = float(renotify_interval)
+    if "stall_threshold" in data:
+        config_source["stall_threshold"] = float(stall_threshold)
+    if "context_advisory_threshold" in data:
+        config_source["context_advisory_threshold"] = int(context_advisory_threshold)
+
     return Config(
+        config_source=config_source,
         port=port,
         bind=bind,
         data_dir=data_dir,

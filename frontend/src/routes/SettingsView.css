@@ -169,3 +169,170 @@
   font-size: 11px;
   color: var(--faint);
 }
+
+/* Right column panels: notifications, watchdogs, daemon info/token */
+
+.tierMatrix {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tierRow {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.tierRow:last-child {
+  border-bottom: none;
+}
+
+.tierRowMeta {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.tierPill {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 2px 7px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.tierPillInterrupt {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 8%, transparent);
+  border-color: color-mix(in srgb, var(--red) 32%, var(--line));
+}
+
+.tierPillNotify {
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 8%, transparent);
+  border-color: color-mix(in srgb, var(--amber) 32%, var(--line));
+}
+
+.tierPillBadge {
+  color: var(--cyan);
+  background: color-mix(in srgb, var(--cyan) 8%, transparent);
+  border-color: color-mix(in srgb, var(--cyan) 32%, var(--line));
+}
+
+.tierPillSilent {
+  color: var(--faint);
+  background: color-mix(in srgb, var(--faint) 8%, transparent);
+  border-color: var(--line);
+}
+
+.tierHint {
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+.tierChecks {
+  display: flex;
+  gap: 12px;
+}
+
+.checkButton {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.checkButton input[type="checkbox"] {
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}
+
+.overrideTag {
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--amber);
+  border: 1px solid color-mix(in srgb, var(--amber) 40%, var(--line));
+  padding: 1px 5px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.formField select {
+  font-size: 12.5px;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface2);
+  color: var(--text);
+}
+
+.watchdogGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+@media (max-width: 700px) {
+  .watchdogGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.daemonInfoGrid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 12px;
+  align-items: baseline;
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+
+.daemonInfoRow {
+  display: contents;
+}
+
+.daemonInfoRow span {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.daemonInfoRow code {
+  font-family: var(--mono);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.tokenRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tokenValue {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 4px 8px;
+  background: var(--surface2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  letter-spacing: 0.02em;
+}
+
+.tokenActions {
+  display: flex;
+  gap: 8px;
+}

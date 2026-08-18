@@ -52,10 +52,20 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
       };
     }
 
+    function reconnect() {
+      socketRef.current?.close();
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      backoffRef.current = INITIAL_BACKOFF_MS;
+      connect();
+    }
+
+    window.addEventListener("ompire:token-set", reconnect);
+
     connect();
 
     return () => {
       closedByUnmountRef.current = true;
+      window.removeEventListener("ompire:token-set", reconnect);
       if (timeoutRef.current) clearTimeout(timeoutRef.current);
       socketRef.current?.close();
     };

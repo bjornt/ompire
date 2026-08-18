@@ -271,3 +271,35 @@ async def test_turn_end_hook_fires_through_real_tracker(tracked) -> None:
     assert event.payload["tokens"] == {"input": 1200, "output": 340}
 
     await supervisor.stop(1, "main")
+
+
+async def test_threshold_change_clears_fired_latch() -> None:
+    """Changing the threshold clears the fired latch so a sample crossing
+    the new threshold fires again."""
+    hub = EventHub()
+    sampler = AdvisorySampler(hub, stats_throttle_interval=0, context_advisory_threshold=80)
+    queue = hub.subscribe()
+
+    handle = FakeHandle({"get_state": _state(85), "get_session_stats": _stats()})
+    await sampler.sample_turn_end(1, "main", handle)
+    event = await queue.get()
+    assert event.type == "stats"
+    event = await queue.get()
+    assert event.type == "advisory"
+    assert event.payload["kind"] == "context-high"
+
+    # Same context percent should not re-fire until the latch is cleared.
+    with pytest.raises(asyncio.TimeoutError):
+        async with asyncio.timeout(0.05):
+            await queue.get()
+
+    # Raising the threshold clears the latch. A later sample that crosses
+    # the new threshold fires again.
+    sampler.set_threshold(90)
+    handle2 = FakeHandle({"get_state": _state(95), "get_session_stats": _stats()})
+    await sampler.sample_turn_end(1, "main", handle2)
+    event = await queue.get()
+    assert event.type == "stats"
+    event = await queue.get()
+    assert event.type == "advisory"
+    assert event.payload["context_pct"] == 95

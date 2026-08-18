@@ -123,6 +123,13 @@ class AdvisorySampler:
             ):
                 self._clear_maybe_waiting_if_left_idle(task_id, session, to_status)
 
+    def set_threshold(self, pct: int) -> None:
+        """Update the context advisory threshold. The new value applies to
+        the next sample; clearing the fired latch lets a sample already above
+        the new threshold fire immediately."""
+        self._threshold = pct
+        self._context_high.clear()
+
     def clear_task(self, task_id: int) -> None:
         """Drop per-task bookkeeping (task cleanup/purge, mirroring
         `SessionTracker.discard`)."""

@@ -15,6 +15,7 @@ from fastapi import APIRouter, WebSocket
 from sqlalchemy import Engine
 
 from ompire_daemon.agent import EVENT_STREAM_END, AgentSupervisor
+from ompire_daemon.registry.settings import SettingsStore
 from ompire_daemon.auth import check_ws_token
 from ompire_daemon.events import EventHub
 from ompire_daemon.gpg import GpgProbe
@@ -54,6 +55,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
+    websocket.app.state.ws_connections.add(websocket)
 
     engine: Engine = websocket.app.state.engine
     events: EventHub = websocket.app.state.events
@@ -99,6 +101,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         for task_id, info in websocket.app.state.ships.snapshot().items()
     }
     gpg_payload = asdict(websocket.app.state.gpg.current())
+    settings = SettingsStore(engine, websocket.app.state.config).effective()
     await _send_envelope(
         websocket,
         next(seq),
@@ -113,6 +116,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             "reviews": reviews_payload,
             "ships": ships_payload,
             "gpg": gpg_payload,
+            "settings": settings,
         },
     )
 
@@ -128,6 +132,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await forwarder
         events.unsubscribe(queue)
+        websocket.app.state.ws_connections.discard(websocket)
 
 
 async def _forward_agent_events(
@@ -168,6 +173,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: int, session: 
         return
 
     await websocket.accept()
+    websocket.app.state.ws_connections.add(websocket)
 
     # Snapshot and subscribe with no await between them, so no event can fall
     # into a gap or be duplicated between replay and live.
@@ -192,4 +198,5 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: int, session: 
         # Client went away mid-send; nothing left to deliver.
         pass
     finally:
+        websocket.app.state.ws_connections.discard(websocket)
         handle.unsubscribe(queue)

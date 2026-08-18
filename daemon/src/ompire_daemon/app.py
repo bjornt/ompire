@@ -9,14 +9,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
 
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.api.rest import router as api_router
 from ompire_daemon.api.ws import router as ws_router
 from ompire_daemon.auth import load_or_create_token
-from ompire_daemon.config import Config
+from ompire_daemon.config import DEFAULT_CONFIG_PATH, Config
 from ompire_daemon.db import db_path_for, make_engine
 from ompire_daemon.events import EventHub
 from ompire_daemon.gpg import GpgProbe
@@ -24,6 +24,7 @@ from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.prwatch import PrWatcher
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
+from ompire_daemon.registry.settings import SettingsStore, get_settings
 from ompire_daemon.registry.tasks import list_tasks
 from ompire_daemon.review import ReviewManager
 from ompire_daemon.sessions import SessionTracker
@@ -114,19 +115,28 @@ async def _prepare_startup(
     return await classify_startup_tasks(engine, events, sessions)
 
 
-def create_app(config: Config, *, frontend_dist: Path = DEFAULT_FRONTEND_DIST) -> FastAPI:
+def create_app(
+    config: Config,
+    *,
+    frontend_dist: Path = DEFAULT_FRONTEND_DIST,
+    config_path: Path | None = None,
+) -> FastAPI:
     config.data_dir.mkdir(parents=True, exist_ok=True)
     db_path = db_path_for(config.data_dir)
     upgrade_head(db_path)
 
     app = FastAPI(title="ompire-daemon", lifespan=_lifespan)
     app.state.config = config
+    app.state.config_path = config_path or DEFAULT_CONFIG_PATH
     app.state.engine = make_engine(db_path)
     app.state.auth_token = load_or_create_token(config.data_dir)
     app.state.events = EventHub()
     app.state.spawn_jobs = set()
+    app.state.ws_connections: set[WebSocket] = set()
+    app.state.settings_store = SettingsStore(app.state.engine, config)
+    effective_settings = app.state.settings_store.effective()
     app.state.sessions = SessionTracker(
-        app.state.events, config.session_idle_debounce, config.stall_threshold
+        app.state.events, config.session_idle_debounce, effective_settings["stall_threshold"]
     )
     app.state.agents = AgentSupervisor(config, app.state.events, app.state.sessions)
     app.state.workflow_runner = WorkflowRunner(
@@ -152,13 +162,14 @@ def create_app(config: Config, *, frontend_dist: Path = DEFAULT_FRONTEND_DIST) -
         app.state.events,
         bind=config.bind,
         port=config.port,
-        renotify_interval=config.renotify_interval,
+        renotify_interval=effective_settings["renotify_interval"],
         enabled=config.notifications_enabled,
     )
+    app.state.notifications.apply_settings(effective_settings)
     app.state.advisories = AdvisorySampler(
         app.state.events,
         stats_throttle_interval=config.stats_throttle_interval,
-        context_advisory_threshold=config.context_advisory_threshold,
+        context_advisory_threshold=effective_settings["context_advisory_threshold"],
     )
     app.state.prwatch = PrWatcher(config, app.state.engine, app.state.events)
     app.state.advisories.register(app.state.sessions)

@@ -23,6 +23,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
             "reviews",
             "ships",
             "gpg",
+            "settings",
         }
         assert payload["projects"] == []
         assert payload["templates"] == []

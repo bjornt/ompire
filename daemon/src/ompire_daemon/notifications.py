@@ -39,6 +39,15 @@ _TIER_BY_STATUS: dict[str, str] = {
 }
 
 _NOTIFYING_TIERS = frozenset({"notify", "interrupt"})
+_ATTENTION_TIERS = frozenset({"badge", "notify", "interrupt"})
+
+# Default per-tier prefs match Settings.dc.html / design D-1.
+_DEFAULT_PREFS: dict[str, dict[str, bool]] = {
+    "interrupt": {"desktop": True, "sound": True, "badge": True},
+    "notify": {"desktop": True, "sound": False, "badge": True},
+    "badge": {"desktop": False, "sound": False, "badge": True},
+    "silent": {"desktop": False, "sound": False, "badge": False},
+}
 
 _NOTIFY_SEND_HELP_TIMEOUT = 5.0
 
@@ -84,6 +93,7 @@ class AttentionNotifier:
         self._enabled = enabled
         self._capable = False
         self._actions_supported = True
+        self._prefs = {tier: dict(channels) for tier, channels in _DEFAULT_PREFS.items()}
         # The published task-level entry (worst tier across sources) and the
         # per-source entries it aggregates: task → source → entry, where the
         # source is the session name, or None for a workflow-gate wait.
@@ -239,7 +249,7 @@ class AttentionNotifier:
         ):
             return
         tier = tier_for(status)
-        if tier in _NOTIFYING_TIERS:
+        if tier in _ATTENTION_TIERS:
             self._set_source(
                 task_id, session, AttentionEntry(tier, status, str(reason), session)
             )
@@ -299,9 +309,12 @@ class AttentionNotifier:
                 "session": entry.session,
             },
         )
-        if self._capable:
+        if not self._capable:
+            return
+        if self._tier_pref(entry.tier, "desktop"):
             self._fire(task_id, entry.tier, entry.status, entry.reason)
-            self._arm_renotify(task_id, entry.tier, entry.status, entry.reason)
+            if self._renotify_interval > 0:
+                self._arm_renotify(task_id, entry.tier, entry.status, entry.reason)
 
     def _leave(self, task_id: int) -> None:
         had_entry = self._entries.pop(task_id, None) is not None
@@ -328,8 +341,32 @@ class AttentionNotifier:
             else None
         )
 
+    def _tier_pref(self, tier: str, channel: str) -> bool:
+        return self._prefs.get(tier, {}).get(channel, _DEFAULT_PREFS.get(tier, {}).get(channel, False))
+
+    def apply_settings(self, settings: dict[str, Any]) -> None:
+        """Update live prefs and re-arm outstanding re-notify timers.
+
+        A new non-zero interval re-arms every pending timer from now. An
+        interval of zero cancels them outright. Desktop-pref changes stop or
+        start re-notification for tasks in the affected tier without firing
+        immediately."""
+        for tier in ("interrupt", "notify", "badge", "silent"):
+            for channel in ("desktop", "sound", "badge"):
+                self._prefs[tier][channel] = bool(
+                    settings.get(f"tier.{tier}.{channel}", _DEFAULT_PREFS[tier][channel])
+                )
+        self._renotify_interval = float(settings.get("renotify_interval", self._renotify_interval))
+
+        for task_id, entry in list(self._entries.items()):
+            if self._renotify_interval <= 0 or not self._tier_pref(entry.tier, "desktop"):
+                self._cancel_renotify(task_id)
+            else:
+                self._cancel_renotify(task_id)
+                self._arm_renotify(task_id, entry.tier, entry.status, entry.reason)
+
     async def _notify_send(self, task_id: int, tier: str, status: str, reason: str) -> None:
-        urgency = "critical" if tier == "interrupt" else "normal"
+        urgency = "critical" if self._tier_pref(tier, "sound") else "normal"
         summary = f"ompire task {task_id}: {status}"
 
         if not self._actions_supported:
@@ -430,8 +467,13 @@ class AttentionNotifier:
         `renotify_interval` and re-arms itself, until a tier transition
         cancels it (answering, the turn moving, or the child exiting)."""
         await asyncio.sleep(self._renotify_interval)
+        # Desktop pref may have been disabled while we slept; don't fire or
+        # re-arm if the tier no longer warrants desktop notifications.
+        if not self._tier_pref(tier, "desktop"):
+            return
         self._fire(task_id, tier, status, reason)
-        self._arm_renotify(task_id, tier, status, reason)
+        if self._renotify_interval > 0:
+            self._arm_renotify(task_id, tier, status, reason)
 
     def _cancel_renotify(self, task_id: int) -> None:
         task = self._renotify_timers.pop(task_id, None)

@@ -21,3 +21,11 @@ export function getDaemonToken(): string | null {
 
   return window.localStorage.getItem(STORAGE_KEY);
 }
+
+/** Persist a new token and notify every listener (including the current tab)
+ * so the WebSocket can reconnect immediately. */
+export function setDaemonToken(token: string): void {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(STORAGE_KEY, token);
+  window.dispatchEvent(new CustomEvent("ompire:token-set"));
+}
