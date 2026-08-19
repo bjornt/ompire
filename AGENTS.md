@@ -11,8 +11,7 @@ cd frontend && pnpm install && pnpm build   # daemon serves frontend/dist at /
 cd daemon && uv sync                        # python >= 3.12
 ```
 
-Toolchain: node 24; pnpm is pinned via `frontend/package.json#packageManager`
-(pnpm 12 alpha — install it exactly, corepack won't switch to alpha pins).
+Toolchain: node 24; pnpm is managed by corepack and pinned via `frontend/package.json#packageManager`.
 `openspec` is a **global** tool, never a project dependency.
 
 ## Test

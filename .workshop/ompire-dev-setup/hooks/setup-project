@@ -1,0 +1,22 @@
+#!/bin/bash
+set -euo pipefail
+
+# Keep npm global installs in the user's home so they are writable and
+# persist across SDK mounts.
+npm config set prefix "$HOME/.local"
+
+# Enable Corepack's pnpm shim in a user-writable directory that is first on
+# the workshop user's PATH.
+mkdir -p "$HOME/.local/bin"
+corepack enable --install-directory "$HOME/.local/bin" pnpm
+
+# Pre-install the exact pnpm version pinned in /project/frontend/package.json.
+# Without this, the first `pnpm` invocation in an action asks whether Corepack
+# should download pnpm.
+export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+export COREPACK_ENABLE_AUTO_PIN=0
+cd /project/frontend
+corepack install
+
+# Sanity check: pnpm must now be usable without further prompts.
+pnpm --version

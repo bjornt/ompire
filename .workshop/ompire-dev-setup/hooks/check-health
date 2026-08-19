@@ -1,0 +1,9 @@
+#!/bin/bash
+set -euo pipefail
+
+if ! sudo -u workshop --login pnpm --version >/dev/null 2>&1; then
+  workshopctl set-health error "pnpm is not available on PATH"
+  exit 1
+fi
+
+workshopctl set-health okay

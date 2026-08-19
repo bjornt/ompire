@@ -15,8 +15,8 @@
 #   3. gh           install the GitHub CLI (agent needs it for PRs; it picks
 #                   up GH_TOKEN from env.sh — no `gh auth login` here, the
 #                   management-plane auth stays on the operator's machine)
-#   3b. toolchain   node (NodeSource 24) + corepack pnpm (the repo pins the
-#                   exact pnpm via packageManager), uv (astral installer)
+#   3b. toolchain   node (NodeSource 24) + corepack pnpm (pinned in
+#                   frontend/package.json#packageManager), uv (astral installer)
 #   3c. workshop    workshop snap + LXD + my-workshop (built from
 #                   github.com/bjornt/my-workshop) — the daemon spawns task
 #                   agents through them. Skip with --skip-workshop.
@@ -154,16 +154,12 @@ if ! command -v node >/dev/null; then
 	curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash - >/dev/null
 	sudo DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs >/dev/null
 fi
-# corepack does not switch to alpha pins reliably; install the exact version
-# the frontend's packageManager field demands, globally, so it wins PATH.
-PINNED_PNPM=$(jq -r '.packageManager // ""' "$ROOT/frontend/package.json" | sed -n 's/^pnpm@\([^+]*\).*/\1/p')
-PINNED_PNPM=${PINNED_PNPM:-latest}
-if [ "$(pnpm --version 2>/dev/null || true)" != "$PINNED_PNPM" ]; then
-	log "pnpm: installing pinned $PINNED_PNPM via npm"
-	sudo rm -f /usr/bin/pnpm /usr/bin/pnpx /usr/local/bin/pnpm /usr/local/bin/pnpx # corepack shims block npm -g
-	sudo npm install -g "pnpm@$PINNED_PNPM" >/dev/null
-	hash -r
-fi
+# The frontend pins pnpm in package.json#packageManager; corepack downloads
+# and uses the exact version declared there. Remove any stale global install
+# so the corepack shim wins in PATH.
+sudo rm -f /usr/bin/pnpm /usr/bin/pnpx /usr/local/bin/pnpm /usr/local/bin/pnpx
+sudo corepack enable pnpm
+hash -r
 # openspec is a global tool, not a project dependency
 if ! command -v openspec >/dev/null; then
 	log "openspec: installing globally via npm"

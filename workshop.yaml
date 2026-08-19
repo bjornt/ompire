@@ -3,5 +3,25 @@ base: ubuntu@26.04
 sdks:
   - name: node
     channel: 24
+  - name: project-ompire-dev-setup
   - name: uv
   - name: openspec
+actions:
+  test-backend: |
+    cd /project/daemon
+    uv run pytest "$@"
+  test-frontend: |
+    cd /project/frontend
+    pnpm test "$@"
+  lint-backend: |
+    cd /project/daemon
+    uvx ruff check src tests "$@"
+  lint-frontend: |
+    cd /project/frontend
+    pnpm lint "$@"
+  typecheck-backend: |
+    cd /project/daemon
+    uv run --with mypy mypy src "$@"
+  typecheck-frontend: |
+    cd /project/frontend
+    pnpm exec tsc -b "$@"
