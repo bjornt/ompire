@@ -42,6 +42,13 @@
   margin-bottom: 4px;
 }
 
+.field input,
+.field select,
+.field textarea {
+  width: 100%;
+  min-width: 0;
+}
+
 /* Read-only workflow echo of the selected template (task-spawn capability);
  * real multi-step workflows arrive with ROADMAP chunk 17. */
 .workflowBlock {
