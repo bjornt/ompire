@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.app import create_app
 from ompire_daemon.config import Config
-from ompire_daemon.db import db_path_for, make_engine
+from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.events import EventHub
 from ompire_daemon.gpg import GpgProbe, GpgStatus
 from ompire_daemon.registry.projects import create_project
@@ -57,6 +57,7 @@ def config(tmp_root: Path) -> Config:
 def engine(config: Config):
     config.data_dir.mkdir(parents=True, exist_ok=True)
     db_path = db_path_for(config.data_dir)
+    ensure_db_dir(db_path)
     eng = make_engine(db_path)
     # Apply schema migrations (tests that bypass create_app need this).
     from ompire_daemon.migrate import upgrade_head

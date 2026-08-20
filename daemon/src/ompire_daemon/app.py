@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
@@ -17,7 +18,7 @@ from ompire_daemon.api.rest import router as api_router
 from ompire_daemon.api.ws import router as ws_router
 from ompire_daemon.auth import load_or_create_token
 from ompire_daemon.config import DEFAULT_CONFIG_PATH, Config
-from ompire_daemon.db import db_path_for, make_engine
+from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.events import EventHub
 from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.migrate import upgrade_head
@@ -33,6 +34,17 @@ from ompire_daemon.static import DEFAULT_FRONTEND_DIST, mount_frontend
 from ompire_daemon.workflows import WorkflowRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _chmod_db_private(db_path: Path) -> None:
+    """Restrict the database directory and files to the owner only."""
+    try:
+        db_path.parent.chmod(0o700)
+        db_path.chmod(0o600)
+        for extra in db_path.parent.glob(f"{db_path.name}-*"):
+            extra.chmod(0o600)
+    except OSError as exc:
+        logger.warning("failed to tighten permissions on data store: %s", exc)
 
 
 @asynccontextmanager
@@ -122,13 +134,16 @@ def create_app(
     config_path: Path | None = None,
 ) -> FastAPI:
     config.data_dir.mkdir(parents=True, exist_ok=True)
+    config.data_dir.chmod(0o755)
     db_path = db_path_for(config.data_dir)
+    ensure_db_dir(db_path)
     upgrade_head(db_path)
 
     app = FastAPI(title="ompire-daemon", lifespan=_lifespan)
     app.state.config = config
     app.state.config_path = config_path or DEFAULT_CONFIG_PATH
     app.state.engine = make_engine(db_path)
+    _chmod_db_private(db_path)
     app.state.auth_token = load_or_create_token(config.data_dir)
     app.state.events = EventHub()
     app.state.spawn_jobs = set()

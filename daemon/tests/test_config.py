@@ -2,12 +2,27 @@ from pathlib import Path
 
 import pytest
 
+from ompire_daemon import config as config_module
 from ompire_daemon.config import Config, ConfigError, load_config
 
 
 def test_defaults_when_file_absent(tmp_path: Path) -> None:
     config = load_config(tmp_path / "does-not-exist.toml")
     assert config == Config()
+
+def test_snap_default_data_dir_is_per_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SNAP_USER_DATA", "/home/alice/snap/ompire/current")
+    monkeypatch.setenv("SNAP_NAME", "ompire")
+    monkeypatch.setenv("XDG_DATA_HOME", "/tmp/xdg")
+
+    assert config_module._default_data_dir() == Path("/home/alice/snap/ompire/current")
+
+
+def test_default_data_dir_uses_xdg_data_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SNAP_USER_DATA", raising=False)
+    monkeypatch.setenv("XDG_DATA_HOME", "/home/alice/.data")
+
+    assert config_module._default_data_dir() == Path("/home/alice/.data/ompire")
 
 
 def test_loads_overrides(tmp_path: Path) -> None:

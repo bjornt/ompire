@@ -132,7 +132,12 @@ settings = Table(
 
 
 def db_path_for(data_dir: Path) -> Path:
-    return data_dir / "ompire.db"
+    return data_dir / "db" / "ompire.db"
+
+
+def ensure_db_dir(db_path: Path) -> None:
+    """Create the parent directory for the SQLite database, owner-only."""
+    db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 
 def make_engine(db_path: Path) -> Engine:

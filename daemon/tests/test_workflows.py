@@ -22,7 +22,7 @@ from sqlalchemy import Engine
 from ompire_daemon import agent as agent_module
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
-from ompire_daemon.db import db_path_for, make_engine
+from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.events import EventHub
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.registry.projects import create_project
@@ -60,6 +60,7 @@ def engine(tmp_path: Path) -> Engine:
     data_dir = tmp_path / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = db_path_for(data_dir)
+    ensure_db_dir(db_path)
     upgrade_head(db_path)
     return make_engine(db_path)
 

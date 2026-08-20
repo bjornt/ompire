@@ -49,8 +49,9 @@ systemctl --user status ompire
 journalctl --user -u ompire -f
 ```
 
-The auth token lives at `<data_dir>/token` (default
-`~/.local/share/ompire/token`) — `cat` it once to paste into the frontend.
+The auth token lives at `<data_dir>/token`. The default is
+`~/.local/share/ompire/token`; the snap user service uses
+`~/snap/ompire/current/token`. `cat` it once to paste into the frontend.
 
 ## Building and serving the frontend
 

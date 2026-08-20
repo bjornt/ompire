@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -11,7 +12,19 @@ DEFAULT_CONFIG_PATH = Path("~/.config/ompire/config.toml").expanduser()
 
 DEFAULT_PORT = 4173
 DEFAULT_BIND = "127.0.0.1"
-DEFAULT_DATA_DIR = Path("~/.local/share/ompire").expanduser()
+
+
+def _default_data_dir() -> Path:
+    """Use per-user snap data, otherwise the XDG data directory."""
+    snap_user_data = os.environ.get("SNAP_USER_DATA")
+    if snap_user_data:
+        return Path(snap_user_data)
+
+    data_home = Path(os.environ.get("XDG_DATA_HOME", "~/.local/share")).expanduser()
+    return data_home / "ompire"
+
+
+DEFAULT_DATA_DIR = _default_data_dir()
 DEFAULT_TASK_DIR_ROOT = Path("~/tasks").expanduser()
 DEFAULT_CHECKOUT_ROOT = Path("~/proj").expanduser()
 DEFAULT_BRANCH_PATTERN = "ompire/<slug>"
