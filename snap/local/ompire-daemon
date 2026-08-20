@@ -1,0 +1,4 @@
+#!/bin/sh -e
+# Launcher for the ompire daemon classic snap.
+# Delegates to the vendored Python virtual environment.
+exec "$SNAP/opt/ompire/venv/bin/python3" -m ompire_daemon

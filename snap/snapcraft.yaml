@@ -1,0 +1,132 @@
+name: ompire
+version: "0.1.0"
+summary: Desktop agent orchestration daemon and web UI
+description: |
+  ompire is a FastAPI daemon + React frontend that drives the "ship flow"
+  (review, sign, push, PR) for agentic coding tasks inside a workshop
+  container.
+
+  Because it needs to spawn and control workshop/LXD containers, invoke `gh`,
+  and talk to the user's GPG/SSH agent, this snap uses classic confinement.
+
+  Host prerequisites (not bundled in the classic snap):
+    - python3 (>= 3.12, the daemon is built for the base's Python version)
+    - gh (authed to GitHub)
+    - lxc / workshop tooling
+    - gpg and a signing key configured in ~/.config/ompire/config.toml
+
+base: core26
+confinement: classic
+grade: stable
+assumes:
+  - snapd2.66
+
+adopt-info: ompire-daemon
+
+platforms:
+  amd64:
+    build-on: [amd64]
+    build-for: [amd64]
+
+parts:
+  ompire-daemon:
+    plugin: nil
+    source: daemon
+    build-packages:
+      - curl
+      - python3
+      - python3-dev
+    build-attributes:
+      - enable-patchelf
+    override-build: |
+      set -eux
+
+      UV_VERSION="0.12.5"
+      INSTALL_DIR="${CRAFT_PART_INSTALL}/opt/ompire/venv"
+
+      # Install the standalone uv binary.
+      mkdir -p /tmp/uv
+      curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
+        -o /tmp/uv/uv.tgz
+      tar -xzf /tmp/uv/uv.tgz -C /tmp/uv --strip-components=1
+      UV=/tmp/uv/uv
+
+      # Create a relocatable venv using the base system Python (classic snap).
+      # The absolute path keeps uv from selecting a managed Python whose
+      # binary lives outside the snap and would be a dangling symlink.
+      "$UV" venv "$INSTALL_DIR" --python /usr/bin/python3 --clear
+
+      # Remove any stale project .venv so uv build uses the venv above.
+      rm -rf .venv
+
+      # Build a wheel and install it (with locked deps) into the venv.
+      "$UV" build --wheel --out-dir dist
+      "$UV" export --no-dev --no-emit-project --output-file requirements.txt
+      "$UV" pip install \
+        --python "$INSTALL_DIR/bin/python3" \
+        -r requirements.txt \
+        dist/*.whl
+
+      # Place migration assets where the installed package looks for them.
+      PYVER=$("$INSTALL_DIR/bin/python3" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+      mkdir -p "$INSTALL_DIR/lib/python$PYVER"
+      cp alembic.ini "$INSTALL_DIR/lib/python$PYVER/alembic.ini"
+      cp -r alembic "$INSTALL_DIR/lib/python$PYVER/alembic"
+
+      # Expose the version from pyproject.toml to snapcraft.
+      VERSION=$(python3 -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+      craftctl set version="$VERSION"
+
+  ompire-frontend:
+    plugin: nil
+    source: frontend
+    build-packages:
+      - curl
+    override-build: |
+      set -eux
+
+      NODE_VERSION="24.19.0"
+      PNPM_VERSION="11.22.0"
+
+      # Fetch Node.js.
+      mkdir -p /tmp/node
+      curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+        -o /tmp/node/node.tar.xz
+      tar -xf /tmp/node/node.tar.xz -C /tmp/node --strip-components=1
+      export PATH="/tmp/node/bin:${PATH}"
+
+      # Fetch the standalone pnpm bundle matching package.json#packageManager.
+      mkdir -p /tmp/node/bin
+      curl -fsSL "https://github.com/pnpm/pnpm/releases/download/v${PNPM_VERSION}/pnpm-linux-x64.tar.gz" \
+        -o /tmp/node/pnpm.tgz
+      tar -xzf /tmp/node/pnpm.tgz -C /tmp/node/bin
+
+      # Remove any node_modules left over from a prior/interrupted build in
+      # this reused build dir. Without this, pnpm detects a stale/mismatched
+      # modules directory and blocks on an interactive "reinstall from
+      # scratch? (Y/n)" prompt that has no TTY to answer, hanging forever.
+      rm -rf node_modules
+      CI=true pnpm install --frozen-lockfile
+      pnpm run build
+
+      # Stage where the installed static.py looks for it
+      # (site-packages/ompire_daemon/static.py -> .../venv/lib/frontend/dist).
+      mkdir -p "${CRAFT_PART_INSTALL}/opt/ompire/venv/lib/frontend"
+      cp -r dist "${CRAFT_PART_INSTALL}/opt/ompire/venv/lib/frontend/dist"
+
+  launcher:
+    plugin: nil
+    source: snap/local
+    override-build: |
+      install -D -m 0755 ompire-daemon \
+        "${CRAFT_PART_INSTALL}/bin/ompire-daemon"
+
+apps:
+  ompire-daemon:
+    command: bin/ompire-daemon
+    daemon: simple
+    daemon-scope: user
+    install-mode: enable
+    restart-condition: on-failure
+    environment:
+      PATH: "$SNAP/bin:$SNAP/usr/bin:$PATH"
