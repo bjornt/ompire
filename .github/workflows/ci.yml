@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'daemon/**'
+              - 'workshop.yaml'
+              - 'Makefile'
+              - '.workshop/**'
+            frontend:
+              - 'frontend/**'
+              - 'workshop.yaml'
+              - 'Makefile'
+              - '.workshop/**'
+
+  backend:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        action: [test-backend, lint-backend, typecheck-backend]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: canonical/launch-workshop@b9e184e38f49808ced78e25de19483fe02484c46 # v1
+      - run: workshop run -- ${{ matrix.action }}
+
+  frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        action: [test-frontend, lint-frontend, typecheck-frontend]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: canonical/launch-workshop@b9e184e38f49808ced78e25de19483fe02484c46 # v1
+      - run: workshop run -- ${{ matrix.action }}
