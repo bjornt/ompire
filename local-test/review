@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+#
+# local-test/review — the review steering wheel for the real, unmodified
+# llmvet UI (LOCAL-TESTING.PLAN.md Part 5).
+#
+# llmvet contains no LLM: it serves a diff, and whoever drives the UI
+# decides the outcome — approve, or submit inline comments that the daemon
+# loops back to the live agent as a prompt. The daemon launches it with
+# `-no-open`, so runbooks need a driver. This script is a plain HTTP
+# client of llmvet's own API — the same endpoints the shipped browser UI
+# calls (verified against llmvet 0.3.0-37-g421d7fd, 2026-08-21; see
+# openspec/changes/use-real-llmvet-unchanged/findings.md):
+#
+#   GET  /api/diff?staged=false   the diff the UI renders
+#   POST /api/approve             conclude as approved (exit 0, empty stdout)
+#   POST /api/submit              submit comments, conclude the review
+#
+# The review is identified by the URL the daemon surfaces (the
+# review_started event / the UI). Abort is deliberately not here: it is
+# the daemon's job (POST /tasks/{id}/review/cancel sends the SIGINT).
+#
+# Commands:
+#   diff --url U [--staged]        print the review diff JSON
+#   approve --url U                approve the review
+#   comment --url U --file F --line N [--side old|new]
+#          [--body B | --body-file F] ...   submit one or more comments
+#          (flags repeatable: one comment per --file/--line/--side/--body
+#          quadruple, in order)
+#   selfcheck                      prove the real-binary contract offline
+#                                   in a temp repo; never touches $STATE;
+#                                   skips loudly when llmvet is not on PATH
+
+set -euo pipefail
+
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
+
+command -v curl >/dev/null 2>&1 || die "curl is required but not on PATH"
+command -v jq   >/dev/null 2>&1 || die "jq is required but not on PATH"
+
+# --- review selection -----------------------------------------------------------
+
+# resolve_url VAR <args> : set VAR to the review's base URL from
+# --url <u> / --port <p> (exactly one).
+resolve_url() { # resolve_url <varname> <args...>
+	local __var=$1 __url="" __port=""
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--url)  [ $# -ge 2 ] || die "--url needs a value"; __url=$2; shift 2 ;;
+		--port) [ $# -ge 2 ] || die "--port needs a value"; __port=$2; shift 2 ;;
+		*) die "unknown flag '$1' (expected --url or --port)" ;;
+		esac
+	done
+	[ -n "$__url" ] || [ -n "$__port" ] || die "select the review with --url <u> or --port <p>"
+	[ -z "$__url" ] || [ -z "$__port" ] || die "--url and --port are mutually exclusive"
+	if [ -n "$__port" ]; then
+		__url="http://127.0.0.1:$__port"
+	else
+		__url=${__url%/}
+	fi
+	# NB: the scratch names must not collide with the caller's target
+	# variable — printf -v assigns in *this* scope's view of the name.
+	printf -v "$__var" '%s' "$__url"
+}
+
+# api <method> <url> <path> [curl-args...] : request an llmvet API
+# endpoint; any non-200 is fatal (loud, never silent).
+api() { # api <method> <url> <path> [args...]
+	local method=$1 url=$2 path=$3; shift 3
+	local body code
+	body=$(mktemp)
+	code=$(curl -s -o "$body" -w '%{http_code}' -X "$method" "$url$path" "$@") \
+		|| { rm -f "$body"; die "cannot reach llmvet at $url (is the review open?)"; }
+	if [ "$code" != "200" ]; then
+		printf 'error: llmvet %s %s returned HTTP %s: %s\n' \
+			"$method" "$path" "$code" "$(cat "$body")" >&2
+		rm -f "$body"
+		exit 1
+	fi
+	cat "$body"
+	rm -f "$body"
+}
+
+# --- subcommands ------------------------------------------------------------------
+
+cmd_diff() {
+	local url staged=false
+	local args=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--staged) staged=true; shift ;;
+		*) args+=("$1"); shift ;;
+		esac
+	done
+	resolve_url url "${args[@]+"${args[@]}"}"
+	api GET "$url" "/api/diff?staged=$staged"
+}
+
+cmd_approve() {
+	local url
+	resolve_url url "$@"
+	api POST "$url" /api/approve -H 'Content-Type: application/json' -d '{}'
+	printf 'review approved\n' >&2
+}
+
+cmd_comment() {
+	local url="" files=() lines=() sides=() bodies=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--url)
+			[ $# -ge 2 ] || die "--url needs a value"; url=$2; shift 2 ;;
+		--port)
+			[ $# -ge 2 ] || die "--port needs a value"; url="http://127.0.0.1:$2"; shift 2 ;;
+		--file)
+			[ $# -ge 2 ] || die "--file needs a value"; files+=("$2"); shift 2 ;;
+		--line)
+			[ $# -ge 2 ] || die "--line needs a value"; lines+=("$2"); shift 2 ;;
+		--side)
+			[ $# -ge 2 ] || die "--side needs a value"; sides+=("$2"); shift 2 ;;
+		--body)
+			[ $# -ge 2 ] || die "--body needs a value"; bodies+=("$2"); shift 2 ;;
+		--body-file)
+			[ $# -ge 2 ] || die "--body-file needs a value"
+			[ -f "$2" ] || die "body file '$2' does not exist"
+			bodies+=("$(cat "$2")")
+			shift 2
+			;;
+		*) die "unknown flag '$1'" ;;
+		esac
+	done
+	[ -n "$url" ] || die "select the review with --url <u> or --port <p>"
+	url=${url%/} # trailing slash would produce //api/submit → HTTP 307
+	local n=${#files[@]}
+	[ "$n" -gt 0 ] || die "no comments given: pass at least one --file/--line/--body"
+	[ "${#lines[@]}" -eq "$n" ] || die "got $n --file flags but ${#lines[@]} --line flags (one line per comment)"
+	[ "${#bodies[@]}" -eq "$n" ] || die "got $n --file flags but ${#bodies[@]} --body/--body-file flags (one body per comment)"
+
+	# Comment shape is load-bearing: llmvet takes {file, line, side, body} —
+	# text/content are silently dropped (findings.md). side defaults to new.
+	local json='' i side
+	json='{"comments":['
+	for i in "${!files[@]}"; do
+		side=${sides[$i]:-new}
+		case "$side" in new | old) ;; *) die "invalid --side '$side' (expected new or old)" ;; esac
+		[ "$i" -eq 0 ] || json+=','
+		json+=$(jq -cn --arg f "${files[$i]}" --argjson l "${lines[$i]}" \
+			--arg s "$side" --arg b "${bodies[$i]}" \
+			'{file: $f, line: $l, side: $s, body: $b}')
+	done
+	json+=']}'
+
+	api POST "$url" /api/submit -H 'Content-Type: application/json' -d "$json" >/dev/null
+	printf 'submitted %d comment(s); the daemon loops them back to the agent\n' "$n" >&2
+}
+
+# --- selfcheck ------------------------------------------------------------------
+#
+# Proves the daemon-facing contract against the real binary: exit codes,
+# stdout shapes, and the abort signal path. Fresh process per check, temp
+# repo, nothing outside the temp dir, no network. Skips (exit 0, visible
+# notice) when llmvet is not resolvable on PATH.
+
+selfcheck() {
+	command -v llmvet >/dev/null 2>&1 || {
+		printf 'notice: no real llmvet on PATH — skipping selfcheck\n' >&2
+		exit 0
+	}
+	command -v git >/dev/null 2>&1 || die "git is required but not on PATH"
+
+	# Not local: the EXIT trap references $tmp after the function returns.
+	tmp=$(mktemp -d /tmp/llmvet-review-selfcheck.XXXXXX)
+	trap 'rm -rf "$tmp"' EXIT
+	printf '==> selfcheck workspace: %s\n' "$tmp"
+
+	local check=0
+	fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
+	ok()   { check=$((check + 1)); printf 'ok %d - %s\n' "$check" "$*"; }
+
+	# The probe repo: one committed file plus an uncommitted modification,
+	# so /api/diff has an insert line to comment on.
+	local repo=$tmp/repo
+	git -C "$tmp" init -q repo
+	git -C "$repo" config user.email selfcheck@local-test.invalid
+	git -C "$repo" config user.name 'llmvet selfcheck'
+	printf 'one\n' >"$repo/f.txt"
+	git -C "$repo" add f.txt
+	git -C "$repo" commit -qm base
+	printf 'two\n' >>"$repo/f.txt"
+
+	# llmvet runs as a direct background child, so SIGINT reaches the real
+	# process and `wait` observes its true exit code — the same supervision
+	# posture the daemon has.
+	LLVET_PID=
+	# The subshell execs llmvet, so the pid captured by $! *is* llmvet and
+	# stays a direct child of this shell: SIGINT reaches the real process
+	# and `wait` observes its true exit code — the daemon's supervision
+	# posture. (No pgrep: pattern matching can hit stale wrappers.)
+	launch() { # launch <out> <err>
+		(
+			cd "$repo"
+			exec llmvet -no-open -host 127.0.0.1 -port 0 >"$1" 2>"$2" </dev/null
+		) &
+		LLVET_PID=$!
+		# wait for the banner so the bound port is known
+		local i
+		for i in $(seq 1 50); do
+			grep -q 'Open http://127.0.0.1:' "$2" 2>/dev/null && return 0
+			kill -0 "$LLVET_PID" 2>/dev/null || fail 'llmvet exited before printing its banner'
+			sleep 0.1
+		done
+		fail 'llmvet did not print its banner within 5s'
+	}
+	# conclude : wait (bounded) for the child to exit; set RC to its exit
+	# code. Called directly (not in $(...)) so `wait` sees the parent
+	# shell's child. kill -0 is useless for liveness — the unreaped child
+	# stays a zombie — so the bounded wait is tail --pid; `wait` reaps and
+	# yields the real code.
+	RC=
+	conclude() {
+		RC=0
+		timeout 10 tail --pid="$LLVET_PID" -f /dev/null \
+			|| fail 'llmvet did not exit within 10s'
+		wait "$LLVET_PID" || RC=$?
+	}
+	port_of() { sed -n 's/.*127\.0\.0\.1:\([0-9]\{1,5\}\).*/\1/p' "$1" | head -1; }
+
+	# --- check 1: banner names a reachable port ---------------------------------
+	local out=$tmp/approve.out err=$tmp/approve.err
+	launch "$out" "$err"
+	local port
+	port=$(port_of "$err")
+	[ -n "$port" ] || fail 'banner port could not be parsed'
+	curl -sf -o /dev/null "http://127.0.0.1:$port/" \
+		|| fail 'UI root not reachable on the banner port'
+	ok "banner port $port serves the UI"
+
+	# --- check 2: the diff endpoint reports the modification --------------------
+	local diff
+	diff=$(curl -sf "http://127.0.0.1:$port/api/diff?staged=false") \
+		|| fail 'GET /api/diff failed'
+	printf '%s' "$diff" | jq -e '.files[] | select(.path == "f.txt")' >/dev/null \
+		|| fail 'diff JSON does not list f.txt'
+	ok 'diff endpoint reports the changed file'
+
+	# --- check 3: approve ends exit 0 with empty stdout ---------------------------
+	curl -sf -X POST "http://127.0.0.1:$port/api/approve" >/dev/null \
+		|| fail 'POST /api/approve failed'
+	conclude
+	[ "$RC" = "0" ] || fail "approve exit code is $RC, expected 0"
+	[ ! -s "$out" ] || fail "approve stdout is not empty: $(cat "$out")"
+	ok 'approve: exit 0, empty stdout (daemon outcome: approved)'
+
+	# --- check 4: comment submit ends exit 0 with the blockquoted body ------------
+	out=$tmp/comment.out err=$tmp/comment.err
+	launch "$out" "$err"
+	port=$(port_of "$err")
+	local payload
+	payload=$(jq -cn '{comments: [{file: "f.txt", line: 2, side: "new", body: "Please fix the thing"}]}')
+	curl -sf -X POST "http://127.0.0.1:$port/api/submit" \
+		-H 'Content-Type: application/json' -d "$payload" >/dev/null \
+		|| fail 'POST /api/submit failed'
+	conclude
+	[ "$RC" = "0" ] || fail "comment exit code is $RC, expected 0"
+	grep -q '^> Please fix the thing$' "$out" \
+		|| fail "comment stdout lacks the quoted body line: $(cat "$out")"
+	grep -q '^f\.txt:2 ' "$out" \
+		|| fail "comment stdout lacks the file:line location line: $(cat "$out")"
+	ok 'submit: exit 0, stdout carries the > body blockquote (daemon outcome: comments)'
+
+	# --- check 5: SIGINT ends exit 130 with the abort marker ----------------------
+	out=$tmp/abort.out err=$tmp/abort.err
+	launch "$out" "$err"
+	kill -INT "$LLVET_PID"
+	conclude
+	[ "$RC" = "130" ] || fail "SIGINT exit code is $RC, expected 130"
+	grep -q 'review aborted' "$err" || fail 'stderr lacks the abort marker'
+	[ ! -s "$out" ] || fail "abort stdout is not empty: $(cat "$out")"
+	ok 'SIGINT: exit 130, review aborted (daemon outcome: aborted)'
+
+	printf '==> all %d checks passed\n' "$check"
+}
+
+# --- dispatch ---------------------------------------------------------------------
+
+case "${1:-}" in
+diff)      shift; cmd_diff "$@" ;;
+approve)   shift; cmd_approve "$@" ;;
+comment)   shift; cmd_comment "$@" ;;
+selfcheck) shift; selfcheck "$@" ;;
+-h | --help | help) usage ;;
+*) die "unknown command '${1:-}' — expected diff, approve, comment, or selfcheck" ;;
+esac
