@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { Envelope } from "../types";
-import { applyEnvelope, initialDaemonState } from "./daemonReducer";
+import { applyEnvelope, initialDaemonState, type DaemonState } from "./daemonReducer";
 import { DaemonContext } from "./daemonContext";
 import { getDaemonToken } from "./token";
 
