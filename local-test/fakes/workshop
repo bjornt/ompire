@@ -1,0 +1,575 @@
+#!/usr/bin/env bash
+#
+# local-test/fakes/workshop — a stateful fake of the workshop CLI covering
+# exactly the invocations the ompire daemon and the real my-workshop perform
+# (LOCAL-TESTING.PLAN.md Part 3):
+#
+#   workshop exec -p <clone> -- <argv…>     daemon: agent spawn, ask-timeout
+#                                           preflight, workflow command steps
+#   workshop exec -- <argv…>                my-workshop: tar-based copy
+#   workshop exec <argv…>                   my-workshop: hostname fallback
+#   workshop launch                         my-workshop: the launch step
+#   workshop info                           daemon: workshop_status (cwd);
+#                                           my-workshop: hostname/name parse
+#   workshop remove                         daemon: teardown (cwd)
+#   workshop connect <plug> <slot>          my-workshop: provision step
+#
+# `exec` replaces this process with the command, run on the host with cwd =
+# the project directory — agent children become ordinary local processes
+# with real stdio/signal/exit-code semantics. Launched workshops live in
+# <state>/workshops.json keyed by realpath; `launch` writes the .workshop.lock
+# (8-hex project id — the real CLI's own format, not my-workshop's) that the
+# daemon's spawn pipeline reads. One-shot failure injection lives in the
+# inject.fail_next.launch section (wsctl wraps it in Part 8). Any other
+# invocation fails loudly, so a new daemon callsite can never silently no-op.
+#
+# Error strings and the info YAML shape mimic real workshop 0.9.5, captured
+# 2026-08-21 on the QA host (reference table:
+# openspec/changes/local-testing-fake-workshop/design.md). No network, no
+# LXD, no containers.
+#
+# State root: $LOCAL_TEST_STATE if set, else <repo>/local-test/.state.
+#
+# Commands:
+#   exec [-p <path>] [--] <argv…>   run argv on the host, cwd = project path
+#   launch [-p <path>] [name…]      write .workshop.lock, register, exit 0
+#   info [-p <path>] [name]         present ⇒ YAML on stdout; else gone error
+#   remove [-p <path>] [name…]      deregister; already gone ⇒ gone error
+#   connect <plug> <slot>           record the connection, exit 0
+#   selfcheck                       prove the whole contract offline in a
+#                                   temp root; never touches $STATE
+#   --version                       plausible banner (marked fake)
+
+set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+STATE_ROOT=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
+WS_JSON=$STATE_ROOT/workshops.json
+
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
+unsupported() { printf 'workshop (fake): unsupported invocation: %s\n' "$*" >&2; exit 1; }
+
+command -v jq >/dev/null 2>&1 || die "jq is required but not on PATH"
+
+# --- state helpers -------------------------------------------------------------
+
+state_init() {
+	if [ ! -f "$WS_JSON" ]; then
+		mkdir -p "$STATE_ROOT"
+		printf '{"workshops":{},"inject":{"fail_next":{"launch":null}}}\n' \
+			>"$WS_JSON"
+	fi
+}
+
+# Every mutation is jq -> tmp -> atomic rename: readers never see a
+# half-written file. An unparseable state file fails loudly inside jq itself
+# (parse error on stderr, non-zero exit) — the daemon maps that to `unknown`,
+# which is exactly the state worth exercising.
+state_write() { # state_write <tmp-path>
+	mv "$1" "$WS_JSON"
+}
+
+registry_get() { # registry_get <realpath>: print the entry JSON, nothing when absent
+	# Read-only: never creates the state file (the exec hot path must not).
+	# A corrupt file makes jq exit non-zero with its parse error on stderr —
+	# exit explicitly: bash does not apply set -e inside command-substitution
+	# subshells, so a silent fallthrough would read corrupt state as
+	# "not launched".
+	[ -f "$WS_JSON" ] || return 0
+	local out rc=0
+	out=$(jq -c --arg p "$1" '.workshops[$p] // empty' "$WS_JSON") || rc=$?
+	[ "$rc" -eq 0 ] || exit "$rc"
+	[ -n "$out" ] && printf '%s\n' "$out"
+	return 0
+}
+
+consume_fail_next() { # consume_fail_next launch: print armed mode, or fail
+	# Runs inside an `if` condition, where set -e is suppressed — every
+	# failure must exit explicitly or the injection would silently disarm.
+	local key=$1 armed tmp rc=0
+	armed=$(jq -r --arg k "$key" '.inject.fail_next[$k] // empty' "$WS_JSON") || rc=$?
+	[ "$rc" -eq 0 ] || exit "$rc"
+	[ -n "$armed" ] || return 1
+	tmp=$(mktemp "$WS_JSON.XXXXXX") || return 1
+	jq --arg k "$key" '.inject.fail_next[$k] = null' "$WS_JSON" >"$tmp" || {
+		rm -f "$tmp"
+		exit 1
+	}
+	state_write "$tmp"
+	printf '%s\n' "$armed"
+}
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+new_id() { # 8 lowercase hex chars — the real CLI's project-id format
+	printf '%04x%04x' $((RANDOM & 0xffff)) $((RANDOM & 0xffff))
+}
+
+# --- project helpers -----------------------------------------------------------
+
+# A project is a directory with at least one workshop definition
+# (canonical/workshop isProject, single-file form).
+is_project() { # is_project <dir>
+	[ -f "$1/workshop.yaml" ] || [ -f "$1/.workshop.yaml" ]
+}
+
+yaml_top() { # yaml_top <dir> <key>: top-level "key: value" from the definition
+	local f
+	for f in "$1/workshop.yaml" "$1/.workshop.yaml"; do
+		[ -f "$f" ] || continue
+		sed -n "s/^$2:[[:space:]]*//p" "$f" | head -1 | sed 's/[[:space:]]*$//'
+		return
+	done
+}
+
+# resolve_project <path-or-empty>: sets PROJ_REAL to the project directory
+# (the -p path, else the cwd). Missing paths fail with the real CLI's error.
+resolve_project() {
+	local p=${1:-$PWD}
+	if [ ! -e "$p" ]; then
+		printf 'error: cannot create or load project at "%s": lstat %s: no such file or directory\n' \
+			"$p" "$p" >&2
+		exit 1
+	fi
+	PROJ_REAL=$(realpath "$p")
+}
+
+not_a_project() {
+	printf 'error: not a project (no workshop files found)\n' >&2
+	exit 1
+}
+
+require_project() { # require_project <dir>: definition must exist
+	is_project "$1" || not_a_project
+}
+
+workshop_name() { # workshop_name <dir>: definition name, or a placeholder
+	local n
+	n=$(yaml_top "$1" name)
+	printf '%s' "${n:-workshop}"
+}
+
+# --- exec ------------------------------------------------------------------------
+
+cmd_exec() {
+	local path="" started=0
+	# The daemon and my-workshop address the project via `-p <path>` before
+	# `--`; my-workshop also uses bare `exec <argv…>` (hostname fallback).
+	# Everything after `--` (or the first non-flag argument) is the command.
+	while [ $# -gt 0 ] && [ "$started" -eq 0 ]; do
+		case "$1" in
+		--) started=1; shift ;;
+		-p) [ $# -ge 2 ] || die "exec: option -p requires a value"
+			path=$2; shift 2 ;;
+		-*) unsupported "exec (unknown option $1)" ;;
+		*) started=1 ;;
+		esac
+	done
+	local cmd=("$@")
+	[ ${#cmd[@]} -gt 0 ] || unsupported "exec (no command given)"
+
+	# No state writes on this path — resolve, validate, replace ourselves.
+	resolve_project "$path"
+	require_project "$PROJ_REAL"
+	local entry
+	entry=$(registry_get "$PROJ_REAL")
+	if [ -z "$entry" ]; then
+		printf 'error: cannot exec command in "%s": workshop not launched\n' \
+			"$(workshop_name "$PROJ_REAL")" >&2
+		exit 1
+	fi
+	cd "$PROJ_REAL" || die "exec: cannot cd to $PROJ_REAL"
+	exec "${cmd[@]}"
+}
+
+# --- launch ----------------------------------------------------------------------
+
+cmd_launch() {
+	local path=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-p) [ $# -ge 2 ] || die "launch: option -p requires a value"
+			path=$2; shift 2 ;;
+		# Workshop-name positionals select among definitions; the daemon and
+		# my-workshop only ever run single-workshop projects — accepted, ignored.
+		-[a-z]*) unsupported "launch (unknown option $1)" ;;
+		*) shift ;;
+		esac
+	done
+
+	resolve_project "$path"
+	require_project "$PROJ_REAL"
+	state_init
+
+	# One-shot injection, consumed before any effect.
+	local armed
+	if armed=$(consume_fail_next launch); then
+		case "$armed" in
+		fail)
+			printf 'error: injected launch failure (fake)\n' >&2
+			exit 1
+			;;
+		no-lock)
+			# Exit 0 with no lock and no registration: the daemon's
+			# "launch succeeded but .workshop.lock is missing or empty"
+			# spawn error path.
+			exit 0
+			;;
+		*)
+			die "launch: unknown fail_next mode: $armed"
+			;;
+		esac
+	fi
+
+	local name id now tmp
+	name=$(workshop_name "$PROJ_REAL")
+	id=$(jq -r --arg p "$PROJ_REAL" '.workshops[$p].id // empty' "$WS_JSON")
+	[ -n "$id" ] || id=$(new_id) # re-launch keeps the id (idempotence)
+	now=$(now_utc)
+
+	printf '%s' "$id" >"$PROJ_REAL/.workshop.lock" ||
+		die "launch: cannot write $PROJ_REAL/.workshop.lock"
+	tmp=$(mktemp "$WS_JSON.XXXXXX")
+	jq --arg p "$PROJ_REAL" --arg name "$name" --arg id "$id" --arg now "$now" '
+		.workshops[$p] = {
+			name: $name,
+			id: $id,
+			launched_at: $now,
+			connects: ((.workshops[$p].connects) // [])
+		}' "$WS_JSON" >"$tmp"
+	state_write "$tmp"
+}
+
+# --- info --------------------------------------------------------------------------
+
+print_info_yaml() { # print_info_yaml <realpath> <name> <id>
+	local base
+	base=$(yaml_top "$1" base)
+	printf 'name:\t%s\n' "$2"
+	printf 'base:\t%s\n' "${base:-ubuntu@24.04}"
+	printf 'project:\t%s\n' "$1"
+	# Always present so real my-workshop's hostname parse never falls back to
+	# `workshop exec hostname -I`.
+	printf 'hostname:\tws-%s.local\n' "$3"
+	printf 'status:\tready\n'
+	printf 'notes:\t-\n'
+}
+
+cmd_info() {
+	local path=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-p) [ $# -ge 2 ] || die "info: option -p requires a value"
+			path=$2; shift 2 ;;
+		-[a-z]*) unsupported "info (unknown option $1)" ;;
+		*) shift ;; # workshop-name positional, ignored
+		esac
+	done
+
+	resolve_project "$path"
+	require_project "$PROJ_REAL"
+	local entry
+	entry=$(registry_get "$PROJ_REAL")
+	if [ -n "$entry" ]; then
+		print_info_yaml "$PROJ_REAL" \
+			"$(jq -r '.name' <<<"$entry")" "$(jq -r '.id' <<<"$entry")"
+		exit 0
+	fi
+	printf 'error: workshop not launched\n' >&2
+	exit 1
+}
+
+# --- remove ------------------------------------------------------------------------
+
+cmd_remove() {
+	local path=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-p) [ $# -ge 2 ] || die "remove: option -p requires a value"
+			path=$2; shift 2 ;;
+		-[a-z]*) unsupported "remove (unknown option $1)" ;;
+		*) shift ;; # workshop-name positionals, ignored
+		esac
+	done
+
+	resolve_project "$path"
+	require_project "$PROJ_REAL"
+	local entry
+	entry=$(registry_get "$PROJ_REAL")
+	if [ -n "$entry" ]; then
+		state_init
+		local tmp
+		tmp=$(mktemp "$WS_JSON.XXXXXX")
+		jq --arg p "$PROJ_REAL" 'del(.workshops[$p])' "$WS_JSON" >"$tmp"
+		state_write "$tmp"
+		# .workshop.lock stays on disk: the real CLI preserves the project
+		# id; the daemon deletes the whole clone afterwards anyway.
+		exit 0
+	fi
+	printf 'error: cannot remove "%s": workshop not launched\n' \
+		"$(workshop_name "$PROJ_REAL")" >&2
+	exit 1
+}
+
+# --- connect -----------------------------------------------------------------------
+
+cmd_connect() {
+	[ $# -eq 2 ] || unsupported "connect (expected <plug> <slot>, got: $*)"
+	local plug=$1 slot=$2
+	resolve_project ""
+	require_project "$PROJ_REAL"
+	local entry
+	entry=$(registry_get "$PROJ_REAL")
+	if [ -z "$entry" ]; then
+		printf 'error: cannot connect "%s" to "%s": workshop not launched\n' \
+			"$plug" "$slot" >&2
+		exit 1
+	fi
+	state_init
+	local tmp
+	tmp=$(mktemp "$WS_JSON.XXXXXX")
+	jq --arg p "$PROJ_REAL" --arg plug "$plug" --arg slot "$slot" \
+		'.workshops[$p].connects += [[$plug, $slot]]' "$WS_JSON" >"$tmp"
+	state_write "$tmp"
+}
+
+# --- selfcheck ---------------------------------------------------------------------
+
+SELF_TMP=""
+
+selfcheck_cleanup() { [ -n "$SELF_TMP" ] && rm -rf "$SELF_TMP"; }
+
+SELF_CHECKS=0
+
+ok() { SELF_CHECKS=$((SELF_CHECKS + 1)); printf '  ok    %s\n' "$1"; }
+fail() { # fail <name> [detail]
+	printf '  FAIL  %s\n' "$1" >&2
+	[ $# -gt 1 ] && printf '%s\n' "$2" | sed 's/^/        /' >&2
+	printf 'selfcheck failed at: %s\n' "$1" >&2
+	exit 1
+}
+
+cmd_selfcheck() {
+	trap selfcheck_cleanup EXIT
+
+	# Isolated throwaway root: $STATE_ROOT is never touched.
+	SELF_TMP=$(mktemp -d)
+	local root=$SELF_TMP/state
+	local err=$SELF_TMP/err
+	log() { printf '==> selfcheck: %s\n' "$1"; }
+
+	# Every contract check runs the fake exactly as the daemon and
+	# my-workshop do: same argv shapes, environment inherited, state root
+	# via LOCAL_TEST_STATE. Absolute path: several checks cd into the
+	# project directory first.
+	local self_bin
+	self_bin=$(realpath "$0")
+	ws_run() { LOCAL_TEST_STATE=$root "$self_bin" "$@"; }
+	# The daemon (and my-workshop) drive info/launch/remove/connect with
+	# cwd = the project directory and no -p — reproduce that shape.
+	in_proj() { (cd "$proj" && ws_run "$@"); }
+
+	local proj=$SELF_TMP/clone
+	mkdir -p "$proj"
+	printf 'name: selfcheck-ws\nbase: ubuntu@24.04\n' >"$proj/workshop.yaml"
+
+	# ---- 1/10 launch: lock + registration, info present
+	log "1/10 launch, lock, registration, info present"
+	in_proj launch >/dev/null 2>"$err" ||
+		fail "launch exits 0" "$(cat "$err")"
+	local lock
+	lock=$(cat "$proj/.workshop.lock")
+	[[ $lock =~ ^[0-9a-f]{8}$ ]] ||
+		fail "lock is an 8-hex project id" "got: $lock"
+	jq -e --arg p "$proj" --arg lock "$lock" '.workshops[$p].id == $lock' \
+		"$root/workshops.json" >/dev/null ||
+		fail "launch registers the project keyed by realpath"
+	local info
+	info=$(in_proj info 2>"$err") || fail "info (launched) exits 0" "$(cat "$err")"
+	grep -q $'^name:\tselfcheck-ws$' <<<"$info" ||
+		fail "info prints the workshop name" "$info"
+	grep -q $'^hostname:\t'"ws-$lock.local$" <<<"$info" ||
+		fail "info prints a hostname keyed by the project id" "$info"
+	grep -q $'^status:\tready$' <<<"$info" ||
+		fail "info prints a status line" "$info"
+	ok "launch → lock + registration → info present (YAML shape)"
+
+	# ---- 2/10 re-launch idempotence
+	log "2/10 re-launch is idempotent"
+	in_proj launch >/dev/null 2>"$err" ||
+		fail "re-launch exits 0" "$(cat "$err")"
+	[ "$(cat "$proj/.workshop.lock")" = "$lock" ] ||
+		fail "re-launch keeps the existing project id"
+	ok "re-launch preserves the id and the lock"
+
+	# ---- 3/10 exec passthrough: exit code, stdout, stderr, cwd, env prefix
+	log "3/10 exec passthrough (daemon argv shape)"
+	local out rc=0
+	out=$(ws_run exec -p "$proj" -- sh -c 'echo out-line; echo err-line >&2; exit 3' \
+		2>"$err") || rc=$?
+	[ "$rc" -eq 3 ] || fail "exec propagates the exit code" "rc=$rc"
+	[ "$out" = "out-line" ] || fail "exec propagates stdout" "got: $out"
+	grep -q '^err-line$' "$err" || fail "exec propagates stderr" "$(cat "$err")"
+	out=$(ws_run exec -p "$proj" -- pwd 2>"$err") ||
+		fail "exec pwd exits 0" "$(cat "$err")"
+	[ "$out" = "$proj" ] || fail "exec runs with cwd = the project path" "got: $out"
+	out=$(ws_run exec -p "$proj" -- env SENTINEL=xyz printenv SENTINEL 2>"$err") ||
+		fail "exec env prefix passes through" "$(cat "$err")"
+	[ "$out" = "xyz" ] || fail "env prefix sets the variable in the command" "got: $out"
+	ok "exec: exit code, stdout, stderr, cwd, env prefix all pass through"
+
+	# ---- 4/10 exec stdin piping (my-workshop's tar shape)
+	log "4/10 exec stdin piping"
+	out=$(printf 'piped-line\n' | ws_run exec -p "$proj" -- cat 2>"$err") ||
+		fail "exec cat exits 0" "$(cat "$err")"
+	[ "$out" = "piped-line" ] || fail "exec pipes stdin to the command" "got: $out"
+	ok "exec: stdin pipes through (tar-copy shape)"
+
+	# ---- 5/10 remove → gone; info absent via the exact marker
+	log "5/10 remove, then info absent"
+	in_proj remove >/dev/null 2>"$err" ||
+		fail "remove exits 0" "$(cat "$err")"
+	rc=0
+	in_proj info >/dev/null 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "info after remove exits non-zero"
+	[ "$(cat "$err")" = "error: workshop not launched" ] ||
+		fail "info after remove prints the exact gone marker" "$(cat "$err")"
+	[ -f "$proj/.workshop.lock" ] ||
+		fail "remove leaves .workshop.lock on disk (the project survives)"
+	ok "remove deregisters; info reports the gone marker"
+
+	# ---- 6/10 exec not-launched (definition present, unregistered)
+	log "6/10 exec and remove on an unlaunched workshop"
+	rc=0
+	ws_run exec -p "$proj" -- true >/dev/null 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "exec on unlaunched workshop exits non-zero"
+	grep -q 'cannot exec command in "selfcheck-ws": workshop not launched' "$err" ||
+		fail "exec names the workshop in the gone-marker error" "$(cat "$err")"
+	rc=0
+	in_proj remove >/dev/null 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "remove of a gone workshop exits non-zero"
+	grep -q 'cannot remove "selfcheck-ws": workshop not launched' "$err" ||
+		fail "remove names the workshop in the gone-marker error" "$(cat "$err")"
+	ok "exec/remove on a gone workshop produce the marker (daemon: absent/success)"
+
+	# ---- 7/10 not-a-project and missing path: errors WITHOUT gone markers
+	log "7/10 not-a-project and missing-path errors"
+	local plain=$SELF_TMP/plain
+	mkdir -p "$plain"
+	rc=0
+	ws_run info -p "$plain" >/dev/null 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "info in a non-project exits non-zero"
+	grep -q 'not a project (no workshop files found)' "$err" ||
+		fail "info in a non-project matches the real error" "$(cat "$err")"
+	grep -qiE 'not launched|not found' "$err" &&
+		fail "not-a-project error must contain no gone marker" "$(cat "$err")"
+	rc=0
+	ws_run exec -p "$SELF_TMP/no-such-dir" -- true >/dev/null 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "exec on a missing path exits non-zero"
+	grep -q "cannot create or load project at \"$SELF_TMP/no-such-dir\": lstat" "$err" ||
+		fail "exec on a missing path matches the real lstat error" "$(cat "$err")"
+	ok "not-a-project / missing path: no gone marker (daemon: unknown)"
+
+	# ---- 8/10 one-shot fail_next for launch, both modes
+	log "8/10 one-shot fail_next injection"
+	jq '.inject.fail_next.launch = "fail"' "$root/workshops.json" \
+		>"$root/workshops.json.tmp" && mv "$root/workshops.json.tmp" "$root/workshops.json"
+	rc=0
+	in_proj launch >/dev/null 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "armed fail mode exits non-zero"
+	grep -q 'injected launch failure' "$err" ||
+		fail "armed fail mode prints the injected error" "$(cat "$err")"
+	jq -e '.inject.fail_next.launch == null' "$root/workshops.json" >/dev/null ||
+		fail "fail injection consumed (reset to null)"
+	in_proj launch >/dev/null 2>"$err" ||
+		fail "next launch after fail injection succeeds" "$(cat "$err")"
+	# no-lock: start from a clean (removed) workshop so both effects — no
+	# lock AND no registration — are observable.
+	in_proj remove >/dev/null 2>"$err" ||
+		fail "remove before no-lock test" "$(cat "$err")"
+	rm -f "$proj/.workshop.lock"
+	jq '.inject.fail_next.launch = "no-lock"' "$root/workshops.json" \
+		>"$root/workshops.json.tmp" && mv "$root/workshops.json.tmp" "$root/workshops.json"
+	in_proj launch >/dev/null 2>"$err" ||
+		fail "armed no-lock mode exits 0" "$(cat "$err")"
+	[ ! -e "$proj/.workshop.lock" ] ||
+		fail "no-lock mode writes no .workshop.lock"
+	jq -e --arg p "$proj" '.workshops[$p] == null' "$root/workshops.json" >/dev/null ||
+		fail "no-lock mode registers nothing"
+	jq -e '.inject.fail_next.launch == null' "$root/workshops.json" >/dev/null ||
+		fail "no-lock injection consumed (reset to null)"
+	in_proj launch >/dev/null 2>"$err" ||
+		fail "next launch after no-lock injection succeeds" "$(cat "$err")"
+	[ -s "$proj/.workshop.lock" ] ||
+		fail "launch after no-lock injection writes the lock"
+	ok "fail_next: fail and no-lock modes are one-shot by consumption"
+
+	# ---- 9/10 connect recording + unsupported rejection
+	log "9/10 connect recording, unsupported rejection"
+	in_proj connect selfcheck-ws/plug selfcheck-ws/slot >/dev/null 2>"$err" ||
+		fail "connect exits 0 on a launched workshop" "$(cat "$err")"
+	jq -e --arg p "$proj" \
+		'.workshops[$p].connects == [["selfcheck-ws/plug", "selfcheck-ws/slot"]]' \
+		"$root/workshops.json" >/dev/null ||
+		fail "connect records the plug/slot pair"
+	rc=0
+	ws_run refresh >/dev/null 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "unsupported subcommand exits non-zero"
+	grep -q 'unsupported invocation' "$err" ||
+		fail "unsupported subcommand names the invocation" "$(cat "$err")"
+	ok "connect records; unsupported invocations fail loudly"
+
+	# ---- 10/10 corrupt state ⇒ parse error with no gone marker (unknown)
+	log "10/10 corrupt state yields a non-gone error"
+	printf 'not json at all' >"$root/workshops.json"
+	rc=0
+	in_proj info >/dev/null 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "info on corrupt state exits non-zero"
+	grep -qiE 'not launched|not found' "$err" &&
+		fail "corrupt-state error must contain no gone marker" "$(cat "$err")"
+	ok "corrupt state fails loudly without a gone marker (daemon: unknown)"
+
+	# ---- real my-workshop integration (opt-in) --------------------------------
+	local mw=${MY_WORKSHOP_BIN:-$(command -v my-workshop || true)}
+	if [ -n "$mw" ]; then
+		log "11/11 real my-workshop against the fake"
+		local mwclone=$SELF_TMP/mwclone
+		mkdir -p "$mwclone"
+		git -C "$mwclone" init -q
+		git -C "$mwclone" -c user.name=t -c user.email=t@t commit -q \
+			--allow-empty -m init
+		local mwroot=$SELF_TMP/mwstate rc2=0
+		(cd "$mwclone" &&
+			LOCAL_TEST_STATE=$mwroot PATH="$(dirname "$self_bin"):$PATH" \
+			"$mw" >/dev/null 2>"$err") || rc2=$?
+		[ "$rc2" -eq 0 ] || fail "real my-workshop exits 0 on the fake" \
+			"$(cat "$err")"
+		[ -f "$mwclone/workshop.yaml" ] ||
+			fail "my-workshop created workshop.yaml"
+		git -C "$mwclone" check-ignore -q workshop.yaml ||
+			fail "my-workshop hid workshop.yaml from git"
+		[ -s "$mwclone/.workshop.lock" ] ||
+			fail "the fake left a non-empty .workshop.lock for my-workshop"
+		ok "real my-workshop: exit 0, hidden workshop.yaml, non-empty lock"
+	else
+		printf '  skip  11/11 real my-workshop: no binary on PATH (set MY_WORKSHOP_BIN)\n'
+	fi
+
+	printf 'selfcheck: all %d checks passed\n' "$SELF_CHECKS"
+}
+
+# --- dispatch -----------------------------------------------------------------------
+
+command=${1:-help}
+case "$command" in
+exec) shift; cmd_exec "$@" ;;
+launch) shift; cmd_launch "$@" ;;
+info) shift; cmd_info "$@" ;;
+remove) shift; cmd_remove "$@" ;;
+connect) shift; cmd_connect "$@" ;;
+selfcheck) shift; cmd_selfcheck "$@" ;;
+--version) printf '0.9.5 (fake, local-test)\n' ;;
+help | --help | -h) usage ;;
+*) unsupported "$*" ;;
+esac
