@@ -1,0 +1,1128 @@
+#!/usr/bin/env python3
+"""Fake omp: deterministic rpc-ui scenario engine for offline local E2E
+(LOCAL-TESTING.PLAN.md Part 4). The daemon (unmodified) execs this through
+the fake `workshop` (Part 3) — `workshop exec -p <clone> -- [env …] omp …` —
+so this process's cwd is the task clone and stdio carries the rpc-ui NDJSON.
+
+Consumed contracts (daemon call sites):
+  agent.py:verify_ask_timeout   omp config get ask.timeout       -> "0", rc 0
+  agent.py:build_agent_argv     omp --mode rpc-ui --no-title
+                                [--model M] [--thinking T] [--resume <id>]
+  agent.py AgentHandle          ready handshake; prompt bursts;
+                                get_state / get_session_stats / steer /
+                                follow_up / abort_and_prompt
+  ship.py ShipManager.draft     get_last_assistant_text -> {"data":{"text":…}}
+  workflows.py                  .ompire/outcome.json written by the "agent"
+  review.py                     llmvet comment loopback prompts
+
+The frame shapes are the corpus recorded from real omp (16.5.2 / 17.2.12)
+that daemon/tests/fake_omp.py also uses; config/version output shapes were
+captured live from omp 17.0.1 inside the QA workshop container.
+
+Scenario selection happens at prompt time (the daemon authors the prompts):
+  1. a [[scenario:<name>]] line in the prompt text (+ [[scenario-param:k=v]])
+  2. a one-shot armed scenario in <state>/omp-scenarios.json (clone, global)
+  3. classification of daemon-authored prompts (ship draft markers, judge
+     preamble, resume nudge, blockquoted review comments)
+  4. default: happy
+Process-level scenarios (silent, crash, exit-after-ready, ignore-term,
+get-state-fails) resolve at launch from the control file's startup slot.
+
+State layout (under $LOCAL_TEST_STATE, else local-test/.state):
+  omp-scenarios.json   {"startup": {...}, "next_prompt": {...}}
+  omp-sessions/<id>.jsonl   per-session transcript (launch/prompt/exit)
+
+Usage: omp config get ask.timeout | omp --version
+       omp [--mode rpc-ui --no-title] [--model M] [--thinking T]
+           [--resume <id>]
+       omp selfcheck
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+
+CAPTURED_VERSION = "17.0.1"
+
+# --- literals from the daemon source (classification anchors) ---------------
+# ship.py:_DRAFT_PROMPT carries these markers.
+_DRAFT_MARKERS = ("<<<COMMIT_MESSAGE>>>", "<<<PR_TITLE>>>")
+# workflows.py:_run_judge's prompt opener.
+_JUDGE_PREFIX = "You are the fallback judge for the ompire workflow engine"
+# workflows.py:RESUME_NUDGE.
+_NUDGE_PREFIX = "The daemon restarted while you were working; please continue."
+# workflows.py:OUTCOME_INSTRUCTION names this path inside backticks.
+_OUTCOME_HINT = "`.ompire/outcome.json`"
+
+OUTCOME_PATH = ".ompire/outcome.json"
+WORK_ARTIFACT = "fake-agent-work.txt"
+
+_SCENARIO_RE = re.compile(r"\[\[scenario:([a-z0-9-]+)\]\]")
+_PARAM_RE = re.compile(r"\[\[scenario-param:([a-z0-9-]+)=([^\]]*)\]\]")
+
+KNOWN_SCENARIOS = {
+    # behavior
+    "happy", "outcome-failed", "ship-draft", "judge", "review-comments",
+    "resume-nudge", "commit",
+    # protocol (promoted from daemon/tests/fake_omp.py)
+    "die", "fail", "garbage", "big", "queue", "no-end", "ask", "approve",
+    "ask-cancel", "bad-ask", "auto-retry", "auto-retry-hang",
+    # process-level (startup slot only)
+    "silent", "crash", "exit-after-ready", "ignore-term", "get-state-fails",
+}
+STARTUP_SCENARIOS = {"silent", "crash", "exit-after-ready", "ignore-term",
+                     "get-state-fails"}
+
+USAGE = __doc__.split("State layout")[0].strip()
+
+
+def die(msg: str) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def unsupported(argv: list[str]) -> None:
+    print(f"unsupported invocation: {' '.join(argv)}", file=sys.stderr)
+    sys.exit(2)
+
+
+# --- state helpers -----------------------------------------------------------
+
+def state_root() -> Path:
+    root = os.environ.get("LOCAL_TEST_STATE")
+    return Path(root) if root else Path(__file__).resolve().parent.parent / ".state"
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read_control() -> dict:
+    path = state_root() / "omp-scenarios.json"
+    try:
+        with path.open(encoding="utf-8") as fh:
+            doc = json.load(fh)
+        return doc if isinstance(doc, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        # Corrupt control file: treat as empty but never crash the session.
+        return {}
+
+
+def _write_control(doc: dict) -> None:
+    _atomic_write(
+        state_root() / "omp-scenarios.json",
+        json.dumps(
+            {"startup": doc.get("startup", {}),
+             "next_prompt": doc.get("next_prompt", {})},
+            indent=2, sort_keys=True,
+        ) + "\n",
+    )
+
+
+def _consume_slot(slot: str) -> str | None:
+    """One-shot consume: clone key first, then global; null both."""
+    doc = _read_control()
+    entries = doc.get(slot, {})
+    if not isinstance(entries, dict):
+        return None
+    clone = str(Path.cwd().resolve())
+    value = entries.get(clone)
+    if value is None:
+        value = entries.get("global")
+        key = "global" if value is not None else None
+    else:
+        key = clone
+    if key is None:
+        return None
+    entries[key] = None
+    doc[slot] = entries
+    _write_control(doc)
+    return value if isinstance(value, str) else None
+
+
+# --- transcript store --------------------------------------------------------
+
+class Transcript:
+    """Append-only per-session JSONL: launch/prompt/exit records."""
+
+    def __init__(self, session_id: str) -> None:
+        self.path = state_root() / "omp-sessions" / f"{session_id}.jsonl"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, record: dict) -> None:
+        record = dict(record, ts=_now_iso())
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+
+    def load(self) -> list[dict]:
+        records: list[dict] = []
+        try:
+            with self.path.open(encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue  # torn append: skip, degrade gracefully
+        except FileNotFoundError:
+            pass
+        return records
+
+
+def _now_iso() -> str:
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+# --- frame emission ----------------------------------------------------------
+
+def emit(frame: dict) -> None:
+    print(json.dumps(frame), flush=True)
+
+
+# --- scenario side effects ---------------------------------------------------
+
+def write_outcome(scenario: str, turn: int, status: str = "success",
+                  artifacts: dict | None = None) -> None:
+    document: dict = {
+        "version": 1,
+        "status": status,
+        "summary": f"fake omp {scenario} turn {turn}",
+    }
+    if artifacts is not None:
+        document["artifacts"] = artifacts
+    path = Path.cwd() / OUTCOME_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+
+def append_work_artifact(scenario: str, turn: int) -> None:
+    with (Path.cwd() / WORK_ARTIFACT).open("a", encoding="utf-8") as fh:
+        fh.write(f"{scenario} turn {turn}: fake agent work\n")
+
+
+def git_commit(turn: int) -> str | None:
+    """One real commit of the current tree; returns the subject or None."""
+    subject = f"fake omp: agent work {turn}"
+    try:
+        subprocess.run(["git", "add", "-A"], cwd=".", check=True,
+                       capture_output=True)
+        result = subprocess.run(
+            ["git", "commit", "-m", subject], cwd=".", capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        return subject
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def ship_draft_text(turn: int) -> str:
+    return (
+        "<<<COMMIT_MESSAGE>>>\n"
+        f"fake omp: squashed agent work (turn {turn})\n\n"
+        "Deterministic change authored by the local-test fake omp agent.\n"
+        "<<<PR_TITLE>>>\n"
+        f"Fake agent work (turn {turn})\n"
+        "<<<PR_BODY>>>\n"
+        "## Summary\n\nDeterministic fake-omp turn. See the commit history "
+        "and `fake-agent-work.txt` for the turn log.\n"
+    )
+
+
+# --- the engine --------------------------------------------------------------
+
+class Engine:
+    """One rpc-ui session process."""
+
+    def __init__(self, argv: list[str], resume_id: str | None) -> None:
+        self.argv = argv
+        self.turn = 0
+        self.queued = 0
+        self.message_count = 0
+        self.last_assistant_text: str | None = None
+        self.startup_scenario: str | None = None
+        self.resume_id = resume_id
+        self.session_id = resume_id
+        self.transcript: Transcript | None = None
+
+    # -- launch ---------------------------------------------------------------
+
+    def launch(self) -> None:
+        self.startup_scenario = _consume_slot("startup")
+        if self.startup_scenario is not None and \
+                self.startup_scenario not in STARTUP_SCENARIOS | KNOWN_SCENARIOS:
+            die(f"unknown startup scenario {self.startup_scenario!r} in "
+                f"control file")
+
+        if self.session_id is None:
+            self.session_id = str(uuid.uuid4())
+        self.transcript = Transcript(self.session_id)
+        self.transcript.append({
+            "kind": "launch",
+            "argv": self.argv,
+            "cwd": str(Path.cwd().resolve()),
+            "resume": self.resume_id,
+            "environ": dict(os.environ),
+            "startup_scenario": self.startup_scenario,
+        })
+
+        scenario = self.startup_scenario
+        if scenario == "crash":
+            print("Error: No models available", file=sys.stderr, flush=True)
+            sys.exit(1)
+        if scenario == "silent":
+            for _ in sys.stdin:
+                pass
+            self._exit(0)
+            return
+        emit({"type": "ready"})
+        if scenario == "exit-after-ready":
+            self._exit(7)
+            return
+        if scenario == "ignore-term":
+            import signal
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            for _ in sys.stdin:
+                pass
+            self._exit(0)
+            return
+
+        # Resume restores observable context (design D-7).
+        for record in self.transcript.load():
+            if record.get("kind") == "prompt":
+                self.message_count += 2
+                text = record.get("assistant_text")
+                if isinstance(text, str):
+                    self.last_assistant_text = text
+                self.turn += 1
+
+        self._main_loop()
+
+    def _exit(self, code: int) -> None:
+        if self.transcript is not None:
+            self.transcript.append({"kind": "exit", "code": code})
+        sys.exit(code)
+
+    # -- main loop ------------------------------------------------------------
+
+    def _main_loop(self) -> None:
+        pending_ui: dict | None = None
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                request = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(request, dict):
+                continue
+
+            if pending_ui is not None:
+                if request.get("type") == "extension_ui_response" and \
+                        request.get("id") == pending_ui["ui_id"]:
+                    self._ui_finish(pending_ui, request)
+                    pending_ui = None
+                    continue
+                self._handle_generic(request)
+                continue
+
+            if request.get("type") != "prompt":
+                self._handle_generic(request)
+                continue
+
+            scenario, params, clean_message = resolve_scenario(
+                request.get("message", ""))
+            pending = self._serve_prompt(
+                request.get("id", ""), scenario, params, clean_message)
+            if pending is not None:
+                pending_ui = pending
+        self._exit(0)
+
+    # -- request handling -------------------------------------------------------
+
+    def _handle_generic(self, request: dict) -> None:
+        request_id = request.get("id", "")
+        rtype = request.get("type")
+        if rtype == "get_state":
+            if self.startup_scenario == "get-state-fails":
+                emit({"id": request_id, "type": "response",
+                      "command": "get_state", "success": False,
+                      "error": "state unavailable"})
+            else:
+                emit({
+                    "id": request_id, "type": "response",
+                    "command": "get_state", "success": True,
+                    "data": {
+                        "isStreaming": False,
+                        "isCompacting": False,
+                        "queuedMessageCount": self.queued,
+                        "messageCount": self.message_count,
+                        "sessionId": self.session_id,
+                    },
+                })
+            return
+        if rtype == "get_session_stats":
+            emit({
+                "id": request_id, "type": "response",
+                "command": "get_session_stats", "success": True,
+                "data": {
+                    "inputTokens": 1200,
+                    "outputTokens": 340,
+                    "totalCostUsd": 0.0123,
+                    "messageCount": self.message_count,
+                },
+            })
+            return
+        if rtype == "get_last_assistant_text":
+            # The shape ship.py's draft path is load-bearing on (found by
+            # dogfooding: data is an object wrapping "text").
+            if self.last_assistant_text is None:
+                emit({"id": request_id, "type": "response",
+                      "command": "get_last_assistant_text",
+                      "success": False, "error": "no assistant message yet"})
+            else:
+                emit({"id": request_id, "type": "response",
+                      "command": "get_last_assistant_text", "success": True,
+                      "data": {"text": self.last_assistant_text}})
+            return
+        if rtype in ("steer", "follow_up", "abort_and_prompt"):
+            if request.get("message", "") == "fail":
+                emit({"id": request_id, "type": "response",
+                      "command": rtype, "success": False, "error": "boom"})
+            else:
+                emit({"id": request_id, "type": "response",
+                      "command": rtype, "success": True})
+            return
+        emit({"id": request_id, "type": "response",
+              "command": rtype, "success": False,
+              "error": f"Unknown command: {rtype}"})
+
+    # -- prompt serving ---------------------------------------------------------
+
+    def _serve_prompt(self, request_id: str, scenario: str, params: dict,
+                      message: str) -> dict | None:
+        """Serve one prompt; returns a pending-ui dict when the scenario
+        waits on an extension_ui_response."""
+        self.turn += 1
+        turn = self.turn
+        assistant_text = f"{scenario} turn {turn} complete"
+
+        if scenario == "die":
+            self._exit(23)
+        if scenario == "fail":
+            emit({"id": request_id, "type": "response", "command": "prompt",
+                  "success": False, "error": "boom"})
+            self._record(scenario, None)
+            return None
+        if scenario == "ask":
+            self.message_count += 2
+            pending = self._ask_start(request_id, message)
+            self._record(scenario, None)
+            return pending
+        if scenario == "approve":
+            self.message_count += 2
+            pending = self._approval_start(request_id, message)
+            self._record(scenario, None)
+            return pending
+        if scenario == "ask-cancel":
+            self.message_count += 2
+            self._ask_finish(self._ask_start(request_id, message),
+                             {"cancelled": True})
+            return None
+        if scenario == "auto-retry":
+            self.message_count += 2
+            assistant_text = "retried ok"
+            self._retry_prefix(request_id, message, hang=False)
+            self._burst_tail(request_id, message, assistant_text)
+            self._finish_turn(scenario, assistant_text)
+            return None
+        if scenario == "auto-retry-hang":
+            self.message_count += 2
+            self._retry_prefix(request_id, message, hang=True)
+            self._record(scenario, None)
+            return None
+        if scenario == "bad-ask":
+            self.message_count += 2
+            emit({"id": request_id, "type": "response", "command": "prompt",
+                  "success": True})
+            emit({"type": "agent_start"})
+            emit({"type": "extension_ui_request"})
+            emit({"type": "agent_end"})
+            return None
+        if scenario == "garbage":
+            print("this is not json", flush=True)
+            emit({"type": "note", "text": "still alive"})
+        if scenario == "queue":
+            self.queued = 1
+        if scenario == "judge":
+            route = params.get("route", "__complete__")
+            write_outcome(scenario, turn, artifacts={"route": route})
+            assistant_text = f"judged: route {route}"
+        elif scenario == "outcome-failed":
+            write_outcome(scenario, turn, status="failed")
+            assistant_text = f"{scenario} turn {turn} failed"
+        elif scenario == "ship-draft":
+            assistant_text = ship_draft_text(turn)
+        elif scenario == "commit":
+            subject = git_commit(turn)
+            assistant_text = (
+                f"committed: {subject}" if subject else "nothing to commit")
+        elif scenario in ("happy", "review-comments", "resume-nudge"):
+            if _OUTCOME_HINT in message:
+                write_outcome(scenario, turn)
+                append_work_artifact(scenario, turn)
+                assistant_text = f"{scenario} turn {turn}: outcome written"
+            elif scenario == "review-comments":
+                assistant_text = (
+                    "addressed review comments:\n"
+                    + "\n".join(
+                        f"- fixed: {ln[2:].strip()}"
+                        for ln in message.splitlines() if ln.startswith(">"))
+                )
+
+        self.message_count += 2
+        self._burst(request_id, message, assistant_text,
+                    big=scenario == "big", end=scenario != "no-end")
+        self._finish_turn(scenario, assistant_text)
+        return None
+
+    def _finish_turn(self, scenario: str, assistant_text: str | None) -> None:
+        if assistant_text is not None:
+            self.last_assistant_text = assistant_text
+        self._record(scenario, assistant_text)
+
+    def _record(self, scenario: str, assistant_text: str | None) -> None:
+        if self.transcript is not None:
+            self.transcript.append({
+                "kind": "prompt", "scenario": scenario,
+                "assistant_text": assistant_text,
+            })
+
+    # -- recorded frame sequences ---------------------------------------------
+
+    def _burst(self, prompt_id: str, message: str, assistant_text: str,
+               big: bool = False, end: bool = True) -> None:
+        emit({"type": "extension_ui_request", "id": "1535befcedd1a5c6",
+              "method": "setWidget", "widgetKey": "autoresearch"})
+        emit({"id": prompt_id, "type": "response", "command": "prompt",
+              "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "turn_start"})
+        user_message = {"role": "user",
+                        "content": [{"type": "text", "text": message}]}
+        emit({"type": "message_start", "message": user_message})
+        emit({"type": "message_end", "message": user_message})
+        emit({"type": "message_start",
+              "message": {"role": "assistant", "content": []}})
+        if big:
+            emit({"type": "tool_output", "data": "x" * 200_000})
+        assistant_message = {"role": "assistant",
+                             "content": [{"type": "text",
+                                          "text": assistant_text}]}
+        emit({"type": "message_end", "message": assistant_message})
+        emit({"type": "turn_end", "message": assistant_message})
+        if end:
+            emit({"type": "agent_end",
+                  "messages": [user_message, assistant_message]})
+
+    def _burst_tail(self, prompt_id: str, message: str,
+                    assistant_text: str) -> None:
+        emit({"type": "turn_start"})
+        user_message = {"role": "user",
+                        "content": [{"type": "text", "text": message}]}
+        emit({"type": "message_start", "message": user_message})
+        emit({"type": "message_end", "message": user_message})
+        assistant_message = {"role": "assistant",
+                             "content": [{"type": "text",
+                                          "text": assistant_text}]}
+        emit({"type": "message_start",
+              "message": {"role": "assistant", "content": []}})
+        emit({"type": "message_end", "message": assistant_message})
+        emit({"type": "turn_end", "message": assistant_message})
+        emit({"type": "agent_end",
+              "messages": [user_message, assistant_message]})
+
+    def _retry_prefix(self, prompt_id: str, message: str, *,
+                      hang: bool) -> None:
+        emit({"id": prompt_id, "type": "response", "command": "prompt",
+              "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 5,
+              "delayMs": 40000, "errorMessage": "HTTP 429 from gateway"})
+        if not hang:
+            emit({"type": "auto_retry_end", "success": True, "attempt": 1})
+
+    def _ask_start(self, prompt_id: str, message: str) -> dict:
+        emit({"id": prompt_id, "type": "response", "command": "prompt",
+              "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "turn_start"})
+        user_message = {"role": "user",
+                        "content": [{"type": "text", "text": message}]}
+        emit({"type": "message_start", "message": user_message})
+        emit({"type": "message_end", "message": user_message})
+        emit({"type": "extension_ui_request", "id": "ask-ui-1",
+              "method": "select",
+              "title": "Apply the same lock ordering to the dhcpd6 loop?",
+              "options": ["Yes, both loops (Recommended)", "v4 only",
+                          "Other (type your own)"]})
+        emit({"type": "tool_execution_start", "toolCallId": "toolu_ask1",
+              "toolName": "ask",
+              "args": {"questions": [{
+                  "id": "demo",
+                  "question": "Apply the same lock ordering to the dhcpd6 "
+                              "loop?",
+                  "options": [
+                      {"label": "Yes, both loops", "description": "Widen the fix"},
+                      {"label": "v4 only",
+                       "description": "Match the reproducer"}],
+                  "recommended": 0}]},
+              "intent": "Demonstrating ask tool"})
+        return {"kind": "ask", "ui_id": "ask-ui-1",
+                "tool_call_id": "toolu_ask1", "user_message": user_message}
+
+    def _ask_finish(self, pending: dict, reply: dict) -> None:
+        emit({"type": "tool_execution_end",
+              "toolCallId": pending["tool_call_id"]})
+        answer_text = f"got answer: {reply}"
+        self._ui_tail(pending, answer_text)
+
+    def _approval_start(self, prompt_id: str, message: str) -> dict:
+        emit({"id": prompt_id, "type": "response", "command": "prompt",
+              "success": True})
+        emit({"type": "agent_start"})
+        emit({"type": "turn_start"})
+        user_message = {"role": "user",
+                        "content": [{"type": "text", "text": message}]}
+        emit({"type": "message_start", "message": user_message})
+        emit({"type": "message_end", "message": user_message})
+        emit({"type": "extension_ui_request", "id": "approval-ui-1",
+              "method": "select", "options": ["Approve", "Deny"]})
+        return {"kind": "approval", "ui_id": "approval-ui-1",
+                "user_message": user_message}
+
+    def _ui_finish(self, pending: dict, reply: dict) -> None:
+        if pending["kind"] == "ask":
+            self._ask_finish(pending, reply)
+        else:
+            self._ui_tail(pending, f"got answer: {reply}")
+
+    def _ui_tail(self, pending: dict, answer_text: str) -> None:
+        assistant_message = {"role": "assistant",
+                             "content": [{"type": "text",
+                                          "text": answer_text}]}
+        emit({"type": "message_start",
+              "message": {"role": "assistant", "content": []}})
+        emit({"type": "message_end", "message": assistant_message})
+        emit({"type": "turn_end", "message": assistant_message})
+        emit({"type": "agent_end",
+              "messages": [pending["user_message"], assistant_message]})
+        self.last_assistant_text = answer_text
+        self._record(f"{pending['kind']}-reply", answer_text)
+
+
+# --- scenario resolution (design D-3) ----------------------------------------
+
+def resolve_scenario(message: str) -> tuple[str, dict, str]:
+    """Returns (scenario, params, message-without-directive-lines)."""
+    scenario: str | None = None
+    params: dict[str, str] = {}
+    clean_lines: list[str] = []
+    for line in message.splitlines():
+        match = _SCENARIO_RE.search(line)
+        if match and scenario is None:
+            scenario = match.group(1)
+            continue
+        pmatch = _PARAM_RE.search(line)
+        if pmatch:
+            params[pmatch.group(1)] = pmatch.group(2)
+            continue
+        clean_lines.append(line)
+    clean_message = "\n".join(clean_lines)
+
+    if scenario is None:
+        scenario = _consume_slot("next_prompt")
+    if scenario is None:
+        scenario = classify_prompt(clean_message)
+    return scenario, params, clean_message
+
+
+def classify_prompt(message: str) -> str:
+    if all(marker in message for marker in _DRAFT_MARKERS):
+        return "ship-draft"
+    if message.startswith(_JUDGE_PREFIX):
+        return "judge"
+    if message.startswith(_NUDGE_PREFIX):
+        return "resume-nudge"
+    lines = [ln for ln in message.splitlines() if ln.strip()]
+    if lines and all(ln.lstrip().startswith(">") for ln in lines):
+        return "review-comments"
+    return "happy"
+
+
+# --- argv dispatch (design D-2) ----------------------------------------------
+
+def main() -> None:
+    argv = sys.argv[1:]
+
+    if argv == ["config", "get", "ask.timeout"]:
+        print("0")
+        return
+    if argv == ["--version"]:
+        print(f"omp/{CAPTURED_VERSION} (fake, local-test)")
+        return
+    if argv == ["selfcheck"]:
+        selfcheck()
+        return
+
+    if argv and argv[0] == "--mode" and len(argv) >= 2 and argv[1] == "rpc-ui":
+        resume: str | None = None
+        i = 2
+        while i < len(argv):
+            flag = argv[i]
+            if flag == "--no-title":
+                i += 1
+            elif flag in ("--model", "--thinking") and i + 1 < len(argv):
+                i += 2
+            elif flag == "--resume" and i + 1 < len(argv):
+                resume = argv[i + 1]
+                i += 2
+            else:
+                unsupported(argv)
+        engine = Engine(argv, resume)
+        engine.launch()
+        return
+
+    unsupported(argv)
+
+
+# --- selfcheck (design D-8) --------------------------------------------------
+
+def selfcheck() -> None:
+    import shutil
+
+    failures = 0
+    total = 0
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        nonlocal failures, total
+        total += 1
+        if ok:
+            print(f"  ok    {total:2d}  {name}")
+        else:
+            failures += 1
+            print(f"  FAIL  {total:2d}  {name}" +
+                  (f" — {detail}" if detail else ""))
+
+    self_bin = os.path.abspath(__file__)
+    workdir = Path(tempfile.mkdtemp(prefix="omp-selfcheck-"))
+    original_state = os.environ.get("LOCAL_TEST_STATE")
+    try:
+        state = workdir / "state"
+        clone = workdir / "clone"
+        state.mkdir()
+        clone.mkdir()
+        os.environ["LOCAL_TEST_STATE"] = str(state)
+
+        def run(args: list[str], stdin: str | None = None,
+                cwd: Path | None = None) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [sys.executable, self_bin, *args],
+                input=stdin, capture_output=True, text=True,
+                cwd=str(cwd or clone), timeout=30)
+
+        def session(scenario_arm: dict | None = None,
+                    cwd_dir: Path | None = None,
+                    extra_args: list[str] | None = None) -> subprocess.Popen:
+            if scenario_arm is not None:
+                slot, key, value = scenario_arm["slot"], \
+                    scenario_arm["key"], scenario_arm["value"]
+                doc = {"startup": {}, "next_prompt": {}}
+                doc[slot][key] = value
+                _atomic_write(state / "omp-scenarios.json",
+                              json.dumps(doc))
+            return subprocess.Popen(
+                [sys.executable, self_bin, "--mode", "rpc-ui",
+                 "--no-title", *(extra_args or [])],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+                cwd=str(cwd_dir or clone))
+
+        def send(proc: subprocess.Popen, obj: dict) -> None:
+            assert proc.stdin is not None
+            proc.stdin.write(json.dumps(obj) + "\n")
+            proc.stdin.flush()
+
+        def read_frames(proc: subprocess.Popen, count: int,
+                        timeout: float = 10.0) -> list[dict]:
+            import selectors
+            frames: list[dict] = []
+            raw_lines: list[str] = []
+            sel = selectors.DefaultSelector()
+            assert proc.stdout is not None
+            sel.register(proc.stdout, selectors.EVENT_READ)
+            import time
+            deadline = time.monotonic() + timeout
+            while len(raw_lines) < count and time.monotonic() < deadline:
+                if not sel.select(timeout=max(0.05, deadline - time.monotonic())):
+                    break
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                raw_lines.append(line)
+            sel.close()
+            for line in raw_lines:
+                try:
+                    frames.append(json.loads(line))
+                except json.JSONDecodeError:
+                    frames.append({"__raw__": line})
+            return frames
+
+        def send_prompt(proc: subprocess.Popen, message: str,
+                        request_id: str = "r1") -> None:
+            send(proc, {"id": request_id, "type": "prompt",
+                        "message": message})
+
+        # 1. preflight
+        r = run(["config", "get", "ask.timeout"])
+        check("ask-timeout preflight prints 0",
+              r.returncode == 0 and r.stdout.strip() == "0", r.stdout.strip())
+
+        # 2. ready + get_state
+        p = session()
+        frames = read_frames(p, 1)
+        check("ready frame emitted", bool(frames) and
+              frames[0].get("type") == "ready")
+        send(p, {"id": "s1", "type": "get_state"})
+        frames = read_frames(p, 1)
+        sid = frames[0].get("data", {}).get("sessionId", "") \
+            if frames and frames[0].get("success") else ""
+        check("get_state reports a session id", bool(sid))
+
+        # 3. happy turn with outcome instruction
+        outcome_prompt = ("Do the work.\n\nWhen you have finished the work "
+                          "above, write your result as JSON to "
+                          "`.ompire/outcome.json` with exactly this schema.")
+        send_prompt(p, outcome_prompt, "r1")
+        frames = read_frames(p, 10)
+        types = [f.get("type") for f in frames]
+        check("prompt acked", any(
+            f.get("type") == "response" and f.get("command") == "prompt"
+            and f.get("success") for f in frames))
+        check("burst ends in agent_end", "agent_end" in types)
+        outcome_file = clone / OUTCOME_PATH
+        try:
+            outcome = json.loads(outcome_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            outcome = {}
+        check("outcome file valid", outcome.get("version") == 1 and
+              outcome.get("status") == "success" and
+              isinstance(outcome.get("summary"), str))
+        check("work artifact appended",
+              (clone / WORK_ARTIFACT).exists())
+
+        # 4. get_last_assistant_text
+        send(p, {"id": "s2", "type": "get_session_stats"})
+        frames = read_frames(p, 1)
+        check("get_session_stats shape", frames and
+              frames[0].get("success") and
+              isinstance(frames[0].get("data", {}).get("messageCount"), int))
+        send(p, {"id": "s3", "type": "get_last_assistant_text"})
+        frames = read_frames(p, 1)
+        check("get_last_assistant_text returns emitted text",
+              frames and frames[0].get("success") and
+              isinstance(frames[0].get("data", {}).get("text"), str))
+
+        # 5. directive scenarios (fresh process so turn state is clean)
+        p.terminate(); p.wait()
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, "[[scenario:ask]]\nplease?", "r1")
+        frames = read_frames(p, 8)
+        ui = next((f for f in frames if
+                   f.get("type") == "extension_ui_request"), None)
+        check("ask scenario raises a question", ui is not None)
+        if ui is not None:
+            send(p, {"type": "extension_ui_response", "id": ui["id"],
+                     "value": "Yes, both loops"})
+            frames = read_frames(p, 5)
+            check("ask reply completes the turn", any(
+                f.get("type") == "agent_end" for f in frames))
+
+        p.terminate(); p.wait()
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, "[[scenario:no-end]]\nwork", "r1")
+        frames = read_frames(p, 9)
+        check("no-end burst lacks agent_end",
+              not any(f.get("type") == "agent_end" for f in frames))
+        p.terminate(); p.wait()
+
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, "[[scenario:die]]\nwork", "r1")
+        p.wait(timeout=10)
+        check("die exits 23", p.returncode == 23)
+
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, "[[scenario:garbage]]\nwork", "r1")
+        frames = read_frames(p, 12)
+        check("garbage emits an unparseable line", any(
+            "__raw__" in f for f in frames))
+
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, "[[scenario:queue]]\nwork", "r1")
+        read_frames(p, 10)
+        send(p, {"id": "q1", "type": "get_state"})
+        frames = read_frames(p, 1)
+        check("queue reports queuedMessageCount 1", frames and
+              frames[0].get("data", {}).get("queuedMessageCount") == 1)
+        p.terminate(); p.wait()
+
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, "[[scenario:outcome-failed]]\n" + outcome_prompt, "r1")
+        read_frames(p, 10)
+        try:
+            outcome = json.loads((clone / OUTCOME_PATH).read_text())
+        except (OSError, json.JSONDecodeError):
+            outcome = {}
+        check("outcome-failed writes status failed",
+              outcome.get("status") == "failed")
+        p.terminate(); p.wait()
+
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, "[[scenario:judge]]\n[[scenario-param:route=fix]]\n"
+                       "judge it", "r1")
+        read_frames(p, 10)
+        try:
+            outcome = json.loads((clone / OUTCOME_PATH).read_text())
+        except (OSError, json.JSONDecodeError):
+            outcome = {}
+        check("judge writes parameterized route",
+              outcome.get("artifacts", {}).get("route") == "fix")
+        p.terminate(); p.wait()
+
+        # git commit scenario (real repo)
+        r = subprocess.run(["git", "init", "-q"], cwd=str(clone))
+        subprocess.run(["git", "config", "user.email",
+                        "fake@local-test"], cwd=str(clone), check=True)
+        subprocess.run(["git", "config", "user.name",
+                        "fake omp"], cwd=str(clone), check=True)
+        (clone / "new-file.txt").write_text("work\n")
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, "[[scenario:commit]]\n" + outcome_prompt, "r1")
+        read_frames(p, 10)
+        log = subprocess.run(["git", "log", "--oneline"], cwd=str(clone),
+                             capture_output=True, text=True)
+        check("commit scenario creates a real commit",
+              "agent work" in log.stdout)
+        p.terminate(); p.wait()
+
+        # 6. classification from verbatim daemon prompts
+        draft_prompt = """You are helping the operator ship this task.
+
+Please propose:
+1. A concise commit message for the final squash commit.
+2. A PR title.
+3. A PR body.
+
+Format your reply as:
+
+<<<COMMIT_MESSAGE>>>
+<the commit message>
+
+<<<PR_TITLE>>>
+<the PR title>
+
+<<<PR_BODY>>>
+<the PR body>
+"""
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, draft_prompt, "r1")
+        read_frames(p, 10)
+        send(p, {"id": "g1", "type": "get_last_assistant_text"})
+        frames = read_frames(p, 1)
+        text = frames[0].get("data", {}).get("text", "") if frames else ""
+        parsed = _parse_draft(text)
+        check("ship draft classified and parseable",
+              parsed is not None and all(parsed),
+              text[:60])
+        p.terminate(); p.wait()
+
+        judge_prompt = ("You are the fallback judge for the ompire workflow "
+                        "engine: classify this.")
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, judge_prompt, "r1")
+        read_frames(p, 10)
+        try:
+            outcome = json.loads((clone / OUTCOME_PATH).read_text())
+        except (OSError, json.JSONDecodeError):
+            outcome = {}
+        check("judge prompt classified", outcome.get("artifacts", {})
+              .get("route") == "__complete__")
+        p.terminate(); p.wait()
+
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, "The daemon restarted while you were working; please "
+                       "continue.", "r1")
+        frames = read_frames(p, 10)
+        check("resume nudge classified", any(
+            f.get("type") == "agent_end" for f in frames))
+        p.terminate(); p.wait()
+
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, 'Review comments:\n"> Please fix the thing"\n'
+                       '"> Also the other thing"', "r1")
+        frames = read_frames(p, 10)
+        check("review comments classified", any(
+            f.get("type") == "agent_end" for f in frames))
+        p.terminate(); p.wait()
+
+        # 7. control file arming
+        _atomic_write(state / "omp-scenarios.json", json.dumps(
+            {"startup": {}, "next_prompt": {str(clone.resolve()): "big"}}))
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, "plain work", "r1")
+        frames = read_frames(p, 11)
+        check("clone-keyed armed scenario fires", any(
+            f.get("type") == "tool_output" and
+            len(str(f.get("data", ""))) > 100_000 for f in frames))
+        p.terminate(); p.wait()
+
+        _atomic_write(state / "omp-scenarios.json", json.dumps(
+            {"startup": {}, "next_prompt": {"global": "outcome-failed"}}))
+        p = session()
+        read_frames(p, 1)
+        send_prompt(p, "plain work", "r1")
+        read_frames(p, 10)
+        try:
+            outcome = json.loads((clone / OUTCOME_PATH).read_text())
+        except (OSError, json.JSONDecodeError):
+            outcome = {}
+        check("global armed scenario fires once", outcome.get("status")
+              == "failed")
+        p.terminate(); p.wait()
+
+        control_now = json.loads(
+            (state / "omp-scenarios.json").read_text())
+        check("armed entry consumed", control_now.get("next_prompt", {})
+              .get("global") is None)
+
+        p = session({"slot": "startup", "key": "global", "value": "crash"})
+        _, err = p.communicate(timeout=10)
+        check("startup crash exits 1 pre-ready",
+              p.returncode == 1 and "No models available" in err)
+
+        p = session({"slot": "startup", "key": "global",
+                     "value": "exit-after-ready"})
+        read_frames(p, 1)
+        p.wait(timeout=10)
+        check("exit-after-ready exits 7", p.returncode == 7)
+
+        # 8. resume
+        p = session()
+        read_frames(p, 1)
+        send(p, {"id": "rs1", "type": "get_state"})
+        frames = read_frames(p, 1)
+        sid = frames[0].get("data", {}).get("sessionId", "")
+        send_prompt(p, "[[scenario:ship-draft]]\ndraft", "r1")
+        read_frames(p, 10)
+        send(p, {"id": "rs2", "type": "get_last_assistant_text"})
+        frames = read_frames(p, 1)
+        pre_text = frames[0].get("data", {}).get("text", "")
+        p.kill(); p.wait()
+
+        p = session(extra_args=["--resume", sid])
+        read_frames(p, 1)
+        send(p, {"id": "rs3", "type": "get_state"})
+        frames = read_frames(p, 1)
+        data = frames[0].get("data", {})
+        check("resume preserves session id",
+              data.get("sessionId") == sid)
+        check("resume restores message count",
+              data.get("messageCount") == 2)
+        send(p, {"id": "rs4", "type": "get_last_assistant_text"})
+        frames = read_frames(p, 1)
+        check("resume restores last assistant text",
+              frames[0].get("data", {}).get("text") == pre_text)
+        p.terminate(); p.wait()
+
+        # 9. loud rejection
+        r = run(["run", "-p", "."])
+        check("unsupported invocation rejected loudly",
+              r.returncode != 0 and "unsupported invocation" in r.stderr)
+        r = run(["--version"])
+        check("version banner carries fake marker",
+              r.returncode == 0 and "fake, local-test" in r.stdout)
+
+        # 10. persistent state root untouched
+        check("persistent state root untouched",
+              not (workdir / "persistent-marker").exists())
+    finally:
+        os.environ.pop("LOCAL_TEST_STATE", None)
+        if original_state is not None:
+            os.environ["LOCAL_TEST_STATE"] = original_state
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    if failures:
+        print(f"\n{failures}/{total} checks FAILED")
+        sys.exit(1)
+    print(f"\nall {total} checks passed")
+
+
+def _parse_draft(text: str) -> tuple[str, str, str] | None:
+    """Mirror of ship._parse_draft (three non-empty sections)."""
+    markers = ["<<<COMMIT_MESSAGE>>>", "<<<PR_TITLE>>>", "<<<PR_BODY>>>"]
+    sections: dict[str, str] = {}
+    for i, marker in enumerate(markers):
+        idx = text.find(marker)
+        if idx < 0:
+            return None
+        start = idx + len(marker)
+        next_marker = markers[i + 1] if i + 1 < len(markers) else None
+        end = text.find(next_marker, start) if next_marker else len(text)
+        if end < 0:
+            return None
+        sections[marker] = text[start:end].strip()
+    return (sections["<<<COMMIT_MESSAGE>>>"], sections["<<<PR_TITLE>>>"],
+            sections["<<<PR_BODY>>>"])
+
+
+if __name__ == "__main__":
+    main()
