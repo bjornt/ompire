@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+#
+# local-test/forge — the local git forge: GitHub-shaped URLs resolving to
+# local bare repositories (LOCAL-TESTING.PLAN.md Part 1).
+#
+# The daemon's git operations (spawn fetch/clone/branch, ship push with
+# --force-with-lease, review fetch, gpg's user.signingkey lookup) all run
+# with the daemon's inherited environment. Pointing GIT_CONFIG_GLOBAL at
+# the generated gitconfig rewrites both GitHub URL forms of every forge
+# repo to its bare-repo path — zero daemon changes.
+#
+# State root: $LOCAL_TEST_STATE if set, else <repo>/local-test/.state.
+#
+# Commands:
+#   init <owner/repo> [--base B] [--name N] [--email E]
+#                       idempotently create + seed the bare repo, install
+#                       the pre-receive hook
+#   gitconfig [--name N] [--email E] [--signingkey FPR]
+#                       regenerate $STATE/gitconfig from the forge tree
+#   reject-push <owner/repo>
+#                       arm a one-shot push rejection for that repo
+#   selfcheck           prove the whole git contract offline in a temp
+#                       root; never touches $STATE
+#
+# Everything is offline: no network, no GitHub, no containers.
+
+set -euo pipefail
+
+# --- state root -------------------------------------------------------------
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+STATE_ROOT=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
+FORGE_ROOT=$STATE_ROOT/forge/github.com
+GITCONFIG=$STATE_ROOT/gitconfig
+
+DEFAULT_NAME="Local Test"
+DEFAULT_EMAIL="local-test@ompire.invalid"
+
+log()  { printf '==> %s\n' "$*"; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
+
+# The forge's own git calls never read the user's real config: no leaking
+# or depending on the invoking shell's git settings. Checks that need the
+# generated gitconfig override it per command.
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
+forge_dir() { # forge_dir <owner/repo> -> $FORGE_ROOT/<owner>/<repo>.git
+	local slug=$1
+	[[ $slug == */* && $slug != *..* && $slug != /* && $slug != */ ]] ||
+		die "invalid repo slug '$slug' (expected owner/repo)"
+	printf '%s/%s.git' "$FORGE_ROOT" "$slug"
+}
+
+github_ssh_url() { printf 'git@github.com:%s.git' "$1"; }
+github_https_url() { printf 'https://github.com/%s.git' "$1"; }
+
+# --- hooks ------------------------------------------------------------------
+
+PRE_RECEIVE_HOOK='#!/bin/sh
+# installed by local-test/forge — rejects exactly one push when armed
+d=$(cd "$(dirname "$0")/.." && pwd)
+if [ -f "$d/.reject-next" ]; then
+    rm -f "$d/.reject-next"
+    echo "forge: rejecting push (injected failure)" >&2
+    exit 1
+fi
+exit 0
+'
+
+install_hook() { # install_hook <bare-repo> [marker-preserve]
+	local repo=$1 marker=${2:-}
+	if [ "$marker" = "preserve" ]; then
+		# rewrite the hook but keep an armed marker (refreshing an existing repo)
+		local tmp_marker=""
+		[ -f "$repo/.reject-next" ] && { tmp_marker=$(mktemp); cp "$repo/.reject-next" "$tmp_marker"; }
+		printf '%s\n' "$PRE_RECEIVE_HOOK" >"$repo/hooks/pre-receive"
+		[ -n "$tmp_marker" ] && mv "$tmp_marker" "$repo/.reject-next"
+	else
+		printf '%s\n' "$PRE_RECEIVE_HOOK" >"$repo/hooks/pre-receive"
+	fi
+	chmod +x "$repo/hooks/pre-receive"
+}
+
+# --- init -------------------------------------------------------------------
+
+cmd_init() {
+	local slug="" base=main name="" email=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--base) base=$2; shift 2 ;;
+		--name) name=$2; shift 2 ;;
+		--email) email=$2; shift 2 ;;
+		-*) die "init: unknown option $1" ;;
+		*) [ -z "$slug" ] || die "init: unexpected argument '$1'"; slug=$1; shift ;;
+		esac
+	done
+	[ -n "$slug" ] || die "init: missing <owner/repo>"
+	[ -n "$name" ] || name=$DEFAULT_NAME
+	[ -n "$email" ] || email=$DEFAULT_EMAIL
+
+	local repo
+	repo=$(forge_dir "$slug")
+	mkdir -p "$(dirname "$repo")"
+
+	if [ ! -d "$repo" ]; then
+		# -b matters: a bare HEAD pointing at a missing ref makes clones
+		# warn "remote HEAD refers to nonexistent ref" and check out an
+		# unborn HEAD, breaking spawn's `checkout -b <branch> origin/<base>`.
+		git init --quiet --bare -b "$base" "$repo"
+	fi
+
+	if ! git -C "$repo" rev-parse --verify --quiet "refs/heads/$base" >/dev/null; then
+		# Seed via a temp clone: one commit on <base>, pushed to the bare repo.
+		local seed
+		seed=$(mktemp -d)
+		git init --quiet -b "$base" "$seed"
+		printf '# %s\n\nLocal-test forge repo for ompire offline E2E.\n' "$slug" >"$seed/README.md"
+		git -C "$seed" add README.md
+		git -C "$seed" -c user.name="$name" -c user.email="$email" \
+			commit --quiet -m "chore: seed $slug base branch"
+		git -C "$seed" push --quiet "$repo" "$base:$base"
+		rm -rf "$seed"
+		log "init: seeded $slug (base $base)"
+	else
+		log "init: $slug already seeded (base $base present)"
+	fi
+
+	# Always ensure the bare HEAD matches the base branch.
+	git -C "$repo" symbolic-ref HEAD "refs/heads/$base"
+
+	install_hook "$repo" preserve
+	log "init: $slug ready at $repo"
+}
+
+# --- gitconfig ----------------------------------------------------------------
+
+cmd_gitconfig() {
+	local name="" email="" signingkey=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--name) name=$2; shift 2 ;;
+		--email) email=$2; shift 2 ;;
+		--signingkey) signingkey=$2; shift 2 ;;
+		-*) die "gitconfig: unknown option $1" ;;
+		*) die "gitconfig: unexpected argument '$1'" ;;
+		esac
+	done
+	[ -n "$name" ] || name=$DEFAULT_NAME
+	[ -n "$email" ] || email=$DEFAULT_EMAIL
+
+	mkdir -p "$STATE_ROOT"
+	local tmp
+	tmp=$(mktemp "$GITCONFIG.XXXXXX")
+	{
+		printf '# generated by local-test/forge — do not edit; regenerate with `forge gitconfig`\n'
+		# One insteadOf entry per URL form per repo, longest-prefix safe:
+		# repo-scoped suffixes (owner/repo.git) never collide with each other.
+		for repo in "$FORGE_ROOT"/*/*.git; do
+			[ -d "$repo" ] || continue
+			local slug
+			slug=$(basename "$(dirname "$repo")")/$(basename "$repo" .git)
+			printf '[url "%s"]\n\tinsteadOf = %s\n' "$repo" "$(github_ssh_url "$slug")"
+			printf '[url "%s"]\n\tinsteadOf = %s\n' "$repo" "$(github_https_url "$slug")"
+		done
+		printf '[user]\n\tname = %s\n\temail = %s\n' "$name" "$email"
+		[ -n "$signingkey" ] && printf '\tsigningkey = %s\n' "$signingkey"
+	} >"$tmp"
+	mv "$tmp" "$GITCONFIG"
+	log "gitconfig: wrote $GITCONFIG"
+}
+
+# --- reject-push ---------------------------------------------------------------
+
+cmd_reject_push() {
+	[ $# -eq 1 ] || die "reject-push: expected <owner/repo>"
+	local repo
+	repo=$(forge_dir "$1")
+	[ -d "$repo" ] || die "reject-push: no such forge repo: $1"
+	touch "$repo/.reject-next"
+	log "reject-push: next push to $1 will be rejected (one-shot)"
+}
+
+# --- selfcheck -----------------------------------------------------------------
+
+SELF_TMP=""
+
+selfcheck_cleanup() { [ -n "$SELF_TMP" ] && rm -rf "$SELF_TMP"; }
+
+SELF_CHECKS=0
+
+check() { # check <name> <command...>: run, count, or die with stderr on failure
+	local name=$1; shift
+	SELF_CHECKS=$((SELF_CHECKS + 1))
+	if "$@" >/dev/null 2>"$SELF_TMP/err"; then
+		printf '  ok    %s\n' "$name"
+	else
+		printf '  FAIL  %s\n' "$name" >&2
+		sed 's/^/        /' "$SELF_TMP/err" >&2
+		die "selfcheck failed at: $name"
+	fi
+}
+
+check_not() { # check_not <name> <command...>: pass when the command fails
+	local name=$1; shift
+	SELF_CHECKS=$((SELF_CHECKS + 1))
+	if "$@" >/dev/null 2>"$SELF_TMP/err"; then
+		printf '  FAIL  %s (unexpectedly succeeded)\n' "$name" >&2
+		die "selfcheck failed at: $name"
+	else
+		printf '  ok    %s\n' "$name"
+	fi
+}
+
+cmd_selfcheck() {
+	# Trap must live here, not at top level: outside selfcheck, SELF_TMP is
+	# empty and the cleanup's `[ -n … ] && …` would return 1 and poison the
+	# exit code of every other subcommand.
+	trap selfcheck_cleanup EXIT
+
+	# Isolated throwaway root: $STATE is never touched, and the forge
+	# machinery runs against it via LOCAL_TEST_STATE + the gitconfig
+	# override consumed by the seed/git helper above.
+	SELF_TMP=$(mktemp -d)
+	local root=$SELF_TMP/state
+	log "selfcheck: isolated root $root"
+	local slug=local-test/sandbox base=main
+	local branch=ompire/selfcheck-1
+
+	# Create + seed the forge and its gitconfig in the temp root. The
+	# forge's own git calls must see no config (GIT_CONFIG_GLOBAL=/dev/null
+	# by default here) while the checks below exercise the *generated*
+	# gitconfig explicitly.
+	LOCAL_TEST_STATE=$root "$0" init "$slug" --base "$base" \
+		--name "Self Check" --email "selfcheck@ompire.invalid" >/dev/null
+	LOCAL_TEST_STATE=$root "$0" gitconfig --name "Self Check" \
+		--email "selfcheck@ompire.invalid" >/dev/null
+	[ -f "$root/gitconfig" ] || die "selfcheck: gitconfig not generated"
+
+	local bare=$root/forge/github.com/local-test/sandbox.git
+	local ssh=https=""
+	ssh=$(github_ssh_url "$slug")
+	https=$(github_https_url "$slug")
+
+	# Every check runs with the generated gitconfig active — exactly how
+	# the daemon's git children see the world.
+	run() { GIT_CONFIG_GLOBAL="$root/gitconfig" "$@"; }
+
+	log "selfcheck: 1/6 clone via GitHub SSH URL"
+	check "git clone via ssh-form GitHub URL" \
+	run git clone --quiet "$ssh" "$SELF_TMP/checkout"
+	check "cloned default branch is the seeded base" \
+		test "$(git -C "$SELF_TMP/checkout" symbolic-ref --short HEAD)" = "$base"
+	check "origin still records the GitHub URL" \
+		test "$(git -C "$SELF_TMP/checkout" remote get-url origin)" = "$ssh"
+	check "seed commit present" \
+		git -C "$SELF_TMP/checkout" rev-parse --verify --quiet HEAD
+
+	log "selfcheck: 2/6 spawn shape (fetch, hardlink clone, branch)"
+	check "checkout fetch origin" \
+		run git -C "$SELF_TMP/checkout" fetch --quiet origin
+	check "local hardlink clone of the checkout" \
+		git clone --quiet "$SELF_TMP/checkout" "$SELF_TMP/taskclone"
+	check "branch from origin/<base> in the task clone" \
+		run git -C "$SELF_TMP/taskclone" checkout --quiet -b "$branch" "origin/$base"
+	check "commit on the task branch (identity from the gitconfig)" \
+		run git -C "$SELF_TMP/taskclone" commit --quiet --allow-empty -m "selfcheck work"
+
+	log "selfcheck: 3/6 ship shape (remote, fetch, force-with-lease push)"
+	check "remote add ship-target with the GitHub URL" \
+		run git -C "$SELF_TMP/taskclone" remote add ship-target "$ssh"
+	check "fetch ship-target" \
+		run git -C "$SELF_TMP/taskclone" fetch --quiet ship-target
+	check "push HEAD with --force-with-lease" \
+		run git -C "$SELF_TMP/taskclone" push --quiet ship-target \
+			"HEAD:refs/heads/$branch" --force-with-lease
+	check "branch landed on the bare repo" \
+		git -C "$bare" rev-parse --verify --quiet "refs/heads/$branch"
+
+	log "selfcheck: 4/6 stale lease rejection"
+	# Move the bare ref past the clone's tracking info, then push again.
+	run git -C "$bare" update-ref "refs/heads/$branch" \
+		"$(run git -C "$bare" commit-tree "$(git -C "$bare" rev-parse "refs/heads/$branch^{tree}")" -m moved-on)"
+	check_not "push with stale lease rejected" \
+		run git -C "$SELF_TMP/taskclone" push --quiet ship-target \
+			"HEAD:refs/heads/$branch" --force-with-lease
+
+	log "selfcheck: 5/6 one-shot pre-receive rejection"
+	check "re-fetch after the stale-lease rejection" \
+		run git -C "$SELF_TMP/taskclone" fetch --quiet ship-target
+	LOCAL_TEST_STATE=$root "$0" reject-push "$slug" >/dev/null
+	check_not "armed push rejected" \
+		run git -C "$SELF_TMP/taskclone" push --quiet ship-target \
+			"HEAD:refs/heads/$branch" --force-with-lease
+	check "marker consumed (one-shot)" \
+		test ! -e "$bare/.reject-next"
+	check "subsequent push succeeds" \
+		run git -C "$SELF_TMP/taskclone" push --quiet ship-target \
+			"HEAD:refs/heads/$branch" --force-with-lease
+
+	log "selfcheck: 6/6 identity + HTTPS form"
+	check "commit author comes from the gitconfig" \
+		test "$(git -C "$SELF_TMP/taskclone" log -1 --format=%an)" = "Self Check"
+	check "commit email comes from the gitconfig" \
+		test "$(git -C "$SELF_TMP/taskclone" log -1 --format=%ae)" = "selfcheck@ompire.invalid"
+	check "no signingkey configured by default" \
+		test -z "$(GIT_CONFIG_GLOBAL="$root/gitconfig" git config --get user.signingkey)"
+	check "https-form ls-remote resolves offline" \
+		run git ls-remote --quiet "$https" HEAD
+
+	printf 'selfcheck: all %d checks passed\n' "$SELF_CHECKS"
+}
+
+# --- dispatch -------------------------------------------------------------------
+
+command=${1:-help}
+case "$command" in
+init) shift; cmd_init "$@" ;;
+gitconfig) shift; cmd_gitconfig "$@" ;;
+reject-push) shift; cmd_reject_push "$@" ;;
+selfcheck) shift; cmd_selfcheck "$@" ;;
+help | --help | -h) usage ;;
+*) die "unknown command: $command (try 'help')" ;;
+esac
