@@ -1,0 +1,561 @@
+#!/usr/bin/env bash
+#
+# local-test/env — LOCAL-TESTING.PLAN.md Part 7: environment orchestration.
+#
+# One command from a plain machine to a driving-ready offline E2E daemon:
+# spawn a task, drive Review to approval, run Ship (draft → sign → push →
+# PR) — no LXD, no LLM provider, no GitHub. The daemon is real and
+# unmodified; only the external CLIs are faked or redirected (Parts 1–6).
+# Everything the daemon touches — HOME, config, data dir, gitconfig,
+# GNUPGHOME, task clones, PATH — lives under one throwaway state root.
+#
+# State root: $LOCAL_TEST_STATE if set, else <repo>/local-test/.state.
+# This tool owns, under the state root:
+#   home/                     daemon HOME (config, data, proj, tasks)
+#   bin/                      the daemon's PATH: fake workshop + omp
+#                             (symlinks), pinned real my-workshop + llmvet
+#   tools.json                provenance of the pinned real tools
+#   daemon.sh                 restart wrapper (same env as `up` used)
+# and delegates to the sibling CLIs (forge, gpg, fakes/…) which share the
+# same root via $LOCAL_TEST_STATE.
+#
+# Commands:
+#   up [--fresh] [--my-workshop P] [--llmvet P] [--my-workshop-src DIR]
+#                          idempotent bring-up; --fresh wipes the state
+#                          root first. Real-tool resolution order: explicit
+#                          path (flag or LOCAL_TEST_MY_WORKSHOP /
+#                          LOCAL_TEST_LLMVET env) → existing bin copy →
+#                          source build (--my-workshop-src or
+#                          LOCAL_TEST_MY_WORKSHOP_SRC; needs go) → PATH
+#                          copy. Re-pinning: replace the bin copy or rerun
+#                          with an explicit path (a bare re-run keeps it).
+#   down [--wipe]           stop the daemon (state kept); --wipe also kills
+#                          the state root's gpg-agent and removes the root
+#   status                  daemon health + fakes' state summary
+#   selfcheck               full throwaway bring-up (temp root, free port),
+#                          smoke assertions, teardown; persistent root
+#                          untouched
+#
+# LOCAL_TEST_STATE pointed inside the state root; config.toml points
+# gh_command at the fake gh and gpg_signing_key at the ephemeral key.
+# Port: 4173 (daemon default) or $LOCAL_TEST_PORT — a second concurrent
+# environment is a second LOCAL_TEST_STATE + LOCAL_TEST_PORT.
+
+set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+STATE_ROOT=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
+FORGE=$REPO_ROOT/local-test/forge
+GPG=$REPO_ROOT/local-test/gpg
+FAKES=$REPO_ROOT/local-test/fakes
+
+# Pinned real-tool cache, outside the state root so 'up --fresh' / 'down
+# --wipe' (which wipe the root) never lose the resolved binaries.
+TOOLS_CACHE=$REPO_ROOT/local-test/.tools
+# Share the resolved root with every sibling CLI this script invokes (they
+# all honor LOCAL_TEST_STATE; the PATH-shimmed fakes need it too, since
+# their $0-relative default breaks through the bin symlinks).
+export LOCAL_TEST_STATE=$STATE_ROOT
+
+HOME_DIR=$STATE_ROOT/home
+BIN=$STATE_ROOT/bin
+CONFIG_DIR=$HOME_DIR/.config/ompire
+CONFIG=$CONFIG_DIR/config.toml
+DATA=$HOME_DIR/.local/share/ompire
+PIDFILE=$DATA/daemon.pid
+DAEMON_LOG=$DATA/daemon.log
+DAEMON_PORT=${LOCAL_TEST_PORT:-4173}
+DAEMON_URL=http://127.0.0.1:$DAEMON_PORT
+
+SLUG=local-test/sandbox
+NAME=sandbox
+BASE_BRANCH=main
+SSH_URL=git@github.com:$SLUG.git
+CHECKOUT=$HOME_DIR/proj/$NAME
+
+DAEMON_WRAPPER=$STATE_ROOT/daemon.sh
+GITCONFIG=$STATE_ROOT/gitconfig
+
+log()  { printf '==> %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
+
+command -v git  >/dev/null 2>&1 || die "git is required but not on PATH"
+command -v jq   >/dev/null 2>&1 || die "jq is required but not on PATH"
+command -v curl >/dev/null 2>&1 || die "curl is required but not on PATH"
+command -v uv   >/dev/null 2>&1 || die "uv is required but not on PATH"
+
+for f in "$FORGE" "$GPG" "$FAKES/gh" "$FAKES/workshop" "$FAKES/omp"; do
+	[ -x "$f" ] || die "missing local-testing piece: $f"
+done
+
+# --- shared helpers ---------------------------------------------------------
+
+api_daemon() { # api_daemon METHOD PATH [JSON] — needs $DAEMON_TOKEN
+	local method=$1 path=$2 data=${3:-}
+	local -a args=(-fsS -X "$method" -H "Authorization: Bearer $DAEMON_TOKEN"
+		-H "Content-Type: application/json")
+	[ -n "$data" ] && args+=(-d "$data")
+	curl "${args[@]}" "$DAEMON_URL$path"
+}
+
+wipe_state() { # stop the root's gpg-agent, then remove the root
+	case "$STATE_ROOT" in
+	"" | "/" | "$REPO_ROOT") die "refusing to wipe state root '$STATE_ROOT'" ;;
+	esac
+	if [ -d "$STATE_ROOT/gnupg" ]; then
+		GNUPGHOME=$STATE_ROOT/gnupg gpgconf --kill gpg-agent >/dev/null 2>&1 || true
+	fi
+	rm -rf "$STATE_ROOT"
+}
+
+stop_daemon() { # by pidfile; dead/missing pid is success
+	if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+		local pid
+		pid=$(cat "$PIDFILE")
+		log "daemon: stopping (pid $pid)"
+		kill "$pid" 2>/dev/null || true
+		for _ in $(seq 1 60); do
+			kill -0 "$pid" 2>/dev/null || break
+			sleep 0.5
+		done
+		if kill -0 "$pid" 2>/dev/null; then
+			warn "daemon did not exit after SIGTERM+30s — SIGKILL"
+			kill -9 "$pid" 2>/dev/null || true
+		fi
+	else
+		log "daemon: not running"
+	fi
+}
+
+# --- up ----------------------------------------------------------------------
+
+record_tool() { # record_tool <tool> <source> <version-or-"-"> — updates tools.json
+	local tool=$1 source=$2 version=$3 sha
+	sha=$(sha256sum "$BIN/$tool" | awk '{print $1}')
+	mkdir -p "$STATE_ROOT"
+	local base="{}"
+	[ -f "$STATE_ROOT/tools.json" ] && base=$(cat "$STATE_ROOT/tools.json")
+	jq -n --arg base "$base" --arg t "$tool" --arg s "$source" --arg v "$version" --arg sh "$sha" \
+		'($base | fromjson) + {$t: {source: $s, version: $v, sha256: $sh}}' \
+		>"$STATE_ROOT/tools.json.tmp" && mv "$STATE_ROOT/tools.json.tmp" "$STATE_ROOT/tools.json"
+}
+
+resolve_real_tool() { # resolve_real_tool <tool> <explicit> <src-dir> ; copies into bin/
+	local tool=$1 explicit=$2 srcdir=$3 src=""
+	if [ -n "$explicit" ]; then
+		[ -f "$explicit" ] && [ -x "$explicit" ] ||
+			die "explicit $tool path '$explicit' is not an executable file"
+		src="operator path: $explicit"
+	elif [ -f "$BIN/$tool" ] && [ -x "$BIN/$tool" ]; then
+		log "tools: keeping existing $tool ($(sha256sum "$BIN/$tool" | cut -c1-12)…)"
+		local prior version
+		prior=$(jq -r --arg t "$tool" '.[$t].source // empty' "$STATE_ROOT/tools.json" 2>/dev/null) ||
+			prior=""
+		[ -n "$prior" ] || prior="existing bin copy"
+		# re-probe the banner rather than trusting the manifest, so a
+		# hand-replaced bin copy re-pins its true version
+		if [ "$tool" = my-workshop ]; then
+			version=$({ "$BIN/$tool" -h 2>&1 || true; } | sed -n 's/^usage: //p' | head -1)
+		else
+			version=$({ "$BIN/$tool" -version 2>&1 || true; } | head -1)
+		fi
+		[ -n "$version" ] || version=-
+		record_tool "$tool" "$prior" "$version"
+		return
+	elif [ -n "$srcdir" ]; then
+		command -v go >/dev/null 2>&1 || die "$tool source given but go is not on PATH"
+		[ -d "$srcdir" ] || die "$tool source dir '$srcdir' does not exist"
+		log "tools: building $tool from source ($srcdir)"
+		( cd "$srcdir" && go build -o "$BIN/$tool" ./cmd/"$tool" ) ||
+			die "go build failed for $tool"
+		src="source build: $srcdir ($( cd "$srcdir" && git rev-parse --short HEAD 2>/dev/null || echo no-git ))"
+	else
+		local found
+		found=$(command -v "$tool" 2>/dev/null || true)
+		if [ -z "$found" ] && [ -x "$TOOLS_CACHE/$tool" ]; then
+			found=$TOOLS_CACHE/$tool
+			src="tools cache: $found"
+		elif [ -n "$found" ]; then
+			src="PATH copy: $found"
+		else
+			die "cannot resolve real '$tool': pass --$tool <binary>, set LOCAL_TEST_MY_WORKSHOP/LOCAL_TEST_LLMVET, point --my-workshop-src at a source checkout, or put $tool on PATH"
+		fi
+		[ -f "$found" ] && [ -x "$found" ] || die "resolved $tool '$found' is not an executable file"
+		explicit=$found
+	fi
+	# go build already placed a source-built binary; every other path copies
+	if [ "$src" != "source build: "* ]; then
+		install -m 755 "$explicit" "$BIN/$tool" ||
+			die "cannot copy $tool from '$explicit'"
+	fi
+	# refresh the cache so a later --fresh re-pins without re-resolving
+	install -m 755 "$BIN/$tool" "$TOOLS_CACHE/$tool" ||
+		die "cannot cache $tool into $TOOLS_CACHE"
+	# version banner for the manifest (my-workshop has no --version flag;
+	# its usage line is the safe no-side-effect probe — running it bare
+	# would attempt a launch)
+	local version
+	if [ "$tool" = my-workshop ]; then
+		version=$({ "$BIN/$tool" -h 2>&1 || true; } | sed -n 's/^usage: //p' | head -1)
+	else
+		version=$({ "$BIN/$tool" -version 2>&1 || true; } | head -1)
+	fi
+	[ -n "$version" ] || version=-
+	record_tool "$tool" "$src" "$version"
+	log "tools: $tool pinned ($version)"
+}
+
+cmd_up() {
+	local fresh=0 mw="" lv="" mw_src=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--fresh) fresh=1; shift ;;
+		--my-workshop) mw=$2; shift 2 ;;
+		--llmvet) lv=$2; shift 2 ;;
+		--my-workshop-src) mw_src=$2; shift 2 ;;
+		help | --help | -h) usage; exit 0 ;;
+		*) die "unknown argument: $1 (try 'help')" ;;
+		esac	done
+	[ -n "${LOCAL_TEST_MY_WORKSHOP:-}" ] && mw=${mw:-$LOCAL_TEST_MY_WORKSHOP}
+	[ -n "${LOCAL_TEST_LLMVET:-}" ] && lv=${lv:-$LOCAL_TEST_LLMVET}
+	[ -n "${LOCAL_TEST_MY_WORKSHOP_SRC:-}" ] && mw_src=${mw_src:-$LOCAL_TEST_MY_WORKSHOP_SRC}
+
+	# ---- 1. state layout ----------------------------------------------------
+	if [ "$fresh" -eq 1 ] && [ -d "$STATE_ROOT" ]; then
+		log "up: --fresh — wiping $STATE_ROOT"
+		stop_daemon
+		wipe_state
+	fi
+	mkdir -p "$STATE_ROOT" "$BIN" "$HOME_DIR"
+
+	# ---- 2. forge -----------------------------------------------------------
+	log "forge: seeding $SLUG (base $BASE_BRANCH)"
+	"$FORGE" init "$SLUG" --base "$BASE_BRANCH"
+
+	# ---- 3. gpg key, warmed so the ship gate starts open --------------------
+	log "gpg: provisioning + warming the ephemeral signing key"
+	"$GPG" init
+	"$GPG" warm
+	local fpr
+	fpr=$("$GPG" fingerprint)
+
+	# ---- 4. bin: fakes symlinked, real tools pinned --------------------------
+	log "bin: installing fakes + real tools into $BIN"
+	mkdir -p "$TOOLS_CACHE"
+	ln -sfn "$FAKES/workshop" "$BIN/workshop"
+	ln -sfn "$FAKES/omp" "$BIN/omp"
+	resolve_real_tool my-workshop "$mw" "$mw_src"
+	resolve_real_tool llmvet "$lv" ""
+
+	# ---- 5. gitconfig + daemon config ---------------------------------------
+	log "config: regenerating $GITCONFIG (identity + signing key)"
+	"$FORGE" gitconfig --signingkey "$fpr"
+	mkdir -p "$CONFIG_DIR" "$DATA"
+	cat >"$CONFIG" <<EOF
+# Generated by local-test/env up — the offline E2E daemon config.
+gh_command = ["$FAKES/gh"]
+gpg_signing_key = "$fpr"
+port = $DAEMON_PORT
+EOF
+	log "config: $CONFIG (fake gh, gpg $fpr, port $DAEMON_PORT)"
+
+	# ---- 6. checkout from the forge -----------------------------------------
+	if [ -d "$CHECKOUT/.git" ]; then
+		local existing
+		existing=$(git -C "$CHECKOUT" remote get-url origin 2>/dev/null || true)
+		[ "$existing" = "$SSH_URL" ] ||
+			die "checkout $CHECKOUT exists but origin is '$existing' (expected $SSH_URL)"
+		log "checkout: $CHECKOUT already present"
+	else
+		mkdir -p "$(dirname "$CHECKOUT")"
+		log "checkout: cloning $SSH_URL -> $CHECKOUT"
+		GIT_CONFIG_GLOBAL=$GITCONFIG git clone -q "$SSH_URL" "$CHECKOUT"
+	fi
+
+	# ---- 7. frontend + daemon deps, then launch ------------------------------
+	if [ "${LOCAL_TEST_SKIP_FRONTEND:-0}" != "1" ] &&
+		[ ! -f "$REPO_ROOT/frontend/dist/index.html" ]; then
+		log "build: frontend production bundle (daemon serves frontend/dist)"
+		pnpm -C "$REPO_ROOT/frontend" install --frozen-lockfile
+		pnpm -C "$REPO_ROOT/frontend" build
+	fi
+	log "deps: uv sync (daemon)"
+	uv sync --project "$REPO_ROOT/daemon" --quiet
+
+	cat >"$DAEMON_WRAPPER" <<EOF
+#!/usr/bin/env bash
+# Generated by local-test/env up — restarts the offline E2E daemon with
+# the exact environment 'env up' used. NB: deliberately does NOT warm
+# gpg-agent, so a locked gate (local-test/gpg lock) survives restarts.
+set -euo pipefail
+export HOME="$HOME_DIR"
+export GIT_CONFIG_GLOBAL="$GITCONFIG"
+export GNUPGHOME="$STATE_ROOT/gnupg"
+export LOCAL_TEST_STATE="$STATE_ROOT"
+export PATH="$BIN:\$PATH"
+# record our pid (the exec below keeps it) so status/down track a
+# wrapper-restarted daemon too
+mkdir -p "$DATA"
+echo \$\$ >"$PIDFILE"
+exec uv run --project "$REPO_ROOT/daemon" ompire-daemon
+EOF
+	chmod +x "$DAEMON_WRAPPER"
+
+	stop_daemon
+	log "daemon: starting (log: $DAEMON_LOG)"
+	nohup "$DAEMON_WRAPPER" >>"$DAEMON_LOG" 2>&1 &
+	echo $! >"$PIDFILE"
+
+	log "daemon: waiting for readiness on $DAEMON_URL"
+	local ready=0
+	for _ in $(seq 1 120); do
+		if [ -f "$DATA/token" ] &&
+			curl -fsS -H "Authorization: Bearer $(cat "$DATA/token")" \
+				"$DAEMON_URL/api/projects" >/dev/null 2>&1; then
+			ready=1
+			break
+		fi
+		kill -0 "$(cat "$PIDFILE")" 2>/dev/null || {
+			tail -20 "$DAEMON_LOG" >&2
+			die "daemon died during startup — see $DAEMON_LOG"
+		}
+		sleep 0.5
+	done
+	[ "$ready" -eq 1 ] || die "daemon did not become ready — see $DAEMON_LOG"
+	DAEMON_TOKEN=$(cat "$DATA/token")
+
+	# ---- 8. register project + template --------------------------------------
+	local payload
+	payload=$(jq -n --arg n "$NAME" --arg t "$SLUG" --arg u "$SSH_URL" --arg c "$CHECKOUT" \
+		'{name: $n, title: $t, upstream_url: $u, checkout_path: $c}')
+	if ! api_daemon POST /api/projects "$payload" >/dev/null 2>&1; then
+		local existing got
+		existing=$(api_daemon GET "/api/projects/$NAME" 2>/dev/null || true)
+		got=$(jq -r '.upstream_url // empty' <<<"$existing" 2>/dev/null)
+		[ "$got" = "$SSH_URL" ] ||
+			die "project '$NAME' already registered with a different upstream ($got)"
+		log "project: '$NAME' already registered"
+	else
+		log "project: registered '$NAME' ($SSH_URL)"
+	fi
+	payload=$(jq -n --arg n "$NAME" --arg b "$BASE_BRANCH" \
+		'{name: $n, project_name: $n, base_branch: $b}')
+	if ! api_daemon POST /api/templates "$payload" >/dev/null 2>&1; then
+		local existing_tpl got_tpl
+		existing_tpl=$(api_daemon GET "/api/templates/$NAME" 2>/dev/null || true)
+		got_tpl=$(jq -r '.project_name // empty' <<<"$existing_tpl" 2>/dev/null)
+		[ "$got_tpl" = "$NAME" ] ||
+			die "template '$NAME' already exists for a different project ($got_tpl)"
+		log "template: '$NAME' already registered"
+	else
+		log "template: registered '$NAME' (base $BASE_BRANCH)"
+	fi
+
+	# ---- 9. smoke -------------------------------------------------------------
+	local rc=0
+	smoke_ok()   { printf '  ok    %s\n' "$1"; }
+	smoke_fail() { printf '  FAIL  %s\n' "$1" >&2; rc=1; }
+
+	if api_daemon GET /api/projects |
+		jq -e --arg n "$NAME" '.[] | select(.name == $n)' >/dev/null 2>&1; then
+		smoke_ok "daemon serves project '$NAME'"
+	else
+		smoke_fail "project '$NAME' not visible via daemon API"
+	fi
+
+	local gpg_state
+	gpg_state=$(api_daemon GET /api/gpg 2>/dev/null | jq -r '.state // empty' 2>/dev/null || true)
+	case "$gpg_state" in
+	cached) smoke_ok "daemon GPG probe: cached (ship gate allows Sign & commit)" ;;
+	*) smoke_fail "daemon GPG probe: ${gpg_state:-no response} — expected cached" ;;
+	esac
+
+	if [ "${LOCAL_TEST_SKIP_FRONTEND:-0}" = "1" ] &&
+		[ ! -f "$REPO_ROOT/frontend/dist/index.html" ]; then
+		warn "UI check skipped: no frontend build (LOCAL_TEST_SKIP_FRONTEND=1)"
+	else
+		local page=""
+		page=$(curl -fsS "$DAEMON_URL/" -H "Authorization: Bearer $DAEMON_TOKEN" 2>/dev/null || true)
+		if [ -z "$page" ]; then
+			smoke_fail "daemon serves no page at / — daemon or frontend broken?"
+		elif grep -q 'No frontend build found' <<<"$page"; then
+			smoke_fail "daemon serves the placeholder page — frontend/dist missing?"
+		else
+			smoke_ok "UI served at $DAEMON_URL"
+		fi
+	fi
+
+	# every external tool, resolved the way the daemon resolves it
+	if PATH="$BIN:$PATH" "$BIN/workshop" --version >/dev/null 2>&1; then
+		smoke_ok "workshop (fake) resolves in the daemon's PATH"
+	else
+		smoke_fail "workshop (fake) not runnable from $BIN"
+	fi
+	if PATH="$BIN:$PATH" "$BIN/omp" --version >/dev/null 2>&1; then
+		smoke_ok "omp (fake) resolves in the daemon's PATH"
+	else
+		smoke_fail "omp (fake) not runnable from $BIN"
+	fi
+	if "$FAKES/gh" --version >/dev/null 2>&1; then
+		smoke_ok "gh (fake) reachable via gh_command"
+	else
+		smoke_fail "gh (fake) not runnable via gh_command ($FAKES/gh)"
+	fi
+	local mw_banner
+	mw_banner=$("$BIN/my-workshop" -h 2>&1 || true)
+	if grep -qi 'usage: my-workshop' <<<"$mw_banner"; then
+		smoke_ok "my-workshop (real) pinned in $BIN"
+	else
+		smoke_fail "my-workshop in $BIN does not answer its usage banner"
+	fi
+	if "$BIN/llmvet" -version >/dev/null 2>&1; then
+		smoke_ok "llmvet (real) pinned in $BIN"
+	else
+		smoke_fail "llmvet in $BIN does not answer -version"
+	fi
+
+	cat <<-EOF
+
+	==> local-test environment ready
+	    daemon:   $DAEMON_URL  (pid $(cat "$PIDFILE"), log $DAEMON_LOG)
+	    open UI:  $DAEMON_URL/?token=$DAEMON_TOKEN
+	              (the ?token= stashes itself in the browser's localStorage)
+	    project:  $NAME -> $SLUG (checkout $CHECKOUT, base $BASE_BRANCH)
+	    restart:  $DAEMON_WRAPPER
+	    state:    $STATE_ROOT
+	    steer:    local-test/gpg lock|warm — ship-gate state
+	$([ $rc -eq 0 ] || printf '\n    NOTE: one or more smoke checks failed — see above.\n')
+	EOF
+	[ "$rc" -eq 0 ] || exit 1
+}
+
+# --- down ---------------------------------------------------------------------
+
+cmd_down() {
+	local wipe=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--wipe) wipe=1; shift ;;
+		help | --help | -h) usage; exit 0 ;;
+		*) die "unknown argument: $1 (try 'help')" ;;
+		esac
+	done
+	stop_daemon
+	if [ "$wipe" -eq 1 ]; then
+		log "down: --wipe — removing $STATE_ROOT"
+		wipe_state
+	else
+		log "down: state kept at $STATE_ROOT (rerun 'env up' to restart)"
+	fi
+}
+
+# --- status ---------------------------------------------------------------------
+
+count_json_keys() { # count_json_keys <file> — launched entries, 0 if absent
+	[ -f "$1" ] && jq '[.workshops // {} | keys[]] | length' "$1" 2>/dev/null || echo 0
+}
+
+cmd_status() {
+	local pid=""
+	[ -f "$PIDFILE" ] && pid=$(cat "$PIDFILE")
+	if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+		if [ -f "$DATA/token" ] &&
+			curl -fsS -m 3 -H "Authorization: Bearer $(cat "$DATA/token")" \
+				"$DAEMON_URL/api/projects" >/dev/null 2>&1; then
+			printf 'daemon:   running at %s (pid %s)\n' "$DAEMON_URL" "$pid"
+		else
+			printf 'daemon:   UNRESPONSIVE (pid %s alive, API not answering — check %s)\n' \
+				"$pid" "$DAEMON_LOG"
+		fi
+	else
+		printf 'daemon:   stopped\n'
+	fi
+	printf 'state:    %s\n' "$STATE_ROOT"
+	printf 'workshops: %s launched\n' "$(count_json_keys "$STATE_ROOT/workshops.json")"
+	if [ -f "$STATE_ROOT/gh/prs.json" ]; then
+		printf 'gh:       %s PR(s): %s\n' \
+			"$(jq '[.. | objects | select(has("state"))] | length' "$STATE_ROOT/gh/prs.json" 2>/dev/null || echo '?')" \
+			"$(jq -r '[.. | objects | select(has("state")) | .state] | join(",")' "$STATE_ROOT/gh/prs.json" 2>/dev/null || echo '?')"
+	else
+		printf 'gh:       0 PR(s)\n'
+	fi
+	if [ -d "$STATE_ROOT/omp-sessions" ]; then
+		printf 'omp:      %s session(s)\n' "$(find "$STATE_ROOT/omp-sessions" -name '*.jsonl' | wc -l)"
+	else
+		printf 'omp:      0 session(s)\n'
+	fi
+	if [ -f "$STATE_ROOT/gnupg/key.json" ]; then
+		printf 'gpg:      %s\n' "$("$GPG" status)"
+	else
+		printf 'gpg:      no key provisioned\n'
+	fi
+	if [ -f "$STATE_ROOT/tools.json" ]; then
+		jq -r 'to_entries[] | "tools:     \(.key) \(.value.version) (\(.value.sha256[0:12])…, \(.value.source))"' \
+			"$STATE_ROOT/tools.json"
+	fi
+}
+
+# --- selfcheck --------------------------------------------------------------------
+
+cmd_selfcheck() {
+	local tmp port
+	tmp=$(mktemp -d /tmp/ompire-env-selfcheck-XXXXXX)
+	port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+	cleanup() {
+		LOCAL_TEST_STATE=$tmp LOCAL_TEST_PORT=$port "$0" down --wipe >/dev/null 2>&1 || rm -rf "$tmp"
+	}
+	trap cleanup EXIT
+
+	# the persistent root must be untouched: snapshot its listing first
+	# (skipped while its daemon runs — its own writes would false-positive)
+	local persist_hash="" persist_skip=0
+	if [ -d "$STATE_ROOT" ]; then
+		if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+			persist_skip=1
+		else
+			persist_hash=$(find "$STATE_ROOT" -printf '%P\n' 2>/dev/null | sort | sha256sum | awk '{print $1}')
+		fi
+	fi
+
+	# hermetic tool resolution: reuse the persistent root's pinned copies
+	local -a up_args=()
+	[ -x "$BIN/my-workshop" ] && up_args+=(--my-workshop "$BIN/my-workshop")
+	[ -x "$BIN/llmvet" ] && up_args+=(--llmvet "$BIN/llmvet")
+	[ ! -f "$REPO_ROOT/frontend/dist/index.html" ] && export LOCAL_TEST_SKIP_FRONTEND=1
+
+	log "selfcheck: throwaway bring-up (state $tmp, port $port)"
+	if ! LOCAL_TEST_STATE=$tmp LOCAL_TEST_PORT=$port "$0" up "${up_args[@]}"; then
+		die "selfcheck failed — bring-up did not pass its smoke checks"
+	fi
+
+	log "selfcheck: teardown"
+	trap - EXIT # the explicit teardown below owns cleanup from here
+	if ! LOCAL_TEST_STATE=$tmp LOCAL_TEST_PORT=$port "$0" down; then
+		rm -rf "$tmp"
+		die "selfcheck failed — down did not stop the throwaway daemon"
+	fi
+	rm -rf "$tmp"
+
+	if [ "$persist_skip" -eq 1 ]; then
+		warn "persistent-root check skipped: its daemon is running"
+	elif [ -n "$persist_hash" ]; then
+		local after
+		after=$(find "$STATE_ROOT" -printf '%P\n' 2>/dev/null | sort | sha256sum | awk '{print $1}')
+		[ "$after" = "$persist_hash" ] || die "selfcheck failed — persistent state root was modified"
+	fi
+	printf 'selfcheck passed\n'
+}
+
+# --- dispatch -----------------------------------------------------------------------
+
+command=${1:-help}
+case "$command" in
+up) shift; cmd_up "$@" ;;
+down) shift; cmd_down "$@" ;;
+status) shift; cmd_status "$@" ;;
+selfcheck) shift; cmd_selfcheck "$@" ;;
+help | --help | -h) usage ;;
+*) die "unknown command: $command (try 'help')" ;;
+esac
