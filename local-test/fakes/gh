@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+#
+# local-test/fakes/gh — a stateful fake of the GitHub CLI covering exactly
+# the two invocations the ompire daemon performs (LOCAL-TESTING.PLAN.md
+# Part 2):
+#
+#   gh pr create --repo <slug> --base <b> --head <h> --title <t> --body-file <f>
+#   gh pr view <pr-url> --json state,mergedAt
+#
+# PRs live in <state>/gh/prs.json — a miniature local "GitHub". Lifecycle
+# transitions (MERGED/CLOSED, mergedAt) are driven by editing that file;
+# one-shot failure injection by the inject.fail_next section (ghctl wraps
+# both in Part 8). Any other invocation fails loudly, so a new daemon
+# callsite can never silently no-op.
+#
+# Error strings mimic real gh 2.97.0, captured against the QA sandbox repo
+# (reference table: openspec/changes/fake-gh/design.md). No network, no
+# GitHub, no credentials.
+#
+# State root: $LOCAL_TEST_STATE if set, else <repo>/local-test/.state.
+#
+# Commands:
+#   pr create ...       the daemon's create invocation (ship.py:_create_pr)
+#   pr view ...         the daemon's view invocation (prwatch.py:_poll_task)
+#   selfcheck           prove the whole contract offline in a temp root;
+#                       never touches $STATE
+#   --version           plausible banner (marked fake)
+
+set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+STATE_ROOT=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
+PRS_JSON=$STATE_ROOT/gh/prs.json
+
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
+unsupported() { printf 'gh (fake): unsupported invocation: %s\n' "$*" >&2; exit 1; }
+
+command -v jq >/dev/null 2>&1 || die "jq is required but not on PATH"
+
+# --- state helpers -------------------------------------------------------------
+
+state_init() {
+	if [ ! -f "$PRS_JSON" ]; then
+		mkdir -p "$(dirname "$PRS_JSON")"
+		printf '{"repos":{},"inject":{"fail_next":{"create":null,"view":null}}}\n' \
+			>"$PRS_JSON"
+	fi
+}
+
+# Every mutation is jq -> tmp -> atomic rename: readers never see a
+# half-written file. An unparseable state file makes jq itself fail loudly
+# with its own parse error on stderr (the daemon already handles that as a
+# create error / deferred poll tick).
+state_write() { # state_write <tmp-path>
+	mv "$1" "$PRS_JSON"
+}
+
+consume_fail_next() { # consume_fail_next <create|view>: print armed line, or fail
+	local key=$1 armed tmp
+	armed=$(jq -r --arg k "$key" '.inject.fail_next[$k] // empty' "$PRS_JSON")
+	[ -n "$armed" ] || return 1
+	tmp=$(mktemp "$PRS_JSON.XXXXXX")
+	jq --arg k "$key" '.inject.fail_next[$k] = null' "$PRS_JSON" >"$tmp"
+	state_write "$tmp"
+	printf '%s\n' "$armed"
+}
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# --- pr create -------------------------------------------------------------------
+
+cmd_pr_create() {
+	state_init
+	if armed=$(consume_fail_next create); then
+		printf '%s' "$armed" >&2
+		exit 1
+	fi
+
+	local slug="" base="" head="" title="" body_file=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--repo | -R) slug=$2; shift 2 ;;
+		--base) base=$2; shift 2 ;;
+		--head) head=$2; shift 2 ;;
+		--title) title=$2; shift 2 ;;
+		--body-file) body_file=$2; shift 2 ;;
+		-*) unsupported "pr create (unknown option $1)" ;;
+		*) unsupported "pr create (unexpected argument '$1')" ;;
+		esac
+	done
+	# Real gh prompts interactively when title/body are missing; the daemon
+	# always passes them, so the fake fails loudly instead.
+	[ -n "$slug" ] || die "pr create: missing --repo"
+	[ -n "$base" ] || die "pr create: missing --base"
+	[ -n "$head" ] || die "pr create: missing --head"
+	[ -n "$title" ] || die "pr create: missing --title"
+	[ -n "$body_file" ] || die "pr create: missing --body-file"
+	[ -f "$body_file" ] || die "pr create: --body-file not found: $body_file"
+
+	# Duplicate: a head branch with an open PR fails exactly like real gh —
+	# message + existing PR URL on stderr, stdout empty. ship.py scavenges
+	# the URL from combined stdout+stderr, so this path recovers the PR.
+	local dup
+	dup=$(jq -r --arg repo "$slug" --arg head "$head" \
+		'[.repos[$repo].prs[]? | select(.head == $head and .state == "OPEN")][0].number // empty' \
+		"$PRS_JSON")
+	if [ -n "$dup" ]; then
+		printf 'a pull request for branch "%s" into branch "%s" already exists:\n' \
+			"$head" "$base" >&2
+		printf 'https://github.com/%s/pull/%s\n' "$slug" "$dup" >&2
+		exit 1
+	fi
+
+	local n now tmp
+	n=$(jq -r --arg repo "$slug" '.repos[$repo].next_number // 1' "$PRS_JSON")
+	now=$(now_utc)
+	tmp=$(mktemp "$PRS_JSON.XXXXXX")
+	# Explicit merge (not path assignment): jaq does not auto-create deep
+	# paths, and this shape works identically under real jq.
+	jq --arg repo "$slug" --argjson n "$n" --arg head "$head" --arg base "$base" \
+		--arg title "$title" --rawfile body "$body_file" --arg now "$now" '
+		.repos[$repo] = ((.repos[$repo] // {}) + {
+			next_number: ($n + 1),
+			prs: ((.repos[$repo].prs // []) + [{
+				number: $n, head: $head, base: $base, title: $title,
+				body: $body, state: "OPEN", mergedAt: null, createdAt: $now
+			}])
+		})' "$PRS_JSON" >"$tmp"
+	state_write "$tmp"
+
+	printf 'https://github.com/%s/pull/%s\n' "$slug" "$n"
+}
+
+# --- pr view ---------------------------------------------------------------------
+
+cmd_pr_view() {
+	state_init
+	if armed=$(consume_fail_next view); then
+		printf '%s' "$armed" >&2
+		exit 1
+	fi
+
+	local pr="" slug="" fields=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--repo | -R) slug=$2; shift 2 ;;
+		--json) fields=$2; shift 2 ;;
+		-*) unsupported "pr view (unknown option $1)" ;;
+		*) [ -z "$pr" ] || unsupported "pr view (multiple PR arguments)"; pr=$1; shift ;;
+		esac
+	done
+	# A different field list means the daemon changed what it asks for —
+	# the fake must not silently answer a question it was never designed for.
+	[ "$fields" = "state,mergedAt" ] ||
+		unsupported "pr view (--json must be exactly 'state,mergedAt', got '${fields:-none}')"
+
+	local n
+	if [[ $pr =~ ^https://github\.com/([^/]+)/([^/]+)/pull/([0-9]+)$ ]]; then
+		slug="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+		n=${BASH_REMATCH[3]}
+	elif [[ $pr == \#* && -n "$slug" ]]; then
+		n=${pr#\#}
+	else
+		unsupported "pr view (cannot parse PR argument '$pr')"
+	fi
+	[ -n "$slug" ] || die "pr view: no repository (pass a full URL or -R <slug>)"
+
+	local repo_exists
+	repo_exists=$(jq --arg repo "$slug" '(.repos // {}) | has($repo)' "$PRS_JSON")
+	if [ "$repo_exists" != "true" ]; then
+		printf "GraphQL: Could not resolve to a Repository with the name '%s'. (repository)\n" \
+			"$slug" >&2
+		exit 1
+	fi
+
+	local pr_json
+	pr_json=$(jq -c --arg repo "$slug" --argjson n "$n" \
+		'[.repos[$repo].prs[]? | select(.number == $n)][0] // empty' "$PRS_JSON")
+	if [ -z "$pr_json" ]; then
+		printf 'GraphQL: Could not resolve to a PullRequest with the number of %d. (repository.pullRequest)\n' \
+			"$n" >&2
+		exit 1
+	fi
+
+	# Sorted keys: byte-identical to real gh's output shape
+	# {"mergedAt":…,"state":…}, parsed identically by prwatch._parse_pr_view.
+	printf '%s\n' "$pr_json" | jq -cS '{mergedAt: .mergedAt, state: .state}'
+}
+
+# --- selfcheck ---------------------------------------------------------------------
+
+SELF_TMP=""
+
+selfcheck_cleanup() { [ -n "$SELF_TMP" ] && rm -rf "$SELF_TMP"; }
+
+SELF_CHECKS=0
+
+ok() { SELF_CHECKS=$((SELF_CHECKS + 1)); printf '  ok    %s\n' "$1"; }
+fail() { # fail <name> [detail]
+	printf '  FAIL  %s\n' "$1" >&2
+	[ $# -gt 1 ] && printf '%s\n' "$2" | sed 's/^/        /' >&2
+	printf 'selfcheck failed at: %s\n' "$1" >&2
+	exit 1
+}
+
+cmd_selfcheck() {
+	# Trap lives here, not at top level (same reasoning as local-test/forge).
+	trap selfcheck_cleanup EXIT
+
+	# Isolated throwaway root: $STATE_ROOT is never touched.
+	SELF_TMP=$(mktemp -d)
+	local root=$SELF_TMP/state
+	local slug=local-test/sandbox
+	local err=$SELF_TMP/err
+	log() { printf '==> selfcheck: %s\n' "$1"; }
+
+	# Every contract check runs the fake exactly as the daemon does: same
+	# argv shapes, environment inherited, state root via LOCAL_TEST_STATE.
+	gh_run() { LOCAL_TEST_STATE=$root "$0" "$@"; }
+
+	# ---- 1/8 create: the daemon's exact argv, body captured, URL on stdout
+	log "1/8 pr create (daemon argv, body capture, URL on stdout)"
+	local bodyf=$SELF_TMP/body.md
+	printf 'probe body line 1\nline 2\n' >"$bodyf"
+	local out
+	out=$(gh_run pr create --repo "$slug" --base main --head ompire/one \
+		--title "One" --body-file "$bodyf" 2>"$err") ||
+		fail "create #1 exits 0" "$(cat "$err")"
+	[ "$out" = "https://github.com/$slug/pull/1" ] ||
+		fail "create #1 prints the PR URL on stdout" "got: $out"
+	jq -e --arg repo "$slug" '
+		.repos[$repo].prs[0].state == "OPEN" and
+		.repos[$repo].prs[0].body == "probe body line 1\nline 2\n"' \
+		"$root/gh/prs.json" >/dev/null ||
+		fail "create #1 records OPEN state with the body captured"
+	ok "pr create: URL on stdout, OPEN recorded, body captured"
+
+	# ---- 2/8 create: monotonic per-repo numbering
+	log "2/8 monotonic PR numbering"
+	out=$(gh_run pr create --repo "$slug" --base main --head ompire/two \
+		--title "Two" --body-file "$bodyf" 2>"$err") ||
+		fail "create #2 exits 0" "$(cat "$err")"
+	[ "$out" = "https://github.com/$slug/pull/2" ] ||
+		fail "create #2 allocates number 2" "got: $out"
+	ok "pr create: numbers increase monotonically"
+
+	# ---- 3/8 create: already-exists failure, URL recoverable from combined output
+	log "3/8 already-exists failure with recoverable URL"
+	local rc=0
+	out=$(gh_run pr create --repo "$slug" --base main --head ompire/one \
+		--title "Dup" --body-file "$bodyf" 2>"$err") || rc=$?
+	[ "$rc" -ne 0 ] || fail "duplicate create exits non-zero"
+	[ -z "$out" ] || fail "duplicate create prints nothing on stdout" "got: $out"
+	grep -q 'already exists:' "$err" ||
+		fail "duplicate create stderr matches real gh's already-exists message" "$(cat "$err")"
+	# ship.py's recovery: scavenge a URL from combined stdout+stderr.
+	local combined url
+	combined=$(printf '%s\n%s\n' "$out" "$(cat "$err")")
+	url=$(grep -oE 'https://github\.com/[^/ ]+/[^/ ]+/pull/[0-9]+' <<<"$combined" | head -1)
+	[ "$url" = "https://github.com/$slug/pull/1" ] ||
+		fail "combined-scan recovers the existing PR URL" "got: ${url:-none}"
+	jq -e --arg repo "$slug" '(.repos[$repo].prs | length) == 2' \
+		"$root/gh/prs.json" >/dev/null ||
+		fail "duplicate create records no new PR"
+	ok "pr create: already-exists fails with a recoverable URL"
+
+	# ---- 4/8 view: OPEN
+	log "4/8 pr view OPEN"
+	out=$(gh_run pr view "https://github.com/$slug/pull/1" --json state,mergedAt 2>"$err") ||
+		fail "view #1 exits 0" "$(cat "$err")"
+	[ "$out" = '{"mergedAt":null,"state":"OPEN"}' ] ||
+		fail "view #1 reports OPEN with null mergedAt" "got: $out"
+	ok "pr view: OPEN with null mergedAt"
+
+	# ---- 5/8 view: MERGED and CLOSED via state mutation
+	log "5/8 pr view MERGED/CLOSED via state mutation"
+	local tmpjq
+	tmpjq=$(mktemp "$root/gh/prs.json.XXXXXX")
+	jq --arg repo "$slug" '.repos[$repo].prs[1].state = "MERGED" |
+		.repos[$repo].prs[1].mergedAt = "2026-08-21T12:00:00Z"' \
+		"$root/gh/prs.json" 2>"$err" >"$tmpjq" || fail "mutating PR 2 to MERGED" "$(cat "$err")"
+	mv "$tmpjq" "$root/gh/prs.json"
+	out=$(gh_run pr view "https://github.com/$slug/pull/2" --json state,mergedAt 2>"$err") ||
+		fail "view #2 exits 0" "$(cat "$err")"
+	[ "$out" = '{"mergedAt":"2026-08-21T12:00:00Z","state":"MERGED"}' ] ||
+		fail "view #2 reports MERGED with the recorded timestamp" "got: $out"
+	jq --arg repo "$slug" '.repos[$repo].prs[1].state = "CLOSED" |
+		.repos[$repo].prs[1].mergedAt = null' \
+		"$root/gh/prs.json" >"$tmpjq" && mv "$tmpjq" "$root/gh/prs.json"
+	out=$(gh_run pr view "https://github.com/$slug/pull/2" --json state,mergedAt 2>"$err") ||
+		fail "view #2 (closed) exits 0" "$(cat "$err")"
+	[ "$out" = '{"mergedAt":null,"state":"CLOSED"}' ] ||
+		fail "view #2 reports CLOSED with null mergedAt" "got: $out"
+	ok "pr view: state transitions visible through the state file"
+
+	# ---- 6/8 view: both GraphQL not-found errors
+	log "6/8 not-found errors"
+	rc=0
+	gh_run pr view "https://github.com/$slug/pull/999" --json state,mergedAt \
+		>"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "view of unknown PR number exits non-zero"
+	grep -q 'Could not resolve to a PullRequest with the number of 999' "$err" ||
+		fail "unknown PR number matches real gh's PullRequest error" "$(cat "$err")"
+	rc=0
+	gh_run pr view "https://github.com/local-test/no-such-repo/pull/1" --json state,mergedAt \
+		>"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "view in unknown repo exits non-zero"
+	grep -q "Could not resolve to a Repository with the name 'local-test/no-such-repo'" "$err" ||
+		fail "unknown repo matches real gh's Repository error" "$(cat "$err")"
+	ok "pr view: both not-found errors, exit 1"
+
+	# ---- 7/8 one-shot fail_next for view and create
+	log "7/8 one-shot fail_next injection"
+	jq '.inject.fail_next.view = "GraphQL: injected view failure (fake)"' \
+		"$root/gh/prs.json" >"$tmpjq" && mv "$tmpjq" "$root/gh/prs.json"
+	rc=0
+	gh_run pr view "https://github.com/$slug/pull/1" --json state,mergedAt \
+		>"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "armed view fails"
+	grep -q 'injected view failure' "$err" ||
+		fail "armed view prints the armed line on stderr" "$(cat "$err")"
+	jq -e '.inject.fail_next.view == null' "$root/gh/prs.json" >/dev/null ||
+		fail "view injection consumed (reset to null)"
+	out=$(gh_run pr view "https://github.com/$slug/pull/1" --json state,mergedAt 2>"$err") ||
+		fail "next view after injection succeeds" "$(cat "$err")"
+	jq '.inject.fail_next.create = "GraphQL: injected create failure (fake)"' \
+		"$root/gh/prs.json" >"$tmpjq" && mv "$tmpjq" "$root/gh/prs.json"
+	rc=0
+	gh_run pr create --repo "$slug" --base main --head ompire/three \
+		--title "Three" --body-file "$bodyf" >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "armed create fails"
+	grep -q 'injected create failure' "$err" ||
+		fail "armed create prints the armed line on stderr" "$(cat "$err")"
+	jq -e --arg repo "$slug" '
+		(.repos[$repo].prs | length) == 2 and .inject.fail_next.create == null' \
+		"$root/gh/prs.json" >/dev/null ||
+		fail "create injection consumed and no PR recorded"
+	out=$(gh_run pr create --repo "$slug" --base main --head ompire/three \
+		--title "Three" --body-file "$bodyf" 2>"$err") ||
+		fail "next create after injection succeeds" "$(cat "$err")"
+[ "$out" = "https://github.com/$slug/pull/3" ] ||
+		fail "create after injection continues the numbering" "got: $out"
+	ok "fail_next: one-shot by consumption, both subcommands"
+
+	# ---- 8/8 loud rejection of an unsupported invocation
+	log "8/8 unsupported invocation fails loudly"
+	rc=0
+	gh_run pr list >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "pr list exits non-zero"
+	grep -q 'unsupported invocation' "$err" ||
+		fail "pr list names the unsupported invocation" "$(cat "$err")"
+	ok "unsupported invocations fail loudly"
+
+	printf 'selfcheck: all %d checks passed\n' "$SELF_CHECKS"
+}
+
+# --- dispatch -----------------------------------------------------------------------
+
+command=${1:-help}
+case "$command" in
+pr)
+	case "${2:-}" in
+	create) shift 2; cmd_pr_create "$@" ;;
+	view) shift 2; cmd_pr_view "$@" ;;
+	*) unsupported "pr ${2:-}" ;;
+	esac
+	;;
+selfcheck) shift; cmd_selfcheck "$@" ;;
+--version) printf 'gh version 2.97.0 (fake, local-test)\n' ;;
+help | --help | -h) usage ;;
+*) unsupported "$*" ;;
+esac
