@@ -77,6 +77,14 @@ async def _run_step(step: Step) -> str:
         raise StepFailedError(step.name, f"cannot exec {step.argv[0]!r}: {exc}") from exc
     try:
         _, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=step.timeout)
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.kill()
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(process.wait(), timeout=5)
+        raise
     except TimeoutError:
         process.kill()
         # `wait()` also waits for pipe EOF; a grandchild still holding the

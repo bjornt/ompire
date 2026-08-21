@@ -882,6 +882,12 @@ async def _run_command(
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
             process.communicate(), timeout=timeout
         )
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.kill()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(process.wait(), timeout=5)
+        raise
     except TimeoutError:
         process.kill()
         await process.wait()

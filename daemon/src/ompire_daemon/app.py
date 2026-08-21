@@ -84,6 +84,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         recovery_job.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await recovery_job
+        background_jobs = list(app.state.spawn_jobs)
+        for job in background_jobs:
+            job.cancel()
+        if background_jobs:
+            await asyncio.gather(*background_jobs, return_exceptions=True)
         await notifier.stop()
         await advisories.stop()
         await prwatch.stop()

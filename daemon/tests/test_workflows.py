@@ -105,7 +105,7 @@ def _make_task(
 
 
 @pytest.fixture
-def rig(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+async def rig(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Runner + supervisor + tracker wired to fake omp with a fast debounce.
     `scenario` lets a test switch the fake omp behavior before the run."""
     scenario = {"name": "happy"}
@@ -130,7 +130,11 @@ def rig(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     )
     supervisor = AgentSupervisor(config, hub, tracker)
     runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
-    return runner, supervisor, tracker, hub, scenario
+    try:
+        yield runner, supervisor, tracker, hub, scenario
+    finally:
+        await runner.shutdown()
+        await supervisor.shutdown()
 
 
 async def wait_for_run(engine: Engine, task_id: int, statuses: set[str], timeout: float = 10.0):

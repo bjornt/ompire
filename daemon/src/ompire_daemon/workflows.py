@@ -30,9 +30,12 @@ guessing (bugfix-workflow design D-3/D-4/D-5).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import re
+import signal
 import traceback
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -1312,19 +1315,18 @@ class WorkflowRunner:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
             )
         except OSError as exc:
             raise _StepInfraFailure(f"cannot exec 'workshop': {exc}") from exc
         try:
             output_bytes, _ = await asyncio.wait_for(process.communicate(), timeout=step.timeout)
-        except TimeoutError:
-            process.kill()
-            # `wait()` also waits for pipe EOF; a grandchild holding the pipe
-            # (real workshop exec shape) must not hang the run — bound it.
-            import contextlib
-
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(process.wait(), timeout=5)
+        except (asyncio.CancelledError, TimeoutError) as exc:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            await process.communicate()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             raise _StepInfraFailure(f"command timed out after {step.timeout}s") from None
         tail = output_bytes[-_COMMAND_OUTPUT_TAIL:].decode("utf-8", errors="replace")
         # A non-zero exit is outcome DATA (routing on it is a following

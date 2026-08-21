@@ -331,7 +331,7 @@ def _template_error(exc: Exception) -> HTTPException:
         return HTTPException(status.HTTP_409_CONFLICT, str(exc))
     # InvalidSlugError rides FastAPI's request validation (field_validator);
     # the rest are registry-level 422s.
-    return HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+    return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
 
 
 @router.get("/templates", response_model=list[TemplateOut])
@@ -507,7 +507,7 @@ async def spawn_task_route(
     try:
         clone_path = clone_path_for(config.task_dir_root, project.name, body.slug)
     except ClonePathOutsideRootError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
 
     branch = template.branch_pattern.replace("<slug>", body.slug)
     try:
@@ -1093,7 +1093,7 @@ def update_settings_route(
         result = settings_store.update(body)
     except SettingsValidationError as exc:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             f"{exc.key}: {exc.message}",
         ) from exc
     _apply_settings_live(result.settings, events, notifications, advisories, sessions)
