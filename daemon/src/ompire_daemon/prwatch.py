@@ -124,7 +124,10 @@ def _parse_pr_view(stdout: str) -> tuple[str | None, str | None]:
         return None, None
     if not isinstance(data, dict):
         return None, None
-    pr_state = _STATE_MAP.get(data.get("state"))
+    state = data.get("state")
+    if not isinstance(state, str):
+        return None, None
+    pr_state = _STATE_MAP.get(state)
     if pr_state is None:
         return None, None
     merged_at = data.get("mergedAt")

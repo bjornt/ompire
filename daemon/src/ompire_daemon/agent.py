@@ -134,6 +134,8 @@ class AgentHandle:
         self._subscribers: set[asyncio.Queue] = set()
         self._stderr_capture: deque[str] = deque(maxlen=_STDERR_CAPTURE_LIMIT)
         self._exited: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+        assert process.stdout is not None
+        assert process.stdin is not None
         self._conn = rpc.RpcConnection(process.stdout, process.stdin, self._publish_frame)
         self._stderr_task = asyncio.create_task(self._read_stderr())
         self._exit_watcher = asyncio.create_task(self._watch_exit())
@@ -258,9 +260,11 @@ class AgentHandle:
             queue.put_nowait(event)
 
     async def _read_stderr(self) -> None:
+        stderr = self._process.stderr
+        assert stderr is not None
         while True:
             try:
-                line = await self._process.stderr.readline()
+                line = await stderr.readline()
             except ValueError:
                 logger.warning("agent stderr line exceeded stream limit; dropped")
                 continue
@@ -284,8 +288,9 @@ class AgentHandle:
         self._exited.set_result(code)
 
     async def _await_ready(self, timeout: float) -> None:
+        futures: set[asyncio.Future[Any]] = {self._conn.ready, self._exited}
         done, _ = await asyncio.wait(
-            {self._conn.ready, self._exited},
+            futures,
             timeout=timeout,
             return_when=asyncio.FIRST_COMPLETED,
         )

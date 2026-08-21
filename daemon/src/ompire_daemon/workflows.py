@@ -786,8 +786,12 @@ class WorkflowRunner:
         while step is not None:
             task = get_task(self._engine, task_id)
             ctx = _RunContext(task, template, list_step_records(self._engine, task_id))
-            is_nudge = isinstance(step, _NudgedAgentStep)
-            declared = step._step if is_nudge else step
+            if isinstance(step, _NudgedAgentStep):
+                declared: Step = step._step
+                is_nudge = True
+            else:
+                declared = step
+                is_nudge = False
             record = append_step_record(
                 self._engine,
                 task_id,
@@ -910,7 +914,7 @@ class WorkflowRunner:
         template: Template,
         workflow: Workflow,
         records: list[StepRecord],
-    ) -> Step | None:
+) -> Step | _NudgedAgentStep | None:
         """Compute where a recovered run continues and re-drive the
         interrupted step per kind. Returns the step to enter the main loop
         with, or None when recovery itself finished/parked the run."""
@@ -959,7 +963,8 @@ class WorkflowRunner:
                 self._publish_task_updated(updated)
                 return None
             if last.kind == "agent" and last.prompted_at is not None:
-                return _NudgedAgentStep(step)  # type: ignore[arg-type]
+                assert isinstance(step, AgentStep)
+                return _NudgedAgentStep(step)
             return step
         # Last record finished ok: a decision routes explicitly (its recorded
         # route); anything else falls through.
@@ -1070,12 +1075,11 @@ class WorkflowRunner:
         thinking: str | None,
     ) -> _StepResult:
         task = ctx.task
-        nudged = isinstance(step, _NudgedAgentStep)
         await self._ensure_session(task, step.session, model=model, thinking=thinking)
         handle = self._supervisor.get(task.id, step.session)
         assert handle is not None
 
-        if nudged:
+        if isinstance(step, _NudgedAgentStep):
             prompt = step.nudge
         else:
             prompt = step.prompt(ctx)

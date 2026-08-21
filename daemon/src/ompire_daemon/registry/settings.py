@@ -13,9 +13,9 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import Engine, text
+from sqlalchemy import CursorResult, Engine, text
 from sqlalchemy.orm import Session
 
 from ompire_daemon.config import Config
@@ -213,8 +213,11 @@ class SettingsStore:
         if key not in _DEFAULTS:
             return False
         with Session(self._engine) as session:
-            result = session.execute(
-                settings_table.delete().where(settings_table.c.key == key)
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    settings_table.delete().where(settings_table.c.key == key)
+                ),
             )
             session.commit()
             return result.rowcount > 0

@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI
 from sqlalchemy import Engine
 
 from ompire_daemon.advisories import AdvisorySampler
@@ -153,7 +153,7 @@ def create_app(
     app.state.auth_token = load_or_create_token(config.data_dir)
     app.state.events = EventHub()
     app.state.spawn_jobs = set()
-    app.state.ws_connections: set[WebSocket] = set()
+    app.state.ws_connections = set()
     app.state.settings_store = SettingsStore(app.state.engine, config)
     effective_settings = app.state.settings_store.effective()
     app.state.sessions = SessionTracker(

@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -230,8 +230,8 @@ class SessionTracker:
         # existing debounce path or subscribing to the watcher") — the
         # advisory sampler registers here so the tracker itself stays a pure
         # classifier with no advisory/tier knowledge (mirrors design D-1).
-        self._turn_end_hooks: list[Callable[[int, str, AgentHandle], Awaitable[None]]] = []
-        self._idle_entered_hooks: list[Callable[[int, str, AgentHandle], Awaitable[None]]] = []
+        self._turn_end_hooks: list[Callable[[int, str, AgentHandle], Coroutine[Any, Any, None]]] = []
+        self._idle_entered_hooks: list[Callable[[int, str, AgentHandle], Coroutine[Any, Any, None]]] = []
 
     def set_stall_threshold(self, seconds: float) -> None:
         """Update the stall watchdog threshold. Applies only to timers armed
@@ -239,15 +239,15 @@ class SessionTracker:
         (design D-2)."""
         self._stall_threshold = seconds
 
-    def add_turn_end_hook(self, hook: Callable[[int, str, AgentHandle], Awaitable[None]]) -> None:
+    def add_turn_end_hook(self, hook: Callable[[int, str, AgentHandle], Coroutine[Any, Any, None]]) -> None:
         self._turn_end_hooks.append(hook)
 
-    def add_idle_entered_hook(self, hook: Callable[[int, str, AgentHandle], Awaitable[None]]) -> None:
+    def add_idle_entered_hook(self, hook: Callable[[int, str, AgentHandle], Coroutine[Any, Any, None]]) -> None:
         self._idle_entered_hooks.append(hook)
 
     def _fire_hooks(
         self,
-        hooks: list[Callable[[int, str, AgentHandle], Awaitable[None]]],
+        hooks: list[Callable[[int, str, AgentHandle], Coroutine[Any, Any, None]]],
         task_id: int,
         session: str,
         handle: AgentHandle,

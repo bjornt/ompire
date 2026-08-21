@@ -155,7 +155,10 @@ def update_project(
         result = conn.execute(projects.update().where(projects.c.name == name).values(**values))
         if result.rowcount == 0:
             raise ProjectNotFoundError(name)
-    return get_project(engine, new_name if rename else name)
+    if rename:
+        assert new_name is not None
+        return get_project(engine, new_name)
+    return get_project(engine, name)
 
 
 def _referencing_task_labels(engine: Engine, name: str) -> list[str]:

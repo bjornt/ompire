@@ -390,6 +390,7 @@ class ReviewManager:
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
         code = process.returncode
+        assert code is not None
         await self._interpret_exit(task_id, task, code, stdout, stderr)
 
     async def _interpret_exit(

@@ -163,7 +163,9 @@ def create_task(
                     updated_at=now,
                 )
             )
-            task_id = result.inserted_primary_key[0]
+            inserted = result.inserted_primary_key
+            assert inserted is not None
+            task_id = inserted[0]
     except IntegrityError as exc:
         raise DuplicateTaskError(project_name, slug) from exc
     return get_task(engine, task_id)

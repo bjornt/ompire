@@ -4,6 +4,7 @@ otherwise. Must be mounted after API routers so /api/* takes precedence.
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +36,7 @@ class _SPAStaticFiles(StaticFiles):
     `/api` namespace keep Starlette/FastAPI's normal 404/405 responses.
     """
 
-    async def get_response(self, path: str, scope: dict[str, Any]) -> Response:
+    async def get_response(self, path: str, scope: MutableMapping[str, Any]) -> Response:
         try:
             return await super().get_response(path, scope)
         except HTTPException as exc:

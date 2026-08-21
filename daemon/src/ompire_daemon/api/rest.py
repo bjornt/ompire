@@ -814,7 +814,8 @@ async def agent_state_route(
     # Pass the agent's `data` through untouched (isStreaming, queuedMessageCount,
     # todos, context usage, model); the daemon never reinterprets its meaning.
     response = await _agent_request(handle, "get_state")
-    return response.get("data") or {}
+    data = response.get("data")
+    return data if isinstance(data, dict) else {}
 
 
 @router.get("/tasks/{task_id}/sessions/{session}/agent/stats")
@@ -828,7 +829,8 @@ async def agent_stats_route(
     _require_declared_session(task, session)
     handle = _require_live_agent(supervisor, task_id, session)
     response = await _agent_request(handle, "get_session_stats")
-    return response.get("data") or {}
+    data = response.get("data")
+    return data if isinstance(data, dict) else {}
 
 
 # --- Workflow gates (workflow-engine capability) ----------------------------
