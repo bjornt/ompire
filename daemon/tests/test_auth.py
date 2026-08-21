@@ -57,15 +57,13 @@ def test_correct_token_returns_200(client: TestClient) -> None:
 
 
 def test_ws_missing_token_refused(client: TestClient) -> None:
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/ws-protected"):
-            pass
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws-protected"):
+        pass
 
 
 def test_ws_wrong_token_refused(client: TestClient) -> None:
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/ws-protected?token=wrong"):
-            pass
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/ws-protected?token=wrong"):
+        pass
 
 
 def test_ws_correct_token_accepted(client: TestClient) -> None:

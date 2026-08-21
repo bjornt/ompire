@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any
 
 from fastapi import FastAPI, WebSocket
+from sqlalchemy import Engine
 
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentSupervisor
@@ -25,7 +26,7 @@ from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.prwatch import PrWatcher
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
-from ompire_daemon.registry.settings import SettingsStore, get_settings
+from ompire_daemon.registry.settings import SettingsStore
 from ompire_daemon.registry.tasks import list_tasks
 from ompire_daemon.review import ReviewManager
 from ompire_daemon.sessions import SessionTracker

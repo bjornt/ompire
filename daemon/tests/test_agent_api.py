@@ -288,17 +288,18 @@ def test_session_scoped_routes_404_for_undeclared_session(
 
 
 def test_agent_ws_rejects_bad_token(client: TestClient, registry_task_id: int) -> None:
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect(f"/api/ws/agents/{registry_task_id}/main?token=wrong"):
-            pass
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect(f"/api/ws/agents/{registry_task_id}/main?token=wrong"):
+        pass
 
 
 def test_agent_ws_rejects_missing_agent(
     client: TestClient, auth_token: str, registry_task_id: int
 ) -> None:
-    with client.websocket_connect(f"/api/ws/agents/{registry_task_id}/main?token={auth_token}") as ws:
-        with pytest.raises(WebSocketDisconnect) as excinfo:
-            ws.receive_json()
+    with (
+        client.websocket_connect(f"/api/ws/agents/{registry_task_id}/main?token={auth_token}") as ws,
+        pytest.raises(WebSocketDisconnect) as excinfo,
+    ):
+        ws.receive_json()
     assert excinfo.value.code == 4404
 
 

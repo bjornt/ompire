@@ -30,7 +30,11 @@ from ompire_daemon.registry.tasks import (
     mark_spawn_completed,
     mark_workshop_launched,
 )
-from ompire_daemon.registry.templates import Template, TemplateNotFoundError, get_template
+from ompire_daemon.registry.templates import (
+    Template,
+    TemplateNotFoundError,
+    get_template,
+)
 from ompire_daemon.workflows import UnknownWorkflowNameError, WorkflowRunner
 
 _STDERR_LIMIT = 64 * 1024

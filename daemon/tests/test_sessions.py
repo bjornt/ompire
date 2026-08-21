@@ -12,7 +12,6 @@ from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.sessions import SessionTracker
-
 from tests.test_rpc import fake_omp_argv
 
 DEBOUNCE = 0.2
@@ -141,7 +140,7 @@ async def test_queued_messages_stay_working(tracked) -> None:
 
 
 async def test_get_state_failure_falls_back_to_debounce_only(tracked) -> None:
-    supervisor, tracker, hub, scenario = tracked
+    supervisor, _tracker, hub, scenario = tracked
     scenario["name"] = "get-state-fails"
     queue = hub.subscribe()
     handle = await supervisor.start(1, "main", "/clone")
@@ -169,7 +168,7 @@ async def test_exit_during_debounce_wins(tracked) -> None:
 
 
 async def test_crash_reason_names_exit_code(tracked) -> None:
-    supervisor, tracker, hub, scenario = tracked
+    supervisor, _tracker, hub, scenario = tracked
     scenario["name"] = "exit-after-ready"
     queue = hub.subscribe()
     await supervisor.start(1, "main", "/clone")
@@ -284,7 +283,7 @@ def await_status_sync(queue: asyncio.Queue) -> dict:
 
 
 def test_snapshot_shape(tracked) -> None:
-    _, tracker, hub, _ = tracked
+    _, tracker, _hub, _ = tracked
     assert tracker.snapshot() == {}
 
 
@@ -422,7 +421,7 @@ async def test_silence_stalls_a_working_session(tracked_stall) -> None:
 
 
 async def test_frame_recovers_a_stalled_session(tracked_stall) -> None:
-    supervisor, tracker, hub, _ = tracked_stall
+    supervisor, _tracker, hub, _ = tracked_stall
     queue = hub.subscribe()
     handle = await supervisor.start(1, "main", "/clone")
     await handle.prompt("no-end")
@@ -480,7 +479,7 @@ async def test_new_stall_threshold_applies_to_new_arms_only(tracked) -> None:
 
 
 async def test_auto_retry_start_and_end_transitions(tracked) -> None:
-    supervisor, tracker, hub, _ = tracked
+    supervisor, _tracker, hub, _ = tracked
     queue = hub.subscribe()
     handle = await supervisor.start(1, "main", "/clone")
 

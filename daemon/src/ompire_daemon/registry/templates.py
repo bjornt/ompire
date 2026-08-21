@@ -14,7 +14,8 @@ from sqlalchemy import Engine
 from sqlalchemy.exc import IntegrityError
 
 from ompire_daemon.db import projects, tasks, templates
-from ompire_daemon.registry.projects import ProjectNotFoundError, validate_slug
+from ompire_daemon.registry.projects import validate_slug
+
 # The engine's registry is the source of truth for valid workflow names
 # (workflow-engine design D-2); no import cycle — workflows.py references
 # templates only under TYPE_CHECKING.
@@ -131,7 +132,7 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _row_to_template(row) -> Template:  # noqa: ANN001
+def _row_to_template(row) -> Template:
     return Template(
         name=row.name,
         project_name=row.project_name,

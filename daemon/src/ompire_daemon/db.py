@@ -145,7 +145,7 @@ def make_engine(db_path: Path) -> Engine:
     engine = create_engine(f"sqlite:///{db_path}", future=True)
 
     @event.listens_for(engine, "connect")
-    def _set_wal_mode(dbapi_connection, connection_record) -> None:  # noqa: ANN001
+    def _set_wal_mode(dbapi_connection, connection_record) -> None:
         cursor = dbapi_connection.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.close()

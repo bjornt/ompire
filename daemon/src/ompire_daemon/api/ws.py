@@ -15,16 +15,13 @@ from fastapi import APIRouter, WebSocket
 from sqlalchemy import Engine
 
 from ompire_daemon.agent import EVENT_STREAM_END, AgentSupervisor
-from ompire_daemon.registry.settings import SettingsStore
 from ompire_daemon.auth import check_ws_token
 from ompire_daemon.events import EventHub
-from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.registry.projects import list_projects
+from ompire_daemon.registry.settings import SettingsStore
 from ompire_daemon.registry.tasks import list_tasks
 from ompire_daemon.registry.templates import list_templates
 from ompire_daemon.registry.workflows import list_step_records
-from ompire_daemon.review import ReviewManager
-from ompire_daemon.ship import ShipManager
 
 router = APIRouter()
 

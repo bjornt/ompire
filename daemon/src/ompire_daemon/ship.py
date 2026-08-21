@@ -30,7 +30,7 @@ from ompire_daemon.sessions import wait_for_idle
 from ompire_daemon.spawn import Step, _run_step
 
 if TYPE_CHECKING:
-    from ompire_daemon.agent import AgentHandle, AgentSupervisor
+    from ompire_daemon.agent import AgentSupervisor
     from ompire_daemon.gpg import GpgProbe, GpgStatus
     from ompire_daemon.sessions import SessionTracker
 
@@ -199,7 +199,7 @@ class ShipManager:
 
             try:
                 response = await handle.request("get_last_assistant_text")
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 raise ShipError(f"agent request failed: {exc}") from exc
 
             # Live omp wraps the text: {"data": {"text": ...}} — the same
@@ -221,7 +221,7 @@ class ShipManager:
                 "ship_draft", {"task_id": task.id, "draft": asdict(parsed)}
             )
             return state
-        except asyncio.TimeoutError:
+        except TimeoutError:
             state = self._set_state(
                 task.id, status="error", draft=None, error="timed out waiting for agent draft"
             )

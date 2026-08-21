@@ -372,7 +372,7 @@ class ReviewManager:
             )
             self._processes[task_id] = process
             stdout_bytes, stderr_bytes = await process.communicate()
-        except Exception as exc:  # noqa: BLE001 — any spawn failure is a review error
+        except Exception as exc:
             logger.exception("llmvet spawn failed for task %d", task_id)
             await self._finalize(
                 task_id,

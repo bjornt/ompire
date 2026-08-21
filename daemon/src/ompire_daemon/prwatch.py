@@ -64,7 +64,7 @@ class PrWatcher:
         while True:
             try:
                 await self.poll_once()
-            except Exception:  # noqa: BLE001 — the loop must survive anything
+            except Exception:
                 logger.exception("pr poll tick failed")
             await asyncio.sleep(self._config.pr_poll_interval)
 
@@ -74,7 +74,7 @@ class PrWatcher:
         for task in await asyncio.to_thread(list_pr_pollable_tasks, self._engine):
             try:
                 await self._poll_task(task)
-            except Exception:  # noqa: BLE001 — one task must not skip the rest
+            except Exception:
                 logger.warning("pr poll failed for task %d", task.id, exc_info=True)
 
     async def _poll_task(self, task: Task) -> None:

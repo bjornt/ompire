@@ -43,12 +43,11 @@ from ompire_daemon.registry.workflows import (
 )
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.workflows import WorkflowRunner
-
 from tests.test_rpc import fake_omp_argv
 
 
 @pytest.fixture
-def engine_project(app, git_checkout: Path):  # noqa: ANN001, ANN201
+def engine_project(app, git_checkout: Path):
     engine = app.state.engine
     project = create_project(
         engine,
@@ -61,7 +60,7 @@ def engine_project(app, git_checkout: Path):  # noqa: ANN001, ANN201
     return engine, project
 
 
-def _make_task(engine, project, tmp_path: Path, slug: str):  # noqa: ANN001, ANN202
+def _make_task(engine, project, tmp_path: Path, slug: str):
     clone_path = tmp_path / "tasks" / slug
     return create_task(
         engine,
@@ -73,7 +72,7 @@ def _make_task(engine, project, tmp_path: Path, slug: str):  # noqa: ANN001, ANN
     )
 
 
-def _record_main_session(engine, task_id: int, omp_session_id: str = "sess-1") -> None:  # noqa: ANN001
+def _record_main_session(engine, task_id: int, omp_session_id: str = "sess-1") -> None:
     """Seed the session rows a successful spawn would have written (lazy
     spawn by the workflow engine records the row, then the omp identity)."""
     record_session_spawned(engine, task_id, "main")
@@ -150,7 +149,7 @@ async def test_run_recovery_resumes_with_resume_argv_and_no_reprompt(
 
     captured_resume = {}
 
-    def fake_build(clone, env, resume=None, model=None, thinking=None):  # noqa: ANN001
+    def fake_build(clone, env, resume=None, model=None, thinking=None):
         captured_resume["value"] = resume
         return fake_omp_argv("happy")
 
@@ -240,7 +239,7 @@ async def test_run_recovery_legacy_complete_run_is_not_redriven(
     finish_step_record(engine, task.id, record.seq, status="ok")
     task = set_run_status(engine, task.id, "complete", None)
 
-    def fake_build(clone, env, resume=None, model=None, thinking=None):  # noqa: ANN001
+    def fake_build(clone, env, resume=None, model=None, thinking=None):
         return fake_omp_argv("happy")
 
     monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
@@ -279,7 +278,7 @@ async def test_run_recovery_legacy_complete_run_is_not_redriven(
     await supervisor.stop(task.id, "main")
 
 
-def _drain(queue) -> list:  # noqa: ANN001
+def _drain(queue) -> list:
     events = []
     while not queue.empty():
         events.append(queue.get_nowait())

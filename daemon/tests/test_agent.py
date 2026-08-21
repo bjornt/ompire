@@ -20,7 +20,6 @@ from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.rpc import AgentGoneError
 from ompire_daemon.sessions import SessionTracker
-
 from tests.test_rpc import fake_omp_argv
 
 
@@ -243,7 +242,7 @@ async def test_supervisor_resume_appends_resume_flag(monkeypatch) -> None:
     sup = AgentSupervisor(config, hub)
     captured = {}
 
-    def fake_build(clone, env, resume=None, model=None, thinking=None):  # noqa: ANN001
+    def fake_build(clone, env, resume=None, model=None, thinking=None):
         captured["resume"] = resume
         return fake_omp_argv("happy")
 
@@ -265,7 +264,7 @@ async def test_supervisor_threads_model_and_thinking(monkeypatch) -> None:
     sup = AgentSupervisor(config, hub)
     captured = {}
 
-    def fake_build(clone, env, resume=None, model=None, thinking=None):  # noqa: ANN001
+    def fake_build(clone, env, resume=None, model=None, thinking=None):
         captured["model"] = model
         captured["thinking"] = thinking
         return fake_omp_argv("happy")

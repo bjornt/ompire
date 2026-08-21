@@ -6,7 +6,6 @@ import asyncio
 import os
 import subprocess
 import textwrap
-from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -23,17 +22,16 @@ from ompire_daemon.registry.tasks import (
     create_task,
     get_task,
     mark_archived,
-    mark_pr_url,
 )
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import (
+    NoLiveAgentError,
     ShipDraft,
     ShipManager,
-    NoLiveAgentError,
-    parse_github_owner,
-    parse_github_slug,
     _find_pr_url,
     _parse_draft,
+    parse_github_owner,
+    parse_github_slug,
 )
 
 
@@ -337,7 +335,7 @@ async def test_commit_and_ship_squashes_delta(
     monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
 
     origin = tmp_root / "origin.git"
-    project, task = _make_project_and_task(
+    _project, task = _make_project_and_task(
         engine, tmp_root, upstream_url="git@github.com:owner/repo.git"
     )
 
@@ -408,7 +406,7 @@ async def test_commit_failure_restores_head_and_cleans_ref(
     monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
 
     origin = tmp_root / "origin.git"
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
 
     # Fake gpg that fails signing.
     tmp_root.joinpath("bin").mkdir(exist_ok=True)
@@ -455,6 +453,7 @@ async def test_commit_failure_restores_head_and_cleans_ref(
         ["git", "-C", task.clone_path, "rev-parse", "--verify", "refs/ompire/ship-orig"],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert result.returncode != 0
 
@@ -465,7 +464,7 @@ async def test_commit_and_ship_retain_rewrites_range(
     monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
 
     origin = tmp_root / "origin.git"
-    project, task = _make_project_and_task(
+    _project, task = _make_project_and_task(
         engine, tmp_root, upstream_url="git@github.com:owner/repo.git"
     )
 
@@ -549,7 +548,7 @@ async def test_commit_and_ship_retain_refuses_dirty_tree(
     monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
 
     origin = tmp_root / "origin.git"
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
 
     _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
 
@@ -571,7 +570,7 @@ async def test_commit_and_ship_retain_refuses_merge_commits(
     monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
 
     origin = tmp_root / "origin.git"
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
 
     _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
     _run_git(Path(task.clone_path), "add", "file3.txt")
@@ -603,7 +602,7 @@ async def test_commit_and_ship_retain_refuses_empty_range(
     monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
 
     origin = tmp_root / "origin.git"
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
 
     _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
     # Drop the uncommitted change and reset the branch to main.
@@ -629,7 +628,7 @@ async def test_commit_and_ship_retain_amend_failure_restores_head(
     monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
 
     origin = tmp_root / "origin.git"
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
 
     tmp_root.joinpath("bin").mkdir(exist_ok=True)
     fake_gpg = _write_script(
@@ -690,6 +689,7 @@ async def test_commit_and_ship_retain_amend_failure_restores_head(
         ["git", "-C", task.clone_path, "rev-parse", "--verify", "refs/ompire/ship-orig"],
         capture_output=True,
         text=True,
+        check=False,
     )
     assert result.returncode != 0
 
@@ -700,7 +700,7 @@ async def test_commit_and_ship_retain_verification_failure_restores_head(
     monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
 
     origin = tmp_root / "origin.git"
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
 
     _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
     _setup_signing_gpg(Path(task.clone_path), tmp_root / "bin")
@@ -913,7 +913,7 @@ class FakeAgentHandle:
 async def test_draft_via_agent_publishes_draft(
     tmp_root, engine, ships, agents, hub, monkeypatch
 ):
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
     draft_text = textwrap.dedent(
         """\
         <<<COMMIT_MESSAGE>>>
@@ -963,7 +963,7 @@ async def test_draft_via_agent_publishes_draft(
 async def test_draft_without_live_agent_raises(
     tmp_root, engine, ships, monkeypatch
 ):
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
     with pytest.raises(NoLiveAgentError):
         await ships.draft(task)
 
@@ -972,7 +972,7 @@ async def test_draft_without_live_agent_raises(
 
 
 def test_draft_route_409_without_live_agent(client, auth_header, engine, tmp_root):
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
     response = client.post(
         f"/api/tasks/{task.id}/ship/draft", headers=auth_header
     )
@@ -980,7 +980,7 @@ def test_draft_route_409_without_live_agent(client, auth_header, engine, tmp_roo
 
 
 def test_commit_route_409_gpg_locked(client, auth_header, engine, tmp_root, app, monkeypatch):
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
     monkeypatch.setattr(app.state.gpg, "probe", _locked_gpg_probe())
     response = client.post(
         f"/api/tasks/{task.id}/ship/commit",
@@ -999,7 +999,7 @@ def test_commit_route_409_gpg_locked(client, auth_header, engine, tmp_root, app,
 def test_commit_route_409_unsupported_mode(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
     monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
     response = client.post(
         f"/api/tasks/{task.id}/ship/commit",
@@ -1017,7 +1017,7 @@ def test_commit_route_409_unsupported_mode(
 def test_commit_route_409_retain_dirty_tree(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
     monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
     origin = tmp_root / "origin.git"
     _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
@@ -1039,7 +1039,7 @@ def test_commit_route_409_retain_dirty_tree(
 def test_commit_route_409_retain_merge_commits(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
     monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
     origin = tmp_root / "origin.git"
     _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
@@ -1071,7 +1071,7 @@ def test_commit_route_409_retain_merge_commits(
 def test_commit_route_409_retain_empty_range(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
     monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
     origin = tmp_root / "origin.git"
     _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
@@ -1096,7 +1096,7 @@ def test_commit_route_409_retain_empty_range(
 def test_commit_route_accepts_retain_mode(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
     monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
     origin = tmp_root / "origin.git"
     _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
@@ -1122,7 +1122,7 @@ def test_commit_route_accepts_retain_mode(
 def test_commit_route_409_when_ship_in_flight(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
     monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
     app.state.ships.seed_commit(task.id)
     response = client.post(
@@ -1138,7 +1138,7 @@ def test_commit_route_409_when_ship_in_flight(
 
 
 def test_snapshot_carries_ships_and_gpg(client, auth_header, engine, tmp_root, app):
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
     app.state.ships._set_state(
         task.id,
         status="drafted",
@@ -1160,7 +1160,7 @@ def test_snapshot_carries_ships_and_gpg(client, auth_header, engine, tmp_root, a
 async def test_cleanup_calls_cancel_and_drop(
     tmp_root, engine, client, auth_header, app, monkeypatch
 ):
-    project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root)
     dropped: list[int] = []
     async def fake_cancel_and_drop(tid: int) -> None:
         dropped.append(tid)
@@ -1182,8 +1182,8 @@ async def test_cleanup_calls_cancel_and_drop(
 async def test_purge_calls_drop_ship(
     tmp_root, engine, client, auth_header, app, monkeypatch
 ):
-    project, task = _make_project_and_task(engine, tmp_root)
-    archived = mark_archived(engine, task.id)
+    _project, task = _make_project_and_task(engine, tmp_root)
+    mark_archived(engine, task.id)
     dropped: list[int] = []
     monkeypatch.setattr(app.state.ships, "drop_ship", lambda tid: dropped.append(tid))
 

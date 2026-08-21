@@ -399,11 +399,11 @@ def _bugfix_fix_prompt(ctx: RunContext) -> str:
         ]
     lines += [
         "",
-        "Fix the bug in the working tree. Do not edit anything under `.ompire/` "
+        ("Fix the bug in the working tree. Do not edit anything under `.ompire/` "
         "and do not weaken or delete the reproducer script. Commit your change "
         "on the current branch when done (the review flow unstages everything "
         "for review and the ship flow squashes later — but never push). Then "
-        "write your outcome: a summary of the root cause and the fix.",
+        "write your outcome: a summary of the root cause and the fix."),
     ]
     return join_preamble(ctx.template.preamble, "\n".join(lines))
 
@@ -784,7 +784,7 @@ class WorkflowRunner:
             task = get_task(self._engine, task_id)
             ctx = _RunContext(task, template, list_step_records(self._engine, task_id))
             is_nudge = isinstance(step, _NudgedAgentStep)
-            declared = step._step if is_nudge else step  # noqa: SLF001
+            declared = step._step if is_nudge else step
             record = append_step_record(
                 self._engine,
                 task_id,

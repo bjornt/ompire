@@ -70,7 +70,7 @@ def validate_slug(name: str) -> None:
         raise InvalidSlugError(name)
 
 
-def _row_to_project(row) -> Project:  # noqa: ANN001
+def _row_to_project(row) -> Project:
     return Project(
         name=row.name,
         title=row.title,

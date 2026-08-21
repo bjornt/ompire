@@ -32,3 +32,9 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.ruff.lint.per-file-ignores]
+"src/**" = ["B008", "S110"]
+"tests/**" = ["B008", "ASYNC221"]
+
+

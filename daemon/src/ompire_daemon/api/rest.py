@@ -16,21 +16,15 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import Engine
 
 from ompire_daemon import auth
-from ompire_daemon.registry.settings import SettingsStore, SettingsValidationError
-
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
-from ompire_daemon.gpg import GpgProbe
-from ompire_daemon.notifications import AttentionNotifier
-from ompire_daemon.review import ReviewAlreadyOpenError, ReviewError, ReviewManager
-from ompire_daemon.rpc import AgentGoneError, RequestFailedError
-from ompire_daemon.ship import ShipError, ShipManager
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
+from ompire_daemon.gpg import GpgProbe
+from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.registry.projects import (
     DuplicateProjectError,
-    InvalidSlugError,
     Project,
     ProjectHasReferencingTasksError,
     ProjectNotFoundError,
@@ -41,6 +35,7 @@ from ompire_daemon.registry.projects import (
     update_project,
     validate_slug,
 )
+from ompire_daemon.registry.settings import SettingsStore, SettingsValidationError
 from ompire_daemon.registry.tasks import (
     ClonePathOutsideRootError,
     DuplicateTaskError,
@@ -72,7 +67,10 @@ from ompire_daemon.registry.templates import (
     update_template,
     validate_thinking,
 )
+from ompire_daemon.review import ReviewAlreadyOpenError, ReviewError, ReviewManager
+from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.sessions import SessionTracker
+from ompire_daemon.ship import ShipError, ShipManager
 from ompire_daemon.spawn import run_spawn_pipeline
 from ompire_daemon.workflows import (
     JUDGE_SESSION,

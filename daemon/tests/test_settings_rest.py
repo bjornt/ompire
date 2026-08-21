@@ -4,13 +4,9 @@ daemon info, token show/rotate, and WebSocket snapshot/reset."""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-
-from ompire_daemon.config import Config
-
 
 EXPECTED_DEFAULTS = {
     "tier.interrupt.desktop": True,

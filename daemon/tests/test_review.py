@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import subprocess
-import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -156,17 +154,17 @@ class TestResetDance:
         await reviews._reset_to_merge_base(str(checkout), "main")
 
         diff = subprocess.run(
-            ["git", "diff", "--stat"], cwd=checkout, capture_output=True, text=True
+            ["git", "diff", "--stat"], cwd=checkout, capture_output=True, text=True, check=False
         ).stdout
         assert "2 insertions" in diff
 
         await reviews._restore(str(checkout))
         restored = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=checkout, capture_output=True, text=True
+            ["git", "rev-parse", "HEAD"], cwd=checkout, capture_output=True, text=True, check=False
         ).stdout.strip()
         assert restored == orig
         status = subprocess.run(
-            ["git", "status", "--short"], cwd=checkout, capture_output=True, text=True
+            ["git", "status", "--short"], cwd=checkout, capture_output=True, text=True, check=False
         ).stdout.strip()
         assert status == ""
 
@@ -203,7 +201,7 @@ class TestResetDance:
         )
         assert restored is True
         current = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=checkout, capture_output=True, text=True
+            ["git", "rev-parse", "HEAD"], cwd=checkout, capture_output=True, text=True, check=False
         ).stdout.strip()
         assert current == orig
         ref_exists = subprocess.run(
@@ -211,6 +209,7 @@ class TestResetDance:
             cwd=checkout,
             capture_output=True,
             text=True,
+            check=False,
         )
         assert ref_exists.returncode != 0
 

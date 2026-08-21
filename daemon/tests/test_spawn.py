@@ -10,9 +10,9 @@ for the run to settle (`_wait_workflow_settled`) before asserting."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
-import asyncio
 from dataclasses import replace
 from pathlib import Path
 
@@ -32,7 +32,6 @@ from ompire_daemon.registry.templates import create_template
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.spawn import run_spawn_pipeline
 from ompire_daemon.workflows import WorkflowRunner
-
 from tests.conftest import FAKE_WORKSHOP_SCRIPT
 
 
@@ -60,7 +59,7 @@ def pipeline(app):
     tracker = SessionTracker(hub, idle_debounce=0.1)
     supervisor = AgentSupervisor(config, hub, tracker)
 
-    async def run(engine, task_id: int, run_config: Config | None = None, **overrides):  # noqa: ANN001
+    async def run(engine, task_id: int, run_config: Config | None = None, **overrides):
         effective = run_config or config
         runner = WorkflowRunner(engine, effective, hub, supervisor, tracker)
         await run_spawn_pipeline(engine, hub, effective, task_id, runner, **overrides)
@@ -68,7 +67,7 @@ def pipeline(app):
     return run, hub, tracker, supervisor
 
 
-def _make_project(engine, checkout: Path):  # noqa: ANN001, ANN202
+def _make_project(engine, checkout: Path):
     return create_project(
         engine,
         name="demo",
@@ -80,7 +79,7 @@ def _make_project(engine, checkout: Path):  # noqa: ANN001, ANN202
 
 
 def _make_template(
-    engine,  # noqa: ANN001
+    engine,
     checkout: Path,
     *,
     base_branch: str = "main",
@@ -101,7 +100,7 @@ def _make_template(
     )
 
 
-def _make_task(engine, config: Config, *, prompt: str = "fix the bug"):  # noqa: ANN001, ANN202
+def _make_task(engine, config: Config, *, prompt: str = "fix the bug"):
     clone_path = clone_path_for(config.task_dir_root, "demo", "fix-bug")
     return create_task(
         engine,
@@ -114,14 +113,14 @@ def _make_task(engine, config: Config, *, prompt: str = "fix the bug"):  # noqa:
     )
 
 
-def _drain(queue) -> list[Event]:  # noqa: ANN001
+def _drain(queue) -> list[Event]:
     events = []
     while not queue.empty():
         events.append(queue.get_nowait())
     return events
 
 
-async def _wait_workflow_settled(engine, task_id: int, timeout: float = 10.0):  # noqa: ANN001, ANN202
+async def _wait_workflow_settled(engine, task_id: int, timeout: float = 10.0):
     """Poll the registry until the task's workflow run reaches a terminal
     status. The pipeline hands the task to the engine asynchronously, so
     post-handoff state (live session, tracker status, workflow_step events)
@@ -136,7 +135,7 @@ async def _wait_workflow_settled(engine, task_id: int, timeout: float = 10.0):  
     raise AssertionError("workflow run did not settle in time")
 
 
-def _user_messages(handle) -> list[str]:  # noqa: ANN001
+def _user_messages(handle) -> list[str]:
     """The user-role message texts echoed by fake omp in the handle's ring
     buffer — what the daemon actually prompted the session with."""
     return [
@@ -147,7 +146,7 @@ def _user_messages(handle) -> list[str]:  # noqa: ANN001
     ]
 
 
-async def test_successful_pipeline(app, git_checkout: Path, fake_my_workshop, pipeline) -> None:  # noqa: ANN001
+async def test_successful_pipeline(app, git_checkout: Path, fake_my_workshop, pipeline) -> None:
     engine = app.state.engine
     run, hub, tracker, supervisor = pipeline
     config: Config = replace(
@@ -208,7 +207,7 @@ async def test_successful_pipeline(app, git_checkout: Path, fake_my_workshop, pi
 
 
 async def test_empty_prompt_skips_prompt_step(
-    app, git_checkout: Path, fake_my_workshop, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, pipeline
 ) -> None:
     engine = app.state.engine
     run, hub, tracker, supervisor = pipeline
@@ -244,7 +243,7 @@ async def test_empty_prompt_skips_prompt_step(
 
 
 async def test_clone_excludes_outcome_dir_from_git(
-    app, git_checkout: Path, fake_my_workshop, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, pipeline
 ) -> None:
     """The clone step appends `.ompire/` to `.git/info/exclude` (workflow
     engine design D-3), so a written `.ompire/outcome.json` never dirties
@@ -283,7 +282,7 @@ async def test_clone_excludes_outcome_dir_from_git(
 
 
 async def test_agent_step_failure_fails_the_run(
-    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, pipeline
 ) -> None:
     engine = app.state.engine
     run, hub, tracker, _ = pipeline
@@ -326,10 +325,10 @@ async def test_agent_step_failure_fails_the_run(
 
 
 async def test_session_id_capture_failure_leaves_it_null_and_spawn_succeeds(
-    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, pipeline
 ) -> None:
     engine = app.state.engine
-    run, hub, tracker, supervisor = pipeline
+    run, hub, _tracker, supervisor = pipeline
     config: Config = replace(
         app.state.config,
         my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
@@ -364,10 +363,10 @@ async def test_session_id_capture_failure_leaves_it_null_and_spawn_succeeds(
 
 
 async def test_prompt_failure_fails_the_run(
-    app, git_checkout: Path, fake_my_workshop, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, pipeline
 ) -> None:
     engine = app.state.engine
-    run, hub, tracker, supervisor = pipeline
+    run, _hub, _tracker, supervisor = pipeline
     config: Config = replace(
         app.state.config,
         my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
@@ -389,7 +388,7 @@ async def test_prompt_failure_fails_the_run(
     await supervisor.stop(task.id, "main")
 
 
-async def test_step_failure_captures_stderr(app, git_checkout: Path, pipeline) -> None:  # noqa: ANN001
+async def test_step_failure_captures_stderr(app, git_checkout: Path, pipeline) -> None:
     engine = app.state.engine
     run, hub, _, _ = pipeline
     queue = hub.subscribe()
@@ -413,7 +412,7 @@ async def test_step_failure_captures_stderr(app, git_checkout: Path, pipeline) -
     assert task_updates[-1]["state"] == "failed"
 
 
-async def test_leftover_directory_fails(app, git_checkout: Path, pipeline) -> None:  # noqa: ANN001
+async def test_leftover_directory_fails(app, git_checkout: Path, pipeline) -> None:
     engine = app.state.engine
     run, hub, _, _ = pipeline
     queue = hub.subscribe()
@@ -433,7 +432,7 @@ async def test_leftover_directory_fails(app, git_checkout: Path, pipeline) -> No
     assert failed_steps and failed_steps[0]["step"] == "clone"
 
 
-async def test_workshop_step_failure(app, git_checkout: Path, fake_my_workshop, pipeline) -> None:  # noqa: ANN001
+async def test_workshop_step_failure(app, git_checkout: Path, fake_my_workshop, pipeline) -> None:
     engine = app.state.engine
     run, hub, _, _ = pipeline
     config: Config = replace(
@@ -460,7 +459,7 @@ async def test_workshop_step_failure(app, git_checkout: Path, fake_my_workshop, 
     assert "launch exploded" in failed_steps[0]["stderr"]
 
 
-async def test_workshop_step_timeout(app, git_checkout: Path, fake_my_workshop, pipeline) -> None:  # noqa: ANN001
+async def test_workshop_step_timeout(app, git_checkout: Path, fake_my_workshop, pipeline) -> None:
     engine = app.state.engine
     run, _, _, _ = pipeline
     config: Config = replace(
@@ -480,7 +479,7 @@ async def test_workshop_step_timeout(app, git_checkout: Path, fake_my_workshop, 
 
 
 async def test_workshop_lock_missing_after_success(
-    app, git_checkout: Path, fake_my_workshop, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, pipeline
 ) -> None:
     engine = app.state.engine
     run, hub, _, _ = pipeline
@@ -506,7 +505,7 @@ async def test_workshop_lock_missing_after_success(
     assert failed_steps and failed_steps[0]["step"] == "workshop"
 
 
-async def test_workshop_tool_missing(app, git_checkout: Path, pipeline) -> None:  # noqa: ANN001
+async def test_workshop_tool_missing(app, git_checkout: Path, pipeline) -> None:
     engine = app.state.engine
     run, _, _, _ = pipeline
     config: Config = replace(
@@ -528,7 +527,7 @@ async def test_workshop_tool_missing(app, git_checkout: Path, pipeline) -> None:
 
 
 async def test_template_missing_at_pipeline_start_fails_before_git(
-    app, git_checkout: Path, fake_my_workshop, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, pipeline
 ) -> None:
     engine = app.state.engine
     run, hub, tracker, _ = pipeline
@@ -564,7 +563,7 @@ async def test_template_missing_at_pipeline_start_fails_before_git(
 
 
 async def test_preamble_prepended_to_prompt(
-    app, git_checkout: Path, fake_my_workshop, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, pipeline
 ) -> None:
     engine = app.state.engine
     run, _, _, supervisor = pipeline
@@ -591,7 +590,7 @@ async def test_preamble_prepended_to_prompt(
 
 
 async def test_empty_preamble_sends_prompt_unchanged(
-    app, git_checkout: Path, fake_my_workshop, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, pipeline
 ) -> None:
     engine = app.state.engine
     run, _, _, supervisor = pipeline
@@ -613,7 +612,7 @@ async def test_empty_preamble_sends_prompt_unchanged(
 
 
 async def test_preamble_alone_never_prompts(
-    app, git_checkout: Path, fake_my_workshop, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, pipeline
 ) -> None:
     engine = app.state.engine
     run, hub, tracker, supervisor = pipeline
@@ -642,7 +641,7 @@ async def test_preamble_alone_never_prompts(
     await supervisor.stop(task.id, "main")
 
 
-def _argv_capturing_workshop(fake_workshop_cli: Path, argv_file: Path) -> None:  # noqa: ANN001
+def _argv_capturing_workshop(fake_workshop_cli: Path, argv_file: Path) -> None:
     """Like the conftest fake, but records the rpc-ui spawn argv to a file."""
     from tests.conftest import FAKE_OMP
 
@@ -660,7 +659,7 @@ esac
 
 
 async def test_template_model_thinking_on_agent_argv(
-    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, tmp_path: Path, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, tmp_path: Path, pipeline
 ) -> None:
     engine = app.state.engine
     run, _, _, supervisor = pipeline
@@ -684,7 +683,7 @@ async def test_template_model_thinking_on_agent_argv(
 
 
 async def test_overrides_beat_template_values(
-    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, tmp_path: Path, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, tmp_path: Path, pipeline
 ) -> None:
     engine = app.state.engine
     run, _, _, supervisor = pipeline
@@ -710,7 +709,7 @@ async def test_overrides_beat_template_values(
 
 
 async def test_template_defaults_omit_flags(
-    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, tmp_path: Path, pipeline  # noqa: ANN001
+    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, tmp_path: Path, pipeline
 ) -> None:
     engine = app.state.engine
     run, _, _, supervisor = pipeline

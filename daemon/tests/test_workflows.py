@@ -49,7 +49,6 @@ from ompire_daemon.workflows import (
     registered_workflows,
     unregister_workflow,
 )
-
 from tests.test_rpc import fake_omp_argv
 
 DEBOUNCE = 0.1
@@ -66,7 +65,7 @@ def engine(tmp_path: Path) -> Engine:
 
 
 @pytest.fixture
-def project(engine: Engine, tmp_path: Path):  # noqa: ANN001, ANN201
+def project(engine: Engine, tmp_path: Path):
     return create_project(
         engine,
         name="demo",
@@ -106,7 +105,7 @@ def _make_task(
 
 
 @pytest.fixture
-def rig(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):  # noqa: ANN001, ANN201
+def rig(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Runner + supervisor + tracker wired to fake omp with a fast debounce.
     `scenario` lets a test switch the fake omp behavior before the run."""
     scenario = {"name": "happy"}
@@ -190,7 +189,7 @@ def test_workflow_definition_validation() -> None:
         )
 
 
-def test_template_validation_uses_engine_registry(engine: Engine, project) -> None:  # noqa: ANN001
+def test_template_validation_uses_engine_registry(engine: Engine, project) -> None:
     assert "single-step" in registered_workflows()
     with pytest.raises(UnknownWorkflowError):
         _make_template(engine, workflow="no-such-workflow")
@@ -199,8 +198,8 @@ def test_template_validation_uses_engine_registry(engine: Engine, project) -> No
 # --- single-step parity (2.4, D-10) ------------------------------------------
 
 
-async def test_single_step_delivers_preamble_plus_prompt(rig, engine, project, tmp_path: Path) -> None:  # noqa: ANN001
-    runner, supervisor, tracker, hub, _scenario = rig
+async def test_single_step_delivers_preamble_plus_prompt(rig, engine, project, tmp_path: Path) -> None:
+    runner, supervisor, tracker, _hub, _scenario = rig
     template = _make_template(engine, preamble="PRE")
     task = _make_task(engine, tmp_path, template, prompt="do it")
 
@@ -227,8 +226,8 @@ async def test_single_step_delivers_preamble_plus_prompt(rig, engine, project, t
     assert session_row is not None and session_row.omp_session_id == "fake-session-id"
 
 
-async def test_single_step_empty_prompt_sends_nothing(rig, engine, project, tmp_path: Path) -> None:  # noqa: ANN001
-    runner, supervisor, tracker, hub, _scenario = rig
+async def test_single_step_empty_prompt_sends_nothing(rig, engine, project, tmp_path: Path) -> None:
+    runner, supervisor, tracker, _hub, _scenario = rig
     template = _make_template(engine, preamble="PRE")
     task = _make_task(engine, tmp_path, template, prompt="")
 
@@ -242,8 +241,8 @@ async def test_single_step_empty_prompt_sends_nothing(rig, engine, project, tmp_
     assert list_step_records(engine, task.id)[0].prompted_at is None
 
 
-async def test_run_fails_when_session_spawn_fails(rig, engine, project, tmp_path: Path) -> None:  # noqa: ANN001
-    runner, supervisor, tracker, hub, scenario = rig
+async def test_run_fails_when_session_spawn_fails(rig, engine, project, tmp_path: Path) -> None:
+    runner, _supervisor, tracker, _hub, scenario = rig
     scenario["name"] = "crash"
     template = _make_template(engine)
     task = _make_task(engine, tmp_path, template)
@@ -301,8 +300,8 @@ async def _write_outcome_when_prompted(
     raise RuntimeError("prompt never observed")
 
 
-async def test_outcome_written(rig, engine, project, tmp_path: Path, outcome_workflow) -> None:  # noqa: ANN001
-    runner, supervisor, tracker, hub, _scenario = rig
+async def test_outcome_written(rig, engine, project, tmp_path: Path, outcome_workflow) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="outcome-wf")
     task = _make_task(engine, tmp_path, template)
     # A stale file from "an earlier step" must be unlinked before prompting.
@@ -339,8 +338,8 @@ async def test_outcome_written(rig, engine, project, tmp_path: Path, outcome_wor
     assert "outcome.json" in user_prompts(supervisor, task.id, "main")[0]
 
 
-async def test_outcome_missing_is_data_not_failure(rig, engine, project, tmp_path: Path, outcome_workflow) -> None:  # noqa: ANN001
-    runner, supervisor, tracker, hub, _scenario = rig
+async def test_outcome_missing_is_data_not_failure(rig, engine, project, tmp_path: Path, outcome_workflow) -> None:
+    runner, _supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="outcome-wf")
     task = _make_task(engine, tmp_path, template)
 
@@ -353,8 +352,8 @@ async def test_outcome_missing_is_data_not_failure(rig, engine, project, tmp_pat
     assert record.error and "no outcome file" in record.error
 
 
-async def test_outcome_malformed_recorded_as_null(rig, engine, project, tmp_path: Path, outcome_workflow) -> None:  # noqa: ANN001
-    runner, supervisor, tracker, hub, _scenario = rig
+async def test_outcome_malformed_recorded_as_null(rig, engine, project, tmp_path: Path, outcome_workflow) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="outcome-wf")
     task = _make_task(engine, tmp_path, template)
 
@@ -396,7 +395,7 @@ BRANCH_WORKFLOW = Workflow(
 
 
 @pytest.fixture
-def branch_workflow(fake_workshop_cli: Path):  # noqa: ANN001
+def branch_workflow(fake_workshop_cli: Path):
     """Register the branching workflow; the autouse fake workshop exits 0 for
     any command, so `probe-cmd` records exit_code 0 by default."""
     register_workflow(BRANCH_WORKFLOW)
@@ -404,8 +403,8 @@ def branch_workflow(fake_workshop_cli: Path):  # noqa: ANN001
     unregister_workflow(BRANCH_WORKFLOW.name)
 
 
-async def test_command_and_decision_routing(rig, engine, project, tmp_path: Path, branch_workflow) -> None:  # noqa: ANN001
-    runner, supervisor, tracker, hub, _scenario = rig
+async def test_command_and_decision_routing(rig, engine, project, tmp_path: Path, branch_workflow) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="branch-wf")
     task = _make_task(engine, tmp_path, template)
 
@@ -434,7 +433,7 @@ async def test_command_exit_code_is_outcome_data(
         '  *) exit 0 ;;\n'
         "esac\n"
     )
-    runner, supervisor, tracker, hub, _scenario = rig
+    runner, _supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="branch-wf")
     task = _make_task(engine, tmp_path, template)
 
@@ -483,7 +482,7 @@ async def test_command_infra_failure_fails_run(
     )
     register_workflow(workflow)
     try:
-        runner, supervisor, tracker, hub, _scenario = rig
+        runner, _supervisor, _tracker, _hub, _scenario = rig
         template = _make_template(engine, workflow="slow-cmd-wf")
         task = _make_task(engine, tmp_path, template)
 
@@ -498,8 +497,8 @@ async def test_command_infra_failure_fails_run(
         unregister_workflow(workflow.name)
 
 
-async def test_decision_unresolvable_escalates_to_gate(rig, engine, project, tmp_path: Path) -> None:  # noqa: ANN001
-    def raise_route(ctx) -> str:  # noqa: ANN001, ANN202
+async def test_decision_unresolvable_escalates_to_gate(rig, engine, project, tmp_path: Path) -> None:
+    def raise_route(ctx) -> str:
         raise RuntimeError("missing repro outcome")
 
     workflow = Workflow(
@@ -512,7 +511,7 @@ async def test_decision_unresolvable_escalates_to_gate(rig, engine, project, tmp
     )
     register_workflow(workflow)
     try:
-        runner, supervisor, tracker, hub, _scenario = rig
+        runner, _supervisor, _tracker, _hub, _scenario = rig
         template = _make_template(engine, workflow="raise-wf")
         task = _make_task(engine, tmp_path, template)
 
@@ -537,8 +536,8 @@ async def test_decision_unresolvable_escalates_to_gate(rig, engine, project, tmp
         unregister_workflow(workflow.name)
 
 
-async def test_resume_gate_rejects_non_waiting_run(rig, engine, project, tmp_path: Path) -> None:  # noqa: ANN001
-    runner, supervisor, tracker, hub, _scenario = rig
+async def test_resume_gate_rejects_non_waiting_run(rig, engine, project, tmp_path: Path) -> None:
+    runner, _supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine)
     task = _make_task(engine, tmp_path, template)
 
@@ -568,10 +567,10 @@ TWO_SESSION_WORKFLOW = Workflow(
 )
 
 
-async def test_multi_step_run_with_two_named_sessions(rig, engine, project, tmp_path: Path) -> None:  # noqa: ANN001
+async def test_multi_step_run_with_two_named_sessions(rig, engine, project, tmp_path: Path) -> None:
     register_workflow(TWO_SESSION_WORKFLOW)
     try:
-        runner, supervisor, tracker, hub, _scenario = rig
+        runner, supervisor, tracker, _hub, _scenario = rig
         template = _make_template(engine, workflow="two-session-wf")
         task = _make_task(engine, tmp_path, template)
 
@@ -605,7 +604,7 @@ async def test_interrupted_agent_step_is_nudged_once(
     """Restart mid-turn: the interrupted record closes failed, the resumed
     session gets ONE resume nudge (not the full prompt), and the step
     completes from the following turn boundary."""
-    runner, supervisor, tracker, hub, scenario = rig
+    runner, supervisor, _tracker, _hub, scenario = rig
     scenario["name"] = "no-end"  # burst without agent_end: the turn never ends
     template = _make_template(engine, workflow="outcome-wf")
     task = _make_task(engine, tmp_path, template)
@@ -663,7 +662,7 @@ async def test_unsent_agent_step_sends_fresh_after_restart(
 ) -> None:
     """Crash after the step record was created but before the prompt went
     out: recovery sends the step prompt, not a nudge."""
-    runner, supervisor, tracker, hub, _scenario = rig
+    runner, supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine)
     task = _make_task(engine, tmp_path, template)
 
@@ -705,7 +704,7 @@ async def test_unsent_agent_step_sends_fresh_after_restart(
     assert prompts == ["do it"]  # the full step prompt, not the nudge
 
 
-async def test_gate_survives_restart(rig, engine, project, tmp_path: Path) -> None:  # noqa: ANN001
+async def test_gate_survives_restart(rig, engine, project, tmp_path: Path) -> None:
     """A run waiting at a gate re-arms after a restart: same record, same
     message, resumable."""
     workflow = Workflow(
@@ -718,7 +717,7 @@ async def test_gate_survives_restart(rig, engine, project, tmp_path: Path) -> No
     )
     register_workflow(workflow)
     try:
-        runner, supervisor, tracker, hub, _scenario = rig
+        runner, _supervisor, _tracker, _hub, _scenario = rig
         template = _make_template(engine, workflow="gate-wf")
         task = _make_task(engine, tmp_path, template)
 
@@ -826,7 +825,7 @@ def test_workflow_resume_endpoint_404_and_409(
 
 async def test_decision_route_complete_finishes_run_early(
     rig, engine, project, tmp_path: Path
-) -> None:  # noqa: ANN001
+) -> None:
     """A decision returning COMPLETE finishes the run without executing the
     remaining declared steps, recording the sentinel as its route outcome."""
     workflow = Workflow(
@@ -840,7 +839,7 @@ async def test_decision_route_complete_finishes_run_early(
     )
     register_workflow(workflow)
     try:
-        runner, supervisor, tracker, hub, _scenario = rig
+        runner, _supervisor, _tracker, _hub, _scenario = rig
         template = _make_template(engine, workflow="complete-wf")
         task = _make_task(engine, tmp_path, template)
 
@@ -904,10 +903,10 @@ async def _write_outcome_when_session_prompted(
 
 async def test_step_judge_synthesizes_missing_outcome(
     rig, engine, project, tmp_path: Path, outcome_workflow
-) -> None:  # noqa: ANN001
+) -> None:
     """The work step idles with no outcome file; the judge session then
     classifies the step and its document becomes the step's outcome."""
-    runner, supervisor, tracker, hub, _scenario = rig
+    runner, supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="outcome-wf")
     task = _make_task(engine, tmp_path, template)
 
@@ -948,10 +947,10 @@ async def test_step_judge_synthesizes_missing_outcome(
 
 async def test_step_judge_uncertain_leaves_null_outcome(
     rig, engine, project, tmp_path: Path, outcome_workflow
-) -> None:  # noqa: ANN001
+) -> None:
     """A judge that writes nothing is uncertain: the null outcome stands with
     its original note — no guessing."""
-    runner, supervisor, tracker, hub, _scenario = rig
+    runner, supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="outcome-wf")
     task = _make_task(engine, tmp_path, template)
 
@@ -966,11 +965,11 @@ async def test_step_judge_uncertain_leaves_null_outcome(
     assert user_prompts(supervisor, task.id, JUDGE_SESSION)
 
 
-async def test_decision_judge_resolves_route(rig, engine, project, tmp_path: Path) -> None:  # noqa: ANN001
+async def test_decision_judge_resolves_route(rig, engine, project, tmp_path: Path) -> None:
     """A raising decision defers to the judge; a confident judged route is
     validated and followed, with provenance noted on the record."""
 
-    def raise_route(ctx) -> str:  # noqa: ANN001, ANN202
+    def raise_route(ctx) -> str:
         raise RuntimeError("missing repro outcome")
 
     workflow = Workflow(
@@ -983,7 +982,7 @@ async def test_decision_judge_resolves_route(rig, engine, project, tmp_path: Pat
     )
     register_workflow(workflow)
     try:
-        runner, supervisor, tracker, hub, _scenario = rig
+        runner, supervisor, _tracker, _hub, _scenario = rig
         template = _make_template(engine, workflow="judge-route-wf")
         task = _make_task(engine, tmp_path, template)
 
@@ -1020,11 +1019,11 @@ async def test_decision_judge_resolves_route(rig, engine, project, tmp_path: Pat
 
 async def test_decision_judge_invalid_route_escalates(
     rig, engine, project, tmp_path: Path
-) -> None:  # noqa: ANN001
+) -> None:
     """A judged route naming no declared step is rejected; the run parks at
     the synthesized gate as if no judgment had happened."""
 
-    def no_route(ctx) -> None:  # noqa: ANN001, ANN202
+    def no_route(ctx) -> None:
         return None
 
     workflow = Workflow(
@@ -1037,7 +1036,7 @@ async def test_decision_judge_invalid_route_escalates(
     )
     register_workflow(workflow)
     try:
-        runner, supervisor, tracker, hub, _scenario = rig
+        runner, supervisor, _tracker, _hub, _scenario = rig
         template = _make_template(engine, workflow="judge-bad-route-wf")
         task = _make_task(engine, tmp_path, template)
 
@@ -1114,7 +1113,7 @@ async def test_judge_spawn_failure_degrades_without_judging(
 
 async def test_judge_spawn_uses_judge_model(
     rig, engine, project, tmp_path: Path, outcome_workflow, monkeypatch: pytest.MonkeyPatch
-) -> None:  # noqa: ANN001
+) -> None:
     """The judge session spawns with the config's judge_model override while
     workflow sessions get the run's (here absent) model."""
     seen_models: list[str | None] = []
@@ -1126,7 +1125,7 @@ async def test_judge_spawn_uses_judge_model(
             fake_omp_argv("happy"),
         )[1],
     )
-    runner, supervisor, tracker, hub, _scenario = rig
+    runner, supervisor, _tracker, _hub, _scenario = rig
     # Re-point the runner at a config carrying judge_model.
     config = Config(
         data_dir=tmp_path / "data",
@@ -1136,8 +1135,8 @@ async def test_judge_spawn_uses_judge_model(
         spawn_step_timeout=10,
         judge_model="judge-x",
     )
-    runner._config = config  # noqa: SLF001 — test-only rewiring
-    supervisor._config = config  # noqa: SLF001
+    runner._config = config
+    supervisor._config = config
 
     template = _make_template(engine, workflow="outcome-wf")
     task = _make_task(engine, tmp_path, template)
@@ -1157,10 +1156,10 @@ def _bugfix_outcome(status: str, summary: str, **artifacts: str) -> str:
     return json.dumps(outcome)
 
 
-async def test_bugfix_happy_path_script_validates(rig, engine, project, tmp_path: Path) -> None:  # noqa: ANN001
+async def test_bugfix_happy_path_script_validates(rig, engine, project, tmp_path: Path) -> None:
     """reproduce → triage → fix → script validation → COMPLETE, with the
     agent-validation step skipped and the escalate gate never reached."""
-    runner, supervisor, tracker, hub, _scenario = rig
+    runner, supervisor, tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="bugfix", preamble="PRE")
     task = _make_task(engine, tmp_path, template, prompt="bug: off by one")
 
@@ -1217,8 +1216,8 @@ async def test_bugfix_happy_path_script_validates(rig, engine, project, tmp_path
 
 async def test_bugfix_unreproducible_bug_escalates_before_fix(
     rig, engine, project, tmp_path: Path
-) -> None:  # noqa: ANN001
-    runner, supervisor, tracker, hub, _scenario = rig
+) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="bugfix")
     task = _make_task(engine, tmp_path, template, prompt="bug: flaky test")
 
@@ -1247,7 +1246,7 @@ async def test_bugfix_unreproducible_bug_escalates_before_fix(
 
 async def test_bugfix_rejection_loops_then_escalates(
     rig, engine, project, tmp_path: Path, fake_workshop_cli: Path
-) -> None:  # noqa: ANN001
+) -> None:
     """The reproducer script keeps failing: fix is re-prompted with the
     validation report, and the run escalates after the third attempt."""
     fake_workshop_cli.write_text(
@@ -1259,7 +1258,7 @@ async def test_bugfix_rejection_loops_then_escalates(
         '  *) exit 0 ;;\n'
         "esac\n"
     )
-    runner, supervisor, tracker, hub, _scenario = rig
+    runner, supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="bugfix")
     task = _make_task(engine, tmp_path, template, prompt="bug: crash")
 
@@ -1302,10 +1301,10 @@ async def test_bugfix_rejection_loops_then_escalates(
     await wait_for_run(engine, task.id, {"complete"})
 
 
-async def test_bugfix_agent_validation_when_no_script(rig, engine, project, tmp_path: Path) -> None:  # noqa: ANN001
+async def test_bugfix_agent_validation_when_no_script(rig, engine, project, tmp_path: Path) -> None:
     """No repro_command artifact: validation is a turn on the reproducer
     session (which keeps its reproduction context), not the command step."""
-    runner, supervisor, tracker, hub, _scenario = rig
+    runner, supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="bugfix")
     task = _make_task(engine, tmp_path, template, prompt="bug: colors wrong")
 
@@ -1343,10 +1342,10 @@ async def test_bugfix_agent_validation_when_no_script(rig, engine, project, tmp_
 
 async def test_bugfix_judge_fires_on_missing_reproduce_outcome(
     rig, engine, project, tmp_path: Path
-) -> None:  # noqa: ANN001
+) -> None:
     """The reproducer idles without an outcome file; the judge classifies the
     step and the run routes on the judged outcome."""
-    runner, supervisor, tracker, hub, _scenario = rig
+    runner, supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="bugfix")
     task = _make_task(engine, tmp_path, template, prompt="bug: crash")
 
@@ -1381,7 +1380,7 @@ async def test_bugfix_judge_fires_on_missing_reproduce_outcome(
 
 async def test_bugfix_restart_mid_loop_nudges_and_continues(
     rig, engine, project, tmp_path: Path, fake_workshop_cli: Path
-) -> None:  # noqa: ANN001
+) -> None:
     """Restart with a fix turn in flight: the coder is resumed and nudged,
     the loop continues from persisted records, and the run completes."""
     fake_workshop_cli.write_text(
@@ -1393,7 +1392,7 @@ async def test_bugfix_restart_mid_loop_nudges_and_continues(
         '  *) exit 0 ;;\n'
         "esac\n"
     )
-    runner, supervisor, tracker, hub, scenario = rig
+    runner, supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="bugfix")
     task = _make_task(engine, tmp_path, template, prompt="bug: crash")
 
@@ -1478,10 +1477,10 @@ async def test_bugfix_restart_mid_loop_nudges_and_continues(
 
 async def test_bugfix_escalate_gate_survives_restart(
     rig, engine, project, tmp_path: Path
-) -> None:  # noqa: ANN001
+) -> None:
     """A run parked at the escalate gate re-arms after a restart with the
     same message and resumes to completion."""
-    runner, supervisor, tracker, hub, _scenario = rig
+    runner, supervisor, _tracker, _hub, _scenario = rig
     template = _make_template(engine, workflow="bugfix")
     task = _make_task(engine, tmp_path, template, prompt="bug: flaky")
 

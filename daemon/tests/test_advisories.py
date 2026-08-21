@@ -16,7 +16,6 @@ from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.sessions import SessionTracker
-
 from tests.test_rpc import fake_omp_argv
 
 THROTTLE = 0.15
@@ -225,12 +224,12 @@ async def test_clear_task_drops_bookkeeping() -> None:
     await sampler.sample_turn_end(
         1, "main", FakeHandle({"get_state": _state(90), "get_session_stats": _stats()})
     )
-    assert (1, "main") in sampler._context_high  # noqa: SLF001 — bookkeeping check
+    assert (1, "main") in sampler._context_high
 
     sampler.clear_task(1)
 
-    assert (1, "main") not in sampler._context_high  # noqa: SLF001
-    assert (1, "main") not in sampler._last_sampled_at  # noqa: SLF001
+    assert (1, "main") not in sampler._context_high
+    assert (1, "main") not in sampler._last_sampled_at
 
 
 @pytest.fixture
@@ -256,7 +255,7 @@ def tracked(monkeypatch: pytest.MonkeyPatch):
 
 
 async def test_turn_end_hook_fires_through_real_tracker(tracked) -> None:
-    supervisor, tracker, hub, sampler = tracked
+    supervisor, _tracker, hub, _sampler = tracked
     queue = hub.subscribe()
     handle = await supervisor.start(1, "main", "/clone")
     await handle.prompt("hi")

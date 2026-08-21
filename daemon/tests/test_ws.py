@@ -109,9 +109,8 @@ def test_reconnect_gets_fresh_snapshot(
 
 
 def test_ws_requires_valid_token(client: TestClient) -> None:
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/api/ws?token=wrong"):
-            pass
+    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/api/ws?token=wrong"):
+        pass
 
 
 def test_task_events_and_snapshot(

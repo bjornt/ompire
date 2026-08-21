@@ -112,7 +112,7 @@ def _create(client: TestClient, auth_headers: dict[str, str], name: str = "ompir
     return response.json()
 
 
-def _put_payload(project: dict, **overrides) -> dict:  # noqa: ANN003
+def _put_payload(project: dict, **overrides) -> dict:
     payload = {
         "title": project["title"],
         "upstream_url": project["upstream_url"],
@@ -123,7 +123,7 @@ def _put_payload(project: dict, **overrides) -> dict:  # noqa: ANN003
     return payload
 
 
-def _reference_task(app, tmp_path: Path, name: str, slug: str, archived: bool = False):  # noqa: ANN001, ANN202
+def _reference_task(app, tmp_path: Path, name: str, slug: str, archived: bool = False):
     task = create_task(
         app.state.engine,
         project_name=name,
@@ -313,7 +313,7 @@ def test_rename_blocked_by_referencing_template(
 def test_repointing_template_unblocks_project_delete(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
-    project = _create(client, auth_headers)
+    _create(client, auth_headers)
     _create(client, auth_headers, name="other")
     template = _create_template(client, auth_headers, "ompire")
 

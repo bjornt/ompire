@@ -16,7 +16,8 @@ import contextlib
 import itertools
 import json
 import logging
-from typing import Any, Callable, Literal
+from collections.abc import Callable
+from typing import Any, Literal
 
 from pydantic import BaseModel, ValidationError
 

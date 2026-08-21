@@ -30,7 +30,7 @@ def _create_template(
     return response.json()
 
 
-def _put_payload(template: dict, **overrides) -> dict:  # noqa: ANN003
+def _put_payload(template: dict, **overrides) -> dict:
     payload = {
         "project_name": template["project_name"],
         "base_branch": template["base_branch"],

@@ -104,7 +104,7 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _row_to_task(row) -> Task:  # noqa: ANN001
+def _row_to_task(row) -> Task:
     return Task(
         id=row.id,
         project_name=row.project_name,
@@ -196,7 +196,7 @@ def list_pr_pollable_tasks(engine: Engine) -> list[Task]:
     return [_row_to_task(row) for row in rows]
 
 
-def _update(engine: Engine, task_id: int, **values) -> Task:  # noqa: ANN003
+def _update(engine: Engine, task_id: int, **values) -> Task:
     with engine.begin() as conn:
         result = conn.execute(
             tasks.update().where(tasks.c.id == task_id).values(updated_at=_now_iso(), **values)

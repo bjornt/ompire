@@ -30,7 +30,7 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _row_to_session(row) -> TaskSession:  # noqa: ANN001
+def _row_to_session(row) -> TaskSession:
     return TaskSession(
         task_id=row.task_id,
         name=row.name,

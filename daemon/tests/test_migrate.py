@@ -81,15 +81,16 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
 
 
 def _land_at_0006(db_path: Path) -> None:
-    from alembic import command
     from alembic.config import Config as AlembicConfig
+
+    from alembic import command
 
     cfg = AlembicConfig(str(REAL_ALEMBIC_INI))
     cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
     command.upgrade(cfg, "0006")
 
 
-def _alembic_cfg(db_path: Path):  # noqa: ANN201
+def _alembic_cfg(db_path: Path):
     from alembic.config import Config as AlembicConfig
 
     cfg = AlembicConfig(str(REAL_ALEMBIC_INI))
@@ -332,8 +333,9 @@ def test_migration_0004_session_id_upgrade_downgrade_roundtrip(tmp_path: Path) -
     assert "session_id" not in columns
     assert "pr_url" in columns
 
-    from alembic import command
     from alembic.config import Config as AlembicConfig
+
+    from alembic import command
 
     cfg = AlembicConfig(str(REAL_ALEMBIC_INI))
     cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")
@@ -483,8 +485,9 @@ def test_upgrade_from_older_revision_preserves_rows(
 
     # Land the db at revision 0001 (older revision) and insert a row.
     upgrade_head_to_revision = synthetic_two_revision_project
-    from alembic import command
     from alembic.config import Config as AlembicConfig
+
+    from alembic import command
 
     cfg = AlembicConfig(str(upgrade_head_to_revision))
     cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db_path}")

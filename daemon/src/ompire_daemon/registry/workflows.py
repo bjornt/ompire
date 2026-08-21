@@ -45,7 +45,7 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _row_to_record(row) -> StepRecord:  # noqa: ANN001
+def _row_to_record(row) -> StepRecord:
     outcome = json.loads(row.outcome_json) if row.outcome_json is not None else None
     return StepRecord(
         task_id=row.task_id,

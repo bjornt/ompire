@@ -42,7 +42,7 @@ def engine(tmp_path: Path) -> Engine:
 
 
 @pytest.fixture
-def project(engine: Engine, tmp_path: Path):  # noqa: ANN001, ANN201
+def project(engine: Engine, tmp_path: Path):
     return create_project(
         engine,
         name="demo",
@@ -53,7 +53,7 @@ def project(engine: Engine, tmp_path: Path):  # noqa: ANN001, ANN201
     )
 
 
-def _make_task(engine: Engine, project, tmp_path: Path, slug: str) -> Task:  # noqa: ANN001
+def _make_task(engine: Engine, project, tmp_path: Path, slug: str) -> Task:
     return create_task(
         engine,
         project_name=project.name,
@@ -64,7 +64,7 @@ def _make_task(engine: Engine, project, tmp_path: Path, slug: str) -> Task:  # n
     )
 
 
-def test_task_carries_workflow_fields(engine: Engine, project, tmp_path: Path) -> None:  # noqa: ANN001
+def test_task_carries_workflow_fields(engine: Engine, project, tmp_path: Path) -> None:
     task = _make_task(engine, project, tmp_path, "fix-bug")
     assert task.workflow_name == "single-step"
     assert task.workflow_status is None
@@ -76,7 +76,7 @@ def test_task_carries_workflow_fields(engine: Engine, project, tmp_path: Path) -
     assert get_task(engine, task.id).workflow_status == "running"
 
 
-def test_session_rows_round_trip(engine: Engine, project, tmp_path: Path) -> None:  # noqa: ANN001
+def test_session_rows_round_trip(engine: Engine, project, tmp_path: Path) -> None:
     task = _make_task(engine, project, tmp_path, "fix-bug")
 
     session = record_session_spawned(engine, task.id, "main")
@@ -97,7 +97,7 @@ def test_session_rows_round_trip(engine: Engine, project, tmp_path: Path) -> Non
     assert again.omp_session_id == "abc-123"
 
 
-def test_step_records_round_trip(engine: Engine, project, tmp_path: Path) -> None:  # noqa: ANN001
+def test_step_records_round_trip(engine: Engine, project, tmp_path: Path) -> None:
     task = _make_task(engine, project, tmp_path, "fix-bug")
 
     first = append_step_record(engine, task.id, step="work", kind="agent", session="main")
@@ -131,7 +131,7 @@ def test_step_records_round_trip(engine: Engine, project, tmp_path: Path) -> Non
 
 
 def test_reconcile_startup_fails_interrupted_spawn(
-    engine: Engine, project, tmp_path: Path  # noqa: ANN001
+    engine: Engine, project, tmp_path: Path
 ) -> None:
     task = _make_task(engine, project, tmp_path, "never-spawned")
 
@@ -145,7 +145,7 @@ def test_reconcile_startup_fails_interrupted_spawn(
 
 
 def test_reconcile_startup_missing_session_is_not_fatal(
-    engine: Engine, project, tmp_path: Path  # noqa: ANN001
+    engine: Engine, project, tmp_path: Path
 ) -> None:
     """Sessions are lazily spawned (workflow-engine design D-6): a
     spawn-completed task with no recorded session identity (a command-only
@@ -162,7 +162,7 @@ def test_reconcile_startup_missing_session_is_not_fatal(
 
 
 def test_reconcile_startup_returns_recoverable_candidate(
-    engine: Engine, project, tmp_path: Path  # noqa: ANN001
+    engine: Engine, project, tmp_path: Path
 ) -> None:
     task = _make_task(engine, project, tmp_path, "recoverable")
     mark_spawn_completed(engine, task.id)
@@ -179,7 +179,7 @@ def test_reconcile_startup_returns_recoverable_candidate(
 
 
 def test_reconcile_startup_leaves_failed_and_archived_alone(
-    engine: Engine, project, tmp_path: Path  # noqa: ANN001
+    engine: Engine, project, tmp_path: Path
 ) -> None:
     from ompire_daemon.registry.tasks import mark_archived, mark_failed
 
