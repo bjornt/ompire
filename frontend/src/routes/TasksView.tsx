@@ -2,6 +2,11 @@ import { useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { ContextRing } from "../components/ContextRing";
 import { answerAgent, cleanupTask, startReview } from "../lib/api";
+import {
+  attentionSection,
+  getAttentionSeverity,
+  isAttentionTask,
+} from "../lib/attention";
 import { confirmCleanup, prLinkLabel } from "../lib/cleanup";
 import { formatTokensCost } from "../lib/advisories";
 import {
@@ -354,19 +359,40 @@ function TaskCard({
 }
 
 export function TasksView() {
-  const { tasks, projects, sessions, workflows, stats, advisories, reviews } = useDaemonState();
+  const { tasks, projects, sessions, workflows, stats, advisories, reviews, attention, settings } =
+    useDaemonState();
   const [searchParams] = useSearchParams();
   // Project filter (projects-view capability): the Projects card's
   // active-tasks pill lands here via `?project=<name>`.
   const projectFilter = searchParams.get("project");
-  const visible = tasks.filter(
-    (t) => t.state !== "archived" && (projectFilter === null || t.project_name === projectFilter),
-  );
+  const attentionFilter = searchParams.get("attention") === "1";
+  const visible = tasks.filter((t) => {
+    if (t.state === "archived") return false;
+    if (projectFilter !== null && t.project_name !== projectFilter) return false;
+    if (attentionFilter && !isAttentionTask(t, attention, settings)) return false;
+    return true;
+  });
   // Shipped rows (merge-poll capability, design D-5): every task with a
   // pr_url, live or archived, most-recently-updated first.
   const shipped = tasks
     .filter((t) => t.pr_url && (projectFilter === null || t.project_name === projectFilter))
     .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+
+  // Partition into sections (ROADMAP2 chunk 1: make-attention-actionable).
+  const severity = (t: Task) => getAttentionSeverity(t, attention) ?? -1;
+  const byRecency = (a: Task, b: Task) => b.updated_at.localeCompare(a.updated_at);
+  const needsYou: Task[] = [];
+  const running: Task[] = [];
+  const idle: Task[] = [];
+  for (const t of visible) {
+    const section = attentionSection(t, sessions[t.id], attention, settings);
+    if (section === "needs-you") needsYou.push(t);
+    else if (section === "running") running.push(t);
+    else idle.push(t);
+  }
+  needsYou.sort((a, b) => severity(b) - severity(a) || byRecency(a, b));
+  running.sort(byRecency);
+  idle.sort(byRecency);
 
   return (
     <>
@@ -388,24 +414,78 @@ export function TasksView() {
       </div>
 
       {visible.length === 0 && shipped.length === 0 ? (
-        <div className="empty" data-testid="tasks-empty-state">
-          <strong>No tasks yet</strong>
-          <span>Spawn one to get an agent working on something.</span>
-        </div>
+        attentionFilter ? (
+          <div className="empty" data-testid="attention-empty-state">
+            <strong>No tasks need your attention right now</strong>
+            <span>
+              <Link to={projectFilter != null ? `?project=${projectFilter}` : "/tasks"}>
+                Show all tasks
+              </Link>
+            </span>
+          </div>
+        ) : (
+          <div className="empty" data-testid="tasks-empty-state">
+            <strong>No tasks yet</strong>
+            <span>Spawn one to get an agent working on something.</span>
+          </div>
+        )
       ) : (
-        <div className="cardGrid" data-testid="tasks-list">
-          {visible.map((task) => (
-            <TaskCard
-              key={task.id}
-              task={task}
-              sessions={sessions[task.id]}
-              workflow={workflows[task.id]}
-              stats={stats[task.id]}
-              advisories={advisories[task.id]}
-              review={reviews[task.id]}
-            />
-          ))}
-        </div>
+        <>
+          {needsYou.length > 0 && (
+            <section data-testid="section-needs-you">
+              <h3 className="sectionHeading">Needs you</h3>
+              <div className="cardGrid">
+                {needsYou.map((task) => (
+                  <TaskCard
+                    key={task.id}
+                    task={task}
+                    sessions={sessions[task.id]}
+                    workflow={workflows[task.id]}
+                    stats={stats[task.id]}
+                    advisories={advisories[task.id]}
+                    review={reviews[task.id]}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
+          {running.length > 0 && (
+            <section data-testid="section-running">
+              <h3 className="sectionHeading">Running</h3>
+              <div className="cardGrid">
+                {running.map((task) => (
+                  <TaskCard
+                    key={task.id}
+                    task={task}
+                    sessions={sessions[task.id]}
+                    workflow={workflows[task.id]}
+                    stats={stats[task.id]}
+                    advisories={advisories[task.id]}
+                    review={reviews[task.id]}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
+          {idle.length > 0 && (
+            <section data-testid="section-idle">
+              <h3 className="sectionHeading">Idle/other</h3>
+              <div className="cardGrid">
+                {idle.map((task) => (
+                  <TaskCard
+                    key={task.id}
+                    task={task}
+                    sessions={sessions[task.id]}
+                    workflow={workflows[task.id]}
+                    stats={stats[task.id]}
+                    advisories={advisories[task.id]}
+                    review={reviews[task.id]}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
+        </>
       )}
 
       {shipped.length > 0 && (

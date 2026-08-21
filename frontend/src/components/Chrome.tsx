@@ -1,4 +1,4 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { Link, NavLink, Outlet } from "react-router-dom";
 import { useEffect } from "react";
 import { useDaemonState } from "../lib/daemonSocket";
 import { countNeedsAttention } from "../lib/attention";
@@ -83,9 +83,14 @@ export function Chrome() {
           ))}
         </nav>
         <div className="chips">
-          <span className="chip needsYouChip" title="Tasks needing the operator">
+          <Link
+            className={`chip${needsYou > 0 ? " needsYouChip" : ""}`}
+            to={needsYou > 0 ? "/tasks?attention=1" : "/tasks"}
+            title="Tasks needing the operator"
+            data-testid="attention-chip"
+          >
             {needsYou} need you
-          </span>
+          </Link>
           <span className="chip" title={daemonChip.title}>
             <span className="dot" style={{ background: daemonChip.dot }} />
             daemon

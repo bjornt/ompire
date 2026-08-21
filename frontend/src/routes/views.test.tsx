@@ -1511,6 +1511,33 @@ describe("Chrome GPG chip", () => {
   });
 });
 
+describe("Chrome attention chip", () => {
+  it("renders an <a> to /tasks?attention=1 when attention count is non-zero", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      attention: { 1: { tier: "interrupt", status: "failed", reason: "", session: "main" } },
+    });
+
+    const chip = screen.getByTestId("attention-chip");
+    expect(chip.tagName).toBe("A");
+    expect(chip).toHaveAttribute("href", "/tasks?attention=1");
+    expect(chip).toHaveClass("needsYouChip");
+  });
+
+  it("renders an <a> to /tasks when attention count is zero", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+    });
+
+    const chip = screen.getByTestId("attention-chip");
+    expect(chip.tagName).toBe("A");
+    expect(chip).toHaveAttribute("href", "/tasks");
+    expect(chip).not.toHaveClass("needsYouChip");
+  });
+});
+
 describe("TasksView PR link", () => {
   it("renders a PR link on a card when task.pr_url is set", async () => {
     await renderAt("/tasks", {
@@ -1521,6 +1548,136 @@ describe("TasksView PR link", () => {
     const link = screen.getByTestId("task-pr-link-1") as HTMLAnchorElement;
     expect(link).toBeInTheDocument();
     expect(link.href).toBe("https://github.com/ompire/maas/pull/7");
+  });
+});
+
+describe("TasksView attention filter and sections", () => {
+  it("shows only attention tasks when ?attention=1 is set", async () => {
+    await renderAt("/tasks?attention=1", {
+      projects: [project],
+      tasks: [
+        makeTask({ id: 1, state: "failed", updated_at: "2026-08-01T00:00:00Z" }),
+        makeTask({ id: 2, updated_at: "2026-08-01T00:01:00Z" }),
+      ],
+      attention: {},
+    });
+
+    expect(screen.getByTestId("section-needs-you")).toBeTruthy();
+    expect(screen.queryByTestId("task-card-2")).toBeNull();
+  });
+
+  it("filters by both project and attention together", async () => {
+    await renderAt("/tasks?attention=1&project=maas", {
+      projects: [project],
+      tasks: [
+        makeTask({ id: 1, state: "failed", project_name: "maas" }),
+        makeTask({ id: 2, state: "failed", project_name: "other" }),
+      ],
+      attention: {},
+    });
+
+    expect(screen.getByTestId("task-card-1")).toBeTruthy();
+    expect(screen.queryByTestId("task-card-2")).toBeNull();
+  });
+
+  it("shows attention-specific empty state when filtered to zero", async () => {
+    await renderAt("/tasks?attention=1", {
+      projects: [project],
+      tasks: [makeTask({ id: 1, state: "created" })],
+      attention: {},
+    });
+
+    const empty = screen.getByTestId("attention-empty-state");
+    expect(empty).toHaveTextContent("No tasks need your attention right now");
+    expect(within(empty).getByRole("link")).toHaveTextContent("Show all tasks");
+  });
+
+  it("preserves project param in the 'Show all tasks' link", async () => {
+    await renderAt("/tasks?attention=1&project=maas", {
+      projects: [project],
+      tasks: [makeTask({ id: 1, state: "created", project_name: "maas" })],
+      attention: {},
+    });
+
+    expect(within(screen.getByTestId("attention-empty-state")).getByRole("link")).toHaveAttribute(
+      "href",
+      "/tasks?project=maas",
+    );
+  });
+
+  it("sections task into Needs you, Running, and Idle/other", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [
+        makeTask({ id: 1, updated_at: "2026-08-01T00:00:00Z" }),
+        makeTask({ id: 2, updated_at: "2026-08-01T00:01:00Z" }),
+        makeTask({ id: 3, updated_at: "2026-08-01T00:02:00Z" }),
+      ],
+      attention: {
+        1: { tier: "interrupt", status: "failed", reason: "", session: "main" },
+        2: { tier: "silent", status: "working", reason: "", session: "main" },
+      },
+      sessions: {
+        2: { main: { status: "working", reason: "", since: "" } },
+        3: { main: { status: "idle", reason: "", since: "" } },
+      },
+    });
+
+    const sectionNeedsYou = screen.getByTestId("section-needs-you");
+    expect(sectionNeedsYou).toHaveTextContent("Needs you");
+    expect(within(sectionNeedsYou).getByTestId("task-card-1")).toBeTruthy();
+
+    const sectionRunning = screen.getByTestId("section-running");
+    expect(sectionRunning).toHaveTextContent("Running");
+    expect(within(sectionRunning).getByTestId("task-card-2")).toBeTruthy();
+
+    const sectionIdle = screen.getByTestId("section-idle");
+    expect(sectionIdle).toHaveTextContent("Idle/other");
+    expect(within(sectionIdle).getByTestId("task-card-3")).toBeTruthy();
+  });
+
+  it("sorts Needs you by severity then recency", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [
+        makeTask({ id: 1, updated_at: "2026-08-01T00:01:00Z" }),
+        makeTask({ id: 2, updated_at: "2026-08-01T00:00:00Z" }),
+      ],
+      attention: {
+        1: { tier: "notify", status: "waiting-input", reason: "", session: "main" },
+        2: { tier: "interrupt", status: "failed", reason: "", session: "main" },
+      },
+    });
+
+    const cards = within(screen.getByTestId("section-needs-you")).getAllByTestId(/^task-card-/);
+    expect(cards[0]).toHaveAttribute("data-testid", "task-card-2"); // interrupt > notify
+    expect(cards[1]).toHaveAttribute("data-testid", "task-card-1");
+  });
+
+  it("hides section heading when empty", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask({ id: 1, updated_at: "2026-08-01T00:00:00Z" })],
+      attention: {
+        1: { tier: "interrupt", status: "failed", reason: "", session: "main" },
+      },
+    });
+
+    expect(screen.getByTestId("section-needs-you")).toBeTruthy();
+    expect(screen.queryByTestId("section-running")).toBeNull();
+    expect(screen.queryByTestId("section-idle")).toBeNull();
+  });
+
+  it("state: 'failed' tasks without attention entry show in Needs you", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask({ id: 1, state: "failed", updated_at: "2026-08-01T00:00:00Z" })],
+      attention: {},
+    });
+
+    const section = screen.getByTestId("section-needs-you");
+    expect(section).toHaveTextContent("Needs you");
+    expect(within(section).getByTestId("task-card-1")).toBeTruthy();
   });
 });
 
