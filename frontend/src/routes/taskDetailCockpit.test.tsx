@@ -147,7 +147,7 @@ describe("cockpit transcript", () => {
 
     const agent = agentSocket();
     expect(agent).toBeDefined();
-    act(() => {
+    await act(async () => {
       agent!.onopen?.();
       agent!.emit("agent_start", {});
       agent!.emit("message_end", {
@@ -559,7 +559,7 @@ describe("workflow strip", () => {
     stubFetch();
     await renderDetail(twoSessionSnapshots.sessions, twoSessionSnapshots.workflows);
 
-    act(() => {
+    await act(async () => {
       mainSocket().emit("workflow_step", {
         task_id: 1,
         step: "fix",
