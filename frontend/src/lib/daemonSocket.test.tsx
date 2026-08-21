@@ -1,6 +1,7 @@
 import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DaemonProvider, useDaemonState } from "./daemonSocket";
+import { DaemonProvider } from "./daemonSocket";
+import { useDaemonState } from "./useDaemonState";
 
 class MockWebSocket {
   static instances: MockWebSocket[] = [];

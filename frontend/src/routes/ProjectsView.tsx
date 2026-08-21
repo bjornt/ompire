@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { createProject, deleteProject, updateProject } from "../lib/api";
-import { useDaemonState } from "../lib/daemonSocket";
+import { useDaemonState } from "../lib/useDaemonState";
 import type { Project, Task } from "../types";
 import "./ProjectsView.css";
 

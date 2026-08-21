@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { spawnTask } from "../lib/api";
-import { useDaemonState } from "../lib/daemonSocket";
+import { useDaemonState } from "../lib/useDaemonState";
 import { REGISTERED_WORKFLOWS, THINKING_LEVELS, templateCheckout } from "../lib/templates";
 import type { SpawnStepName, SpawnStepPayload, StepRecord, Task, ThinkingLevel } from "../types";
 import "./SpawnView.css";

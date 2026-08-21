@@ -1,6 +1,6 @@
 import { Link, NavLink, Outlet } from "react-router-dom";
 import { useEffect } from "react";
-import { useDaemonState } from "../lib/daemonSocket";
+import { useDaemonState } from "../lib/useDaemonState";
 import { countNeedsAttention } from "../lib/attention";
 import { setFaviconBadge } from "../lib/favicon";
 import type { ConnectionState, GpgStatus } from "../types";

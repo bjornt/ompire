@@ -11,7 +11,7 @@ import {
   type TemplateInput,
 } from "../lib/api";
 import { setDaemonToken } from "../lib/token";
-import { useDaemonState } from "../lib/daemonSocket";
+import { useDaemonState } from "../lib/useDaemonState";
 import { REGISTERED_WORKFLOWS, THINKING_LEVELS, templateCheckout } from "../lib/templates";
 import type {
   AttentionTier,

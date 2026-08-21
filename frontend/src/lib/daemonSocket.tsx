@@ -1,9 +1,8 @@
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { Envelope } from "../types";
-import { applyEnvelope, initialDaemonState, type DaemonState } from "./daemonReducer";
+import { applyEnvelope, initialDaemonState } from "./daemonReducer";
+import { DaemonContext } from "./daemonContext";
 import { getDaemonToken } from "./token";
-
-const DaemonContext = createContext<DaemonState | null>(null);
 
 const INITIAL_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 10000;
@@ -72,10 +71,4 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return <DaemonContext.Provider value={state}>{children}</DaemonContext.Provider>;
-}
-
-export function useDaemonState(): DaemonState {
-  const state = useContext(DaemonContext);
-  if (!state) throw new Error("useDaemonState must be used within a DaemonProvider");
-  return state;
 }

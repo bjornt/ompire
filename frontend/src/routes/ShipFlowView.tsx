@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { useDaemonState } from "../lib/daemonSocket";
+import { useDaemonState } from "../lib/useDaemonState";
 import { defaultSessionName } from "../lib/daemonReducer";
 import { cleanupTask, draftShip, recheckGpg, shipCommit } from "../lib/api";
 import { confirmCleanup } from "../lib/cleanup";
-import { formatElapsed } from "./TasksView";
+import { formatElapsed } from "../lib/formatElapsed";
 import type { GpgStatus, ReviewIteration, ReviewState, SessionInfo, ShipState, Task } from "../types";
 import "./ShipFlowView.css";
 

@@ -9,9 +9,9 @@ import {
   taskSessionNames,
   workflowActive,
 } from "../lib/daemonReducer";
-import { useDaemonState } from "../lib/daemonSocket";
+import { useDaemonState } from "../lib/useDaemonState";
 import type { SessionInfo, StepRecord, TaskDetail, WorkflowState, WorkshopStatus } from "../types";
-import { formatElapsed } from "./TasksView";
+import { formatElapsed } from "../lib/formatElapsed";
 import { QuestionCard } from "./QuestionCard";
 import { TaskComposer } from "./TaskComposer";
 import { TaskStatusStrip } from "./TaskStatusStrip";
