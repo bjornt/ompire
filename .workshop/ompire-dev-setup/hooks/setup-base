@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+
+# Install make so the project Makefile is usable inside the workshop.
+apt-get update
+eatmydata apt-get install make

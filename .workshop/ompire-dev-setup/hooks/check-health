@@ -6,4 +6,9 @@ if ! sudo -u workshop --login pnpm --version >/dev/null 2>&1; then
   exit 1
 fi
 
+if ! sudo -u workshop --login make --version >/dev/null 2>&1; then
+  workshopctl set-health error "make is not available on PATH"
+  exit 1
+fi
+
 workshopctl set-health okay
