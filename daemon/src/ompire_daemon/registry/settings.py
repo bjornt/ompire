@@ -1,4 +1,4 @@
-"""Layered daemon settings store (daemon-settings capability, design D-1).
+"""Layered daemon settings store. Architectural boundary: ADR-0013.
 
 Effective value resolution:
 
@@ -36,7 +36,7 @@ class SettingsValidationError(Exception):
 
 # Recognised settings keys and their default values.
 #
-# Design D-1 tier defaults match Settings.dc.html: desktop on for
+# Tier defaults preserve the original preference matrix: desktop on for
 # interrupt/notify, sound on for interrupt only, badge on for
 # interrupt/notify/badge, everything else off.
 _DEFAULTS: dict[str, Any] = {

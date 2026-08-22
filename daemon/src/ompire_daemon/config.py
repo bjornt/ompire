@@ -111,10 +111,9 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class Config:
-    # Source values from the operator's config.toml for keys the daemon
-    # exposes through the layered settings store. Empty when the daemon is
-    # constructed from defaults/tests; populated by load_config when a file
-    # exists. Not compared so Config() == Config() regardless of source.
+    # ADR-0013: preserve values explicitly set in operator-owned config.toml
+    # so the layered settings store can distinguish them from defaults.
+    # Empty for defaults/tests; not compared so Config() == Config().
     config_source: dict[str, Any] = field(default_factory=dict, compare=False)
 
     port: int = DEFAULT_PORT

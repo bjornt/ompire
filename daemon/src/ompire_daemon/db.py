@@ -124,8 +124,8 @@ workflow_step_records = Table(
     Column("finished_at", String, nullable=True),
 )
 
-# Settings store (daemon-settings capability, design D-1): UI-editable
-# overrides persisted as JSON-encoded scalar values, layered over config.toml.
+# ADR-0013: UI-editable overrides are persisted as JSON-encoded scalar
+# values and layered over operator-owned config.toml.
 settings = Table(
     "settings",
     metadata,
