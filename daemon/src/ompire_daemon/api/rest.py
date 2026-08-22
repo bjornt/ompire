@@ -1,4 +1,7 @@
-"""REST endpoints under /api/. Commands only — events go out over the WebSocket."""
+"""REST endpoints under /api/. Commands only — events go out over the WebSocket.
+
+Architecture: ADR-0004 (docs/adr/0004-use-rest-and-websocket-snapshot-deltas.md)
+"""
 
 from __future__ import annotations
 

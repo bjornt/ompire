@@ -1,4 +1,5 @@
 // Architecture: ADR-0002 (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
+// Transport: ADR-0004 (docs/adr/0004-use-rest-and-websocket-snapshot-deltas.md)
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { Envelope } from "../types";
 import { applyEnvelope, initialDaemonState, type DaemonState } from "./daemonReducer";

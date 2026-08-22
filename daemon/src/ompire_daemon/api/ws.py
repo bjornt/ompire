@@ -2,6 +2,7 @@
 here — REST is the only way to mutate state.
 
 Architecture: ADR-0002 (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
+and ADR-0004 (docs/adr/0004-use-rest-and-websocket-snapshot-deltas.md).
 """
 
 from __future__ import annotations

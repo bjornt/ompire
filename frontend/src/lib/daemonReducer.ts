@@ -98,6 +98,7 @@ export const initialDaemonState: DaemonState = {
   settings: {},
 };
 
+// Architecture: ADR-0004 (docs/adr/0004-use-rest-and-websocket-snapshot-deltas.md)
 /** Applies one envelope from the daemon's WebSocket. `snapshot` is a full
  * state replacement; every other `type` is an incremental delta. Unknown
  * types are ignored so the frontend forward-compatibly tolerates event

@@ -3,6 +3,8 @@ import type { Envelope } from "../types";
 import { emptyTranscript, reduceFrame, type Transcript } from "./agentFrames";
 import { getDaemonToken } from "./token";
 
+// Architecture: ADR-0004 (docs/adr/0004-use-rest-and-websocket-snapshot-deltas.md)
+
 /* Per-agent event-channel client (agent-event-stream): connects to
  * `/api/ws/agents/:taskId/:session`, replays the daemon's ring buffer then follows live
  * events, and reconnects while the agent is live (`enabled`). The daemon closes
