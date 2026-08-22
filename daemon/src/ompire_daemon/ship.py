@@ -1,8 +1,10 @@
-"""Daemon-run ship flow: draft → squash → sign → push → PR.
+"""Daemon-run host-side publishing flow: draft → sign → push → PR.
 
-Implements SPEC Decision 7's "shipping on approval" (ROADMAP #13).  The
-only durable artifact is `tasks.pr_url`; everything else is transient, in
-memory state mirroring `ReviewManager`.
+Architecture: ADR-0011
+(docs/adr/0011-keep-review-and-publishing-authority-outside-agent-sandbox.md)
+
+The only durable artifact is `tasks.pr_url`; everything else is transient,
+in-memory state mirroring `ReviewManager`.
 """
 
 from __future__ import annotations

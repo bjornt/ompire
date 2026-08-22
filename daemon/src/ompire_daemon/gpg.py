@@ -1,5 +1,8 @@
 """GPG signing-key lock probe (SPEC Decision 7, design D-4).
 
+Architecture: ADR-0011
+(docs/adr/0011-keep-review-and-publishing-authority-outside-agent-sandbox.md)
+
 Derives the signing subkey's keygrip once, then probes `gpg-agent` via
 `gpg-connect-agent KEYINFO --no-ask` without triggering a pinentry.
 """

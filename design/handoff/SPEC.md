@@ -448,6 +448,7 @@ Spawning from the UI = pick template, name the task slug, write the prompt.
 ---
 
 ## Decision 7: Review, commit, and PR automation — daemon-run llmvet
+<!-- Durable decision: [ADR-0011](../../docs/adr/0011-keep-review-and-publishing-authority-outside-agent-sandbox.md) -->
 
 **Decision:** The daemon (not the agent) runs
 [llmvet](https://github.com/bjornt/llmvet) on the host side of the task

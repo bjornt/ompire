@@ -1,4 +1,7 @@
-"""Daemon-run llmvet review (SPEC Decision 7, design D-3/D-4/D-5).
+"""Daemon-run host-side review authority.
+
+Architecture: ADR-0011
+(docs/adr/0011-keep-review-and-publishing-authority-outside-agent-sandbox.md)
 
 `ReviewManager` owns the per-task review state, the reset dance, the
 supervised llmvet subprocess, exit interpretation, and the comment loopback
