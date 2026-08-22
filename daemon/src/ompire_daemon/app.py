@@ -3,6 +3,8 @@
 Architecture: ADR-0002 (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
 Trusted control-plane language: ADR-0003
 (docs/adr/0003-implement-trusted-control-plane-in-python.md)
+Local persistence: ADR-0005
+(docs/adr/0005-persist-local-state-with-sqlite-core-and-alembic.md)
 """
 
 from __future__ import annotations

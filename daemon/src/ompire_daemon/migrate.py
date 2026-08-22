@@ -1,4 +1,8 @@
-"""Programmatic Alembic migration runner, so operators never invoke alembic by hand."""
+"""Programmatic Alembic migration runner, so operators never invoke alembic by hand.
+
+Architecture: ADR-0005
+(docs/adr/0005-persist-local-state-with-sqlite-core-and-alembic.md)
+"""
 
 from __future__ import annotations
 

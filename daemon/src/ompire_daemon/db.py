@@ -1,6 +1,9 @@
 """SQLite engine and Core table metadata. No ORM: queries are built against
 `Table` objects directly. This `metadata` is the schema source of truth;
 Alembic migrations under `daemon/alembic/` are generated from it.
+
+Architecture: ADR-0005
+(docs/adr/0005-persist-local-state-with-sqlite-core-and-alembic.md)
 """
 
 from __future__ import annotations
