@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+#
+# local-test/ghctl — LOCAL-TESTING.PLAN.md Part 8: the steering wheel for
+# the fake gh (Part 2). PR lifecycle and failure injection against the
+# same $STATE/gh/prs.json the fake reads — no parallel state, no daemon
+# changes. The observable contract is the fake gh itself: every
+# transition here is what the daemon's `pr view` poll path must see.
+#
+# State root: $LOCAL_TEST_STATE if set, else <repo>/local-test/.state.
+# This tool owns nothing — it only rewrites the fake's state file with
+# the same atomic jq -> tmp -> rename discipline.
+#
+# Commands:
+#   pr [<n>] [--repo <slug>]      list PRs (or show one): number, head,
+#                                 base, state, timestamps
+#   merge <n> [--repo <slug>]     OPEN -> MERGED with mergedAt=now
+#   close <n> [--repo <slug>]     OPEN -> CLOSED, mergedAt=null
+#   reopen <n> [--repo <slug>]    CLOSED -> OPEN
+#   fail-next [create|view] [--message <text>]
+#                                 arm a one-shot failure for the next
+#                                 matching fake invocation (bare: print
+#                                 both slots without changing them)
+#   selfcheck                     prove the whole contract offline in a
+#                                 temp root against the real fake gh;
+#                                 never touches $STATE
+#   help                          this message
+
+set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+STATE_ROOT=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
+PRS_JSON=$STATE_ROOT/gh/prs.json
+GH=$REPO_ROOT/local-test/fakes/gh
+
+# gh-style defaults (captured reference table, fake-gh design.md).
+DEFAULT_FAIL_CREATE='GraphQL: injected create failure (fake)'
+DEFAULT_FAIL_VIEW='GraphQL: injected view failure (fake)'
+
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
+
+command -v jq >/dev/null 2>&1 || die "jq is required but not on PATH"
+
+state_write() { # state_write <tmp-path>
+	mv "$1" "$PRS_JSON"
+}
+
+mutate() { # mutate <jq-options…> <jq-filter>: atomic read-modify-write
+	local filter="${*: -1}"
+	local -a opts=("${@:1:$(( $# - 1 ))}")
+	[ -f "$PRS_JSON" ] ||
+		die "no gh state at $PRS_JSON — run a local-test environment first (env up)"
+	local tmp
+	tmp=$(mktemp "$PRS_JSON.XXXXXX")
+	jq "${opts[@]}" "$filter" "$PRS_JSON" >"$tmp" || { rm -f "$tmp"; return 1; }
+	state_write "$tmp"
+}
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# resolve_repo [<n>]: the --repo flag, else the single repo in state.
+# PR number is passed through when present.
+resolve_repo() { # resolve_repo <args…> -> sets REPO (and PR when numeric)
+	REPO="" ; PR=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--repo | -R) REPO=$2; shift 2 ;;
+		[0-9]*) [ -z "$PR" ] || die "multiple PR numbers given"; PR=$1; shift ;;
+		*) die "unknown argument: $1" ;;
+		esac
+	done
+	if [ -z "$REPO" ]; then
+		[ -f "$PRS_JSON" ] ||
+			die "no gh state at $PRS_JSON — run a local-test environment first (env up)"
+		REPO=$(jq -r '[.repos // {} | keys[]] | if length == 1 then .[0] elif length == 0 then "none" else "AMBIGUOUS:" + join(",") end' "$PRS_JSON")
+		case "$REPO" in
+		none) die "no repositories in gh state — create a PR first or pass --repo <slug>" ;;
+		AMBIGUOUS:*) die "multiple repositories in gh state (${REPO#AMBIGUOUS:}) — pass --repo <slug>" ;;
+		esac
+	fi
+}
+
+repo_has() { # repo_has <slug>
+	jq -e --arg r "$1" '(.repos // {}) | has($r)' "$PRS_JSON" >/dev/null
+}
+
+pr_json() { # pr_json <n>: the PR object, empty when absent
+	jq -c --arg r "$REPO" --argjson n "$1" \
+		'[.repos[$r].prs[]? | select(.number == $n)][0] // empty' "$PRS_JSON"
+}
+
+require_pr() { # require_pr <n>: prints current state, dies when absent
+	local n=$1 out
+	[ -n "$PR_STATE" ] || PR_STATE=$(pr_json "$n")
+	[ -n "$PR_STATE" ] || die "no PR #$n in $REPO (known: $(pr_numbers))"
+}
+
+pr_numbers() {
+	jq -r --arg r "$REPO" '[.repos[$r].prs[]?.number] | map(tostring) | join(", ")' "$PRS_JSON"
+}
+
+# --- pr -----------------------------------------------------------------------
+
+cmd_pr() {
+	resolve_repo "$@"
+	[ -f "$PRS_JSON" ] || die "no gh state at $PRS_JSON"
+	if [ -n "$PR" ]; then
+		local out
+		out=$(pr_json "$PR")
+		[ -n "$out" ] || die "no PR #$PR in $REPO (known: $(pr_numbers))"
+		printf '%s\n' "$out" | jq -r '"#\(.number) \(.state) \(.head) -> \(.base)\n  title:    \(.title)\n  created:  \(.createdAt)\n  merged:   \(.mergedAt // "-")"'
+	else
+		jq -r --arg r "$REPO" '.repos[$r].prs[]? |
+			"#\(.number) \(.state) \(.head) -> \(.base)  (\(.title))"' "$PRS_JSON"
+	fi
+}
+
+# --- lifecycle ------------------------------------------------------------------
+
+transition() { # transition <n> <from-states> <to-state> <mergedAt-jq>
+	local n=$1 from=$2 to=$3 merged=$4
+	[ -n "$n" ] || die "missing PR number (try: $0 $CMD <n>)"
+	[[ $n =~ ^[0-9]+$ ]] || die "PR number must be numeric, got '$n'"
+	repo_has "$REPO" || die "unknown repository '$REPO' in gh state"
+	PR_STATE=$(pr_json "$n")
+	require_pr "$n"
+	local cur
+	cur=$(jq -r '.state' <<<"$PR_STATE")
+	[[ ",$from," == *",$cur,"* ]] ||
+		die "PR #$n in $REPO is $cur — only $from can $CMD (use '$0 pr $n' to inspect)"
+	mutate --arg r "$REPO" --argjson n "$n" --arg to "$to" --arg now "$(now_utc)" \
+		'.repos[$r].prs |= map(if .number == $n
+			then .state = $to | .mergedAt = (if $to == "MERGED" then $now else null end)
+			else . end)'
+	printf 'PR #%s in %s: %s -> %s\n' "$n" "$REPO" "$cur" "$to"
+}
+
+cmd_merge() {
+	local n=""; while [ $# -gt 0 ]; do
+		case "$1" in
+		[0-9]*) [ -z "$n" ] || die "multiple PR numbers given"; n=$1; shift ;;
+		--repo | -R) REPO=${REPO:-$2}; shift 2 ;;
+		*) die "unknown argument: $1" ;;
+		esac
+	done
+	resolve_repo ${REPO:+--repo "$REPO"} ${n:+"$n"}
+	CMD=merge transition "$PR" OPEN MERGED x
+}
+
+cmd_close() {
+	local n=""; while [ $# -gt 0 ]; do
+		case "$1" in
+		[0-9]*) [ -z "$n" ] || die "multiple PR numbers given"; n=$1; shift ;;
+		--repo | -R) REPO=${REPO:-$2}; shift 2 ;;
+		*) die "unknown argument: $1" ;;
+		esac
+	done
+	resolve_repo ${REPO:+--repo "$REPO"} ${n:+"$n"}
+	CMD=close transition "$PR" OPEN CLOSED x
+}
+
+cmd_reopen() {
+	local n=""; while [ $# -gt 0 ]; do
+		case "$1" in
+		[0-9]*) [ -z "$n" ] || die "multiple PR numbers given"; n=$1; shift ;;
+		--repo | -R) REPO=${REPO:-$2}; shift 2 ;;
+		*) die "unknown argument: $1" ;;
+		esac
+	done
+	resolve_repo ${REPO:+--repo "$REPO"} ${n:+"$n"}
+	CMD=reopen transition "$PR" CLOSED OPEN x
+}
+
+# --- fail-next ---------------------------------------------------------------------
+
+cmd_fail_next() {
+	local site="" message=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		create | view) [ -z "$site" ] || die "one site per invocation"; site=$1; shift ;;
+		--message) message=$2; shift 2 ;;
+		*) die "unknown argument: $1 (usage: fail-next [create|view] [--message <text>])" ;;
+		esac
+	done
+	[ -f "$PRS_JSON" ] ||
+		die "no gh state at $PRS_JSON — run a local-test environment first (env up)"
+
+	if [ -z "$site" ]; then # inspection only
+		local c v
+		c=$(jq -r '.inject.fail_next.create // "none"' "$PRS_JSON")
+		v=$(jq -r '.inject.fail_next.view // "none"' "$PRS_JSON")
+		printf 'create: %s\nview:   %s\n' "$c" "$v"
+		return 0
+	fi
+
+	local msg=${message:-$([ "$site" = create ] && printf '%s' "$DEFAULT_FAIL_CREATE" || printf '%s' "$DEFAULT_FAIL_VIEW")}
+	mutate --arg site "$site" --arg msg "$msg" \
+		'.inject.fail_next[$site] = $msg'
+	printf 'armed: next %s fails once with:\n  %s\n' "$site" "$msg"
+}
+
+# --- selfcheck -----------------------------------------------------------------------
+
+SELF_TMP=""
+
+selfcheck_cleanup() { [ -n "$SELF_TMP" ] && rm -rf "$SELF_TMP"; }
+
+SELF_CHECKS=0
+
+ok() { SELF_CHECKS=$((SELF_CHECKS + 1)); printf '  ok    %s\n' "$1"; }
+fail() { # fail <name> [detail]
+	printf '  FAIL  %s\n' "$1" >&2
+	[ $# -gt 1 ] && printf '%s\n' "$2" | sed 's/^/        /' >&2
+	printf 'selfcheck failed at: %s\n' "$1" >&2
+	exit 1
+}
+
+cmd_selfcheck() {
+	trap selfcheck_cleanup EXIT
+
+	SELF_TMP=$(mktemp -d)
+	local root=$SELF_TMP/state
+	local slug=local-test/sandbox
+	local err=$SELF_TMP/err
+	local bodyf=$SELF_TMP/body.md
+	local out rc
+	log() { printf '==> selfcheck: %s\n' "$1"; }
+	ctl_run() { LOCAL_TEST_STATE=$root "$0" "$@"; }
+	gh_run()  { LOCAL_TEST_STATE=$root "$GH" "$@"; }
+	printf 'probe body\n' >"$bodyf"
+
+	# ---- 1/7 create two PRs through the real fake
+	log "1/7 seeding PRs through the real fake gh"
+	[ -x "$GH" ] || fail "fake gh missing at $GH"
+	out=$(gh_run pr create --repo "$slug" --base main --head ompire/one \
+		--title "One" --body-file "$bodyf" 2>"$err") ||
+		fail "create #1" "$(cat "$err")"
+	out=$(gh_run pr create --repo "$slug" --base main --head ompire/two \
+		--title "Two" --body-file "$bodyf" 2>"$err") ||
+		fail "create #2" "$(cat "$err")"
+	ok "seeded 2 PRs via the fake gh"
+
+	# ---- 2/7 pr listing and show
+	log "2/7 pr listing and show"
+	out=$(ctl_run pr) || fail "pr list" "$out"
+	grep -q '#1 OPEN ompire/one -> main' <<<"$out" ||
+		fail "pr list shows PR 1" "$out"
+	grep -q '#2 OPEN' <<<"$out" || fail "pr list shows PR 2" "$out"
+	out=$(ctl_run pr 1) || fail "pr show" "$out"
+	grep -q 'title:    One' <<<"$out" || fail "pr show carries the title" "$out"
+	ok "pr: list and show"
+
+	# ---- 3/7 merge is visible through the daemon's poll path
+	log "3/7 merge visible to pr view"
+	ctl_run merge 1 >/dev/null || fail "merge 1"
+	out=$(gh_run pr view "https://github.com/$slug/pull/1" --json state,mergedAt 2>"$err") ||
+		fail "view after merge" "$(cat "$err")"
+	jq -e '.state == "MERGED" and .mergedAt != null' <<<"$out" >/dev/null ||
+		fail "view reports MERGED with a timestamp" "$out"
+	ok "merge: MERGED + mergedAt visible to the poll path"
+
+	# ---- 4/7 close/reopen and state guards
+	log "4/7 close, reopen, and refused transitions"
+	ctl_run close 2 >/dev/null || fail "close 2"
+	out=$(gh_run pr view "https://github.com/$slug/pull/2" --json state,mergedAt 2>"$err") ||
+		fail "view after close" "$(cat "$err")"
+	jq -e '.state == "CLOSED" and .mergedAt == null' <<<"$out" >/dev/null ||
+		fail "view reports CLOSED with null mergedAt" "$out"
+	ctl_run reopen 2 >/dev/null || fail "reopen 2"
+	out=$(gh_run pr view "https://github.com/$slug/pull/2" --json state,mergedAt 2>"$err") ||
+		fail "view after reopen" "$(cat "$err")"
+	jq -e '.state == "OPEN"' <<<"$out" >/dev/null || fail "view reports OPEN again" "$out"
+	rc=0
+	ctl_run merge 1 >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "merging a MERGED PR is refused"
+	grep -q 'is MERGED' <<<"$(cat "$err")" ||
+		fail "refusal names the current state" "$(cat "$err")"
+	rc=0
+	ctl_run merge 999 >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "unknown PR number is refused"
+	grep -q 'no PR #999' <<<"$(cat "$err")" ||
+		fail "unknown PR error names the PR" "$(cat "$err")"
+	ok "close/reopen: transitions and refusals"
+
+	# ---- 5/7 fail-next arming fires once through the real fake
+	log "5/7 fail-next create and view"
+	ctl_run fail-next create >/dev/null || fail "arm create"
+	rc=0
+	gh_run pr create --repo "$slug" --base main --head ompire/three \
+		--title "Three" --body-file "$bodyf" >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "armed create fails"
+	grep -q 'injected create failure' "$err" ||
+		fail "armed create prints the default message" "$(cat "$err")"
+	gh_run pr create --repo "$slug" --base main --head ompire/three \
+		--title "Three" --body-file "$bodyf" >"$SELF_TMP/o" 2>"$err" ||
+		fail "next create succeeds (slot consumed)" "$(cat "$err")"
+	ctl_run fail-next view --message "custom boom" >/dev/null || fail "arm view"
+	rc=0
+	gh_run pr view "https://github.com/$slug/pull/1" --json state,mergedAt \
+		>"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "armed view fails"
+	grep -q 'custom boom' "$err" || fail "armed view prints the custom message" "$(cat "$err")"
+	gh_run pr view "https://github.com/$slug/pull/1" --json state,mergedAt \
+		>"$SELF_TMP/o" 2>"$err" || fail "next view succeeds" "$(cat "$err")"
+	ok "fail-next: custom + default messages, one-shot by consumption"
+
+	# ---- 6/7 bare fail-next inspects without mutating
+	log "6/7 fail-next inspection"
+	ctl_run fail-next view >/dev/null # leave view armed
+	out=$(ctl_run fail-next) || fail "bare fail-next" "$out"
+	grep -q '^create: none$' <<<"$out" || fail "create slot reads none" "$out"
+	grep -q '^view:   GraphQL: injected view failure (fake)$' <<<"$out" ||
+		fail "view slot reads the armed default" "$out"
+	gh_run pr view "https://github.com/$slug/pull/1" --json state,mergedAt \
+		>/dev/null 2>&1 || true # consume it so the fake is clean again
+	ok "fail-next (bare): inspection without mutation"
+
+	# ---- 7/7 loud rejection of unknown subcommands
+	log "7/7 unknown subcommand"
+	rc=0
+	ctl_run nonsense >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "unknown subcommand exits non-zero"
+	grep -q 'unknown command' <<<"$(cat "$err")" ||
+		fail "unknown subcommand names itself" "$(cat "$err")"
+	ok "unknown subcommands fail loudly"
+
+	printf 'selfcheck: all %d checks passed\n' "$SELF_CHECKS"
+}
+
+# --- dispatch -----------------------------------------------------------------------
+
+command=${1:-help}
+case "$command" in
+pr) shift; cmd_pr "$@" ;;
+merge) shift; cmd_merge "$@" ;;
+close) shift; cmd_close "$@" ;;
+reopen) shift; cmd_reopen "$@" ;;
+fail-next) shift; cmd_fail_next "$@" ;;
+selfcheck) shift; cmd_selfcheck "$@" ;;
+help | --help | -h) usage ;;
+*)
+	printf 'ghctl: unknown command: %s\n\n' "$command" >&2
+	usage >&2
+	exit 1
+	;;
+esac

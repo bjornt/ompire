@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+#
+# local-test/wsctl — LOCAL-TESTING.PLAN.md Part 8: the steering wheel for
+# the fake workshop (Part 3). Registry inspection, deregistration, and
+# launch-level failure injection against the same
+# $STATE/workshops.json the fake reads — the injection point above the
+# real my-workshop, whose own failures need no support.
+#
+# State root: $LOCAL_TEST_STATE if set, else <repo>/local-test/.state.
+# This tool owns nothing — it only rewrites the fake's state file with
+# the same atomic jq -> tmp -> rename discipline.
+#
+# Commands:
+#   list                        every launched workshop: path, id, name,
+#                               launch time, connections
+#   remove <clone>              deregister (like `workshop remove`,
+#                               .workshop.lock stays on disk)
+#   fail-next launch [fail|no-lock|off]
+#                               steer the one-shot launch injection:
+#                               fail = next launch exits non-zero,
+#                               no-lock = exits 0 without writing
+#                               .workshop.lock (the daemon's "launch
+#                               succeeded but no lock" spawn error path),
+#                               off = disarm. Bare: print the armed mode.
+#   selfcheck                   prove the whole contract offline in a
+#                               temp root against the real fake workshop;
+#                               never touches $STATE
+#   help                        this message
+set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+STATE_ROOT=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
+WS_JSON=$STATE_ROOT/workshops.json
+WS=$REPO_ROOT/local-test/fakes/workshop
+SELF_BIN=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
+
+command -v jq >/dev/null 2>&1 || die "jq is required but not on PATH"
+
+state_write() { # state_write <tmp-path>
+	mv "$1" "$WS_JSON"
+}
+
+mutate() { # mutate <jq-options…> <jq-filter>: atomic read-modify-write
+	local filter="${*: -1}"
+	local -a opts=("${@:1:$(( $# - 1 ))}")
+	[ -f "$WS_JSON" ] ||
+		die "no workshop state at $WS_JSON — run a local-test environment first (env up)"
+	local tmp
+	tmp=$(mktemp "$WS_JSON.XXXXXX")
+	jq "${opts[@]}" "$filter" "$WS_JSON" >"$tmp" || { rm -f "$tmp"; return 1; }
+	state_write "$tmp"
+}
+
+require_state() {
+	[ -f "$WS_JSON" ] ||
+		die "no workshop state at $WS_JSON — run a local-test environment first (env up)"
+}
+
+# --- list -----------------------------------------------------------------------
+
+cmd_list() {
+	if [ ! -f "$WS_JSON" ]; then
+		printf 'no workshops launched\n'
+		return 0
+	fi
+	local count
+	count=$(jq '[.workshops // {} | keys[]] | length' "$WS_JSON")
+	if [ "$count" -eq 0 ]; then
+		printf 'no workshops launched\n'
+		return 0
+	fi
+	jq -r '.workshops | to_entries | sort_by(.key)[] |
+		"\(.key)\n  id:     \(.value.id)  name: \(.value.name)\n  since:  \(.value.launched_at)\n  connects: \(.value.connects | length)"' \
+		"$WS_JSON"
+}
+
+# --- remove -----------------------------------------------------------------------
+
+cmd_remove() {
+	[ $# -eq 1 ] || die "usage: $0 remove <clone>"
+	local target=$1 key
+	[ -e "$target" ] || die "no such path: $target"
+	key=$(realpath "$target")
+	require_state
+	local entry
+	entry=$(jq -c --arg p "$key" '.workshops[$p] // empty' "$WS_JSON")
+	if [ -z "$entry" ]; then
+		die "no launched workshop registered for $key (known: $(known_paths))"
+	fi
+	mutate --arg p "$key" 'del(.workshops[$p])'
+	printf 'deregistered %s (.workshop.lock left on disk)\n' "$key"
+}
+
+known_paths() {
+	jq -r '[.workshops // {} | keys[]] | join("\n         ")' "$WS_JSON"
+}
+
+# --- fail-next ---------------------------------------------------------------------
+
+cmd_fail_next() {
+	local mode=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		launch) shift ;;
+		fail | no-lock | off) [ -z "$mode" ] || die "one mode per invocation"; mode=$1; shift ;;
+		*) die "unknown argument: $1 (usage: fail-next launch [fail|no-lock|off])" ;;
+		esac
+	done
+
+	if [ -z "$mode" ]; then # inspection only
+		require_state
+		local armed
+		armed=$(jq -r '.inject.fail_next.launch // "none"' "$WS_JSON")
+		printf 'launch: %s\n' "$armed"
+		return 0
+	fi
+
+	if [ "$mode" = off ]; then
+		mutate '.inject.fail_next.launch = null'
+		printf 'launch injection disarmed\n'
+		return 0
+	fi
+	mutate --arg m "$mode" '.inject.fail_next.launch = $m'
+	local what
+	case "$mode" in
+	fail)   what='next launch exits non-zero' ;;
+	no-lock) what='next launch exits 0 without writing .workshop.lock' ;;
+	esac
+	printf 'armed: %s\n' "$what"
+}
+
+# --- selfcheck -----------------------------------------------------------------------
+
+SELF_TMP=""
+
+selfcheck_cleanup() { [ -n "$SELF_TMP" ] && rm -rf "$SELF_TMP"; }
+
+SELF_CHECKS=0
+
+ok() { SELF_CHECKS=$((SELF_CHECKS + 1)); printf '  ok    %s\n' "$1"; }
+fail() { # fail <name> [detail]
+	printf '  FAIL  %s\n' "$1" >&2
+	[ $# -gt 1 ] && printf '%s\n' "$2" | sed 's/^/        /' >&2
+	printf 'selfcheck failed at: %s\n' "$1" >&2
+	exit 1
+}
+
+cmd_selfcheck() {
+	trap selfcheck_cleanup EXIT
+
+	SELF_TMP=$(mktemp -d)
+	local root=$SELF_TMP/state
+	local err=$SELF_TMP/err
+	local out rc
+	log() { printf '==> selfcheck: %s\n' "$1"; }
+	ctl_run() { LOCAL_TEST_STATE=$root "$SELF_BIN" "$@"; }
+	# The daemon and my-workshop drive launch/info/remove with cwd = the
+	# project directory — reproduce that shape.
+	local ws_bin=$WS
+	ws_run() { LOCAL_TEST_STATE=$root "$ws_bin" "$@"; }
+	in_proj() { (cd "$proj" && ws_run "$@"); }
+
+	[ -x "$ws_bin" ] || fail "fake workshop missing at $ws_bin"
+
+	local proj=$SELF_TMP/clone
+	mkdir -p "$proj"
+	printf 'name: selfcheck-ws\nbase: ubuntu@24.04\n' >"$proj/workshop.yaml"
+
+	# ---- 1/6 list reflects the registry
+	log "1/6 list reflects the registry"
+	out=$(ctl_run list) || fail "list on empty state" "$out"
+	grep -q 'no workshops launched' <<<"$out" ||
+		fail "empty registry reports empty" "$out"
+	in_proj launch >/dev/null 2>"$err" || fail "launch" "$(cat "$err")"
+	local lock
+	lock=$(cat "$proj/.workshop.lock")
+	out=$(ctl_run list) || fail "list after launch" "$out"
+	grep -q "^$proj\$" <<<"$out" || fail "list shows the project path" "$out"
+	grep -q "id:     $lock  name: selfcheck-ws" <<<"$out" ||
+		fail "list shows the id and name" "$out"
+	grep -q 'since:' <<<"$out" || fail "list shows the launch time" "$out"
+	ok "list: empty → launched, with id/name/since"
+
+	# ---- 2/6 remove mirrors workshop remove (lock preserved, info gone)
+	log "2/6 remove mirrors workshop remove"
+	ctl_run remove "$proj" >/dev/null || fail "remove"
+	[ -f "$proj/.workshop.lock" ] ||
+		fail "remove leaves .workshop.lock on disk"
+	rc=0
+	in_proj info >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "info after ctl remove reports gone"
+	grep -q 'workshop not launched' <<<"$(cat "$err")" ||
+		fail "info gone error carries the gone marker" "$(cat "$err")"
+	out=$(ctl_run list) || fail "list after remove" "$out"
+	grep -q 'no workshops launched' <<<"$out" ||
+		fail "registry is empty after remove" "$out"
+	ok "remove: deregisters, lock preserved, gone marker surfaces"
+
+	# ---- 3/6 remove of an unregistered clone fails loudly
+	log "3/6 remove of an unregistered clone"
+	rc=0
+	ctl_run remove "$proj" >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "removing an unregistered clone is refused"
+	grep -q 'no launched workshop registered' <<<"$(cat "$err")" ||
+		fail "refusal names the clone" "$(cat "$err")"
+	rc=0
+	ctl_run remove /nonexistent >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "removing a missing path is refused"
+	ok "remove: unregistered and missing paths refused"
+
+	# ---- 4/6 fail-next launch fail
+	log "4/6 fail-next launch fail"
+	ctl_run fail-next launch fail >/dev/null || fail "arm fail"
+	out=$(ctl_run fail-next) || fail "bare inspection" "$out"
+	grep -q '^launch: fail$' <<<"$out" || fail "inspection shows armed mode" "$out"
+	rc=0
+	in_proj launch >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "armed launch fails"
+	grep -q 'injected launch failure' <<<"$(cat "$err")" ||
+		fail "injected failure names itself" "$(cat "$err")"
+	in_proj launch >/dev/null 2>"$err" ||
+		fail "next launch succeeds (slot consumed)" "$(cat "$err")"
+	ok "fail-next launch fail: one-shot by consumption"
+
+	# ---- 5/6 fail-next launch no-lock
+	log "5/6 fail-next launch no-lock"
+	ctl_run remove "$proj" >/dev/null # back to a clean registry
+	rm -f "$proj/.workshop.lock"
+	ctl_run fail-next launch no-lock >/dev/null || fail "arm no-lock"
+	in_proj launch >/dev/null 2>"$err" ||
+		fail "no-lock launch exits 0" "$(cat "$err")"
+	[ -f "$proj/.workshop.lock" ] &&
+		fail "no-lock launch must not write .workshop.lock"
+	out=$(ctl_run list) || fail "list after no-lock" "$out"
+	grep -q 'no workshops launched' <<<"$out" ||
+		fail "no-lock launch must not register" "$out"
+	in_proj launch >/dev/null 2>"$err" ||
+		fail "next launch behaves normally" "$(cat "$err")"
+	[ -s "$proj/.workshop.lock" ] ||
+		fail "next launch writes the lock"
+	ok "fail-next launch no-lock: lockless success, then normal"
+
+	# ---- 6/6 off + loud rejection
+	log "6/6 off and unknown subcommand"
+	ctl_run fail-next launch fail >/dev/null
+	ctl_run fail-next launch off >/dev/null || fail "disarm"
+	out=$(ctl_run fail-next) || fail "inspection after off" "$out"
+	grep -q '^launch: none$' <<<"$out" || fail "off leaves no armed mode" "$out"
+	rc=0
+	ctl_run nonsense >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "unknown subcommand exits non-zero"
+	grep -q 'unknown command' <<<"$(cat "$err")" ||
+		fail "unknown subcommand names itself" "$(cat "$err")"
+	ok "off and unknown subcommands"
+
+	printf 'selfcheck: all %d checks passed\n' "$SELF_CHECKS"
+}
+
+# --- dispatch -----------------------------------------------------------------------
+
+command=${1:-help}
+case "$command" in
+list) shift; cmd_list "$@" ;;
+remove) shift; cmd_remove "$@" ;;
+fail-next) shift; cmd_fail_next "$@" ;;
+selfcheck) shift; cmd_selfcheck "$@" ;;
+help | --help | -h) usage ;;
+*)
+	printf 'wsctl: unknown command: %s\n\n' "$command" >&2
+	usage >&2
+	exit 1
+	;;
+esac

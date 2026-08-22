@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+#
+# local-test/gpgctl — LOCAL-TESTING.PLAN.md Part 8: the steering wheel for
+# the ship gate (Part 6). Delegates to local-test/gpg — the owner of the
+# throwaway keyring — and adds the one thing operators actually want in
+# a glance: both verdicts the ship gate consumes, side by side (the
+# local KEYINFO probe and the daemon's own /api/gpg state).
+#
+# State root: $LOCAL_TEST_STATE if set, else <repo>/local-test/.state.
+# Key provisioning stays with `local-test/gpg init` (run by env up);
+# this tool only steers.
+#
+# Daemon resolution for `status`:
+#   port:   `port =` in <state>/home/.config/ompire/config.toml, else
+#           $LOCAL_TEST_PORT, else 4173
+#   token:  <state>/home/.local/share/ompire/token
+#
+# Commands:
+#   lock         drop the passphrase cache (gate probes locked)
+#   warm         cache the passphrase (gate probes cached)
+#   fingerprint  print the ephemeral key's fingerprint
+#   status       local probe verdict + the daemon's /api/gpg verdict
+#                (daemon line says "unreachable" when it is down)
+#   selfcheck    prove the delegation + status contract offline in a
+#                temp root; never touches $STATE
+#   help         this message
+
+set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+STATE_ROOT=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
+GPG=$REPO_ROOT/local-test/gpg
+HOME_DIR=$STATE_ROOT/home
+CONFIG=$HOME_DIR/.config/ompire/config.toml
+TOKEN_FILE=$HOME_DIR/.local/share/ompire/token
+
+SELF_BIN=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
+
+[ -x "$GPG" ] || die "local-test/gpg missing at $GPG"
+command -v curl >/dev/null 2>&1 || die "curl is required but not on PATH"
+
+daemon_port() {
+	local port=""
+	if [ -f "$CONFIG" ]; then
+		port=$(sed -n 's/^port[[:space:]]*=[[:space:]]*\([0-9]\+\).*/\1/p' "$CONFIG" | head -1)
+	fi
+	printf '%s' "${port:-${LOCAL_TEST_PORT:-4173}}"
+}
+
+daemon_gpg_state() { # daemon_gpg_state: prints the state, or "unreachable: <reason>"
+	local port token resp
+	port=$(daemon_port)
+	if [ ! -f "$TOKEN_FILE" ]; then
+		printf 'unreachable: no token at %s' "$TOKEN_FILE"
+		return 0
+	fi
+	token=$(cat "$TOKEN_FILE")
+	resp=$(curl -fsS -m 3 -H "Authorization: Bearer $token" \
+		"http://127.0.0.1:$port/api/gpg" 2>&1) || {
+		printf 'unreachable (%s)' "$(head -c 120 <<<"$resp" | tr '\n' ' ')"
+		return 0
+	}
+	jq -r '.state // "unknown response"' <<<"$resp" 2>/dev/null ||
+		printf 'unknown response'
+}
+
+cmd_status() {
+	local local_state
+	local_state=$("$GPG" status)
+	printf 'local:   %s\n' "$local_state"
+	printf 'daemon:  %s\n' "$(daemon_gpg_state)"
+}
+
+# --- selfcheck -----------------------------------------------------------------------
+
+SELF_TMP=""
+
+selfcheck_cleanup() { [ -n "$SELF_TMP" ] && rm -rf "$SELF_TMP"; }
+
+SELF_CHECKS=0
+
+ok() { SELF_CHECKS=$((SELF_CHECKS + 1)); printf '  ok    %s\n' "$1"; }
+fail() { # fail <name> [detail]
+	printf '  FAIL  %s\n' "$1" >&2
+	[ $# -gt 1 ] && printf '%s\n' "$2" | sed 's/^/        /' >&2
+	printf 'selfcheck failed at: %s\n' "$1" >&2
+	exit 1
+}
+
+cmd_selfcheck() {
+	trap selfcheck_cleanup EXIT
+
+	SELF_TMP=$(mktemp -d)
+	local root=$SELF_TMP/state
+	local err=$SELF_TMP/err
+	local out rc
+	log() { printf '==> selfcheck: %s\n' "$1"; }
+	ctl_run() { LOCAL_TEST_STATE=$root "$SELF_BIN" "$@"; }
+	# The gpg tool itself is already proven by its own selfcheck; here we
+	# prove the delegation and the status shape only.
+	gpg_run() { LOCAL_TEST_STATE=$root "$GPG" "$@"; }
+
+	log "1/4 lock/warm/fingerprint delegate with identical semantics"
+	gpg_run init >/dev/null || fail "gpg init (throwaway root)"
+	out=$(ctl_run fingerprint) || fail "fingerprint" "$out"
+	[ "$out" = "$(gpg_run fingerprint)" ] ||
+		fail "fingerprint matches the gpg tool's" "$out"
+	ctl_run warm >/dev/null || fail "warm"
+	[ "$(gpg_run status | awk '{print $1}')" = cached ] ||
+		fail "warm delegated: probe reports cached"
+	ctl_run lock >/dev/null || fail "lock"
+	[ "$(gpg_run status | awk '{print $1}')" = locked ] ||
+		fail "lock delegated: probe reports locked"
+	ok "lock/warm/fingerprint: delegation is exact"
+
+	log "2/4 status reports the local probe and the daemon verdict"
+	gpg_run warm >/dev/null
+	out=$(ctl_run status) || fail "status" "$out"
+	grep -qE '^local:   (cached|locked) [0-9A-F]+$' <<<"$out" ||
+		fail "status shows the local verdict + fingerprint" "$out"
+	ok "status: local verdict present"
+
+	log "3/4 status degrades to unreachable without a daemon"
+	rm -rf "$root/home" # no token, no config: nothing to talk to
+	out=$(ctl_run status) || fail "status without daemon" "$out"
+	grep -q '^daemon:  unreachable' <<<"$out" ||
+		fail "status says unreachable when the daemon is gone" "$out"
+	ok "status: unreachable degradation"
+
+	log "4/4 unknown subcommand"
+	rc=0
+	ctl_run nonsense >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "unknown subcommand exits non-zero"
+	grep -q 'unknown command' <<<"$(cat "$err")" ||
+		fail "unknown subcommand names itself" "$(cat "$err")"
+	ok "unknown subcommands fail loudly"
+
+	printf 'selfcheck: all %d checks passed\n' "$SELF_CHECKS"
+}
+
+# --- dispatch -----------------------------------------------------------------------
+
+command=${1:-help}
+case "$command" in
+lock) shift; "$GPG" lock "$@" ;;
+warm) shift; "$GPG" warm "$@" ;;
+fingerprint) shift; "$GPG" fingerprint "$@" ;;
+status) shift; cmd_status "$@" ;;
+selfcheck) shift; cmd_selfcheck "$@" ;;
+help | --help | -h) usage ;;
+*)
+	printf 'gpgctl: unknown command: %s\n\n' "$command" >&2
+	usage >&2
+	exit 1
+	;;
+esac

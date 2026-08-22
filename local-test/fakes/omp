@@ -139,25 +139,28 @@ def _write_control(doc: dict) -> None:
     )
 
 
-def _consume_slot(slot: str) -> str | None:
-    """One-shot consume: clone key first, then global; null both."""
+def _consume_slot(slot: str, session_id: str | None = None) -> str | None:
+    """One-shot consume. next_prompt: clone, then session, then global;
+    startup: clone, then global (session identity does not exist before
+    launch). Nulls the consumed key."""
     doc = _read_control()
     entries = doc.get(slot, {})
     if not isinstance(entries, dict):
         return None
     clone = str(Path.cwd().resolve())
-    value = entries.get(clone)
-    if value is None:
-        value = entries.get("global")
-        key = "global" if value is not None else None
-    else:
-        key = clone
-    if key is None:
-        return None
-    entries[key] = None
-    doc[slot] = entries
-    _write_control(doc)
-    return value if isinstance(value, str) else None
+    keys = [clone]
+    if slot != "startup" and session_id is not None:
+        keys.append(session_id)
+    keys.append("global")
+    for key in keys:
+        value = entries.get(key)
+        if value is None:
+            continue
+        entries[key] = None
+        doc[slot] = entries
+        _write_control(doc)
+        return value if isinstance(value, str) else None
+    return None
 
 
 # --- transcript store --------------------------------------------------------
@@ -287,10 +290,10 @@ class Engine:
             "argv": self.argv,
             "cwd": str(Path.cwd().resolve()),
             "resume": self.resume_id,
+            "pid": os.getpid(),
             "environ": dict(os.environ),
             "startup_scenario": self.startup_scenario,
         })
-
         scenario = self.startup_scenario
         if scenario == "crash":
             print("Error: No models available", file=sys.stderr, flush=True)
@@ -357,7 +360,7 @@ class Engine:
                 continue
 
             scenario, params, clean_message = resolve_scenario(
-                request.get("message", ""))
+                request.get("message", ""), self.session_id)
             pending = self._serve_prompt(
                 request.get("id", ""), scenario, params, clean_message)
             if pending is not None:
@@ -649,7 +652,8 @@ class Engine:
 
 # --- scenario resolution (design D-3) ----------------------------------------
 
-def resolve_scenario(message: str) -> tuple[str, dict, str]:
+def resolve_scenario(message: str,
+                     session_id: str | None = None) -> tuple[str, dict, str]:
     """Returns (scenario, params, message-without-directive-lines)."""
     scenario: str | None = None
     params: dict[str, str] = {}
@@ -667,7 +671,7 @@ def resolve_scenario(message: str) -> tuple[str, dict, str]:
     clean_message = "\n".join(clean_lines)
 
     if scenario is None:
-        scenario = _consume_slot("next_prompt")
+        scenario = _consume_slot("next_prompt", session_id)
     if scenario is None:
         scenario = classify_prompt(clean_message)
     return scenario, params, clean_message
@@ -690,9 +694,16 @@ def classify_prompt(message: str) -> str:
 
 def main() -> None:
     argv = sys.argv[1:]
-
     if argv == ["config", "get", "ask.timeout"]:
         print("0")
+        return
+    if argv == ["scenarios"]:
+        print("behavior:")
+        for name in sorted(KNOWN_SCENARIOS - STARTUP_SCENARIOS):
+            print(f"  {name}")
+        print("startup-only:")
+        for name in sorted(STARTUP_SCENARIOS):
+            print(f"  {name}")
         return
     if argv == ["--version"]:
         print(f"omp/{CAPTURED_VERSION} (fake, local-test)")
@@ -779,30 +790,6 @@ def selfcheck() -> None:
             proc.stdin.write(json.dumps(obj) + "\n")
             proc.stdin.flush()
 
-        def read_frames(proc: subprocess.Popen, count: int,
-                        timeout: float = 10.0) -> list[dict]:
-            import selectors
-            frames: list[dict] = []
-            raw_lines: list[str] = []
-            sel = selectors.DefaultSelector()
-            assert proc.stdout is not None
-            sel.register(proc.stdout, selectors.EVENT_READ)
-            import time
-            deadline = time.monotonic() + timeout
-            while len(raw_lines) < count and time.monotonic() < deadline:
-                if not sel.select(timeout=max(0.05, deadline - time.monotonic())):
-                    break
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                raw_lines.append(line)
-            sel.close()
-            for line in raw_lines:
-                try:
-                    frames.append(json.loads(line))
-                except json.JSONDecodeError:
-                    frames.append({"__raw__": line})
-            return frames
 
         def send_prompt(proc: subprocess.Popen, message: str,
                         request_id: str = "r1") -> None:
@@ -814,6 +801,37 @@ def selfcheck() -> None:
         check("ask-timeout preflight prints 0",
               r.returncode == 0 and r.stdout.strip() == "0", r.stdout.strip())
 
+        def read_frames(proc: subprocess.Popen, count: int,
+                        timeout: float = 10.0) -> list[dict]:
+            """Raw-read drain with a deadline. A select() loop over the
+            TextIOWrapper races Python's read-ahead buffering (a fully
+            buffered burst leaves the fd quiet while lines sit unread),
+            and a bare readline() blocks past the deadline; os.read into
+            a line buffer avoids both."""
+            import select as _select
+            import time
+            frames: list[dict] = []
+            buf = ""
+            deadline = time.monotonic() + timeout
+            fd = proc.stdout.fileno()
+            while len(frames) < count and time.monotonic() < deadline:
+                ready, _, _ = _select.select([proc.stdout], [], [],
+                                             max(0.0, deadline - time.monotonic()))
+                if not ready:
+                    continue
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                buf += chunk.decode("utf-8", "replace")
+                while "\n" in buf and len(frames) < count:
+                    line, buf = buf.split("\n", 1)
+                    if not line:
+                        continue
+                    try:
+                        frames.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        frames.append({"__raw__": line})
+            return frames
         # 2. ready + get_state
         p = session()
         frames = read_frames(p, 1)
@@ -841,7 +859,8 @@ def selfcheck() -> None:
             outcome = json.loads(outcome_file.read_text())
         except (OSError, json.JSONDecodeError):
             outcome = {}
-        check("outcome file valid", outcome.get("version") == 1 and
+        check("outcome file valid",
+              outcome.get("version") == 1 and
               outcome.get("status") == "success" and
               isinstance(outcome.get("summary"), str))
         check("work artifact appended",
@@ -1053,7 +1072,70 @@ Format your reply as:
                      "value": "exit-after-ready"})
         read_frames(p, 1)
         p.wait(timeout=10)
-        check("exit-after-ready exits 7", p.returncode == 7)
+        # 7b. session-keyed arming + launch pid + scenarios verb (Part 8)
+        p = session()
+        read_frames(p, 1)
+        send(p, {"id": "sk0", "type": "get_state"})
+        frames = read_frames(p, 1)
+        sid = frames[0].get("data", {}).get("sessionId", "")
+        _atomic_write(state / "omp-scenarios.json", json.dumps(
+            {"startup": {}, "next_prompt": {sid: "queue"}}))
+        import time as _time
+
+        def drain_until(proc: subprocess.Popen, predicate,
+                        timeout: float = 10.0) -> list[dict]:
+            """readline-drain (immune to the select/read-ahead race that
+            makes read_frames return early when a burst is fully
+            buffered): collect frames until one matches."""
+            got: list[dict] = []
+            deadline = _time.monotonic() + timeout
+            while _time.monotonic() < deadline:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    frame = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                got.append(frame)
+                if predicate(frame):
+                    return got
+            return got
+
+        send_prompt(p, "plain work", "r1")
+        send(p, {"id": "q2", "type": "get_state"})
+        frames = drain_until(p, lambda f: f.get("id") == "q2")
+        q2 = next((f for f in frames if f.get("id") == "q2"), None)
+        check("session-keyed armed scenario fires",
+              q2 is not None and
+              q2.get("data", {}).get("queuedMessageCount") == 1)
+        p.terminate(); p.wait()
+
+        _atomic_write(state / "omp-scenarios.json", json.dumps(
+            {"startup": {}, "next_prompt": {sid: "big"}}))
+        p = session()  # different session: must NOT consume sid's entry
+        read_frames(p, 1)
+        send_prompt(p, "plain work", "r1")
+        frames = drain_until(p, lambda f: f.get("type") == "agent_end")
+        check("session key leaves other sessions alone",
+              not any(f.get("type") == "tool_output" and
+                      len(str(f.get("data", ""))) > 100_000
+                      for f in frames))
+        p.terminate(); p.wait()
+
+        launch_records = []
+        for line in (state / "omp-sessions" / f"{sid}.jsonl").read_text() \
+                .splitlines():
+            record = json.loads(line)
+            if record.get("kind") == "launch":
+                launch_records.append(record)
+        check("launch record carries a pid",
+              launch_records and isinstance(launch_records[0].get("pid"), int))
+
+        r = run(["scenarios"])
+        check("scenarios verb lists the catalog",
+              r.returncode == 0 and "startup-only:" in r.stdout
+              and "ship-draft" in r.stdout)
 
         # 8. resume
         p = session()

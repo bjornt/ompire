@@ -425,7 +425,8 @@ EOF
 	    project:  $NAME -> $SLUG (checkout $CHECKOUT, base $BASE_BRANCH)
 	    restart:  $DAEMON_WRAPPER
 	    state:    $STATE_ROOT
-	    steer:    local-test/gpg lock|warm — ship-gate state
+	    steer:    ghctl (PRs) | wsctl (workshops) | ompctl (scenarios) |
+	              gpgctl (ship gate) — the local-test control CLIs
 	$([ $rc -eq 0 ] || printf '\n    NOTE: one or more smoke checks failed — see above.\n')
 	EOF
 	[ "$rc" -eq 0 ] || exit 1

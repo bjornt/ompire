@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+#
+# local-test/ompctl — LOCAL-TESTING.PLAN.md Part 8: the steering wheel for
+# the fake omp (Part 4). Arms one-shot scenarios keyed the way the fake
+# resolves them (task clone, clone path, session id, or global), and
+# introspects the fake's recorded sessions. Review steering is
+# deliberately NOT here: llmvet is real and operator-driven.
+#
+# State root: $LOCAL_TEST_STATE if set, else <repo>/local-test/.state.
+# Writes only <state>/omp-scenarios.json (same atomic jq -> tmp -> rename
+# discipline as the fake itself); reads <state>/omp-sessions/*.jsonl.
+#
+# Task resolution (--task) goes through the daemon's REST API — the
+# daemon is the only authority for task -> clone:
+#   port:   `port =` in <state>/home/.config/ompire/config.toml, else
+#           $LOCAL_TEST_PORT, else 4173
+#   token:  <state>/home/.local/share/ompire/token
+#
+# Commands:
+#   scenario <name> [--task N | --clone PATH | --session ID | --global]
+#                    [--startup]
+#                          arm a one-shot scenario (default key: global).
+#                          --startup arms the launch-time slot instead
+#                          (clone/global keys only). The entry is consumed
+#                          by the next matching prompt or launch.
+#   scenarios               print the fake's scenario catalog
+#   sessions                list recorded sessions: id, state (live /
+#                          exit code), clone, resume
+#   transcript <session-id> print a session's records (launch / prompts
+#                          with the served scenario / exit), sans environ
+#   selfcheck               prove the whole contract offline in a temp
+#                           root against the real fake omp (task
+#                           resolution against a stub HTTP server); never
+#                           touches $STATE
+#   help                    this message
+
+set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+STATE_ROOT=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
+CONTROL=$STATE_ROOT/omp-scenarios.json
+SESSIONS_DIR=$STATE_ROOT/omp-sessions
+OMP=$REPO_ROOT/local-test/fakes/omp
+HOME_DIR=$STATE_ROOT/home
+CONFIG=$HOME_DIR/.config/ompire/config.toml
+TOKEN_FILE=$HOME_DIR/.local/share/ompire/token
+
+SELF_BIN=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
+
+command -v jq >/dev/null 2>&1 || die "jq is required but not on PATH"
+[ -x "$OMP" ] || die "fake omp missing at $OMP"
+
+# --- control file --------------------------------------------------------------
+
+init_control() {
+	if [ ! -f "$CONTROL" ]; then
+		mkdir -p "$STATE_ROOT"
+		printf '{"startup":{},"next_prompt":{}}\n' >"$CONTROL"
+	fi
+}
+
+mutate_control() { # mutate_control <jq-options…> <jq-filter>
+	local filter="${*: -1}"
+	local -a opts=("${@:1:$(( $# - 1 ))}")
+	init_control
+	local tmp
+	tmp=$(mktemp "$CONTROL.XXXXXX")
+	jq "${opts[@]}" "$filter" "$CONTROL" >"$tmp" || { rm -f "$tmp"; return 1; }
+	mv "$tmp" "$CONTROL"
+}
+
+# --- scenario catalog (the fake is the single source of truth) -------------------
+
+catalog() { # catalog <behavior|startup|all>
+	"$OMP" scenarios 2>/dev/null |
+		awk -v want="$1" '
+			/^(behavior|startup-only):$/ { section = $1; sub(/:$/, "", section); next }
+			/^[[:space:]]+[a-z0-9-]+$/ {
+				gsub(/[[:space:]]/, "", $0)
+				if (want == "all" || want == section) print $0
+			}'
+}
+
+# --- daemon task resolution -------------------------------------------------------
+
+daemon_port() {
+	local port=""
+	if [ -f "$CONFIG" ]; then
+		port=$(sed -n 's/^port[[:space:]]*=[[:space:]]*\([0-9]\+\).*/\1/p' "$CONFIG" | head -1)
+	fi
+	printf '%s' "${port:-${LOCAL_TEST_PORT:-4173}}"
+}
+
+task_clone() { # task_clone <task-id>: prints the clone path from the daemon
+	local id=$1 port token
+	port=$(daemon_port)
+	[ -f "$TOKEN_FILE" ] ||
+		die "no daemon token at $TOKEN_FILE — is the local-test daemon up? (or use --clone/--global)"
+	token=$(cat "$TOKEN_FILE")
+	local resp
+	resp=$(curl -fsS -m 5 -H "Authorization: Bearer $token" \
+		"http://127.0.0.1:$port/api/tasks/$id" 2>&1) ||
+		die "daemon unreachable on :$port — is it up? (or use --clone/--global)$([[ $resp == *'Failed to connect'* ]] && printf '\n  %s' "$resp")"
+	local clone
+	clone=$(jq -r '.clone_path // empty' <<<"$resp" 2>/dev/null)
+	[ -n "$clone" ] ||
+		die "daemon answered but task $id has no clone_path: $resp"
+	printf '%s' "$clone"
+}
+
+# --- scenario -----------------------------------------------------------------------
+
+cmd_scenario() {
+	[ $# -ge 1 ] || die "usage: $0 scenario <name> [--task N | --clone PATH | --session ID | --global] [--startup]"
+	local name=$1; shift
+	[[ $name =~ ^[a-z0-9-]+$ ]] || die "scenario name must be kebab-case, got '$name'"
+
+	local key="" slot=next_prompt startup=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--task)
+			[ $# -ge 2 ] || die "--task requires an id"
+			local clone
+			clone=$(task_clone "$2")
+			key=$(realpath "$clone")
+			shift 2 ;;
+		--clone)
+			[ $# -ge 2 ] || die "--clone requires a path"
+			[ -d "$2" ] || die "--clone path does not exist: $2"
+			key=$(realpath "$2")
+			shift 2 ;;
+		--session)
+			[ $# -ge 2 ] || die "--session requires an id"
+			key="session:$2"
+			shift 2 ;;
+		--global) key="global"; shift ;;
+		--startup) startup=1; shift ;;
+		*) die "unknown argument: $1" ;;
+		esac
+	done
+	key=${key:-global}
+
+	if [ "$startup" -eq 1 ]; then
+		slot=startup
+		case "$key" in
+		session:*) die "startup entries key by clone or global only — session identity does not exist before launch" ;;
+		esac
+		catalog startup | grep -qxF "$name" ||
+			die "unknown startup scenario '$name' (startup-only: $(catalog startup | paste -sd' ' -))"
+	else
+		catalog behavior | grep -qxF "$name" ||
+			die "unknown scenario '$name' (behavior: $(catalog behavior | paste -sd' ' -))"
+	fi
+
+	# Session keys carry a marker prefix: they key the session-id slot of
+	# the control file, distinct from clone paths.
+	local control_key=$key
+	case "$key" in
+	session:*) control_key=${key#session:} ;;
+	esac
+
+	mutate_control --arg slot "$slot" --arg key "$control_key" --arg name "$name" \
+		'.[$slot][$key] = $name'
+	printf 'armed (%s): %s -> %s\n' "$slot" "$key" "$name"
+}
+
+# --- sessions -----------------------------------------------------------------------
+
+session_ids() { # newest first
+	[ -d "$SESSIONS_DIR" ] || return 0
+	ls -1t "$SESSIONS_DIR" 2>/dev/null | sed -n 's/\.jsonl$//p'
+}
+
+record_of_kind() { # record_of_kind <file> <kind>: last record of that kind
+	jq -c --arg k "$2" 'select(.kind == $k)' "$1" 2>/dev/null | tail -1
+}
+
+pid_alive() { # pid_alive <pid>
+	[ "$1" -gt 0 ] 2>/dev/null && kill -0 "$1" 2>/dev/null
+}
+
+cmd_sessions() {
+	local any=0
+	for sid in $(session_ids); do
+		local f=$SESSIONS_DIR/$sid.jsonl
+		local launch exit cwd resume pid state
+		launch=$(record_of_kind "$f" launch) || continue
+		[ -n "$launch" ] || continue
+		exit=$(record_of_kind "$f" exit)
+		cwd=$(jq -r '.cwd // "-"' <<<"$launch")
+		resume=$(jq -r 'if .resume then "resume" else "fresh" end' <<<"$launch")
+		pid=$(jq -r '.pid // 0' <<<"$launch")
+		if [ -n "$exit" ]; then
+			state="exit $(jq -r '.code' <<<"$exit")"
+		elif pid_alive "$pid"; then
+			state="live"
+		else
+			state="dead (no exit record — killed?)"
+		fi
+		printf '%s  %-28s %s  [%s]\n' "$sid" "$state" "$cwd" "$resume"
+		any=1
+	done
+	[ "$any" -eq 1 ] || printf 'no recorded sessions\n'
+}
+
+# --- transcript -----------------------------------------------------------------------
+
+cmd_transcript() {
+	[ $# -eq 1 ] || die "usage: $0 transcript <session-id>"
+	local id=$1
+	local f=$SESSIONS_DIR/$id.jsonl
+	[ -f "$f" ] ||
+		die "no session '$id' (known: $(session_ids | paste -sd' ' -))"
+	jq -c 'del(.environ)' "$f"
+}
+
+# --- selfcheck -----------------------------------------------------------------------
+
+SELF_TMP=""
+
+selfcheck_cleanup() { [ -n "$SELF_TMP" ] && rm -rf "$SELF_TMP"; }
+
+SELF_CHECKS=0
+
+ok() { SELF_CHECKS=$((SELF_CHECKS + 1)); printf '  ok    %s\n' "$1"; }
+fail() { # fail <name> [detail]
+	printf '  FAIL  %s\n' "$1" >&2
+	[ $# -gt 1 ] && printf '%s\n' "$2" | sed 's/^/        /' >&2
+	printf 'selfcheck failed at: %s\n' "$1" >&2
+	exit 1
+}
+
+cmd_selfcheck() {
+	trap selfcheck_cleanup EXIT
+
+	SELF_TMP=$(mktemp -d)
+	local root=$SELF_TMP/state
+	local clone=$SELF_TMP/clone
+	local err=$SELF_TMP/err
+	local out rc
+	log() { printf '==> selfcheck: %s\n' "$1"; }
+	ctl_run() { LOCAL_TEST_STATE=$root "$SELF_BIN" "$@"; }
+	mkdir -p "$root" "$clone"
+
+	# A stub daemon answering GET /api/tasks/N with a clone_path — the
+	# real daemon's response shape for the fields ompctl reads.
+	local stub_port stub_pid
+	stub_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+	mkdir -p "$root/home/.config/ompire" "$root/home/.local/share/ompire"
+	printf 'port = %s\n' "$stub_port" >"$root/home/.config/ompire/config.toml"
+	printf 'stub-token\n' >"$root/home/.local/share/ompire/token"
+	python3 - "$stub_port" "$clone" >"$SELF_TMP/stub.log" 2>&1 <<'STUBEOF' &
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port, clone = int(sys.argv[1]), sys.argv[2]
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/api/tasks/"):
+            body = json.dumps({"id": int(self.path.rsplit("/", 1)[1]),
+                               "clone_path": clone}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+    def log_message(self, *a):
+        pass
+HTTPServer(("127.0.0.1", port), H).serve_forever()
+STUBEOF
+	stub_pid=$!
+	stub_up=0
+	for _ in $(seq 1 50); do
+		curl -fsS -m 1 "http://127.0.0.1:$stub_port/api/tasks/7" \
+			-H 'Authorization: Bearer stub-token' >/dev/null 2>&1 && { stub_up=1; break; }
+		sleep 0.1
+	done
+	[ "$stub_up" -eq 1 ] || { kill "$stub_pid" 2>/dev/null || true; die "stub daemon did not start"; }
+
+	local omp_bin=$OMP
+
+	log "1/6 scenario arming and catalog validation"
+	out=$(ctl_run scenarios) || fail "scenarios" "$out"
+	grep -q 'behavior:' <<<"$out" || fail "catalog lists behavior scenarios" "$out"
+	grep -q 'startup-only:' <<<"$out" || fail "catalog lists startup scenarios" "$out"
+	rc=0
+	ctl_run scenario not-a-scenario >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "unknown scenario refused"
+	grep -q "unknown scenario 'not-a-scenario'" <<<"$(cat "$err")" ||
+		fail "refusal names the catalog" "$(cat "$err")"
+	rc=0
+	ctl_run scenario crash --startup --session abc >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "startup+session refused"
+	grep -q 'clone or global only' <<<"$(cat "$err")" ||
+		fail "startup+session refusal explains why" "$(cat "$err")"
+	rc=0
+	ctl_run scenario crash >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "startup-only scenario refused for prompt arming"
+	ok "scenario: catalog validation and key guards"
+
+	log "2/6 --task resolves through the daemon-shaped API"
+	ctl_run scenario ask --task 7 >/dev/null ||
+		fail "--task arming" "daemon resolution failed"
+	jq -e --arg c "$clone" '.next_prompt[$c] == "ask"' "$root/omp-scenarios.json" >/dev/null ||
+		fail "task key resolved to the clone path" "$(cat "$root/omp-scenarios.json")"
+	ok "--task: clone resolved via the REST task endpoint"
+
+	log "3/6 armed scenarios fire through the real fake"
+	# One self-contained session: plain prompt, clean stdin-close exit.
+	# Asserts the ask scenario served it (extension_ui_request) and that
+	# the process exits 0 with an exit record on stdin EOF.
+	python3 - "$omp_bin" "$root" "$clone" <<'PYEOF' || fail "armed ask scenario did not fire"
+import json, subprocess, sys, os, select, time
+omp, root, clone = sys.argv[1], sys.argv[2], sys.argv[3]
+proc = subprocess.Popen([sys.executable, omp, "--mode", "rpc-ui", "--no-title"],
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    text=True, cwd=clone, env={**os.environ, "LOCAL_TEST_STATE": root})
+def read(n, t=10.0):
+    # raw-read drain: select() over the TextIOWrapper races Python's
+    # read-ahead buffering; os.read into a line buffer avoids it.
+    frames, buf, fd = [], "", proc.stdout.fileno()
+    dl = time.monotonic() + t
+    while len(frames) < n and time.monotonic() < dl:
+        ready, _, _ = select.select([proc.stdout], [], [], max(0.0, dl - time.monotonic()))
+        if not ready:
+            continue
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        buf += chunk.decode("utf-8", "replace")
+        while "\n" in buf and len(frames) < n:
+            line, buf = buf.split("\n", 1)
+            if line:
+                frames.append(line)
+    return frames
+read(1)  # ready
+proc.stdin.write(json.dumps({"id": "r1", "type": "prompt", "message": "plain"}) + "\n")
+proc.stdin.flush()
+frames = "".join(read(9))
+proc.stdin.close()
+code = proc.wait(timeout=10)
+sys.exit(0 if ("extension_ui_request" in frames and code == 0) else 1)
+PYEOF
+	jq -e --arg c "$clone" '.next_prompt[$c] == null' "$root/omp-scenarios.json" >/dev/null ||
+		fail "armed entry consumed by the firing prompt"
+	ok "scenario (--task): fires once via the real fake omp"
+
+	log "4/6 session-keyed arming fires in its session"
+	local fifo=$SELF_TMP/live.fifo before after sid=""
+	before=$(ls -1 "$root/omp-sessions" 2>/dev/null || true)
+	mkfifo "$fifo"
+	(cd "$clone" && LOCAL_TEST_STATE=$root python3 "$omp_bin" \
+		--mode rpc-ui --no-title <"$fifo" >"$SELF_TMP/live.out" 2>&1) &
+	local live_pid=$!
+	exec 9>"$fifo" # hold the writer open: no EOF, session stays live
+	for _ in $(seq 1 50); do
+		after=$(ls -1 "$root/omp-sessions" 2>/dev/null || true)
+		sid=$(comm -13 <(sort <<<"$before") <(sort <<<"$after") | head -1)
+		[ -n "$sid" ] && break
+		sleep 0.1
+	done
+	[ -n "$sid" ] || fail "live session did not record a transcript"
+	sid=${sid%.jsonl}
+	ctl_run scenario queue --session "$sid" >/dev/null ||
+		fail "arming by session key"
+	printf '{"id":"r2","type":"prompt","message":"plain"}\n' >&9
+	local served=""
+	for _ in $(seq 1 50); do
+		served=$(jq -r 'select(.kind == "prompt") | .scenario' \
+			"$root/omp-sessions/$sid.jsonl" 2>/dev/null | tail -1)
+		[ "$served" = "queue" ] && break
+		sleep 0.1
+	done
+	[ "$served" = "queue" ] ||
+		fail "session-keyed scenario served the session's prompt" "served: ${served:-none}"
+	jq -e --arg s "$sid" '.next_prompt[$s] == null' "$root/omp-scenarios.json" >/dev/null ||
+		fail "session-keyed entry consumed"
+	ok "scenario (--session): fires in its session, consumed"
+
+	log "5/6 sessions and transcript"
+	out=$(ctl_run sessions) || fail "sessions" "$out"
+	grep -qE "^[0-9a-f-]+ +live +$clone" <<<"$out" ||
+		fail "sessions reports the live one" "$out"
+	grep -q 'exit 0' <<<"$out" ||
+		fail "sessions reports the exited one's code" "$out"
+	out=$(ctl_run transcript "$sid") || fail "transcript" "$out"
+	jq -e 'select(.kind == "launch") | has("pid")' <<<"$out" >/dev/null ||
+		fail "transcript shows the launch record (pid present)" "$out"
+	jq -e 'select(.kind == "prompt") | .scenario == "queue"' <<<"$out" >/dev/null ||
+		fail "transcript names the served scenario" "$out"
+	rc=0
+	ctl_run transcript no-such-session >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "unknown session refused"
+	ok "sessions/transcript: live detection, exit codes, records"
+
+	log "6/6 unknown subcommand"
+	rc=0
+	ctl_run nonsense >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "unknown subcommand exits non-zero"
+	ok "unknown subcommands fail loudly"
+
+	exec 9>&- # EOF: the live session exits cleanly
+	kill "$stub_pid" 2>/dev/null || true
+	printf 'selfcheck: all %d checks passed\n' "$SELF_CHECKS"
+}
+
+# --- dispatch -----------------------------------------------------------------------
+
+command=${1:-help}
+case "$command" in
+scenario) shift; cmd_scenario "$@" ;;
+scenarios) "$OMP" scenarios ;;
+sessions) shift; cmd_sessions "$@" ;;
+transcript) shift; cmd_transcript "$@" ;;
+selfcheck) shift; cmd_selfcheck "$@" ;;
+help | --help | -h) usage ;;
+*)
+	printf 'ompctl: unknown command: %s\n\n' "$command" >&2
+	usage >&2
+	exit 1
+	;;
+esac
