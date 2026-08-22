@@ -11,6 +11,8 @@ from typing import Any
 DEFAULT_CONFIG_PATH = Path("~/.config/ompire/config.toml").expanduser()
 
 DEFAULT_PORT = 4173
+# Local single-user boundary: ADR-0002
+# (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
 DEFAULT_BIND = "127.0.0.1"
 
 

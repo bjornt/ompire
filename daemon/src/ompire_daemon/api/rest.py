@@ -82,6 +82,8 @@ from ompire_daemon.workflows import (
 )
 from ompire_daemon.workshop import WorkshopRemoveError, remove_workshop, workshop_status
 
+# REST authentication boundary: ADR-0002
+# (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
 router = APIRouter(prefix="/api", dependencies=[Depends(require_bearer_token)])
 
 

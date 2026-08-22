@@ -1,4 +1,7 @@
-"""FastAPI app wiring: config, migrations, auth, routers, static serving."""
+"""FastAPI app wiring: config, migrations, auth, routers, static serving.
+
+Architecture: ADR-0002 (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
+"""
 
 from __future__ import annotations
 

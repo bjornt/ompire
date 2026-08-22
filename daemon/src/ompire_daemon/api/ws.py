@@ -1,5 +1,7 @@
 """WebSocket endpoint: snapshot-then-deltas over /api/ws. No commands accepted
-here — REST is the only way to mutate state (SPEC Decision 2).
+here — REST is the only way to mutate state.
+
+Architecture: ADR-0002 (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
 """
 
 from __future__ import annotations

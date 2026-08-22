@@ -1,4 +1,7 @@
-"""Bearer-token auth: first-run token generation, REST dependency, WS check."""
+"""Bearer-token auth: first-run token generation, REST dependency, WS check.
+
+Architecture: ADR-0002 (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
+"""
 
 from __future__ import annotations
 

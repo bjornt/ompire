@@ -158,6 +158,7 @@ interrupting), and a local relay can be self-hosted.
 ---
 
 ## Decision 2: Delivery form — local daemon + web UI
+<!-- Durable decision: [ADR-0002](../../docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md) -->
 
 **Decision:** A long-running supervisor daemon (systemd user service) owns
 the `omp` child processes and serves a browser UI. No desktop app in v1; if

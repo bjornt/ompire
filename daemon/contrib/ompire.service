@@ -1,3 +1,4 @@
+# Architecture: ADR-0002 (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
 [Unit]
 Description=ompire daemon
 After=network.target
