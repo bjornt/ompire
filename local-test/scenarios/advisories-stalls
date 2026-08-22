@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/advisories-stalls — LOCAL-TESTING.PLAN.md Part 9,
+# flow 9.
+#
+# Protocol-level adversarial frames and the stall watchdog: a `big`
+# (200 KB) frame survives and emits a context advisory, a `no-end` turn
+# stalls and is stopped, and an `auto-retry-hang` surfaces the retrying
+# session state before it is stopped. The stall threshold is lowered to 2 s
+# through the runtime setting and restored on exit.
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+# Lower the live threshold for a bounded stall assertion; lib.sh restores the
+# prior value and settings layer on every exit path.
+setting_set stall_threshold 2
+ws_start
+
+_stopped_by_operator() { # _stopped_by_operator TASK
+	_ws_seen '.type == "status_changed" and .payload.to == "failed" and .payload.reason == "stopped by operator"' "$1"
+}
+
+# --- big: a 200 KB frame flows through ------------------------------------------
+
+tid=$(spawn_task "$(unique_slug big)" "[[scenario:big]]
+Stream something huge.")
+wait_for "big turn completes (workflow complete)" 180 workflow_complete "$tid"
+assert "session went working during big" \
+	_ws_seen '.type == "status_changed" and .payload.to == "working"' "$tid"
+assert "task never failed after big" task_not_failed "$tid"
+assert "big frame triggered context-high advisory" \
+	_ws_seen '.type == "advisory" and .payload.kind == "context-high"' "$tid"
+
+# --- no-end: stall then operator stop ------------------------------------------
+
+follow_up "$tid" "[[scenario:no-end]]
+This turn never ends."
+wait_for "session stalls (no agent_end, threshold 2 s)" 60 \
+	_ws_seen '.type == "status_changed" and .payload.to == "stalled"' "$tid"
+ok "stalled surfaced via status_changed"
+
+session=$(primary_session "$tid")
+api POST "/api/tasks/$tid/sessions/$session/agent/stop" >/dev/null
+[ "$API_CODE" = 200 ] || die "stop after no-end rejected ($API_CODE)"
+wait_for "stalled session stops cleanly" 60 _stopped_by_operator "$tid"
+ok "stalled agent stopped by operator"
+assert "task never entered daemon task failure after stall" task_not_failed "$tid"
+
+# --- auto-retry-hang: retrying state surfaces ------------------------------------
+
+tid2=$(spawn_task "$(unique_slug retry)" "[[scenario:auto-retry-hang]]
+Enter the retry loop and stay there.")
+wait_for "auto-retry surfaces retrying state" 90 \
+	_ws_seen '.type == "status_changed" and .payload.to == "retrying"' "$tid2"
+ok "retrying surfaced via status_changed"
+
+# leave the environment clean: stop the hung agent by operator stop
+session2=$(primary_session "$tid2")
+api POST "/api/tasks/$tid2/sessions/$session2/agent/stop" >/dev/null
+[ "$API_CODE" = 200 ] && ok "hung agent stopped by operator" || fail "agent stop" "code $API_CODE"
+wait_for "auto-retry session stops cleanly" 60 _stopped_by_operator "$tid2"
+

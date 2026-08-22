@@ -27,7 +27,7 @@ from ompire_daemon.registry.tasks import Task, mark_pr_url
 from ompire_daemon.registry.templates import get_template
 from ompire_daemon.review import _run_git_output
 from ompire_daemon.sessions import wait_for_idle
-from ompire_daemon.spawn import Step, _run_step
+from ompire_daemon.spawn import Step, StepFailedError, _run_step
 
 if TYPE_CHECKING:
     from ompire_daemon.agent import AgentSupervisor
@@ -689,21 +689,26 @@ class ShipManager:
         name = await self._ensure_ship_remote(
             clone_path, remote_url, self._config.spawn_step_timeout
         )
-        await _run_step(
-            Step(
-                "ship-push",
-                [
-                    "git",
-                    "-C",
-                    clone_path,
-                    "push",
-                    name,
-                    f"HEAD:refs/heads/{branch}",
-                    "--force-with-lease",
-                ],
-                self._config.spawn_step_timeout,
+        try:
+            await _run_step(
+                Step(
+                    "ship-push",
+                    [
+                        "git",
+                        "-C",
+                        clone_path,
+                        "push",
+                        name,
+                        f"HEAD:refs/heads/{branch}",
+                        "--force-with-lease",
+                    ],
+                    self._config.spawn_step_timeout,
+                )
             )
-        )
+        except StepFailedError as exc:
+            detail = exc.stderr.strip()
+            raise ShipError(f"push failed: {detail or exc}") from exc
+
 
     async def _ensure_ship_remote(
         self, clone_path: str, remote_url: str, timeout: int
@@ -852,6 +857,7 @@ def _parse_draft(text: str) -> ShipDraft | None:
             if nxt != -1 and nxt < next_marker:
                 next_marker = nxt
         sections[marker] = text[start:next_marker].strip()
+
     return ShipDraft(
         commit_message=sections["<<<COMMIT_MESSAGE>>>"],
         pr_title=sections["<<<PR_TITLE>>>"],

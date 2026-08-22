@@ -295,11 +295,12 @@ export GIT_CONFIG_GLOBAL="$GITCONFIG"
 export GNUPGHOME="$STATE_ROOT/gnupg"
 export LOCAL_TEST_STATE="$STATE_ROOT"
 export PATH="$BIN:\$PATH"
-# record our pid (the exec below keeps it) so status/down track a
-# wrapper-restarted daemon too
+# Execute the synced console script directly. uv run supervises a child
+# Python process, so SIGKILL would kill only uv and leave the daemon serving.
+# Direct exec keeps daemon.pid equal to the actual server process.
 mkdir -p "$DATA"
 echo \$\$ >"$PIDFILE"
-exec uv run --project "$REPO_ROOT/daemon" ompire-daemon
+exec "$REPO_ROOT/daemon/.venv/bin/ompire-daemon"
 EOF
 	chmod +x "$DAEMON_WRAPPER"
 

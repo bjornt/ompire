@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""ws-watch — LOCAL-TESTING.PLAN.md Part 9: record /api/ws envelopes.
+
+Connects to the daemon's snapshot-then-deltas WebSocket and appends every
+envelope (the initial `snapshot` first, then each event) to --out as one
+JSON object per line, so bash runbooks can grep/jq the stream. Exits 0
+when --match types have all been observed (or on SIGTERM/SIGINT), 1 on
+connection failure. No dependency beyond the daemon project's venv
+(`websockets` ships with starlette's test surface in daemon/uv.lock).
+
+Usage:
+  ws-watch --url ws://127.0.0.1:4173/api/ws?token=T --out FILE
+           [--match TYPE]… [--timeout SECONDS]
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import signal
+import sys
+
+try:
+    import websockets  # from the daemon venv (uv run --project daemon)
+except ImportError:  # pragma: no cover - environment error, loud exit
+    print(
+        "error: websockets not importable — run under `uv run --project daemon python`",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+async def run(
+    url: str, out_path: str, matches: list[str], timeout: float | None
+) -> int:
+    seen: set[str] = set()
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:  # pragma: no cover
+            pass
+
+    try:
+        conn = await asyncio.wait_for(websockets.connect(url), 10)
+    except Exception as exc:  # noqa: BLE001 — any dial failure is fatal
+        print(f"error: cannot connect to {url}: {exc}", file=sys.stderr)
+        return 1
+
+    async def receive() -> str:
+        first = True
+        with open(out_path, "a", encoding="utf-8") as fh:
+            async for raw in conn:
+                envelope = json.loads(raw)
+                if first and envelope.get("type") != "snapshot":
+                    raise RuntimeError(
+                        "first WebSocket envelope is "
+                        f"{envelope.get('type')!r}, not 'snapshot'"
+                    )
+                first = False
+                fh.write(json.dumps(envelope, separators=(",", ":")) + "\n")
+                fh.flush()
+                seen.add(str(envelope.get("type")))
+                if matches and set(matches) <= seen:
+                    return "matched"
+        raise ConnectionError("WebSocket closed before the recorder was stopped")
+
+    receiver = asyncio.create_task(receive())
+    stopper = asyncio.create_task(stop.wait())
+    timer = asyncio.create_task(asyncio.sleep(timeout)) if timeout is not None else None
+    watched = {receiver, stopper}
+    if timer is not None:
+        watched.add(timer)
+    try:
+        done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+        if receiver in done:
+            try:
+                return 0 if receiver.result() == "matched" else 1
+            except Exception as exc:  # noqa: BLE001 — protocol/close failures are fatal
+                print(f"error: WebSocket recording failed: {exc}", file=sys.stderr)
+                return 1
+        if stopper in done:
+            return 0
+        missing = sorted(set(matches) - seen)
+        if missing:
+            print(
+                f"error: timeout before matching event types: {', '.join(missing)}",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+    finally:
+        for task in watched:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*watched, return_exceptions=True)
+        await conn.close()
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--url", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument(
+        "--match",
+        action="append",
+        default=[],
+        help="event type that may end the recording (repeatable)",
+    )
+    ap.add_argument(
+        "--timeout", type=float, default=None,
+        help="stop after this many seconds regardless",
+    )
+    args = ap.parse_args()
+    sys.exit(asyncio.run(run(args.url, args.out, args.match, args.timeout)))
+
+
+if __name__ == "__main__":
+    main()

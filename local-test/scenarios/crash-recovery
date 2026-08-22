@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/crash-recovery — LOCAL-TESTING.PLAN.md Part 9, flow 7.
+#
+# SIGKILL the daemon mid-flight and prove recovery:
+#   leg 1 (resume): hang the agent via a scenario directive, kill -9 the
+#     daemon, restart — recovery relaunches the fake omp with --resume for
+#     the recorded session, serves the recovery nudge, and the task
+#     reaches completion again.
+#   leg 2 (parked clone): hold ship's squash commit inside a gated
+#     `pre-commit` hook in the task clone (plain git — the hook waits for
+#     a gate file), kill -9 while `refs/ompire/ship-orig` exists, restart
+#     — startup restores the parked clone (ref consumed, HEAD back to the
+#     captured pre-ship commit), and the task ships afterwards.
+#
+# Clone surgery note: leg 2 installs a pre-commit hook in the throwaway
+# task clone and removes it in every exit path (EXIT trap).
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+PARKED_GATE=""
+PARKED_HOOK=""
+PARKED_DRAFT=$(mktemp /tmp/ompire-parked-draft-XXXXXX.json)
+_agent_live() { # _agent_live CLONE
+	$OMPCTL sessions | awk -v clone="$1" '$0 ~ clone {print $1}' | grep -q .
+}
+_launch_count() { # _launch_count SESSION WANT
+	local count
+	count=$($OMPCTL transcript "$1" | jq -s '[.[] | select(.kind == "launch")] | length')
+	[ "$count" -ge "$2" ] && printf '%s' "$count" || { printf 'launches=%s' "$count"; return 1; }
+}
+_parked_cleanup() {
+	if [ -n "$PARKED_GATE" ]; then
+		touch "$PARKED_GATE"
+		sleep 0.3
+		rm -f "$PARKED_GATE"
+	fi
+	[ -z "$PARKED_HOOK" ] || rm -f "$PARKED_HOOK"
+	rm -f "$PARKED_DRAFT"
+}
+register_cleanup _parked_cleanup
+
+ws_start
+
+# --- leg 1: resume after SIGKILL ------------------------------------------------
+
+tid=$(spawn_task "$(unique_slug crash)" "[[scenario:auto-retry-hang]]
+Keep working; the daemon will die under you.")
+clone=$(task_field "$tid" clone_path)
+
+# wait until the fake agent process is live for this clone
+wait_for "fake agent live for the hung task" 90 _agent_live "$clone"
+wait_for "hung turn reaches retrying" 90 \
+	_ws_seen '.type == "status_changed" and .payload.to == "retrying"' "$tid"
+session_id=$($OMPCTL sessions | awk -v clone="$clone" '$0 ~ clone {print $1}' | tail -1)
+agent_pid=$($OMPCTL transcript "$session_id" | jq -r 'select(.kind == "launch") | .pid' | tail -1)
+ok "agent session $session_id (pid $agent_pid) is the one that will orphan"
+
+daemon_kill9
+ws_stop
+ok "daemon SIGKILLed"
+
+daemon_start
+ws_start
+wait_for "session relaunch recorded" 60 _launch_count "$session_id" 2
+# Recovery relaunches the same session id with --resume; the nudge prompt is
+# then served and the workflow completes.
+wait_for "workflow completes after recovery" 180 workflow_complete "$tid"
+$OMPCTL transcript "$session_id" | jq -e --arg sid "$session_id" \
+	'select(.kind == "launch" and .resume == $sid)' >/dev/null &&
+	ok "relaunch carried --resume $session_id" ||
+	fail "relaunch resume flag" "no launch record resumed $session_id"
+$OMPCTL transcript "$session_id" | jq -e \
+	'select(.kind == "prompt" and .scenario == "resume-nudge")' >/dev/null &&
+	ok "recovery nudge served (resume-nudge)" ||
+	fail "recovery nudge" "no resume-nudge prompt served"
+assert "task never failed after recovery" task_not_failed "$tid"
+
+# --- leg 2: parked ship clone restored ------------------------------------------
+
+tid2=$(spawn_task "$(unique_slug parked)" "[[scenario:commit]]\nParked-clone E2E: do the work and commit it.")
+wait_for "work step completes (parked leg)" 180 workflow_complete "$tid2"
+approve_review "$tid2"
+api_json POST "/api/tasks/$tid2/ship/draft" >"$PARKED_DRAFT"
+$GPGCTL warm
+
+clone2=$(task_field "$tid2" clone_path)
+PARKED_GATE=$STATE_ROOT/parked-gate.$$
+PARKED_HOOK=$clone2/.git/hooks/pre-commit
+rm -f "$PARKED_GATE"
+cat >"$PARKED_HOOK" <<HOOK
+#!/bin/sh
+# installed by local-test/scenarios/crash-recovery — blocks the ship squash
+# commit until the gate file appears, holding the daemon in the ship-orig
+# window; self-destructs on first pass.
+rm -f "\$0"
+while [ ! -e "$PARKED_GATE" ]; do sleep 0.2; done
+HOOK
+chmod +x "$PARKED_HOOK"
+
+head_before=$(git -C "$clone2" rev-parse HEAD)
+api POST "/api/tasks/$tid2/ship/commit" \
+	"$(jq -n --arg m "$(jq -r .draft.commit_message "$PARKED_DRAFT")" \
+		'{message: $m, pr_title: "Parked", pr_body: "b", mode: "squash"}')" >/dev/null
+[ "$API_CODE" = 200 ] || die "parked ship commit rejected ($API_CODE)"
+
+wait_for "refs/ompire/ship-orig written (commit held by hook)" 60 \
+	bash -c "git -C '$clone2' rev-parse --verify -q refs/ompire/ship-orig"
+daemon_kill9
+ws_stop
+ok "daemon SIGKILLed inside the ship-orig window"
+
+touch "$PARKED_GATE"
+sleep 0.5
+rm -f "$PARKED_GATE" "$PARKED_HOOK"
+
+daemon_start
+ws_start
+wait_for "parked ship ref consumed on startup" 60 \
+	bash -c "! git -C '$clone2' rev-parse --verify -q refs/ompire/ship-orig"
+head_after=$(git -C "$clone2" rev-parse HEAD)
+[ "$head_after" = "$head_before" ] &&
+	ok "clone restored to pre-ship HEAD" ||
+	fail "parked clone restore" "$head_after != $head_before"
+
+# task drivable again: ship completes on the recovered clone
+api POST "/api/tasks/$tid2/ship/commit" \
+	"$(jq -n --arg m "$(jq -r .draft.commit_message "$PARKED_DRAFT")" \
+		'{message: $m, pr_title: "Parked", pr_body: "b", mode: "squash"}')" >/dev/null
+[ "$API_CODE" = 200 ] || die "post-recovery ship rejected ($API_CODE)"
+wait_for "post-recovery ship finishes" 120 \
+	_ws_seen '.type == "ship_finished" and .payload.status == "shipped"' "$tid2"
+assert "parked task never failed" task_not_failed "$tid2"
+

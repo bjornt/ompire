@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/cleanup — LOCAL-TESTING.PLAN.md Part 9, flow 8.
+#
+# Task teardown: cleanup archives the task, deregisters the fake workshop,
+# and removes the clone; an already-deregistered workshop still cleans up.
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+# --- task 1: plain cleanup ------------------------------------------------------
+
+tid=$(spawn_task "$(unique_slug clean)" "Cleanup E2E: the work.")
+wait_for "work step completes" 180 workflow_complete "$tid"
+clone=$(task_field "$tid" clone_path)
+assert "workshop registered for the clone" \
+	bash -c "'$WSCTL' list | grep -F '$clone'"
+
+api_json POST "/api/tasks/$tid/cleanup" >/dev/null
+[ "$API_CODE" = 200 ] || die "cleanup rejected ($API_CODE)"
+
+state=$(task_field "$tid" state)
+[ "$state" = archived ] && ok "task archived" || fail "task archived" "state=$state"
+[ ! -d "$clone" ] && ok "clone removed ($clone)" || fail "clone removed" "still present"
+assert "workshop deregistered" bash -c "! '$WSCTL' list | grep -Fq '$clone'"
+
+# --- task 2: workshop already gone ----------------------------------------------
+
+tid2=$(spawn_task "$(unique_slug clean2)" "Cleanup E2E 2: the work.")
+wait_for "work step completes (task 2)" 180 workflow_complete "$tid2"
+clone2=$(task_field "$tid2" clone_path)
+$WSCTL remove "$clone2" >/dev/null
+ok "workshop deregistered out-of-band (wsctl remove)"
+
+api_json POST "/api/tasks/$tid2/cleanup" >/dev/null
+[ "$API_CODE" = 200 ] && ok "cleanup still succeeds" ||
+	fail "cleanup with gone workshop" "code $API_CODE"
+state2=$(task_field "$tid2" state)
+[ "$state2" = archived ] && ok "task 2 archived" || fail "task 2 archived" "state=$state2"
+[ ! -d "$clone2" ] && ok "clone 2 removed" || fail "clone 2 removed" "still present"

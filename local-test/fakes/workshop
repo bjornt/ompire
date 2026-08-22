@@ -230,6 +230,12 @@ cmd_launch() {
 
 	printf '%s' "$id" >"$PROJ_REAL/.workshop.lock" ||
 		die "launch: cannot write $PROJ_REAL/.workshop.lock"
+	# Real workshop metadata is infrastructure, not agent work. Keep the fake's
+	# lock observable on disk while excluding it from retain-mode git status.
+	if [ -d "$PROJ_REAL/.git/info" ]; then
+		grep -qxF '/.workshop.lock' "$PROJ_REAL/.git/info/exclude" 2>/dev/null ||
+			printf '/.workshop.lock\n' >>"$PROJ_REAL/.git/info/exclude"
+	fi
 	tmp=$(mktemp "$WS_JSON.XXXXXX")
 	jq --arg p "$PROJ_REAL" --arg name "$name" --arg id "$id" --arg now "$now" '
 		.workshops[$p] = {

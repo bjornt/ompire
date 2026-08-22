@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/merge-poll — LOCAL-TESTING.PLAN.md Part 9, flow 6.
+#
+# Ship, merge the PR in fake gh (`ghctl merge`), and watch the daemon's
+# poll loop record it: task `pr_state=merged`, `pr_merged_at` set, and the
+# merge visible as a `task_updated` event on the WS.
+#
+# pr_poll_interval is a config.toml key (not a runtime setting), so this
+# runbook sets it to 1 s and restarts the daemon through the state root's
+# wrapper; lib.sh restores the config and restarts again on exit.
+
+_pr_merged() { # _pr_merged TASK
+	local s
+	s=$(task_field "$1" pr_state)
+	[ "$s" = merged ] && printf '%s' "$s" || { printf 'pr_state=%s' "$s"; return 1; }
+}
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+config_set pr_poll_interval 1
+daemon_stop
+daemon_start
+
+ws_start
+
+tid=$(spawn_task "$(unique_slug poll)" "[[scenario:commit]]\nMerge-poll E2E: do the work and commit it.")
+wait_for "work step completes" 180 workflow_complete "$tid"
+approve_review "$tid"
+ship_squash "$tid"
+
+pr_url=$(task_field "$tid" pr_url)
+[ -n "$pr_url" ] || die "no pr_url on task $tid"
+pr_n=${pr_url##*/}
+
+# --- merge in fake gh → daemon poll observes ----------------------------------
+
+$GHCTL merge "$pr_n" >/dev/null
+ok "PR $pr_n merged via ghctl"
+
+wait_for "task pr_state=merged" 30 _pr_merged "$tid"
+merged_at=$(task_field "$tid" pr_merged_at)
+[ -n "$merged_at" ] && [ "$merged_at" != null ] &&
+	ok "pr_merged_at set ($merged_at)" ||
+	fail "pr_merged_at" "empty"
+
+assert "merge visible as task_updated on WS" \
+	_ws_seen '.type == "task_updated" and .payload.pr_state == "merged"' "$tid"
+assert "task never failed" task_not_failed "$tid"

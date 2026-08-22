@@ -1083,7 +1083,7 @@ def get_settings_route(settings_store: SettingsStore = Depends(_settings)) -> Se
 
 
 @router.put("/settings", response_model=SettingsOut)
-def update_settings_route(
+async def update_settings_route(
     body: dict[str, Any],
     settings_store: SettingsStore = Depends(_settings),
     events: EventHub = Depends(_events),
@@ -1103,7 +1103,7 @@ def update_settings_route(
 
 
 @router.delete("/settings/{key}", response_model=SettingsOut)
-def delete_settings_route(
+async def delete_settings_route(
     key: str,
     settings_store: SettingsStore = Depends(_settings),
     events: EventHub = Depends(_events),

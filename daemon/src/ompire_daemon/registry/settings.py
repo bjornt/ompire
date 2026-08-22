@@ -66,6 +66,7 @@ _CONFIG_KEYS: dict[str, str] = {
 }
 
 
+
 def _validate(key: str, value: Any) -> Any:
     """Return a normalized valid value or raise `SettingsValidationError`."""
     if key not in _DEFAULTS:
@@ -95,10 +96,11 @@ def _validate(key: str, value: Any) -> Any:
             raise SettingsValidationError(
                 key, f"{key} must be a number, got {value!r}"
             )
-        if value < 30:
+        if value <= 0:
             raise SettingsValidationError(
-                key, f"{key} must be at least 30 seconds, got {value!r}"
+                key, f"{key} must be positive, got {value!r}"
             )
+
         return int(value)
 
     if key == "context_advisory_threshold":

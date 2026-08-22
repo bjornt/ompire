@@ -27,6 +27,7 @@ from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import (
     NoLiveAgentError,
     ShipDraft,
+    ShipError,
     ShipManager,
     _find_pr_url,
     _parse_draft,
@@ -852,6 +853,28 @@ async def test_push_uses_force_with_lease(tmp_root, engine, ships):
         check=True,
     ).stdout
     assert "feature" in branches
+
+
+async def test_push_failure_surfaces_remote_stderr(tmp_root, engine, ships):
+    origin = tmp_root / "origin-reject.git"
+    origin.mkdir()
+    _run_git(origin, "init", "--bare")
+    hook = origin / "hooks" / "pre-receive"
+    hook.write_text(
+        "#!/bin/sh\necho 'forge: rejecting push (injected)' >&2\nexit 1\n"
+    )
+    hook.chmod(0o755)
+
+    clone = tmp_root / "reject-clone"
+    _run_git(tmp_root, "clone", str(origin), str(clone.name))
+    _run_git(clone, "config", "user.email", "t@e.com")
+    _run_git(clone, "config", "user.name", "T")
+    (clone / "a").write_text("a")
+    _run_git(clone, "add", ".")
+    _run_git(clone, "commit", "-m", "initial")
+
+    with pytest.raises(ShipError, match="forge: rejecting push"):
+        await ships._push(clone, str(origin), "feature")
 
 
 async def test_create_pr_parses_url_and_adopts_existing_pr(

@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/run — LOCAL-TESTING.PLAN.md Part 9: the runbook
+# driver.
+#
+#   run <name>    preflight (daemon reachable, project + template
+#                 registered) then execute one runbook
+#   run --all     throwaway state root on a free port: env up, every
+#                 runbook in matrix order, env down --wipe; the persistent
+#                 state root must stay untouched
+#   run --list    print the runbook matrix
+#
+# Runbooks are also directly executable (each sources lib.sh itself); this
+# driver adds preflight and the clean-machine matrix run.
+
+set -euo pipefail
+
+DIR=$(cd "$(dirname "$0")" && pwd)
+REPO_ROOT=$(cd "$DIR/../.." && pwd)
+ENV_TOOL=$REPO_ROOT/local-test/env
+
+# matrix order: happy-path first (it is the template the others assume);
+# crash-recovery last-but-one (it kills the daemon); cleanup last.
+MATRIX=(
+	happy-path
+	ask-approval
+	review-comments
+	ship-retain
+	ship-failures
+	merge-poll
+	advisories-stalls
+	crash-recovery
+	cleanup
+)
+
+die() { printf 'error: %s\n' "$*" >&2; exit 2; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
+
+preflight() {
+	local state=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
+	local port=${LOCAL_TEST_PORT:-4173}
+	local config=$state/home/.config/ompire/config.toml
+	if [ -f "$config" ] && grep -qE '^port[[:space:]]*=' "$config"; then
+		port=$(sed -n 's/^port[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$config" | tail -1)
+	fi
+	local token_file=$state/home/.local/share/ompire/token
+	[ -f "$token_file" ] || die "daemon is not up (no token under $state) — run 'local-test/env up' first"
+	local body
+	body=$(curl -sS -H "Authorization: Bearer $(cat "$token_file")" \
+		"http://127.0.0.1:$port/api/projects") ||
+		die "daemon not reachable on port $port — run 'local-test/env up' first"
+	jq -e 'map(select(.name == "sandbox")) | length == 1' >/dev/null <<<"$body" ||
+		die "project 'sandbox' not registered — run 'local-test/env up'"
+	body=$(curl -sS -H "Authorization: Bearer $(cat "$token_file")" \
+		"http://127.0.0.1:$port/api/templates")
+	jq -e 'map(select(.name == "sandbox")) | length == 1' >/dev/null <<<"$body" ||
+		die "template 'sandbox' not registered — run 'local-test/env up'"
+}
+
+tree_checksum() { # tree_checksum ROOT — names, modes, links, and file bytes
+	tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+		-cf - -C "$1" . | sha256sum | awk '{print $1}'
+}
+
+run_one() { # run_one NAME
+	local name=$1
+	printf '==> runbook: %s\n' "$name"
+	[ -x "$DIR/$name" ] || die "unknown runbook: $name (run --list)"
+	if "$DIR/$name"; then
+		printf '==> %s: PASS\n' "$name"
+	else
+		printf '==> %s: FAIL\n' "$name" >&2
+		return 1
+	fi
+}
+
+run_all() {
+	local tmp port persist_hash persist_skip=0 persist_absent=0 failed=0 name
+	local -a failed_names=()
+	tmp=$(mktemp -d /tmp/ompire-runall-XXXXXX)
+	port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
+	local state_root=$REPO_ROOT/local-test/.state
+	if [ -d "$state_root" ]; then
+		if [ -f "$state_root/home/.local/share/ompire/daemon.pid" ] &&
+			kill -0 "$(cat "$state_root/home/.local/share/ompire/daemon.pid")" 2>/dev/null; then
+			persist_skip=1
+		else
+			persist_hash=$(tree_checksum "$state_root")
+		fi
+	else
+		persist_absent=1
+	fi
+
+	cleanup() {
+		LOCAL_TEST_STATE=$tmp LOCAL_TEST_PORT=$port "$ENV_TOOL" down --wipe >/dev/null 2>&1 || rm -rf "$tmp"
+	}
+	trap cleanup EXIT
+
+	printf '==> matrix: throwaway env (state %s, port %s)\n' "$tmp" "$port"
+	local -a up_args=()
+	[ -x "$state_root/bin/my-workshop" ] && up_args+=(--my-workshop "$state_root/bin/my-workshop")
+	[ -x "$state_root/bin/llmvet" ] && up_args+=(--llmvet "$state_root/bin/llmvet")
+	[ ! -f "$REPO_ROOT/frontend/dist/index.html" ] && export LOCAL_TEST_SKIP_FRONTEND=1
+	LOCAL_TEST_STATE=$tmp LOCAL_TEST_PORT=$port "$ENV_TOOL" up "${up_args[@]}"
+	LOCAL_TEST_STATE=$tmp LOCAL_TEST_PORT=$port preflight
+
+	for name in "${MATRIX[@]}"; do
+		if ! LOCAL_TEST_STATE=$tmp LOCAL_TEST_PORT=$port run_one "$name"; then
+			failed=1
+			failed_names+=("$name")
+			printf '    (continuing with the remaining runbooks)\n' >&2
+		fi
+	done
+
+	printf '==> matrix: teardown\n'
+	trap - EXIT
+	cleanup
+	rm -rf "$tmp"
+
+	if [ "$persist_skip" = 1 ]; then
+		printf 'warning: persistent-root check skipped: its daemon is running\n' >&2
+	elif [ "$persist_absent" = 1 ]; then
+		[ ! -e "$state_root" ] || die "matrix run created the persistent state root"
+	elif [ -n "${persist_hash:-}" ]; then
+		local after
+		after=$(tree_checksum "$state_root")
+		[ "$after" = "$persist_hash" ] || die "matrix run modified the persistent state root"
+	fi
+
+	if [ $failed = 0 ]; then
+		printf 'matrix: ALL PASS\n'
+	else
+		printf 'matrix: FAILED (%s)\n' "${failed_names[*]}" >&2
+		exit 1
+	fi
+}
+
+case "${1:-}" in
+--all) run_all ;;
+--list) printf '%s\n' "${MATRIX[@]}" ;;
+help | --help | -h | "") usage ;;
+*)
+	[ $# -eq 1 ] || die "expected exactly one runbook name (run --list)"
+	preflight
+	run_one "$1"
+	;;
+esac

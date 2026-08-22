@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/happy-path — LOCAL-TESTING.PLAN.md Part 9, flow 1.
+#
+# The primary E2E flow: spawn → agent works (fake omp) → session idle →
+# review approve (real llmvet UI) → ship draft (parsed from the agent's
+# reply) → squash sign+commit+push → PR open on the fake gh. Asserts the
+# externally visible results: the forge branch's new tip carries a valid
+# signature from the ephemeral key, the PR exists OPEN with matching head,
+# and the daemon's own states agree (review approved, ship shipped, task
+# never failed).
+#
+# Preconditions: `local-test/env up` (daemon + project + template).
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+BARE=$STATE_ROOT/forge/github.com/local-test/sandbox.git
+DRAFT_FILE=$(mktemp /tmp/ompire-happy-draft-XXXXXX.json)
+_happy_cleanup() { rm -f "$DRAFT_FILE"; }
+register_cleanup _happy_cleanup
+
+slug=$(unique_slug happy)
+ws_start   # record everything from here on
+
+tid=$(spawn_task "$slug" "[[scenario:commit]]\nHappy-path E2E: do the work and commit it.")
+wait_for "work step completes (session idle)" 180 workflow_complete "$tid"
+assert "task never failed" task_not_failed "$tid"
+
+# --- review: approve through the real llmvet UI -----------------------------
+
+approve_review "$tid"
+
+# --- ship: draft (agent-authored) then squash ---------------------------------
+
+# The draft route awaits the agent's reply synchronously and returns the
+# drafted state (status drafted + parsed draft) — no separate wait needed.
+api_json POST "/api/tasks/$tid/ship/draft" >"$DRAFT_FILE"
+[ "$API_CODE" = 200 ] || die "ship draft failed ($API_CODE): $(cat "$DRAFT_FILE")"
+jq -e '.status == "drafted" and .draft.commit_message and .draft.pr_title' "$DRAFT_FILE" >/dev/null &&
+	ok "draft drafted + parsed (title: $(jq -r .draft.pr_title "$DRAFT_FILE"))" ||
+	fail "draft state" "$(cat "$DRAFT_FILE")"
+message=$(jq -r '.draft.commit_message' "$DRAFT_FILE")
+pr_title=$(jq -r '.draft.pr_title' "$DRAFT_FILE")
+pr_body=$(jq -r '.draft.pr_body // ""' "$DRAFT_FILE")
+
+$GPGCTL warm
+api_json POST "/api/tasks/$tid/ship/commit" \
+	"$(jq -n --arg m "$message" --arg t "$pr_title" --arg b "$pr_body" \
+		'{message: $m, pr_title: $t, pr_body: $b, mode: "squash"}')" >/dev/null
+[ "$API_CODE" = 200 ] || die "ship commit rejected ($API_CODE)"
+wait_for "ship finishes" 120 ship_done "$tid"
+
+# --- assertions ---------------------------------------------------------------
+
+branch=$(task_field "$tid" branch)
+pr_url=$(task_field "$tid" pr_url)
+[ -n "$pr_url" ] && ok "task carries PR url $pr_url" || fail "task pr_url" "empty"
+
+# Signed commit on the forge branch (verifiable with the ephemeral key) from
+# a normal clone, matching the same remote-ref view a downstream consumer has.
+scratch_clone "$BARE" scratch
+assert "forge branch tip signature verifies ($branch)" \
+	forge_git -C "$scratch" verify-commit "origin/$branch"
+
+# PR exists OPEN on fake gh with the exact task head and drafted title.
+pr_number=${pr_url##*/}
+pr_info=$($GHCTL pr "$pr_number" --repo local-test/sandbox)
+grep -F "$branch -> main" <<<"$pr_info" >/dev/null &&
+	grep -F "#${pr_number} OPEN" <<<"$pr_info" >/dev/null &&
+	grep -F "title:    $pr_title" <<<"$pr_info" >/dev/null &&
+	ok "fake gh PR #$pr_number is OPEN with matching head/title" ||
+	fail "fake gh PR matches task" "$pr_info"
+
+# Daemon state agreement.
+assert "review_finished approved observed" \
+	_ws_seen '.type == "review_finished" and .payload.status == "approved"' "$tid"
+assert "ship_finished shipped observed" \
+	_ws_seen '.type == "ship_finished" and .payload.status == "shipped"' "$tid"
+assert "task never failed (final)" task_not_failed "$tid"
+ok "final task state: $(task_field "$tid" state) (pr_state: $(task_field "$tid" pr_state))"

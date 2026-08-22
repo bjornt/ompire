@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/ask-approval — LOCAL-TESTING.PLAN.md Part 9, flow 2.
+#
+# Interactive gates: the task prompt forces the fake omp's `ask` and
+# `approve` scenarios; the runbook answers through the daemon's answer API
+# — free-text answer, then the approval gate on Deny and on Approve — and
+# asserts each gate clears, the agent consumes the answer (transcript), and
+# the session returns to idle.
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+ws_start
+_transcript_has() { "$OMPCTL" transcript "$1" | grep -F "$2" >/dev/null; }
+_idle_count_at_least() {
+	[ "$(ws_count '.type == "status_changed" and .payload.to == "idle" and .payload.task_id == '"$1"'')" -ge "$2" ]
+}
+_question_count_gt() { # _question_count_gt TASK PRIOR
+	[ "$(ws_count '.type == "question_posted" and .payload.task_id == '"$1"'')" -gt "$2" ]
+}
+
+# --- ask: answer, agent continues -------------------------------------------
+
+tid=$(spawn_task "$(unique_slug ask)" "[[scenario:ask]]
+Should we widen the fix to both loops?")
+q=$(wait_question "$tid")
+qid=$(jq -r .id <<<"$q")
+[ -n "$qid" ] && [ "$qid" != null ] && ok "ask question posted (id $qid, kind $(jq -r .kind <<<"$q"))" \
+	|| die "question payload without id: $q"
+
+session_name=$(primary_session "$tid")
+api POST "/api/tasks/$tid/sessions/$session_name/agent/answer" \
+	"$(jq -n --arg id "$qid" --arg text "v4 only" \
+		'{question_id: $id, text: $text}')" >/dev/null
+[ "$API_CODE" = 200 ] || die "answer rejected ($API_CODE)"
+clone=$(task_field "$tid" clone_path)
+session_id=$($OMPCTL sessions | awk -v clone="$clone" '$0 ~ clone {print $1}' | tail -1)
+[ -n "$session_id" ] || die "no session recorded for clone $clone"
+wait_for "ask answer consumed" 60 _transcript_has "$session_id" "v4 only"
+wait_for "ask session returns idle" 120 _idle_count_at_least "$tid" 1
+ok "ask answer consumed and session returned idle"
+
+# --- approve: Deny, then Approve ---------------------------------------------
+
+tid2=$(spawn_task "$(unique_slug approve)" "[[scenario:approve]]
+Gate: allow the deploy?")
+q=$(wait_question "$tid2")
+qid=$(jq -r .id <<<"$q")
+ok "approval gate posted (id $qid, kind $(jq -r .kind <<<"$q"))"
+
+session_name2=$(primary_session "$tid2")
+api POST "/api/tasks/$tid2/sessions/$session_name2/agent/answer" \
+	"$(jq -n --arg id "$qid" '{question_id: $id, approved: false}')" >/dev/null
+[ "$API_CODE" = 200 ] || die "deny rejected ($API_CODE)"
+ok "denied"
+clone2=$(task_field "$tid2" clone_path)
+session2=$($OMPCTL sessions | awk -v clone="$clone2" '$0 ~ clone {print $1}' | tail -1)
+[ -n "$session2" ] || die "no session recorded for clone $clone2"
+wait_for "Deny consumed" 60 _transcript_has "$session2" "'value': 'Deny'"
+questions_before=$(ws_count '.type == "question_posted" and .payload.task_id == '"$tid2"'')
+
+# second gate on the same session via follow-up
+follow_up "$tid2" "[[scenario:approve]]
+Gate again: deploy now?"
+wait_for "second approval gate posted" 60 _question_count_gt "$tid2" "$questions_before"
+q=$(_question_seen "$tid2")
+qid=$(jq -r .id <<<"$q")
+api POST "/api/tasks/$tid2/sessions/$session_name2/agent/answer" \
+	"$(jq -n --arg id "$qid" '{question_id: $id, approved: true}')" >/dev/null
+[ "$API_CODE" = 200 ] || die "approve rejected ($API_CODE)"
+ok "approved"
+
+# transcript: both gate answers recorded with their literal values
+wait_for "Approve consumed" 60 _transcript_has "$session2" "'value': 'Approve'"
+wait_for "approval session returns idle" 120 _idle_count_at_least "$tid2" 1
+assert "transcript records Deny" \
+	bash -c "'$OMPCTL' transcript '$session2' | grep -F \"'value': 'Deny'\""
+assert "transcript records Approve" \
+	bash -c "'$OMPCTL' transcript '$session2' | grep -F \"'value': 'Approve'\""
+
+assert "first task never failed" task_not_failed "$tid"
+assert "second task never failed" task_not_failed "$tid2"

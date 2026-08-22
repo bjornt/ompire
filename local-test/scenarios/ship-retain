@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/ship-retain — LOCAL-TESTING.PLAN.md Part 9, flow 4.
+#
+# Retain mode: build a multi-commit agent history in the task clone (the
+# fake omp's `commit` scenario authors real git commits via follow-up
+# prompts), ship in retain mode, and assert the rewrite contract — commit
+# count preserved and every commit re-signed with the ephemeral key.
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+
+ 
+
+BARE=$STATE_ROOT/forge/github.com/local-test/sandbox.git
+AGENT_COMMITS=2
+DRAFT_FILE=$(mktemp /tmp/ompire-retain-draft-XXXXXX.json)
+_retain_cleanup() { rm -f "$DRAFT_FILE"; }
+register_cleanup _retain_cleanup
+
+ws_start ship_finished
+
+tid=$(spawn_task "$(unique_slug retain)" "Retain-mode E2E: do the initial work.")
+wait_for "work step completes" 180 workflow_complete "$tid"
+
+# --- agent history: one commit per follow-up ---------------------------------
+
+clone=$(task_field "$tid" clone_path)
+for i in $(seq 1 "$AGENT_COMMITS"); do
+	follow_up "$tid" "[[scenario:commit]]
+Agent change $i: stage and commit."
+	# The commit lands in the clone when the fake agent's turn finishes;
+	# observe it as the branch's commit count growing.
+	wait_for "agent commit $i lands in the clone" 60 _clone_commits "$clone" "$i"
+done
+ok "$AGENT_COMMITS agent commits authored"
+
+# --- retain ship ---------------------------------------------------------------
+
+api_json POST "/api/tasks/$tid/ship/draft" >"$DRAFT_FILE"
+[ "$API_CODE" = 200 ] || die "draft failed: $(cat "$DRAFT_FILE")"
+message=$(jq -r '.draft.commit_message' "$DRAFT_FILE")
+pr_title=$(jq -r '.draft.pr_title' "$DRAFT_FILE")
+pr_body=$(jq -r '.draft.pr_body // ""' "$DRAFT_FILE")
+$GPGCTL warm
+api_json POST "/api/tasks/$tid/ship/commit" \
+	"$(jq -n --arg m "$message" --arg t "$pr_title" --arg b "$pr_body" \
+		'{message: $m, pr_title: $t, pr_body: $b, mode: "retain"}')" >/dev/null
+[ "$API_CODE" = 200 ] || die "retain commit rejected ($API_CODE)"
+wait_for "retain ship finished shipped" 120 \
+	_ws_seen '.type == "ship_finished" and .payload.status == "shipped"' "$tid"
+
+# --- assertions -----------------------------------------------------------------
+
+branch=$(task_field "$tid" branch)
+scratch_clone "$BARE" scratch
+# origin/main..origin/<branch> in a normal clone is the retained,
+# rewritten, re-signed history visible to downstream consumers.
+count=$(forge_git -C "$scratch" rev-list --count "origin/main..origin/$branch")
+[ "$count" = "$AGENT_COMMITS" ] &&
+	ok "commit count preserved ($count == $AGENT_COMMITS)" ||
+	fail "commit count preserved" "got $count, want $AGENT_COMMITS"
+
+verified=0
+for sha in $(forge_git -C "$scratch" rev-list "origin/main..origin/$branch"); do
+	forge_git -C "$scratch" verify-commit "$sha" >/dev/null 2>&1 && verified=$((verified + 1))
+done
+[ "$verified" = "$AGENT_COMMITS" ] &&
+	ok "every retained commit signature verifies ($verified/$AGENT_COMMITS)" ||
+	fail "retained commits verified" "only $verified/$AGENT_COMMITS verify"
+
+assert "task never failed" task_not_failed "$tid"
+ok "PR: $(task_field "$tid" pr_url)"

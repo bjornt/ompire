@@ -3,6 +3,7 @@ daemon info, token show/rotate, and WebSocket snapshot/reset."""
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,16 @@ def test_put_override_wins_over_toml(client: TestClient, auth_headers: dict[str,
     assert get_body["settings"]["stall_threshold"] == 900
 
 
+def test_put_accepts_positive_sub_minute_stall_threshold(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    response = client.put(
+        "/api/settings", headers=auth_headers, json={"stall_threshold": 2}
+    )
+    assert response.status_code == 200
+    assert response.json()["settings"]["stall_threshold"] == 2
+
+
 def test_put_validates_unknown_key(client: TestClient, auth_headers: dict[str, str]) -> None:
     response = client.put(
         "/api/settings",
@@ -84,6 +95,24 @@ def test_put_validates_value_range(client: TestClient, auth_headers: dict[str, s
     )
     assert response.status_code == 422
     assert "context_advisory_threshold" in response.json()["detail"]
+
+
+def test_put_applies_live_settings_on_event_loop(
+    client: TestClient, auth_headers: dict[str, str], app, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    applied = False
+
+    def require_running_loop(settings: dict[str, object]) -> None:
+        nonlocal applied
+        asyncio.get_running_loop()
+        applied = True
+
+    monkeypatch.setattr(app.state.notifications, "apply_settings", require_running_loop)
+    response = client.put(
+        "/api/settings", headers=auth_headers, json={"stall_threshold": 2}
+    )
+    assert response.status_code == 200
+    assert applied
 
 
 def test_put_is_atomic(client: TestClient, auth_headers: dict[str, str]) -> None:

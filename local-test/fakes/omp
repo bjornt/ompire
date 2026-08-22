@@ -58,6 +58,8 @@ _DRAFT_MARKERS = ("<<<COMMIT_MESSAGE>>>", "<<<PR_TITLE>>>")
 _JUDGE_PREFIX = "You are the fallback judge for the ompire workflow engine"
 # workflows.py:RESUME_NUDGE.
 _NUDGE_PREFIX = "The daemon restarted while you were working; please continue."
+# review.py:_COMMENTS_PROMPT_PREFIX opens every comment loopback.
+_REVIEW_PREFIX = "The reviewer left the following comments on your changes."
 # workflows.py:OUTCOME_INSTRUCTION names this path inside backticks.
 _OUTCOME_HINT = "`.ompire/outcome.json`"
 
@@ -227,21 +229,22 @@ def append_work_artifact(scenario: str, turn: int) -> None:
         fh.write(f"{scenario} turn {turn}: fake agent work\n")
 
 
-def git_commit(turn: int) -> str | None:
-    """One real commit of the current tree; returns the subject or None."""
+def git_commit(turn: int) -> tuple[str | None, str | None]:
+    """Author one real commit; return its subject or a diagnostic."""
     subject = f"fake omp: agent work {turn}"
     try:
-        subprocess.run(["git", "add", "-A"], cwd=".", check=True,
-                       capture_output=True)
+        subprocess.run(
+            ["git", "add", "-A", "--", "."],
+            cwd=".", check=True, capture_output=True, text=True)
         result = subprocess.run(
             ["git", "commit", "-m", subject], cwd=".", capture_output=True,
             text=True,
         )
         if result.returncode != 0:
-            return None
-        return subject
-    except (OSError, subprocess.SubprocessError):
-        return None
+            return None, (result.stderr or result.stdout).strip()
+        return subject, None
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, str(exc)
 
 
 def ship_draft_text(turn: int) -> str:
@@ -268,6 +271,7 @@ class Engine:
         self.queued = 0
         self.message_count = 0
         self.last_assistant_text: str | None = None
+        self.last_scenario: str | None = None
         self.startup_scenario: str | None = None
         self.resume_id = resume_id
         self.session_id = resume_id
@@ -355,6 +359,20 @@ class Engine:
                 self._handle_generic(request)
                 continue
 
+            request_type = request.get("type")
+            if request_type in ("follow_up", "abort_and_prompt"):
+                request_id = request.get("id", "")
+                emit({"id": request_id, "type": "response",
+                      "command": request_type, "success": True})
+                scenario, params, clean_message = resolve_scenario(
+                    request.get("message", ""), self.session_id)
+                pending = self._serve_prompt(
+                    f"{request_type}-prompt-{request_id}", scenario, params,
+                    clean_message)
+                if pending is not None:
+                    pending_ui = pending
+                continue
+
             if request.get("type") != "prompt":
                 self._handle_generic(request)
                 continue
@@ -387,6 +405,7 @@ class Engine:
                         "queuedMessageCount": self.queued,
                         "messageCount": self.message_count,
                         "sessionId": self.session_id,
+                        "contextPercent": 95 if self.last_scenario == "big" else 10,
                     },
                 })
             return
@@ -433,6 +452,8 @@ class Engine:
         """Serve one prompt; returns a pending-ui dict when the scenario
         waits on an extension_ui_response."""
         self.turn += 1
+        self.last_scenario = scenario
+        self.current_prompt_message = message
         turn = self.turn
         assistant_text = f"{scenario} turn {turn} complete"
 
@@ -493,21 +514,25 @@ class Engine:
         elif scenario == "ship-draft":
             assistant_text = ship_draft_text(turn)
         elif scenario == "commit":
-            subject = git_commit(turn)
+            # A real agent edits before committing: author a deterministic
+            # change each turn so the commit always has content.
+            append_work_artifact(scenario, turn)
+            subject, error = git_commit(turn)
             assistant_text = (
-                f"committed: {subject}" if subject else "nothing to commit")
-        elif scenario in ("happy", "review-comments", "resume-nudge"):
-            if _OUTCOME_HINT in message:
-                write_outcome(scenario, turn)
+                f"committed: {subject}" if subject else f"commit failed: {error}")
+        elif scenario == "review-comments":
+            assistant_text = (
+                "addressed review comments:\n"
+                + "\n".join(
+                    f"- fixed: {ln[2:].strip()}"
+                    for ln in message.splitlines() if ln.startswith(">"))
+            )
+
+        if _OUTCOME_HINT in message and scenario not in {"judge", "outcome-failed"}:
+            write_outcome(scenario, turn)
+            if scenario != "commit":
                 append_work_artifact(scenario, turn)
-                assistant_text = f"{scenario} turn {turn}: outcome written"
-            elif scenario == "review-comments":
-                assistant_text = (
-                    "addressed review comments:\n"
-                    + "\n".join(
-                        f"- fixed: {ln[2:].strip()}"
-                        for ln in message.splitlines() if ln.startswith(">"))
-                )
+            assistant_text = f"{scenario} turn {turn}: outcome written"
 
         self.message_count += 2
         self._burst(request_id, message, assistant_text,
@@ -524,6 +549,7 @@ class Engine:
         if self.transcript is not None:
             self.transcript.append({
                 "kind": "prompt", "scenario": scenario,
+                "message": getattr(self, "current_prompt_message", None),
                 "assistant_text": assistant_text,
             })
 
@@ -685,7 +711,8 @@ def classify_prompt(message: str) -> str:
     if message.startswith(_NUDGE_PREFIX):
         return "resume-nudge"
     lines = [ln for ln in message.splitlines() if ln.strip()]
-    if lines and all(ln.lstrip().startswith(">") for ln in lines):
+    if message.startswith(_REVIEW_PREFIX) and any(
+            ln.lstrip().startswith(">") for ln in lines):
         return "review-comments"
     return "happy"
 
