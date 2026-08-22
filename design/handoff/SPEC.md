@@ -42,6 +42,7 @@ must be supported initially.
 ---
 
 ## Decision 1: Integration protocol — oh-my-pi native RPC
+<!-- Durable decision: [ADR-0007](../../docs/adr/0007-use-native-omp-rpc.md) -->
 
 **Decision:** Each managed agent is an `omp --mode rpc-ui` child process,
 driven over its stdio NDJSON protocol. One process per agent.

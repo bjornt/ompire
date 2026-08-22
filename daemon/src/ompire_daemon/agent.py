@@ -1,6 +1,8 @@
 """Supervised omp agents: `AgentHandle` wraps one `omp --mode rpc-ui` child,
 `AgentSupervisor` maps task ids to live handles (design D-1).
 
+Architecture: ADR-0007 (docs/adr/0007-use-native-omp-rpc.md)
+
 Handles own the whole child lifecycle: spawn, ready handshake, request
 correlation (via `rpc.RpcConnection`), event fan-out through a per-agent ring
 buffer (design D-5), and exit watching (design D-6). Live handles are

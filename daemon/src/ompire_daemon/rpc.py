@@ -7,6 +7,8 @@ for ask/approval handling — `extension_ui_request`, `tool_execution_start`,
 through opaque to the event callback (design D-3). `response` frames resolve
 daemon-generated request ids; push events interleaved on the same stream are
 never treated as responses (spike finding).
+
+Architecture: ADR-0007 (docs/adr/0007-use-native-omp-rpc.md)
 """
 
 from __future__ import annotations
