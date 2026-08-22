@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# local-test/env — LOCAL-TESTING.PLAN.md Part 7: environment orchestration.
-#
+# Architecture: ADR-0014
+# (docs/adr/0014-test-end-to-end-behavior-at-external-process-boundaries.md)
 # One command from a plain machine to a driving-ready offline E2E daemon:
 # spawn a task, drive Review to approval, run Ship (draft → sign → push →
 # PR) — no LXD, no LLM provider, no GitHub. The daemon is real and

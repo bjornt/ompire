@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# local-test/scenarios/run — LOCAL-TESTING.PLAN.md Part 9: the runbook
-# driver.
+# Architecture: ADR-0014
+# (docs/adr/0014-test-end-to-end-behavior-at-external-process-boundaries.md)
+# End-to-end runbook driver.
 #
 #   run <name>    preflight (daemon reachable, project + template
 #                 registered) then execute one runbook
