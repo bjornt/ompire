@@ -1,3 +1,6 @@
+// Central daemon-owned attention classification: ADR-0012
+// (docs/adr/0012-derive-attention-centrally-from-session-state.md)
+
 import type { AttentionEntry, AttentionTier, DaemonSettings, SessionInfo, Task } from "../types";
 
 /** Whether the given attention entry counts toward the "N need you" total

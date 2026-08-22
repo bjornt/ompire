@@ -257,6 +257,7 @@ approval relay, auth, audit) lives in the daemon.
 ---
 
 ## Decision 4: Attention model
+<!-- Durable decision: [ADR-0012](../../docs/adr/0012-derive-attention-centrally-from-session-state.md) -->
 
 **Decision:** The daemon derives a per-agent status from a small set of
 interpreted RPC frames. No manager-injected "fleet tools": mid-turn

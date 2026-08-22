@@ -1,6 +1,9 @@
 """Per-session status state machine (SPEC Decision 4, core subset + D4
 ask/approval extension).
 
+Architecture: ADR-0012
+(docs/adr/0012-derive-attention-centrally-from-session-state.md)
+
 Task/session ownership: ADR-0008
 (docs/adr/0008-model-tasks-as-workflows-over-named-sessions.md)
 

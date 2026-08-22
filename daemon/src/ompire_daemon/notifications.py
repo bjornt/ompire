@@ -1,5 +1,8 @@
 """Desktop attention notifier (SPEC Decision 4; design D-1/D-2/D-3/D-7).
 
+Architecture: ADR-0012
+(docs/adr/0012-derive-attention-centrally-from-session-state.md)
+
 `tier_for` maps every session status to its attention tier in one place
 (design D-1: the session state machine itself carries no tier knowledge).
 `AttentionNotifier` subscribes to the event hub's `status_changed` stream and,
