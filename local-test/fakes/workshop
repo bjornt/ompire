@@ -245,6 +245,7 @@ cmd_launch() {
 			connects: ((.workshops[$p].connects) // [])
 		}' "$WS_JSON" >"$tmp"
 	state_write "$tmp"
+	printf '"%s" launched\n' "$name"
 }
 
 # --- info --------------------------------------------------------------------------
