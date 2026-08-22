@@ -1,8 +1,10 @@
 # ompire-daemon
 
-The ompire daemon: a long-lived local service that owns process lifecycle,
-the project registry, auth, and the REST/WebSocket API. See
-`openspec/changes/add-daemon-skeleton/design.md` for the design rationale.
+The ompire daemon is a long-lived local service that owns process lifecycle,
+the project registry, auth, and the REST/WebSocket API. Its delivery boundary
+is recorded in [ADR-0002](../docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md),
+and its trusted implementation boundary is recorded in
+[ADR-0003](../docs/adr/0003-implement-trusted-control-plane-in-python.md).
 
 ## Dependencies
 

@@ -1,3 +1,6 @@
+// Presentation-only trust boundary: ADR-0003
+// (docs/adr/0003-implement-trusted-control-plane-in-python.md)
+
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles/global.css'

@@ -213,6 +213,7 @@ small tray helper that talks to the daemon.
   approvals already flow through the daemon.
 
 ## Decision 3: Daemon language — Python
+<!-- Durable decision: [ADR-0003](../../docs/adr/0003-implement-trusted-control-plane-in-python.md) -->
 
 **Decision:** The daemon is Python 3.12+ (`asyncio`; FastAPI or Starlette
 for REST + WebSockets; Pydantic for validated frames; SQLite via

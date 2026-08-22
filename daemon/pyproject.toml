@@ -1,3 +1,6 @@
+# Trusted control-plane runtime and dependency boundary: ADR-0003
+# (docs/adr/0003-implement-trusted-control-plane-in-python.md)
+
 [project]
 name = "ompire-daemon"
 version = "0.1.0"

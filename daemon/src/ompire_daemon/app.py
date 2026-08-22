@@ -1,6 +1,8 @@
 """FastAPI app wiring: config, migrations, auth, routers, static serving.
 
 Architecture: ADR-0002 (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
+Trusted control-plane language: ADR-0003
+(docs/adr/0003-implement-trusted-control-plane-in-python.md)
 """
 
 from __future__ import annotations
