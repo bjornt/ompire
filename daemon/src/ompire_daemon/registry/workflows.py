@@ -2,6 +2,9 @@
 plus the run-status mutators for the workflow columns on `tasks`. No ORM —
 Core only, mirroring the `registry/tasks.py` frozen-dataclass pattern.
 
+Architecture: ADR-0008
+(docs/adr/0008-model-tasks-as-workflows-over-named-sessions.md)
+
 One row per executed step; identity is `(task_id, seq)` because loops
 (ROADMAP #18) revisit step names. `outcome` is the parsed
 `.ompire/outcome.json` / command result / decision route / gate note dict,

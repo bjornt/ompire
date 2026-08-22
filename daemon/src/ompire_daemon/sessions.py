@@ -1,6 +1,9 @@
 """Per-session status state machine (SPEC Decision 4, core subset + D4
 ask/approval extension).
 
+Task/session ownership: ADR-0008
+(docs/adr/0008-model-tasks-as-workflows-over-named-sessions.md)
+
 `SessionTracker` owns `{status, reason, since}` per `(task_id, session)` —
 a task runs one omp child per workflow-declared named session
 (workflow-engine design D-1). It is fed by (a) lifecycle calls from the
