@@ -1,0 +1,198 @@
+name: Fast-Forward Merge Bot
+
+on:
+  issue_comment:
+    types: [created]
+
+# Note: `issue_comment` workflows always run the copy of this file on the default
+# branch. Changes here take effect only once landed on the default branch.
+
+# GITHUB_TOKEN is used only to read PR state and post comments. Pushing to a
+# protected default branch uses a separate GitHub App token (see the merge job).
+permissions:
+  contents: read
+
+concurrency:
+  # Serialize merges. Two `/merge` comments racing would fast-forward from the same
+  # base and the loser's push would be rejected.
+  group: ff-merge-${{ github.event.repository.default_branch }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Verify merge preconditions
+    # Broad, cheap filter. The exact command match happens in the parse step, so an
+    # unrelated comment mentioning /merge doesn't produce a red failed run.
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/merge') &&
+      contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      checks: read
+    env:
+      # gh has no git remote to infer the repo from before checkout, and it does not
+      # read GITHUB_REPOSITORY -- only GH_REPO.
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      BASE_BRANCH: ${{ github.event.repository.default_branch }}
+    outputs:
+      go: ${{ steps.cmd.outputs.go }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+    steps:
+      - name: Parse command
+        id: cmd
+        env:
+          # Never interpolate a comment body directly into a script body.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          shopt -s extglob
+          line="${COMMENT_BODY%%$'\n'*}"
+          line="${line//$'\r'/}"
+          line="${line##+([[:space:]])}"
+          line="${line%%+([[:space:]])}"
+          if [[ "$line" == "/merge" ]]; then
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            echo "Ignoring comment: first line is '$line', not exactly '/merge'."
+          fi
+
+      - name: Acknowledge command
+        if: steps.cmd.outputs.go == 'true'
+        env:
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          gh api --silent -X POST \
+            "/repos/$GH_REPO/issues/comments/$COMMENT_ID/reactions" \
+            -f content=eyes || true
+
+      - name: Check commenter permission
+        if: steps.cmd.outputs.go == 'true'
+        env:
+          COMMENTER: ${{ github.event.comment.user.login }}
+        run: |
+          # This legacy field collapses maintain -> write and triage -> read.
+          perm=$(gh api "/repos/$GH_REPO/collaborators/$COMMENTER/permission" --jq '.permission')
+          echo "$COMMENTER has permission: $perm"
+          if [[ "$perm" != "admin" && "$perm" != "write" ]]; then
+            gh pr comment "$PR_NUMBER" \
+              --body "❌ @$COMMENTER does not have write access to this repository."
+            exit 1
+          fi
+
+      - name: Verify PR state, approval, checks and signatures
+        id: pr
+        if: steps.cmd.outputs.go == 'true'
+        run: |
+          fail() { gh pr comment "$PR_NUMBER" --body "$1"; exit 1; }
+
+          pr_json=$(gh pr view "$PR_NUMBER" \
+            --json state,isDraft,baseRefName,headRefOid,reviewDecision)
+          state=$(jq -r '.state'          <<<"$pr_json")
+          draft=$(jq -r '.isDraft'        <<<"$pr_json")
+          base=$(jq  -r '.baseRefName'    <<<"$pr_json")
+          head_sha=$(jq -r '.headRefOid'  <<<"$pr_json")
+          review=$(jq -r '.reviewDecision' <<<"$pr_json")
+
+          [[ "$state" == "OPEN" ]] \
+            || fail "❌ Cannot merge: this PR is \`$state\`."
+          [[ "$draft" == "false" ]] \
+            || fail "❌ Cannot merge: this PR is a draft."
+          # Guard against fast-forwarding the default branch to a PR aimed elsewhere.
+          [[ "$base" == "$BASE_BRANCH" ]] \
+            || fail "❌ Cannot merge: this PR targets \`$base\`, not \`$BASE_BRANCH\`."
+          # reviewDecision is null unless branch protection actually *requires*
+          # approving reviews -- even when an approval is present.
+          [[ "$review" == "APPROVED" ]] \
+            || fail "❌ Cannot merge: review decision is \`$review\` (expected \`APPROVED\`). If this is unexpected, confirm the ruleset requires approving reviews."
+
+          if ! checks=$(gh pr checks "$PR_NUMBER" --required 2>&1); then
+            printf '%s\n' "$checks"
+            fail "❌ Cannot merge: required status checks are failing, still pending, or none are configured."
+          fi
+
+          # The App token in the merge job bypasses branch protection, which means it
+          # also bypasses "require signed commits". So verify signatures here.
+          commits="$RUNNER_TEMP/commits.tsv"
+          gh api --paginate "/repos/$GH_REPO/pulls/$PR_NUMBER/commits" \
+            --jq '.[] | [.sha, (.commit.verification.verified | tostring)] | @tsv' > "$commits"
+          total=$(wc -l < "$commits")
+          # This endpoint is capped at 250 commits; beyond that the list is silently
+          # truncated and unsigned commits could slip through unchecked.
+          if (( total >= 250 )); then
+            fail "❌ Cannot merge: this PR has $total+ commits, past the API's 250-commit cap, so signatures cannot be fully verified."
+          fi
+          bad=$(awk -F'\t' '$2 != "true" { printf "%s ", substr($1, 1, 8) }' "$commits")
+          if [[ -n "${bad// /}" ]]; then
+            fail "❌ Cannot merge: these commits have no verified signature: \`$bad\`"
+          fi
+          echo "Verified signatures on $total commit(s)."
+
+          echo "head_sha=$head_sha" >> "$GITHUB_OUTPUT"
+
+  merge:
+    name: Fast-forward merge
+    needs: gate
+    if: needs.gate.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.issue.number }}
+      BASE_BRANCH: ${{ github.event.repository.default_branch }}
+      HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+    steps:
+      # Must be added as a bypass actor on the ruleset protecting the base branch.
+      - name: Generate App token
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - name: Checkout base branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          # Full history is required to compute fast-forward ancestry.
+          fetch-depth: 0
+          # Persists the App token in .git/config so the push below is authenticated.
+          # Safe here only because this job never executes any code from the PR.
+          token: ${{ steps.app_token.outputs.token }}
+
+      - name: Fast-forward and push
+        run: |
+          fail() { gh pr comment "$PR_NUMBER" --body "$1"; exit 1; }
+
+          # No git identity is configured on purpose: --ff-only creates no commit.
+
+          # Fetch by PR ref rather than branch name -- the head branch lives in the
+          # fork for cross-repo PRs. Merging the exact SHA the gate job validated
+          # closes the window where a push after `/merge` rides in unreviewed.
+          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+
+          if ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
+            fail "❌ Cannot merge: \`${HEAD_SHA:0:8}\` is no longer the PR head (force-pushed after \`/merge\`?). Comment \`/merge\` again to re-run the checks."
+          fi
+
+          if ! git merge --ff-only "$HEAD_SHA"; then
+            fail "❌ Fast-forward failed: \`$BASE_BRANCH\` has commits this branch does not. Please run \`git fetch origin && git rebase origin/$BASE_BRANCH\`, re-sign your commits, and force-push."
+          fi
+
+          if ! git push origin "HEAD:refs/heads/$BASE_BRANCH"; then
+            fail "❌ Push rejected: \`$BASE_BRANCH\` moved while this merge was running. Comment \`/merge\` again."
+          fi
+
+          gh pr comment "$PR_NUMBER" \
+            --body "✅ Fast-forwarded \`$BASE_BRANCH\` to \`${HEAD_SHA:0:8}\`. The author's GPG signatures are preserved."
