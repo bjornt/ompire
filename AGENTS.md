@@ -4,56 +4,63 @@ ompire: Python daemon (FastAPI, `daemon/`) + React/TS frontend (`frontend/`).
 The daemon spawns `omp` agents in workshop containers and drives
 review → signed commit → push → PR ("ship flow").
 
-## Build
+Full contributor documentation: [`docs/develop/`](docs/develop/index.md).
+Start with [Architecture overview](docs/develop/explanation/architecture.md).
+
+## Commands
 
 ```sh
-cd frontend && pnpm install && pnpm build   # daemon serves frontend/dist at /
-cd daemon && uv sync                        # python >= 3.12
+make build        # frontend build + daemon deps
+make test         # pytest + vitest — both must pass before committing
+make lint         # ruff + oxlint
+make typecheck    # mypy + tsc
+make run          # daemon on http://127.0.0.1:4173
 ```
 
-Toolchain: node 24; pnpm is managed by corepack and pinned via `frontend/package.json#packageManager`.
-`openspec` is a **global** tool, never a project dependency.
+Toolchain: node 24; pnpm is managed by corepack and pinned via
+`frontend/package.json#packageManager`. The frontend is a standalone pnpm
+project with its own lockfile — there is intentionally no root
+`package.json`.
 
-## Test
-
-```sh
-cd daemon && uv run pytest                  # 256 tests
-cd frontend && pnpm test                    # 98 tests (vitest)
-cd frontend && pnpm lint                    # oxlint
-```
-
-Run these before committing. Frontend is a standalone pnpm project (own
-lockfile) — there is intentionally no root package.json.
+Details: [Build, test, and run](docs/develop/how-to/build-test-run.md).
 
 ## Run
 
-```sh
-cd daemon && uv run ompire-daemon           # http://127.0.0.1:4173
-```
+Open the UI once with
+`http://127.0.0.1:4173/?token=$(cat ~/.local/share/ompire/token)` (it stashes
+itself in localStorage). Config: `~/.config/ompire/config.toml`.
 
-Open the UI once with `http://127.0.0.1:4173/?token=$(cat
-~/.local/share/ompire/token)` (stashes itself in localStorage). Config:
-`~/.config/ompire/config.toml` (`gpg_signing_key`, `agent_env`, …).
-Ship flow needs: a registered project with `upstream_url`, `gh` on PATH, and
-a GPG-cached signing key (the gate refuses `locked`/`unknown` keys).
+Ship flow needs a registered project with `upstream_url`, `gh` on PATH, and a
+GPG-cached signing key — the gate refuses `locked`/`unknown` keys.
 
-## QA (dogfooding)
+See [Configuration](docs/use/reference/configuration.md).
 
-QA runs against the `ompire-test` GitHub bot account and its sandbox repo —
-never against real repos. Scripts live in `scripts/`:
+## Testing beyond unit tests
 
-- `scripts/setup-qa-agent.sh` — identity lifecycle (operator's machine, needs
-  `gh` authed as the bot with `admin:public_key,admin:gpg_key`): creates the
-  bot's SSH+GPG keys on GitHub; the agent token is a repo-scoped fine-grained
-  PAT. `rotate ssh|gpg|all` rotates keys; `status` verifies; `teardown` cleans.
-- `scripts/setup-qa-env.sh` — QA environment: toolchain, workshop/LXD,
-  browser, deps+build, daemon config, registers the sandbox project, starts
-  the daemon, runs smoke checks. Idempotent; re-run freely.
-- `scripts/qa-auth-tunnel.sh <user@host>` — forwards the auth gateway to a QA
-  host (`ssh -R 4000`) when it runs elsewhere.
-- Any shell acting as the bot: `. .qa-agent/env.sh`.
+- [Local end-to-end harness](docs/develop/how-to/run-local-e2e.md) — real
+  daemon and frontend, executable fakes for network, containers, and the
+  model. `local-test/scenarios/run --all`.
+- [Dogfooding QA loop](docs/develop/how-to/run-the-qa-loop.md) — the real
+  stack against the `ompire-test` bot and its sandbox repo. **Never against
+  real repos.**
 
-The QA loop: spawn a task via the UI or `POST /api/tasks`, drive Review to
-approval, then Ship (draft → Sign & commit → push+PR). Verify results on the
-sandbox repo (commits must show Verified). Record findings in the active
-openspec change's `findings-*.md`.
+## Delivering a change
+
+Changes go through the lightweight skills-based workflow: `change-propose` →
+`change-implement` → `change-finish`, using `changes/<name>/SPEC.md` and
+`PLAN.md`, which are deleted when the change is finished.
+
+Durable knowledge goes to:
+
+| Kind | Location |
+|---|---|
+| Current behavior | [`docs/features/`](docs/features/) |
+| Durable rationale | [`docs/adr/`](docs/adr/) |
+| Long-term direction | [`VISION.md`](VISION.md) |
+
+See [The change workflow](docs/develop/explanation/change-workflow.md),
+[Write a feature document](docs/develop/how-to/write-a-feature-doc.md), and
+[Write an ADR](docs/develop/how-to/write-an-adr.md).
+
+OpenSpec is being retired; `openspec/` is a migration source, not a live
+workflow.

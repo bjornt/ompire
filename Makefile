@@ -9,7 +9,8 @@ ARGS ?=
 .PHONY: help build build-frontend build-backend run clean \
         test test-backend test-frontend \
         lint lint-backend lint-frontend \
-        typecheck typecheck-backend typecheck-frontend
+        typecheck typecheck-backend typecheck-frontend \
+        update-adr-index
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -59,6 +60,11 @@ typecheck-backend: ## Typecheck backend
 
 typecheck-frontend: ## Typecheck frontend
 	cd frontend && pnpm exec tsc -b $(ARGS)
+
+## Documentation
+
+update-adr-index: ## Regenerate the ADR index
+	python3 scripts/update-adr-index.py
 
 ## Clean
 

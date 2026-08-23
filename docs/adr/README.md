@@ -1,10 +1,38 @@
 # Architecture decision records
 
-Architecture decision records (ADRs) capture durable architectural choices, their rationale, consequences, and rejected alternatives. Current feature behavior and ordinary implementation details belong in feature documentation or code.
+ADRs capture durable architectural choices, their rationale, consequences, and
+rejected alternatives. Current feature behavior and ordinary implementation
+details belong in [feature documentation](../features/) or in the code.
 
-Create ADRs in this directory using the next available zero-padded number and a kebab-case filename, for example `0007-use-native-omp-rpc.md`.
+The full authoring procedure and rules are in [Write an architecture decision
+record](../develop/how-to/write-an-adr.md).
 
-## ADR template
+## Index
+
+| ADR | Decision | Status |
+|---|---|---|
+| [0001](0001-adopt-lightweight-skills-based-change-workflow.md) | Adopt the lightweight skills-based change workflow | Accepted |
+| [0002](0002-run-as-local-daemon-with-stateless-web-ui.md) | Run Ompire as a local daemon with a stateless web UI | Accepted |
+| [0003](0003-implement-trusted-control-plane-in-python.md) | Implement the trusted control plane in Python | Accepted |
+| [0004](0004-use-rest-and-websocket-snapshot-deltas.md) | Use REST for commands and WebSocket snapshot-then-deltas for observation | Accepted |
+| [0005](0005-persist-local-state-with-sqlite-core-and-alembic.md) | Persist local control-plane state in SQLite using SQLAlchemy Core and Alembic | Accepted |
+| [0006](0006-give-every-task-a-separate-clone-and-workshop.md) | Give every task a separate clone and Workshop container | Proposed |
+| [0007](0007-use-native-omp-rpc.md) | Integrate agents through supervised native Omp RPC processes | Accepted |
+| [0008](0008-model-tasks-as-workflows-over-named-sessions.md) | Model tasks as workflows over named sessions | Accepted |
+| [0009](0009-use-structured-git-excluded-outcomes.md) | Use structured, Git-excluded files for agent-step outcomes | Proposed |
+| [0010](0010-separate-projects-templates-and-task-snapshots.md) | Separate projects, templates, and task snapshots | Proposed |
+| [0011](0011-keep-review-and-publishing-authority-outside-agent-sandbox.md) | Keep review and publishing authority outside the agent sandbox | Accepted |
+| [0012](0012-derive-attention-centrally-from-session-state.md) | Derive attention centrally from session state | Accepted |
+| [0013](0013-layer-daemon-writable-settings-over-operator-configuration.md) | Layer daemon-writable settings over operator configuration | Accepted |
+| [0014](0014-test-end-to-end-behavior-at-external-process-boundaries.md) | Test end-to-end behavior at external process boundaries | Accepted |
+| [0015](0015-keep-agent-credentials-behind-narrow-brokers.md) | Keep agent credentials behind narrow brokers | Proposed |
+| [0016](0016-persist-authority-bearing-task-history-and-provenance.md) | Persist authority-bearing task history and provenance | Proposed |
+| [0017](0017-use-dedicated-bot-as-default-publishing-identity.md) | Use a dedicated bot as the default publishing identity | Proposed |
+| [0018](0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md) | Keep built-in workflows in Python until portable versioning is required | Accepted |
+| [0019](0019-split-documentation-by-audience-using-diataxis.md) | Split documentation into operator and contributor sets organized by Diátaxis | Proposed |
+| [0020](0020-author-documentation-as-portable-markdown.md) | Author documentation as portable Markdown and treat the site generator as a presentation layer | Proposed |
+
+## Template
 
 ```markdown
 # ADR NNNN: <Decision title>
@@ -14,40 +42,11 @@ Create ADRs in this directory using the next available zero-padded number and a 
 
 ## Context
 
-<Describe the architectural problem, constraints, forces, and relevant
-evidence in durable terms. Explain why a decision is needed, not merely what
-the current feature does. Do not cite implementation paths or line numbers.>
-
 ## Decision
 
-<State one durable choice directly. Define its scope and the invariant future
-changes must preserve.>
-
 ## Consequences
-
-<Describe positive consequences, accepted costs, operational constraints,
-risks, and any explicit conditions that would cause this decision to be
-revisited.>
 
 ## Alternatives considered
 
 ### <Alternative>
-
-<Explain the material benefit and why it was rejected for this context.>
 ```
-
-## Authoring rules
-
-- Keep one architectural decision per ADR. Split independently reversible choices rather than joining them under a broad topic.
-- Write at the level of a durable constraint or boundary. Current UI behavior, endpoint inventories, task ordering, and ordinary implementation details belong in feature documentation or code.
-- Use `Status: Accepted` only when the implementation and current durable documentation agree on the choice. Use `Status: Proposed` when a decision is new or when sources conflict.
-- Use the decision's original acceptance date when it is reliably recorded. Otherwise, use the ADR creation date and identify the record as a backfill in `Context`; never invent a historical date.
-- Ground `Context` by inspecting the current implementation and relevant historical design material, but do not cite source paths or line ranges in the ADR. Those locations are supporting research, not durable links.
-- For an accepted ADR, add a concise `ADR-NNNN` backlink in a comment or docstring at each stable implementation boundary that enforces the decision. Add a comment linking superseded design documents forward to the ADR. Do not annotate every caller or copy rationale into source comments.
-- Treat evidence paths in planning or migration documents as research inputs only. Do not copy them into an ADR.
-- State the decision in present tense and normative terms. Do not retell the implementation sequence.
-- Record both benefits and costs under `Consequences`. Include compatibility, security, recovery, operational, and migration effects when applicable.
-- Name only material alternatives that were genuinely considered or remain plausible. Do not manufacture token alternatives to fill the section.
-- If the implementation, durable documentation, and `VISION.md` disagree, expose the conflict in `Context` and leave the ADR `Proposed`; do not silently choose one source.
-- Never rewrite the substance of an accepted ADR. A later decision adds a new ADR and changes the earlier status to `Superseded by ADR-NNNN`.
-- Omit extra sections unless they add durable information. Implementation instructions belong in a change `PLAN.md`; links flow from implementation and superseded design artifacts to accepted ADRs, not from ADRs to mutable source locations.

@@ -1,0 +1,113 @@
+# HTTP and WebSocket API
+
+The daemon serves a REST API for commands and a WebSocket for observation.
+This split is deliberate: state changes go through REST, and the WebSocket
+accepts no commands at all.
+
+Base URL: `http://127.0.0.1:4173`.
+
+## Authentication
+
+Every request needs the bearer token from `data_dir/token`:
+
+```sh
+curl -H "Authorization: Bearer $(cat ~/.local/share/ompire/token)" ...
+```
+
+The WebSocket authenticates with the same token. Rotating it
+(`POST /api/settings/token/rotate`) closes every open WebSocket with code
+`1008`.
+
+## Interactive reference
+
+The daemon serves generated OpenAPI documentation at `/docs`, and the schema
+itself at `/openapi.json`. That is authoritative for request and response
+bodies; the tables below are a map, not a schema.
+
+## Projects
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/projects` | List |
+| `POST` | `/api/projects` | Create. `201`, or `409` on duplicate name |
+| `GET` | `/api/projects/{name}` | Fetch |
+| `PUT` | `/api/projects/{name}` | Update |
+| `DELETE` | `/api/projects/{name}` | Delete. `409` if tasks or templates reference it |
+
+## Templates
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/templates` | List |
+| `POST` | `/api/templates` | Create |
+| `GET` | `/api/templates/{name}` | Fetch |
+| `PUT` | `/api/templates/{name}` | Update |
+| `DELETE` | `/api/templates/{name}` | Delete |
+
+## Tasks
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/tasks` | List |
+| `GET` | `/api/tasks/{id}` | Detail, including sessions and step records |
+| `POST` | `/api/tasks` | Spawn. Returns `202`; spawning continues in the background |
+| `POST` | `/api/tasks/{id}/cleanup` | Remove workshop, delete clone, archive |
+| `DELETE` | `/api/tasks/{id}` | Purge the record |
+
+## Sessions
+
+All paths are under `/api/tasks/{id}/sessions/{session}/agent`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `.../steer` | Redirect the agent mid-turn |
+| `POST` | `.../follow-up` | Queue a follow-up instruction |
+| `POST` | `.../interrupt` | Interrupt the current turn |
+| `POST` | `.../answer` | Answer a pending question or approval |
+| `POST` | `.../stop` | Stop the agent process |
+| `GET` | `.../state` | Current session state |
+| `GET` | `.../stats` | Token, context, and cost counters |
+
+## Workflow, review, and ship
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/tasks/{id}/workflow/resume` | Resume a workflow stopped at a gate |
+| `POST` | `/api/tasks/{id}/review` | Open a review |
+| `POST` | `/api/tasks/{id}/review/cancel` | Cancel and restore the clone |
+| `POST` | `/api/tasks/{id}/ship/draft` | Have the agent draft commit and PR text. Requires a live agent |
+| `POST` | `/api/tasks/{id}/ship/commit` | Sign, commit, push, open the PR |
+
+`ship/commit` returns `409` when the GPG key is not `cached`, a ship is
+already in flight, the mode is not `squash` or `retain`, or `retain`
+preconditions are unmet.
+
+## Daemon
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/daemon/info` | Version, bind, port, config path, data dir, audit log path |
+| `GET` | `/api/gpg` | Last probed signing-key state |
+| `POST` | `/api/gpg/recheck` | Re-probe and broadcast |
+| `GET` | `/api/settings` | Effective settings |
+| `PUT` | `/api/settings` | Set runtime overrides |
+| `DELETE` | `/api/settings/{key}` | Clear one override |
+| `GET` | `/api/settings/token` | Current bearer token |
+| `POST` | `/api/settings/token/rotate` | Rotate; closes all WebSockets |
+
+## WebSocket
+
+`/api/ws` sends an authoritative snapshot, then deltas. Every frame is an
+envelope:
+
+```json
+{"seq": 12, "ts": "2026-08-22T10:15:00+00:00", "type": "task_updated", "payload": {}}
+```
+
+A reconnect produces a fresh snapshot, so a dropped connection loses nothing.
+Raw agent transcript events are not on this socket — they use separate,
+buffered per-session channels, so a dashboard client is not made to receive
+every frame of every agent.
+
+The protocol is documented in full in [WebSocket
+protocol](../../develop/reference/websocket-protocol.md).
