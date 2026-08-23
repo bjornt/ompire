@@ -14,3 +14,6 @@ local-test/.state/
 
 # Documentation site build output
 site/
+.claude
+.craft
+*.snap

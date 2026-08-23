@@ -1,0 +1,122 @@
+---
+name: change-propose
+description: Define a lightweight project change by creating changes/<name>/SPEC.md and PLAN.md. Use when the user wants to shape a feature, behavioral change, or architectural change before implementation, without OpenSpec or another specification CLI.
+---
+
+Create a complete, implementation-ready change proposal using ordinary Markdown. Do not implement application code while using this skill.
+
+## Inputs
+
+The user may provide a kebab-case change name, a description, or both. If only a description is supplied, derive a concise kebab-case name. The change lives at:
+
+```text
+changes/<name>/
+  SPEC.md
+  PLAN.md
+```
+
+If that directory already exists, read it and continue refining it; never overwrite prior decisions blindly. If multiple existing changes could match and repository context cannot disambiguate them, ask the user which one to use.
+
+## Research first
+
+1. Read repository instructions and relevant existing documentation.
+2. If `docs/VISION.md` exists, read it. If it does not exist, skip all vision-alignment work: do not create it, require it, or add a placeholder vision section.
+3. Read relevant current feature documentation. Prefer the repository's established documentation location; otherwise use `docs/features/`.
+4. Read relevant ADRs. Prefer the established ADR location; otherwise use `docs/adr/`.
+5. Inspect the affected implementation and its tests enough to make the plan concrete and to reuse existing patterns.
+6. Resolve product ambiguity from available context first. Ask the user only about decisions with materially different product outcomes or tradeoffs.
+
+## Create `SPEC.md`
+
+The spec describes the desired user or operator experience, not the implementation.
+
+When `VISION.md` exists, use:
+
+```markdown
+# <Change title>
+
+## Outcome
+
+## Vision alignment
+
+## User experience
+
+## Requirements
+
+## Scope
+
+## Non-goals
+
+## Documentation impact
+```
+
+When `VISION.md` does not exist, omit `## Vision alignment` entirely.
+
+Content rules:
+
+- Name the user or operator outcome and why it matters.
+- Describe the normal flow plus observable failure, unavailable, empty, and recovery behavior where relevant.
+- State requirements as observable behavior and important invariants. Use examples when they remove ambiguity; do not mechanically turn every requirement into formal WHEN/THEN scenarios.
+- Keep implementation files, symbols, database columns, and task ordering out of the spec unless they are themselves a public interface.
+- Link to current feature documentation instead of restating the whole existing feature.
+- Make scope and non-goals explicit. Do not add adjacent improvements that the user did not request.
+- State which current feature documents will be added or changed. `None` is valid only with a concrete reason.
+
+### Vision handling
+
+Only perform this section when `VISION.md` exists.
+
+Classify the change in substance, without requiring classification labels in the file:
+
+- aligned: advances the vision;
+- neutral or enabling: preserves it while enabling maintenance or future work;
+- in tension: conflicts with a principle, boundary, or desired experience;
+- vision-changing: intentionally changes long-term direction.
+
+For a tension, first find an implementation or UX shape that satisfies both the requested outcome and the vision. If that is impossible, surface the exact conflict and ask the user to choose between changing the proposal and changing the vision. Never weaken or rewrite `VISION.md` merely to make a proposal appear aligned. Edit it only after an explicit strategic decision from the user, and record the decision in the spec.
+
+## Create `PLAN.md`
+
+Create the plan after `SPEC.md` is coherent. Use:
+
+```markdown
+# Plan
+
+## Approach
+
+## Affected areas
+
+## Architecture decisions
+
+## Risks
+
+## Tasks
+
+- [ ] <concrete, verifiable task>
+```
+
+Content rules:
+
+- Explain the smallest coherent implementation approach and why it fits existing architecture.
+- Name affected components, interfaces, persistence, operations, tests, and documentation where applicable.
+- Identify durable architectural decisions that require a new ADR or supersede an existing ADR. Routine implementation choices do not require ADRs. If no ADR is expected, say why.
+- Include only material risks and pair each with mitigation or verification.
+- Embed tasks directly in the plan. Tasks must be ordered, implementation-sized, and independently checkable.
+- Map every spec requirement to one or more tasks, and every task back to stated scope.
+- Include applicable behavioral verification, real-surface smoke testing, feature-documentation updates, and ADR work in the tasks.
+- If `VISION.md` exists, include a final task to re-check the completed behavior against it. If it does not exist, include no vision task.
+- Do not add archive, sync, generated metadata, or CLI-validation tasks.
+
+## Self-review
+
+Before finishing:
+
+1. Read both files as a user and as an implementer.
+2. Confirm the spec contains the complete desired experience without implementation leakage.
+3. Confirm every requirement is covered by the plan.
+4. Confirm the plan introduces no unstated product scope.
+5. Confirm documentation and ADR effects are explicit.
+6. If `VISION.md` exists, independently re-check alignment; if absent, confirm neither artifact invented vision work.
+7. Confirm there are no placeholders, deferred design decisions needed to start, or contradictory statements.
+
+Report the change name, artifact paths, major decisions, and any explicit user decision still blocking implementation. Otherwise state that the change is ready for `change-implement`.
