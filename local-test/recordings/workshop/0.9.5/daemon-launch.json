@@ -1,0 +1,39 @@
+{
+  "invocation": {
+    "argv": [
+      "launch"
+    ],
+    "cwd": "<CWD>",
+    "env": {
+      "GIT_CONFIG_GLOBAL": "<GIT_CONFIG_GLOBAL>",
+      "GNUPGHOME": "<GNUPGHOME>",
+      "HOME": "<HOME>",
+      "PATH": "<REPO>/daemon/.venv/bin:<TMP>/fidelity-wrappers:<HOME>/.local/bin:/snap/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
+    },
+    "files_before": {
+      "workshop.yaml": "name: qa-agent\nbase: ubuntu@26.04\nsdks:\n  - name: omp\n    channel: 17/edge\n    plugs:\n      pi-auth-gateway:\n        interface: tunnel\n        endpoint: localhost:4000\n  - name: system\n    slots:\n      pi-auth-gateway:\n        interface: tunnel\n        endpoint: localhost:4000\n"
+    },
+    "input_files": {},
+    "stdin": ""
+  },
+  "kind": "invocation",
+  "metadata": {
+    "captured_at": "2026-08-22T14:23:27Z",
+    "case": "daemon-launch",
+    "tool": "workshop",
+    "tool_version": "0.9.5"
+  },
+  "replay": {
+    "enabled": true
+  },
+  "result": {
+    "exit_code": 0,
+    "files_after": {
+      ".workshop.lock": "<WORKSHOP_ID>",
+      "workshop.yaml": "name: qa-agent\nbase: ubuntu@26.04\nsdks:\n  - name: omp\n    channel: 17/edge\n    plugs:\n      pi-auth-gateway:\n        interface: tunnel\n        endpoint: localhost:4000\n  - name: system\n    slots:\n      pi-auth-gateway:\n        interface: tunnel\n        endpoint: localhost:4000\n"
+    },
+    "stderr": "",
+    "stdout": "\"qa-agent\" launched\n"
+  },
+  "schema_version": 1
+}

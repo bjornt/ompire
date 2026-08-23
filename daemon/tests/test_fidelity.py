@@ -6,7 +6,6 @@ import json
 import subprocess
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[2]
 FIDELITY = ROOT / "local-test" / "fidelity"
 
@@ -16,8 +15,7 @@ def _run(*args: str) -> subprocess.CompletedProcess[str]:
         [str(FIDELITY), *args],
         cwd=ROOT,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         timeout=30,
         check=False,
     )

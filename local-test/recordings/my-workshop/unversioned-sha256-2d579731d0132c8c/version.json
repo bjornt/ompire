@@ -1,0 +1,32 @@
+{
+  "invocation": {
+    "argv": [
+      "--version"
+    ],
+    "cwd": "<CWD>",
+    "env": {
+      "HOME": "<HOME>",
+      "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
+    },
+    "files_before": {},
+    "input_files": {},
+    "stdin": ""
+  },
+  "kind": "invocation",
+  "metadata": {
+    "captured_at": "2026-08-22T14:20:17Z",
+    "case": "version",
+    "tool": "my-workshop",
+    "tool_version": "unversioned-sha256:2d579731d0132c8c"
+  },
+  "replay": {
+    "enabled": false
+  },
+  "result": {
+    "exit_code": 1,
+    "files_after": {},
+    "stderr": "flag provided but not defined: -version\nusage: my-workshop [--base IMAGE] [--revert] [PATH]\n\nBootstrap, ignore, and start a workshop environment.\n\nWraps the standard 'workshop' launch flow so a project's git-tracked\nworkshop YAML can be augmented with the SDKs this developer needs without\never appearing as a local modification in git.\n\nUse --revert to stop ignoring the YAML.\n\nPositional arguments:\n  PATH    Path to the workshop YAML file (default: auto-detect workshop.yaml or a single file under .workshop/)\n\nOptions:\n  -base string\n    \tBase image for a new workshop.yaml (default: additions config, or ubuntu@24.04)\n  -revert\n    \tStop ignoring the workshop YAML and exit without launching: clears skip-worktree and restores a tracked file, or drops the local .git/info/exclude entry for an untracked one.\n",
+    "stdout": ""
+  },
+  "schema_version": 1
+}

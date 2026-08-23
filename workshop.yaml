@@ -25,3 +25,6 @@ actions:
   typecheck-frontend: |
     cd /project/frontend
     pnpm exec tsc -b "$@"
+  docs: |
+    cd /project
+    NO_MKDOCS_2_WARNING=1 uvx --with mkdocs-material mkdocs build --strict "$@"

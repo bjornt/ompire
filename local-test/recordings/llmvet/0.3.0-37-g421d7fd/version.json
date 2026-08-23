@@ -1,0 +1,38 @@
+{
+  "invocation": {
+    "argv": [
+      "-version"
+    ],
+    "cwd": "<CWD>",
+    "env": {
+      "HOME": "<HOME>",
+      "PATH": "<HOME>/.local/bin:/var/lib/workshop/sdk/uv/bin:/var/lib/workshop/sdk/puppeteer-chrome/bin:/var/lib/workshop/sdk/omp/bin:/var/lib/workshop/sdk/node/bin:/var/lib/workshop/sdk/llmvet/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+    },
+    "files_before": {
+      ".workshop.lock": "<WORKSHOP_ID>",
+      "workshop.yaml": "name: dev\nbase: ubuntu@26.04\nsdks:\n  - name: node\n    channel: 24\n  - name: project-ompire-dev-setup\n  - name: uv\n  - name: openspec\n  - name: try-zed-remote\n  - name: try-open-design\n  - name: llmvet\n  - name: puppeteer-chrome\n  - name: try-omp\n    plugs:\n      pi-auth-gateway:\n        interface: tunnel\n        endpoint: localhost:4000\n  - name: system\n    slots:\n      pi-auth-gateway:\n        interface: tunnel\n        endpoint: localhost:4000\nactions:\n  test-backend: |\n    cd <CWD>/daemon\n    uv run pytest \"$@\"\n  test-frontend: |\n    cd <CWD>/frontend\n    pnpm test \"$@\"\n  lint-backend: |\n    cd <CWD>/daemon\n    uvx ruff check src tests \"$@\"\n  lint-frontend: |\n    cd <CWD>/frontend\n    pnpm lint \"$@\"\n  typecheck-backend: |\n    cd <CWD>/daemon\n    uv run --with mypy mypy src \"$@\"\n  typecheck-frontend: |\n    cd <CWD>/frontend\n    pnpm exec tsc -b \"$@\"\n"
+    },
+    "input_files": {},
+    "stdin": ""
+  },
+  "kind": "invocation",
+  "metadata": {
+    "captured_at": "2026-08-22T14:19:57Z",
+    "case": "version",
+    "tool": "llmvet",
+    "tool_version": "0.3.0-37-g421d7fd"
+  },
+  "replay": {
+    "enabled": false
+  },
+  "result": {
+    "exit_code": 0,
+    "files_after": {
+      ".workshop.lock": "<WORKSHOP_ID>",
+      "workshop.yaml": "name: dev\nbase: ubuntu@26.04\nsdks:\n  - name: node\n    channel: 24\n  - name: project-ompire-dev-setup\n  - name: uv\n  - name: openspec\n  - name: try-zed-remote\n  - name: try-open-design\n  - name: llmvet\n  - name: puppeteer-chrome\n  - name: try-omp\n    plugs:\n      pi-auth-gateway:\n        interface: tunnel\n        endpoint: localhost:4000\n  - name: system\n    slots:\n      pi-auth-gateway:\n        interface: tunnel\n        endpoint: localhost:4000\nactions:\n  test-backend: |\n    cd <CWD>/daemon\n    uv run pytest \"$@\"\n  test-frontend: |\n    cd <CWD>/frontend\n    pnpm test \"$@\"\n  lint-backend: |\n    cd <CWD>/daemon\n    uvx ruff check src tests \"$@\"\n  lint-frontend: |\n    cd <CWD>/frontend\n    pnpm lint \"$@\"\n  typecheck-backend: |\n    cd <CWD>/daemon\n    uv run --with mypy mypy src \"$@\"\n  typecheck-frontend: |\n    cd <CWD>/frontend\n    pnpm exec tsc -b \"$@\"\n"
+    },
+    "stderr": "",
+    "stdout": "0.3.0-37-g421d7fd\n"
+  },
+  "schema_version": 1
+}

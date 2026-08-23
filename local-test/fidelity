@@ -1,0 +1,1003 @@
+#!/usr/bin/env python3
+"""Record, sanitize, normalize, and replay local-test CLI contracts.
+
+Architecture: ADR-0014
+(docs/adr/0014-test-end-to-end-behavior-at-external-process-boundaries.md)
+The command has no third-party runtime requirements and never writes
+unsanitized process streams to disk.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import difflib
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any, Iterable
+
+SCHEMA_VERSION = 1
+TOOLS = ("workshop", "my-workshop", "gh", "omp", "llmvet")
+REPLAYABLE = {"workshop", "gh", "omp"}
+ENV_ALLOWLIST = ("HOME", "PATH", "GNUPGHOME", "GIT_CONFIG_GLOBAL", "LOCAL_TEST_STATE")
+SECRET_ENV_KEYS = (
+    "GH_TOKEN", "GITHUB_TOKEN", "QA_GPG_PASSPHRASE", "GPG_PASSPHRASE",
+    "AUTHORIZATION", "HTTP_AUTHORIZATION",
+)
+SELECTED_FILES = (".workshop.lock", "workshop.yaml")
+SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
+DEFAULT_LIMIT = 16 * 1024 * 1024
+_SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = (
+    Path(os.environ["OMPIRE_RECORD_REPO_ROOT"]).resolve()
+    if os.environ.get("OMPIRE_RECORD_REPO_ROOT")
+    else (_SCRIPT_DIR.parent if _SCRIPT_DIR.name == "local-test" else Path.cwd().resolve())
+)
+DEFAULT_GOLDENS = ROOT / "local-test" / "recordings"
+VERSIONS_JSON = DEFAULT_GOLDENS / "versions.json"
+VERSION_COMMANDS = {
+    "workshop": ["--version"],
+    "my-workshop": ["--version"],
+    "gh": ["--version"],
+    "omp": ["--version"],
+    "llmvet": ["-version"],
+}
+
+ISO_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})\b")
+UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b")
+WORKSHOP_ID_RE = re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{8}(?![0-9a-fA-F])")
+KEYINFO_RE = re.compile(r"(?<=KEYINFO )[0-9A-F]{40}\b")
+LOCAL_PORT_RE = re.compile(r"(?P<prefix>https?://(?:127\.0\.0\.1|localhost):)\d{2,5}\b")
+PR_URL_RE = re.compile(r"(https://github\.com/[^/\s]+/[^/\s]+/pull/)\d+\b")
+SECRET_KEY_RE = re.compile(r"(?:token|password|passphrase|authorization|private[_-]?key|secret)", re.I)
+PRIVATE_KEY_RE = re.compile(r"-----BEGIN (?:OPENSSH |PGP )?PRIVATE KEY-----")
+HOST_PATH_RE = re.compile(r"(?<![<\w])/(?:home|tmp|project|var/tmp)/[^\s\"']+")
+SAFE_CASE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+
+class FidelityError(RuntimeError):
+    pass
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    tmp = Path(raw)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(value, fh, indent=2, sort_keys=True, ensure_ascii=False)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def load_json(path: Path) -> Any:
+    try:
+        with path.open(encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FidelityError(f"cannot read JSON {path}: {exc}") from exc
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def text_bytes(data: bytes) -> str:
+    return data.decode("utf-8", errors="backslashreplace")
+
+
+def safe_component(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-.")
+    return cleaned or "unknown"
+
+
+def replace_literals(text: str, replacements: Iterable[tuple[str, str]]) -> str:
+    for old, new in sorted(((a, b) for a, b in replacements if a), key=lambda pair: len(pair[0]), reverse=True):
+        text = text.replace(old, new)
+    return text
+
+
+def normalize_text(text: str, replacements: Iterable[tuple[str, str]] = ()) -> str:
+    text = replace_literals(text, replacements)
+    text = ISO_RE.sub("<TIMESTAMP>", text)
+    text = UUID_RE.sub("<UUID>", text)
+    text = KEYINFO_RE.sub("<KEYGRIP>", text)
+    text = LOCAL_PORT_RE.sub(lambda match: match.group("prefix") + "<PORT>", text)
+    text = PR_URL_RE.sub(lambda match: match.group(1) + "<PR_NUMBER>", text)
+    text = WORKSHOP_ID_RE.sub("<WORKSHOP_ID>", text)
+    return text
+
+
+def _looks_json(text: str) -> bool:
+    stripped = text.strip()
+    return bool(stripped) and stripped[0] in "[{" and stripped[-1] in "]}"
+
+
+def normalize_value(value: Any, replacements: Iterable[tuple[str, str]] = (), key: str = "") -> Any:
+    key_l = key.lower()
+    if isinstance(value, dict):
+        return {k: normalize_value(value[k], replacements, k) for k in sorted(value)}
+    if isinstance(value, list):
+        return [normalize_value(item, replacements, key) for item in value]
+    if isinstance(value, int) and not isinstance(value, bool):
+        if key_l in {"id", "task_id", "taskid", "session_id", "sessionid", "port", "pr_number", "number"}:
+            return 0
+        return value
+    if not isinstance(value, str):
+        return value
+    if key_l in {"timestamp", "created_at", "updated_at", "mergedat", "merged_at", "ts"} and ISO_RE.fullmatch(value):
+        return "<TIMESTAMP>"
+    if key_l in {"id", "session_id", "sessionid", "task_id", "taskid", "workshop_id", "workshopid", "keygrip"}:
+        return "<" + key_l.upper() + ">"
+    if key_l == "request_id":
+        return normalize_text(value, replacements)
+    normalized = normalize_text(value, replacements)
+    if _looks_json(normalized):
+        try:
+            return json.dumps(normalize_value(json.loads(normalized), replacements), sort_keys=True, separators=(",", ":")) + ("\n" if normalized.endswith("\n") else "")
+        except json.JSONDecodeError:
+            pass
+    lines = normalized.splitlines(keepends=True)
+    if lines and all((not line.strip()) or _looks_json(line.strip()) for line in lines):
+        rebuilt: list[str] = []
+        for line in lines:
+            ending = "\n" if line.endswith("\n") else ""
+            raw = line.strip()
+            if not raw:
+                rebuilt.append(ending)
+                continue
+            try:
+                rebuilt.append(json.dumps(normalize_value(json.loads(raw), replacements), sort_keys=True, separators=(",", ":")) + ending)
+            except json.JSONDecodeError:
+                rebuilt.append(line)
+        return "".join(rebuilt)
+    return normalized
+
+
+def normalize_document(value: Any, replacements: Iterable[tuple[str, str]] = ()) -> Any:
+    return normalize_value(copy.deepcopy(value), tuple(replacements))
+
+
+def collect_redactions(extra_file: str | None = None) -> list[str]:
+    values: list[str] = []
+    for key in SECRET_ENV_KEYS:
+        value = os.environ.get(key)
+        if value:
+            values.append(value)
+    if extra_file:
+        path = Path(extra_file)
+        if not path.is_file():
+            raise FidelityError(f"redactions file not found: {path}")
+        for line in path.read_text(encoding="utf-8").splitlines():
+            value = line.strip()
+            if value and not value.startswith("#"):
+                values.append(value)
+    return sorted(set(values), key=len, reverse=True)
+
+
+def audit_safe(value: Any, redactions: Iterable[str] = (), path: str = "$") -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if SECRET_KEY_RE.search(str(key)):
+                raise FidelityError(f"unsafe credential-like key at {path}.{key}")
+            audit_safe(item, redactions, f"{path}.{key}")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            audit_safe(item, redactions, f"{path}[{index}]")
+        return
+    if not isinstance(value, str):
+        return
+    if ".qa-agent" in value:
+        raise FidelityError(f"unsafe QA identity path at {path}")
+    if PRIVATE_KEY_RE.search(value):
+        raise FidelityError(f"private-key material at {path}")
+    for secret in redactions:
+        if secret and secret in value:
+            raise FidelityError(f"configured redaction value remains at {path}")
+    host_path = HOST_PATH_RE.search(value)
+    if host_path:
+        raise FidelityError(f"unnormalized host path at {path}: {host_path.group(0)}")
+
+
+def validate_recording(doc: Any, source: str = "recording") -> dict[str, Any]:
+    if not isinstance(doc, dict):
+        raise FidelityError(f"{source}: root must be an object")
+    required = {"schema_version", "kind", "metadata", "invocation", "result", "replay"}
+    missing = required - set(doc)
+    if missing:
+        raise FidelityError(f"{source}: missing fields: {', '.join(sorted(missing))}")
+    if doc["schema_version"] != SCHEMA_VERSION or doc["kind"] != "invocation":
+        raise FidelityError(f"{source}: unsupported schema/kind")
+    metadata = doc["metadata"]
+    invocation = doc["invocation"]
+    result = doc["result"]
+    replay = doc["replay"]
+    if not isinstance(metadata, dict) or metadata.get("tool") not in TOOLS:
+        raise FidelityError(f"{source}: invalid metadata.tool")
+    for field in ("tool_version", "case", "captured_at"):
+        if not isinstance(metadata.get(field), str) or not metadata[field]:
+            raise FidelityError(f"{source}: metadata.{field} must be non-empty text")
+    if not SAFE_CASE_RE.fullmatch(metadata["case"]):
+        raise FidelityError(f"{source}: invalid case name {metadata['case']!r}")
+    if not isinstance(invocation, dict) or not isinstance(invocation.get("argv"), list) or not all(isinstance(v, str) for v in invocation["argv"]):
+        raise FidelityError(f"{source}: invocation.argv must be a string list")
+    for field in ("cwd", "stdin"):
+        if not isinstance(invocation.get(field), str):
+            raise FidelityError(f"{source}: invocation.{field} must be text")
+    for field in ("env", "files_before", "input_files"):
+        if not isinstance(invocation.get(field), dict):
+            raise FidelityError(f"{source}: invocation.{field} must be an object")
+    if not isinstance(result, dict) or not isinstance(result.get("exit_code"), int):
+        raise FidelityError(f"{source}: result.exit_code must be an integer")
+    for field in ("stdout", "stderr"):
+        if not isinstance(result.get(field), str):
+            raise FidelityError(f"{source}: result.{field} must be text")
+    if not isinstance(result.get("files_after"), dict):
+        raise FidelityError(f"{source}: result.files_after must be an object")
+    if not isinstance(replay, dict) or not isinstance(replay.get("enabled"), bool):
+        raise FidelityError(f"{source}: replay.enabled must be boolean")
+    if replay["enabled"] and metadata["tool"] not in REPLAYABLE:
+        raise FidelityError(f"{source}: {metadata['tool']} has no fake replay target")
+    audit_safe(doc)
+    return doc
+
+
+def path_replacements(cwd: Path, state: Path | None = None, home: Path | None = None, redactions: Iterable[str] = ()) -> list[tuple[str, str]]:
+    pairs = [
+        (str(cwd.resolve()), "<CWD>"),
+        (str(ROOT.resolve()), "<REPO>"),
+        (str(Path(tempfile.gettempdir()).resolve()), "<TMP>"),
+    ]
+    if state:
+        pairs.append((str(state.resolve()), "<STATE>"))
+    if home:
+        pairs.append((str(home.resolve()), "<HOME>"))
+    pairs.extend((secret, "<REDACTED>") for secret in redactions if secret)
+    return pairs
+
+
+def snapshot_files(cwd: Path, replacements: Iterable[tuple[str, str]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for name in SELECTED_FILES:
+        path = cwd / name
+        if not path.is_file():
+            continue
+        data = path.read_bytes()
+        if len(data) > 1024 * 1024:
+            raise FidelityError(f"selected file too large: {path}")
+        result[name] = normalize_text(text_bytes(data), replacements)
+    return result
+
+
+def capture_input_files(tool: str, argv: list[str], cwd: Path, replacements: Iterable[tuple[str, str]]) -> tuple[list[str], dict[str, str]]:
+    normalized = [normalize_text(value, replacements) for value in argv]
+    files: dict[str, str] = {}
+    if tool == "gh":
+        for index, value in enumerate(argv[:-1]):
+            if value != "--body-file":
+                continue
+            source = Path(argv[index + 1])
+            if not source.is_absolute():
+                source = cwd / source
+            if not source.is_file():
+                continue
+            content = source.read_bytes()
+            if len(content) > 1024 * 1024:
+                raise FidelityError(f"gh body file too large: {source}")
+            key = "body.md"
+            files[key] = normalize_text(text_bytes(content), replacements)
+            normalized[index + 1] = f"<CWD>/{key}"
+    return normalized, files
+
+
+class CaptureBuffer:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.data = bytearray()
+        self.exceeded = False
+        self.lock = threading.Lock()
+
+    def add(self, chunk: bytes) -> None:
+        with self.lock:
+            room = self.limit - len(self.data)
+            if room > 0:
+                self.data.extend(chunk[:room])
+            if len(chunk) > room:
+                self.exceeded = True
+
+
+def _pump_input(pipe: Any, capture: CaptureBuffer) -> None:
+    try:
+        while True:
+            chunk = os.read(0, 65536)
+            if not chunk:
+                break
+            capture.add(chunk)
+            try:
+                pipe.write(chunk)
+                pipe.flush()
+            except (BrokenPipeError, OSError):
+                break
+    except OSError:
+        pass
+    finally:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+def _pump_output(pipe: Any, fd: int, capture: CaptureBuffer) -> None:
+    try:
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                break
+            capture.add(chunk)
+            try:
+                os.write(fd, chunk)
+            except OSError:
+                pass
+    finally:
+        pipe.close()
+
+
+def probe_version(tool: str, real: Path) -> str:
+    argv = [str(real), *VERSION_COMMANDS[tool]]
+    try:
+        result = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    first = text_bytes(result.stdout).strip().splitlines()
+    if result.returncode == 0 and first:
+        return first[0]
+    try:
+        digest = hashlib.sha256(real.read_bytes()).hexdigest()[:16]
+    except OSError:
+        return "unversioned"
+    return f"unversioned-sha256:{digest}"
+
+
+def write_capture(doc: dict[str, Any], root: Path) -> Path:
+    validate_recording(doc)
+    metadata = doc["metadata"]
+    directory = root / metadata["tool"] / safe_component(metadata["tool_version"])
+    path = directory / f"{metadata['case']}.json"
+    if path.exists() and os.environ.get("OMPIRE_RECORD_OVERWRITE") != "1":
+        sequence = 2
+        while (directory / f"{metadata['case']}-{sequence}.json").exists():
+            sequence += 1
+        path = directory / f"{metadata['case']}-{sequence}.json"
+    atomic_json(path, doc)
+    return path
+
+
+def run_recorded(tool: str, real: Path, argv: list[str], version: str, case: str, output_root: Path, observational: bool = False) -> int:
+    if tool not in TOOLS:
+        raise FidelityError(f"unsupported tool: {tool}")
+    if not SAFE_CASE_RE.fullmatch(case):
+        raise FidelityError(f"invalid case name: {case}")
+    redactions = collect_redactions(os.environ.get("OMPIRE_RECORD_REDACTIONS_FILE"))
+    cwd = Path.cwd()
+    state = Path(os.environ["LOCAL_TEST_STATE"]) if os.environ.get("LOCAL_TEST_STATE") else None
+    home = Path(os.environ["HOME"]) if os.environ.get("HOME") else None
+    replacements = path_replacements(cwd, state, home, redactions)
+    normalized_argv, input_files = capture_input_files(tool, argv, cwd, replacements)
+    before = snapshot_files(cwd, replacements)
+    env_doc: dict[str, str] = {}
+    for key in ENV_ALLOWLIST:
+        if key in os.environ:
+            value = os.environ[key]
+            if key == "HOME":
+                value = "<HOME>"
+            elif key == "GNUPGHOME":
+                value = "<GNUPGHOME>"
+            elif key == "GIT_CONFIG_GLOBAL":
+                value = "<GIT_CONFIG_GLOBAL>"
+            elif key == "LOCAL_TEST_STATE":
+                value = "<STATE>"
+            else:
+                value = normalize_text(value, replacements)
+            env_doc[key] = value
+
+    limit = int(os.environ.get("OMPIRE_RECORD_MAX_BYTES", str(DEFAULT_LIMIT)))
+    if limit < 1024:
+        raise FidelityError("OMPIRE_RECORD_MAX_BYTES must be at least 1024")
+    stdin_cap, stdout_cap, stderr_cap = (CaptureBuffer(limit) for _ in range(3))
+    proc = subprocess.Popen(
+        [str(real), *argv], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, start_new_session=True,
+    )
+    assert proc.stdin and proc.stdout and proc.stderr
+    threads = [
+        threading.Thread(target=_pump_input, args=(proc.stdin, stdin_cap), daemon=True),
+        threading.Thread(target=_pump_output, args=(proc.stdout, 1, stdout_cap), daemon=True),
+        threading.Thread(target=_pump_output, args=(proc.stderr, 2, stderr_cap), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    previous: dict[int, Any] = {}
+    def forward(signum: int, _frame: Any) -> None:
+        try:
+            os.killpg(proc.pid, signum)
+        except ProcessLookupError:
+            pass
+    for signum in SIGNALS:
+        previous[signum] = signal.signal(signum, forward)
+    try:
+        rc = proc.wait()
+        threads[1].join(timeout=2)
+        threads[2].join(timeout=2)
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+    exit_code = 128 + (-rc) if rc < 0 else rc
+    if any(cap.exceeded for cap in (stdin_cap, stdout_cap, stderr_cap)):
+        eprint(f"fidelity: capture exceeded {limit} bytes; command result preserved, recording discarded")
+        return exit_code
+
+    after = snapshot_files(cwd, replacements)
+    stream_replacements = [*replacements, *[(secret, "<REDACTED>") for secret in redactions]]
+    captured_at = utc_now()
+    doc = {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "invocation",
+        "metadata": {
+            "tool": tool,
+            "tool_version": normalize_text(version, stream_replacements),
+            "case": case,
+            "captured_at": captured_at,
+        },
+        "invocation": {
+            "argv": normalized_argv,
+            "cwd": "<CWD>",
+            "env": env_doc,
+            "stdin": normalize_text(text_bytes(bytes(stdin_cap.data)), stream_replacements),
+            "files_before": before,
+            "input_files": input_files,
+        },
+        "result": {
+            "exit_code": exit_code,
+            "stdout": normalize_text(text_bytes(bytes(stdout_cap.data)), stream_replacements),
+            "stderr": normalize_text(text_bytes(bytes(stderr_cap.data)), stream_replacements),
+            "files_after": after,
+        },
+        "replay": {"enabled": tool in REPLAYABLE and not observational},
+    }
+    doc = normalize_document(doc)
+    doc["metadata"]["captured_at"] = captured_at
+    audit_safe(doc, redactions)
+    path = write_capture(doc, output_root)
+    eprint(f"fidelity: recorded {path}")
+    return exit_code
+
+
+def find_real(tool: str, excluded: Path) -> Path:
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        base = Path(entry)
+        try:
+            if base.resolve() == excluded.resolve():
+                continue
+        except OSError:
+            pass
+        candidate = base / tool
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate.absolute()
+    raise FidelityError(f"cannot resolve real {tool} outside {excluded}")
+
+
+def install_wrappers(directory: Path, mappings: list[str], tools: list[str]) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    explicit: dict[str, Path] = {}
+    for mapping in mappings:
+        if "=" not in mapping:
+            raise FidelityError(f"--tool requires NAME=PATH: {mapping}")
+        name, raw = mapping.split("=", 1)
+        if name not in TOOLS:
+            raise FidelityError(f"unsupported wrapper tool: {name}")
+        path = Path(raw).expanduser().absolute()
+        if not path.is_file() or not os.access(path, os.X_OK):
+            raise FidelityError(f"real binary is not executable: {path}")
+        explicit[name] = path
+    selected = list(dict.fromkeys([*tools, *explicit]))
+    if not selected:
+        selected = list(TOOLS)
+    manifest: dict[str, Any] = {"schema_version": 1, "tools": {}}
+    script = Path(__file__).resolve()
+    for tool in selected:
+        real = explicit.get(tool) or find_real(tool, directory)
+        manifest["tools"][tool] = {"real": str(real), "version": probe_version(tool, real)}
+        wrapper = directory / tool
+        wrapper.unlink(missing_ok=True)
+        wrapper.symlink_to(script)
+    atomic_json(directory / ".fidelity-tools.json", manifest)
+    print(f"installed {len(selected)} wrappers in {directory}")
+
+
+def wrapper_main(tool: str) -> int:
+    wrapper_dir = Path(sys.argv[0]).resolve().parent
+    # Resolving argv[0] follows the symlink to local-test; use the PATH entry
+    # when possible, because the installation manifest lives beside the link.
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(entry) / tool
+        try:
+            if candidate.exists() and candidate.resolve() == Path(__file__).resolve():
+                wrapper_dir = Path(entry).resolve()
+                break
+        except OSError:
+            continue
+    manifest = load_json(wrapper_dir / ".fidelity-tools.json")
+    entry = manifest.get("tools", {}).get(tool)
+    if not isinstance(entry, dict):
+        raise FidelityError(f"wrapper manifest has no target for {tool}")
+    real = Path(entry["real"])
+    if os.environ.get("OMPIRE_RECORD") != "1":
+        os.execve(real, [tool, *sys.argv[1:]], os.environ.copy())
+        raise AssertionError("exec returned")
+    output = os.environ.get("OMPIRE_RECORD_DIR")
+    if not output:
+        raise FidelityError("OMPIRE_RECORD_DIR is required when recording is enabled")
+    case = os.environ.get("OMPIRE_RECORD_CASE") or f"{tool}-{dt.datetime.now().strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+    observational = os.environ.get("OMPIRE_RECORD_OBSERVATIONAL") == "1"
+    return run_recorded(tool, real, sys.argv[1:], entry.get("version", "unknown"), case, Path(output), observational)
+
+
+def expand_placeholders(text: str, cwd: Path, state: Path, home: Path) -> str:
+    return replace_literals(
+        text,
+        (
+            ("<CWD>", str(cwd)),
+            ("<STATE>", str(state)),
+            ("<HOME>", str(home)),
+            ("<REPO>", str(ROOT)),
+            ("<PR_NUMBER>", "999"),
+            ("<PORT>", "4173"),
+            ("<WORKSHOP_ID>", "deadbeef"),
+            ("<UUID>", "11111111-1111-4111-8111-111111111111"),
+        ),
+    )
+
+
+def prepare_replay(doc: dict[str, Any], root: Path) -> tuple[Path, Path, Path, list[str], dict[str, str]]:
+    cwd, state, home = root / "cwd", root / "state", root / "home"
+    cwd.mkdir(parents=True)
+    state.mkdir()
+    home.mkdir()
+    invocation = doc["invocation"]
+    for group in (invocation["files_before"], invocation["input_files"]):
+        for name, content in group.items():
+            if Path(name).is_absolute() or ".." in Path(name).parts:
+                raise FidelityError(f"unsafe replay file path: {name}")
+            path = cwd / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(expand_placeholders(content, cwd, state, home), encoding="utf-8")
+    argv = [expand_placeholders(value, cwd, state, home) for value in invocation["argv"]]
+    env = os.environ.copy()
+    env.update({"LOCAL_TEST_STATE": str(state), "HOME": str(home)})
+    return cwd, state, home, argv, env
+
+
+def canonical_result(result: dict[str, Any], cwd: Path | None = None, state: Path | None = None, home: Path | None = None) -> dict[str, Any]:
+    replacements: list[tuple[str, str]] = []
+    if cwd:
+        replacements.append((str(cwd), "<CWD>"))
+    if state:
+        replacements.append((str(state), "<STATE>"))
+    if home:
+        replacements.append((str(home), "<HOME>"))
+    replacements.append((str(ROOT), "<REPO>"))
+    return normalize_document(result, replacements)
+
+
+def unified(expected: Any, actual: Any, name: str) -> str:
+    before = json.dumps(expected, indent=2, sort_keys=True, ensure_ascii=False).splitlines()
+    after = json.dumps(actual, indent=2, sort_keys=True, ensure_ascii=False).splitlines()
+    return "\n".join(difflib.unified_diff(before, after, fromfile=f"{name}:real", tofile=f"{name}:fake", lineterm=""))
+
+
+def conform_recording(path: Path, expect_mismatch: bool = False) -> tuple[bool, str]:
+    doc = validate_recording(load_json(path), str(path))
+    metadata = doc["metadata"]
+    tool = metadata["tool"]
+    if not doc["replay"]["enabled"]:
+        return True, f"OBSERVE {tool} {metadata['case']} ({metadata['tool_version']})"
+    fake = ROOT / "local-test" / "fakes" / tool
+    if not fake.is_file():
+        raise FidelityError(f"fake not found: {fake}")
+    with tempfile.TemporaryDirectory(prefix="ompire-fidelity-replay-") as raw:
+        cwd, state, home, argv, env = prepare_replay(doc, Path(raw))
+        completed = subprocess.run(
+            [str(fake), *argv], cwd=cwd, env=env,
+            input=expand_placeholders(doc["invocation"]["stdin"], cwd, state, home).encode(),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=30,
+        )
+        actual = {
+            "exit_code": completed.returncode,
+            "stdout": text_bytes(completed.stdout),
+            "stderr": text_bytes(completed.stderr),
+            "files_after": snapshot_files(cwd, ((str(cwd), "<CWD>"), (str(state), "<STATE>"), (str(home), "<HOME>"))),
+        }
+        expected = canonical_result(doc["result"])
+        actual = canonical_result(actual, cwd, state, home)
+        matches = expected == actual
+        if expect_mismatch:
+            matches = not matches
+        message = f"{'PASS' if matches else 'FAIL'} {tool} {metadata['case']} ({metadata['tool_version']})"
+        if expected != actual:
+            message += "\n" + unified(expected, actual, f"{tool}/{metadata['case']}")
+        return matches, message
+
+
+def recording_paths(values: list[str], all_goldens: bool) -> list[Path]:
+    if all_goldens or not values:
+        if not DEFAULT_GOLDENS.is_dir():
+            return []
+        return sorted(path for path in DEFAULT_GOLDENS.rglob("*.json") if path.name != "versions.json")
+    paths: list[Path] = []
+    for value in values:
+        path = Path(value)
+        if path.is_dir():
+            paths.extend(sorted(path.rglob("*.json")))
+        else:
+            paths.append(path)
+    return [path for path in paths if path.name != "versions.json"]
+
+
+def validate_version_manifest(paths: list[Path]) -> None:
+    manifest = load_json(VERSIONS_JSON)
+    if manifest.get("schema_version") != 1 or not isinstance(manifest.get("tools"), dict):
+        raise FidelityError("versions.json: invalid schema")
+    actual_cases: set[str] = set()
+    listed_cases: set[str] = set()
+    for tool, entry in manifest["tools"].items():
+        if tool not in TOOLS or not isinstance(entry, dict):
+            raise FidelityError(f"versions.json: invalid tool entry {tool!r}")
+        if not all(isinstance(entry.get(field), str) and entry[field] for field in ("version", "captured_at", "environment")):
+            raise FidelityError(f"versions.json: incomplete provenance for {tool}")
+        cases = entry.get("cases")
+        if not isinstance(cases, list) or not cases or not all(isinstance(case, str) for case in cases):
+            raise FidelityError(f"versions.json: {tool}.cases must be a non-empty string list")
+        for case in cases:
+            listed_cases.add(case)
+            case_path = DEFAULT_GOLDENS / case
+            if not case_path.is_file():
+                raise FidelityError(f"versions.json: missing listed case {case}")
+            case_doc = validate_recording(load_json(case_path), str(case_path))
+            if case_doc["metadata"]["tool"] != tool or case_doc["metadata"]["tool_version"] != entry["version"]:
+                raise FidelityError(f"versions.json: provenance mismatch for {case}")
+    for path in paths:
+        try:
+            actual_cases.add(str(path.resolve().relative_to(DEFAULT_GOLDENS.resolve())))
+        except ValueError as exc:
+            raise FidelityError(f"golden is outside recording root: {path}") from exc
+    missing = actual_cases - listed_cases
+    stale = listed_cases - actual_cases
+    if missing or stale:
+        details = []
+        if missing:
+            details.append("unlisted: " + ", ".join(sorted(missing)))
+        if stale:
+            details.append("not selected: " + ", ".join(sorted(stale)))
+        raise FidelityError("versions.json case mismatch (" + "; ".join(details) + ")")
+
+
+def update_version_manifest(doc: dict[str, Any], target: Path, environment: str | None) -> None:
+    manifest = load_json(VERSIONS_JSON) if VERSIONS_JSON.is_file() else {"schema_version": 1, "tools": {}}
+    if manifest.get("schema_version") != 1 or not isinstance(manifest.get("tools"), dict):
+        raise FidelityError("versions.json: invalid schema")
+    metadata = doc["metadata"]
+    tool = metadata["tool"]
+    existing = manifest["tools"].get(tool, {})
+    relative = str(target.relative_to(DEFAULT_GOLDENS))
+    cases = list(existing.get("cases", [])) if existing.get("version") == metadata["tool_version"] else []
+    if relative not in cases:
+        cases.append(relative)
+    captured_at = metadata["captured_at"]
+    capture_date = captured_at[:10] if re.match(r"^\d{4}-\d{2}-\d{2}", captured_at) else utc_now()[:10]
+    manifest["tools"][tool] = {
+        "version": metadata["tool_version"],
+        "captured_at": capture_date,
+        "environment": environment or existing.get("environment") or "unspecified",
+        "cases": sorted(cases),
+    }
+    atomic_json(VERSIONS_JSON, manifest)
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    paths = recording_paths(args.paths, args.all)
+    if not paths:
+        raise FidelityError("no recordings found")
+    for path in paths:
+        validate_recording(load_json(path), str(path))
+        print(f"VALID {path}")
+    if args.all or not args.paths:
+        validate_version_manifest(paths)
+        print(f"VALID {VERSIONS_JSON}")
+    return 0
+
+
+def cmd_conform(args: argparse.Namespace) -> int:
+    paths = recording_paths(args.paths, args.all)
+    if not paths:
+        raise FidelityError("no recordings found")
+    ok = True
+    for path in paths:
+        matched, message = conform_recording(path)
+        print(message)
+        ok = ok and matched
+    return 0 if ok else 1
+
+
+def cmd_promote(args: argparse.Namespace) -> int:
+    source = Path(args.capture)
+    doc = validate_recording(load_json(source), str(source))
+    redactions = collect_redactions(args.redactions_file)
+    normalized = normalize_document(doc, ((str(Path.cwd()), "<CWD>"), (str(ROOT), "<REPO>"), *[(secret, "<REDACTED>") for secret in redactions]))
+    normalized["metadata"]["captured_at"] = doc["metadata"]["captured_at"]
+    normalized["metadata"]["case"] = args.case
+    normalized["replay"]["enabled"] = not args.observational and normalized["metadata"]["tool"] in REPLAYABLE
+    audit_safe(normalized, redactions)
+    validate_recording(normalized)
+    target = DEFAULT_GOLDENS / normalized["metadata"]["tool"] / safe_component(normalized["metadata"]["tool_version"]) / f"{args.case}.json"
+    if target.exists() and not args.force:
+        raise FidelityError(f"golden exists (pass --force): {target}")
+    atomic_json(target, normalized)
+    update_version_manifest(normalized, target, args.environment)
+    print(target)
+    return 0
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    left = normalize_document(load_json(Path(args.qa)))
+    right = normalize_document(load_json(Path(args.local)))
+    if left == right:
+        print("outcomes conform")
+        return 0
+    print(unified(left, right, "outcomes"))
+    return 1
+
+
+def cmd_versions(args: argparse.Namespace) -> int:
+    manifest = load_json(Path(args.manifest))
+    tools = manifest.get("tools", {})
+    if not isinstance(tools, dict):
+        raise FidelityError("versions manifest has no tools object")
+    rc = 0
+    install_manifest: dict[str, Any] = {}
+    if args.wrapper_dir:
+        install_manifest = load_json(Path(args.wrapper_dir) / ".fidelity-tools.json").get("tools", {})
+    for tool, entry in sorted(tools.items()):
+        expected = entry.get("version") if isinstance(entry, dict) else None
+        print(f"{tool}: {expected}")
+        if args.check_real:
+            if tool in install_manifest:
+                real = Path(install_manifest[tool]["real"])
+            else:
+                resolved = shutil.which(tool)
+                if not resolved:
+                    eprint(f"VERSION MISSING {tool}: not on PATH")
+                    rc = 1
+                    continue
+                real = Path(resolved)
+            actual = probe_version(tool, real)
+            if actual != expected:
+                eprint(f"VERSION DRIFT {tool}: recorded={expected!r} real={actual!r}")
+                rc = 1
+    return rc
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    install_wrappers(Path(args.directory).resolve(), args.tool, args.tools.split(",") if args.tools else [])
+    return 0
+
+
+def cmd_capture(args: argparse.Namespace) -> int:
+    real = Path(args.real).expanduser().absolute()
+    if not real.is_file() or not os.access(real, os.X_OK):
+        raise FidelityError(f"real binary is not executable: {real}")
+    argv = list(args.argv)
+    if argv and argv[0] == "--":
+        argv.pop(0)
+    version = args.tool_version or probe_version(args.tool, real)
+    return run_recorded(args.tool, real, argv, version, args.case, Path(args.output).resolve(), args.observational)
+
+
+def _sha_tree(path: Path) -> str:
+    digest = hashlib.sha256()
+    if path.is_dir():
+        for child in sorted(p for p in path.rglob("*") if p.is_file()):
+            digest.update(str(child.relative_to(path)).encode())
+            digest.update(child.read_bytes())
+    return digest.hexdigest()
+
+
+def _selfcheck_child(path: Path) -> None:
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os,signal,sys,time\n"
+        "def stop(s,f): print('interrupted', file=sys.stderr, flush=True); sys.exit(130)\n"
+        "signal.signal(signal.SIGINT, stop)\n"
+        "data=sys.stdin.buffer.read() if '--wait' not in sys.argv else b''\n"
+        "if '--lock' in sys.argv: open('.workshop.lock','w').write('deadbeef\\n')\n"
+        "print('out:'+data.decode(), end='', flush=True)\n"
+        "print('err', file=sys.stderr, flush=True)\n"
+        "while '--wait' in sys.argv: time.sleep(.1)\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def cmd_selfcheck(_args: argparse.Namespace) -> int:
+    before = _sha_tree(DEFAULT_GOLDENS)
+    checks = 0
+    def ok(name: str, condition: bool) -> None:
+        nonlocal checks
+        if not condition:
+            raise FidelityError(f"selfcheck failed: {name}")
+        checks += 1
+        print(f"ok {name}")
+
+    with tempfile.TemporaryDirectory(prefix="ompire-fidelity-selfcheck-") as raw:
+        temp = Path(raw)
+        real_dir, wrappers, captures, cwd = temp / "real", temp / "wrappers", temp / "captures", temp / "cwd"
+        for path in (real_dir, wrappers, captures, cwd):
+            path.mkdir()
+        child = real_dir / "gh"
+        _selfcheck_child(child)
+        install_wrappers(wrappers, [f"gh={child}"], [])
+        env = os.environ.copy()
+        env["PATH"] = str(wrappers) + os.pathsep + env.get("PATH", "")
+        direct = subprocess.run(["gh"], cwd=cwd, env=env, input=b"hello", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        ok("disabled wrapper passthrough", direct.returncode == 0 and direct.stdout == b"out:hello" and not list(captures.rglob("*.json")))
+
+        env.update({"OMPIRE_RECORD": "1", "OMPIRE_RECORD_DIR": str(captures), "OMPIRE_RECORD_CASE": "stream-lock", "OMPIRE_RECORD_OVERWRITE": "1"})
+        recorded = subprocess.run(["gh", "--lock"], cwd=cwd, env=env, input=b"hello", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        records = list(captures.rglob("*.json"))
+        ok("enabled stream capture", recorded.returncode == 0 and recorded.stdout == b"out:hello" and len(records) == 1)
+        doc = validate_recording(load_json(records[0]))
+        ok("selected filesystem delta", doc["result"]["files_after"].get(".workshop.lock") == "<WORKSHOP_ID>\n")
+        ok("normalization idempotent", normalize_document(doc) == normalize_document(normalize_document(doc)))
+
+        env["OMPIRE_RECORD_CASE"] = "signal"
+        waiting = subprocess.Popen(["gh", "--wait"], cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(0.3)
+        waiting.send_signal(signal.SIGINT)
+        out, err = waiting.communicate(timeout=5)
+        ok("SIGINT forwarding", waiting.returncode == 130 and b"interrupted" in err)
+
+        unsafe = copy.deepcopy(doc)
+        unsafe["result"]["stdout"] = "-----BEGIN OPENSSH PRIVATE KEY-----"
+        rejected = False
+        try:
+            validate_recording(unsafe)
+        except FidelityError:
+            rejected = True
+        ok("secret audit rejection", rejected)
+
+        qa = {"task": {"id": "11111111-1111-4111-8111-111111111111", "updated_at": "2026-08-22T01:02:03Z"}, "events": [{"type": "done"}]}
+        local = {"events": [{"type": "done"}], "task": {"updated_at": "2026-08-23T04:05:06Z", "id": "22222222-2222-4222-8222-222222222222"}}
+        ok("outcome normalization", normalize_document(qa) == normalize_document(local))
+        local["events"][0]["type"] = "failed"
+        ok("outcome divergence", normalize_document(qa) != normalize_document(local))
+
+        goldens = recording_paths([], True)
+        if goldens:
+            all_match = all(conform_recording(path)[0] for path in goldens)
+            ok("golden replay", all_match)
+            replayable = next((path for path in goldens if load_json(path).get("replay", {}).get("enabled")), None)
+            if replayable:
+                broken = load_json(replayable)
+                broken["result"]["stdout"] += "drift\n"
+                broken_path = temp / "broken.json"
+                atomic_json(broken_path, broken)
+                mismatch_ok, _ = conform_recording(broken_path, expect_mismatch=True)
+                ok("intentional mismatch diff", mismatch_ok)
+        ok("temporary isolation", not (ROOT / "local-test" / ".state" / "fidelity-selfcheck").exists())
+    ok("golden directory unchanged", before == _sha_tree(DEFAULT_GOLDENS))
+    print(f"fidelity selfcheck: {checks} checks passed")
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    sub = result.add_subparsers(dest="command", required=True)
+
+    install = sub.add_parser("install-wrappers", help="install PATH wrappers and immutable real targets")
+    install.add_argument("directory")
+    install.add_argument("--tool", action="append", default=[], metavar="NAME=PATH")
+    install.add_argument("--tools", default="", help="comma-separated tools resolved from PATH")
+    install.set_defaults(func=cmd_install)
+
+    capture = sub.add_parser("capture", help="record one explicit real-binary invocation")
+    capture.add_argument("--tool", required=True, choices=TOOLS)
+    capture.add_argument("--real", required=True)
+    capture.add_argument("--case", required=True)
+    capture.add_argument("--output", required=True)
+    capture.add_argument("--tool-version")
+    capture.add_argument("--observational", action="store_true")
+    capture.add_argument("argv", nargs=argparse.REMAINDER)
+    capture.set_defaults(func=cmd_capture)
+
+    validate = sub.add_parser("validate", help="validate and audit recording JSON")
+    validate.add_argument("paths", nargs="*")
+    validate.add_argument("--all", action="store_true")
+    validate.set_defaults(func=cmd_validate)
+
+    promote = sub.add_parser("promote", help="promote one capture into committed goldens")
+    promote.add_argument("capture")
+    promote.add_argument("--case", required=True)
+    promote.add_argument("--redactions-file")
+    promote.add_argument("--environment", help="capture environment label for versions.json")
+    promote.add_argument("--observational", action="store_true")
+    promote.add_argument("--force", action="store_true")
+    promote.set_defaults(func=cmd_promote)
+
+    conform = sub.add_parser("conform", help="replay goldens against repository fakes")
+    conform.add_argument("paths", nargs="*")
+    conform.add_argument("--all", action="store_true")
+    conform.set_defaults(func=cmd_conform)
+
+    compare = sub.add_parser("compare-outcomes", help="diff normalized QA/local outcome bundles")
+    compare.add_argument("qa")
+    compare.add_argument("local")
+    compare.set_defaults(func=cmd_compare)
+
+    versions = sub.add_parser("versions", help="show or verify real-tool recording versions")
+    versions.add_argument("--manifest", default=str(VERSIONS_JSON))
+    versions.add_argument("--check-real", action="store_true")
+    versions.add_argument("--wrapper-dir")
+    versions.set_defaults(func=cmd_versions)
+
+    selfcheck = sub.add_parser("selfcheck", help="prove the fidelity pipeline offline")
+    selfcheck.set_defaults(func=cmd_selfcheck)
+    return result
+
+
+def main() -> int:
+    invoked = Path(sys.argv[0]).name
+    try:
+        if invoked in TOOLS:
+            return wrapper_main(invoked)
+        args = parser().parse_args()
+        return args.func(args)
+    except FidelityError as exc:
+        eprint(f"fidelity: {exc}")
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

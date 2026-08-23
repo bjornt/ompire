@@ -1,0 +1,38 @@
+{
+  "invocation": {
+    "argv": [
+      "pr",
+      "view",
+      "https://github.com/local-test/does-not-exist/pull/<PR_NUMBER>",
+      "--json",
+      "state,mergedAt"
+    ],
+    "cwd": "<CWD>",
+    "env": {
+      "GIT_CONFIG_GLOBAL": "<GIT_CONFIG_GLOBAL>",
+      "GNUPGHOME": "<GNUPGHOME>",
+      "HOME": "<HOME>",
+      "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
+    },
+    "files_before": {},
+    "input_files": {},
+    "stdin": ""
+  },
+  "kind": "invocation",
+  "metadata": {
+    "captured_at": "2026-08-22T14:20:17Z",
+    "case": "view-unknown-repository",
+    "tool": "gh",
+    "tool_version": "gh version 2.97.0 (2026-07-31)"
+  },
+  "replay": {
+    "enabled": true
+  },
+  "result": {
+    "exit_code": 1,
+    "files_after": {},
+    "stderr": "GraphQL: Could not resolve to a Repository with the name 'local-test/does-not-exist'. (repository)\n",
+    "stdout": ""
+  },
+  "schema_version": 1
+}

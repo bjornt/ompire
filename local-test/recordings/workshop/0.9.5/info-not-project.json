@@ -1,0 +1,32 @@
+{
+  "invocation": {
+    "argv": [
+      "info"
+    ],
+    "cwd": "<CWD>",
+    "env": {
+      "HOME": "<HOME>",
+      "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin"
+    },
+    "files_before": {},
+    "input_files": {},
+    "stdin": ""
+  },
+  "kind": "invocation",
+  "metadata": {
+    "captured_at": "2026-08-22T14:20:17Z",
+    "case": "info-not-project",
+    "tool": "workshop",
+    "tool_version": "0.9.5"
+  },
+  "replay": {
+    "enabled": true
+  },
+  "result": {
+    "exit_code": 1,
+    "files_after": {},
+    "stderr": "error: not a project (no workshop files found)\n",
+    "stdout": ""
+  },
+  "schema_version": 1
+}
