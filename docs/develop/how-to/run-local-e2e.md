@@ -10,6 +10,22 @@ exit codes, streams, and filesystem effects as the real tools, so production
 code has no idea it is under test. Nothing in `daemon/` branches on a test
 flag.
 
+## Real tools on a clean machine
+
+`my-workshop` and `llmvet` are *not* faked, and they are not committed either.
+The first bring-up fetches the pinned, sha256-verified builds into the
+gitignored `local-test/.tools/` cache — no preinstall, not even Go, which is
+vendored into the cache when it is missing.
+
+```sh
+local-test/tools status         # what is cached, and where it came from
+local-test/tools fetch --force  # re-fetch after a pin bump
+```
+
+Supplying your own build still wins: `local-test/env up --my-workshop PATH`,
+`--llmvet PATH`, `--my-workshop-src DIR`, or the matching `LOCAL_TEST_*`
+variables. See [Local testing harness](../../features/local-testing.md).
+
 ## Run the scenarios
 
 ```sh

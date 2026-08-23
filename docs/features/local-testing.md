@@ -98,6 +98,34 @@ than handing over one that is subtly broken.
 Teardown stops the daemon without losing state by default, and status reports
 daemon health alongside fake state.
 
+### Real tools
+
+Two tools in the daemon's `PATH` are real, not faked: `my-workshop` and
+`llmvet`. They are large build artifacts, so they are never committed —
+`local-test/.tools/` is gitignored, and `local-test/tools` provisions it:
+
+| Tool | Source | Pinned by |
+|---|---|---|
+| `llmvet` | Release asset from `bjornt/llmvet` | Tag + sha256 |
+| `my-workshop` | `go build` of `bjornt/my-workshop` (no releases published) | Commit + Go version |
+
+Bring-up resolves a real tool from an operator flag, the state root, a source
+dir, or `PATH`, and falls back to this cache — fetching the pinned build when
+it is empty. A plain checkout therefore needs nothing preinstalled: when `go`
+is missing, a pinned Go toolchain is downloaded, sha256-verified, and unpacked
+into the cache for the build alone. Nothing outside the cache is written.
+
+Every download is sha256-verified against a pin in the script; the source
+build is trimmed of local paths and build ids, so one (commit, Go version)
+yields one digest on any machine. That digest is not the digest of a
+`my-workshop` built elsewhere, which matters where [fidelity](#fidelity)
+identifies that unversioned binary by hash.
+
+`local-test/env` also writes to this cache — it re-caches whatever it pinned
+so a later `up --fresh` need not re-resolve. `local-test/tools status`
+distinguishes the two: `pinned` is the verified fetch, `local` is a copy the
+environment supplied.
+
 ### Control CLIs
 
 Steering happens through published surfaces only:

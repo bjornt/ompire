@@ -11,6 +11,8 @@ __pycache__/
 *.db-wal
 .qa-agent/
 local-test/.state/
+# Fetched real-tool binaries + vendored Go toolchain (local-test/tools)
+local-test/.tools/
 
 # Documentation site build output
 site/

@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+#
+# Architecture: ADR-0014
+# (docs/adr/0014-test-end-to-end-behavior-at-external-process-boundaries.md)
+# Provisions the *real* third-party binaries the offline E2E harness pins
+# into its daemon PATH. They are large, machine-specific build artifacts —
+# never committed. This tool fetches them on demand into the gitignored
+# cache at <repo>/local-test/.tools, so a plain checkout needs nothing
+# preinstalled; `local-test/env up` calls it automatically for any tool it
+# cannot resolve from a flag, the state root, a source dir, or PATH.
+#
+# Everything is pinned and sha256-verified. Nothing outside the cache is
+# written: no system packages, no $HOME/go, no PATH changes.
+#
+# Commands:
+#   fetch [--force] [TOOL...]  provision TOOLs (default: all). Existing
+#                              cache entries are kept — --force re-fetches,
+#                              which is how a pin bump is applied.
+#   status [TOOL...]           what is cached: version, sha256, provenance
+#   clean [--all] [TOOL...]    remove cached TOOLs; --all also drops the
+#                              vendored Go toolchain
+#
+# Tools:
+#   llmvet        release asset from github.com/bjornt/llmvet, pinned by
+#                 tag + sha256 (the review model the daemon drives for real)
+#   my-workshop   go build of a pinned commit of github.com/bjornt/my-workshop
+#                 (no releases are published). When go is not on PATH a
+#                 pinned Go toolchain is downloaded, sha256-verified, and
+#                 unpacked into the cache for this build only.
+#
+# A source build is reproducible per (commit, Go version) — CGO off,
+# -trimpath, cleared build id — but its sha256 is not the sha256 of a
+# binary built elsewhere. `local-test/fidelity versions --check-real`
+# identifies my-workshop by digest, so re-fetching it may require
+# re-recording that observational case.
+
+set -euo pipefail
+
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+CACHE=$REPO_ROOT/local-test/.tools
+MANIFEST=$CACHE/manifest.json
+GOROOT_CACHE=$CACHE/.go
+
+ALL_TOOLS=(llmvet my-workshop)
+
+# --- pins -------------------------------------------------------------------
+# Bump a pin here, then `local-test/tools fetch --force <tool>`.
+
+LLMVET_TAG=v0.3.0
+LLMVET_ASSET_amd64=llmvet-linux-x86
+LLMVET_ASSET_arm64=llmvet-linux-arm64
+LLMVET_SHA_amd64=2fdb9f1e10d5f7dae41c30e60a112bf5fc40e1d4d2e7d79bc4709befed21c9a2
+LLMVET_SHA_arm64=75d45f7aa464be479408652e432d2d83ab807ad4eebe5b01402232cdafd31f3b
+
+MY_WORKSHOP_REPO=https://github.com/bjornt/my-workshop
+MY_WORKSHOP_COMMIT=5a82884178c579cdd3f5eb3d52afbe1ccf9e8192
+
+GO_VERSION=go1.27.0
+GO_SHA_amd64=675c26c449cbb18fc24b74650de1eabbae6e16f64326fd85a283fb3b58280685
+GO_SHA_arm64=51798d2c42d0e1c6ed7fd9f48728b4193abac9e8aad6dbac2fe96a81f5909bda
+
+# --- helpers ----------------------------------------------------------------
+
+log() { printf '[tools] %s\n' "$*" >&2; }
+die() { printf '[tools] error: %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
+
+command -v curl >/dev/null 2>&1 || die "curl is required but not on PATH"
+command -v jq   >/dev/null 2>&1 || die "jq is required but not on PATH"
+command -v tar  >/dev/null 2>&1 || die "tar is required but not on PATH"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required but not on PATH"
+
+host_arch() { # the Go/asset arch name for this machine
+	case "$(uname -m)" in
+	x86_64 | amd64) echo amd64 ;;
+	aarch64 | arm64) echo arm64 ;;
+	*) die "unsupported architecture '$(uname -m)': the pinned tools ship linux amd64/arm64 only" ;;
+	esac
+}
+
+sha_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+known_tool() { # die unless <tool> is one this script provisions
+	local tool=$1 known
+	for known in "${ALL_TOOLS[@]}"; do
+		[ "$tool" = "$known" ] && return 0
+	done
+	die "unknown tool '$tool' (known: ${ALL_TOOLS[*]})"
+}
+
+# One scratch root for the whole run. Per-function RETURN traps are not
+# scoped to the function that sets them in bash — they fire on the next
+# function return too — so cleanup hangs off a single EXIT trap instead.
+SCRATCH=$(mktemp -d)
+trap 'chmod -R u+w "$SCRATCH" 2>/dev/null || true; rm -rf "$SCRATCH"' EXIT
+scratch_dir() { mktemp -d "$SCRATCH/XXXXXX"; }
+
+fetch_verified() { # fetch_verified <url> <dest> <expected-sha256>
+	local url=$1 dest=$2 want=$3 got
+	log "downloading $url"
+	curl -fsSL --retry 3 --retry-delay 2 -o "$dest" "$url" ||
+		die "download failed: $url"
+	got=$(sha_of "$dest")
+	[ "$got" = "$want" ] ||
+		die "sha256 mismatch for $url"$'\n'"  expected $want"$'\n'"  got      $got"
+}
+
+tool_version() { # tool_version <tool> <binary> — the no-side-effect probe
+	local tool=$1 bin=$2 version
+	# my-workshop has no --version flag and running it bare attempts a
+	# launch; its usage line is the safe probe (same rule as local-test/env)
+	if [ "$tool" = my-workshop ]; then
+		version=$({ "$bin" -h 2>&1 || true; } | sed -n 's/^usage: //p' | head -1)
+	else
+		version=$({ "$bin" -version 2>&1 || true; } | head -1)
+	fi
+	[ -n "$version" ] || version=-
+	printf '%s\n' "$version"
+}
+
+record_tool() { # record_tool <tool> <source> — refresh the cache manifest
+	local tool=$1 source=$2 base version sha
+	base=$(cat "$MANIFEST" 2>/dev/null) || base=""
+	[ -n "$base" ] || base='{}'
+	version=$(tool_version "$tool" "$CACHE/$tool")
+	sha=$(sha_of "$CACHE/$tool")
+	jq -n --arg base "$base" --arg t "$tool" --arg s "$source" \
+		--arg v "$version" --arg sh "$sha" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+		'($base | fromjson) + {$t: {source: $s, version: $v, sha256: $sh, fetched_at: $at}}' \
+		>"$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
+	log "$tool ready ($version)"
+}
+
+# --- go toolchain -----------------------------------------------------------
+
+ensure_go() { # echoes the go binary to build with; vendors one if needed
+	if command -v go >/dev/null 2>&1; then
+		printf '%s\n' "$(command -v go)"
+		return
+	fi
+	if [ -x "$GOROOT_CACHE/bin/go" ]; then
+		printf '%s\n' "$GOROOT_CACHE/bin/go"
+		return
+	fi
+	local arch tarball url want tmp
+	arch=$(host_arch)
+	tarball=$GO_VERSION.linux-$arch.tar.gz
+	url=https://go.dev/dl/$tarball
+	eval "want=\$GO_SHA_$arch"
+	log "go is not on PATH — vendoring $GO_VERSION into $GOROOT_CACHE"
+	tmp=$(scratch_dir)
+	fetch_verified "$url" "$tmp/$tarball" "$want"
+	rm -rf "$GOROOT_CACHE"
+	mkdir -p "$GOROOT_CACHE"
+	# the archive's single top-level 'go/' directory becomes $GOROOT_CACHE
+	tar -xzf "$tmp/$tarball" -C "$GOROOT_CACHE" --strip-components=1 ||
+		die "cannot unpack $tarball"
+	[ -x "$GOROOT_CACHE/bin/go" ] || die "unpacked $GO_VERSION has no bin/go"
+	printf '%s\n' "$GOROOT_CACHE/bin/go"
+}
+
+# --- per-tool fetchers ------------------------------------------------------
+
+fetch_llmvet() {
+	local arch asset want url tmp
+	arch=$(host_arch)
+	eval "asset=\$LLMVET_ASSET_$arch"
+	eval "want=\$LLMVET_SHA_$arch"
+	url=https://github.com/bjornt/llmvet/releases/download/$LLMVET_TAG/$asset
+	tmp=$(scratch_dir)
+	fetch_verified "$url" "$tmp/llmvet" "$want"
+	install -m 755 "$tmp/llmvet" "$CACHE/llmvet" || die "cannot install llmvet into $CACHE"
+	record_tool llmvet "release: bjornt/llmvet $LLMVET_TAG ($asset)"
+}
+
+fetch_my_workshop() {
+	local go tmp url
+	go=$(ensure_go)
+	log "building my-workshop from $MY_WORKSHOP_REPO @ ${MY_WORKSHOP_COMMIT:0:12} (go: $go)"
+	tmp=$(scratch_dir)
+	# a commit tarball avoids cloning history for a one-shot build
+	url=$MY_WORKSHOP_REPO/archive/$MY_WORKSHOP_COMMIT.tar.gz
+	log "downloading $url"
+	curl -fsSL --retry 3 --retry-delay 2 -o "$tmp/src.tar.gz" "$url" ||
+		die "download failed: $url"
+	mkdir -p "$tmp/src"
+	tar -xzf "$tmp/src.tar.gz" -C "$tmp/src" --strip-components=1 ||
+		die "cannot unpack the my-workshop source tarball"
+	# self-contained build: scratch caches inside $tmp, no toolchain
+	# auto-download, and a binary trimmed of local paths and build ids so
+	# the same (commit, Go version) yields the same sha256 anywhere
+	( cd "$tmp/src" && env -u GOFLAGS \
+		GOROOT="$(cd "$(dirname "$go")/.." && pwd)" \
+		GOTOOLCHAIN=local \
+		GOCACHE="$tmp/gocache" \
+		GOPATH="$tmp/gopath" \
+		GOPROXY=off \
+		CGO_ENABLED=0 \
+		"$go" build -trimpath -buildvcs=false -ldflags=-buildid= \
+		-o "$tmp/my-workshop" ./cmd/my-workshop ) >&2 ||
+		die "go build failed for my-workshop"
+	install -m 755 "$tmp/my-workshop" "$CACHE/my-workshop" ||
+		die "cannot install my-workshop into $CACHE"
+	record_tool my-workshop "source build: $MY_WORKSHOP_REPO @ ${MY_WORKSHOP_COMMIT:0:12} ($GO_VERSION)"
+}
+
+fetch_tool() { # fetch_tool <tool> <force>
+	local tool=$1 force=$2
+	if [ "$force" -eq 0 ] && [ -x "$CACHE/$tool" ]; then
+		log "$tool: already cached ($(sha_of "$CACHE/$tool" | cut -c1-12)…) — --force to re-fetch"
+		return
+	fi
+	mkdir -p "$CACHE"
+	case "$tool" in
+	llmvet) fetch_llmvet ;;
+	my-workshop) fetch_my_workshop ;;
+	*) die "unknown tool '$tool' (known: ${ALL_TOOLS[*]})" ;;
+	esac
+}
+
+# --- commands ---------------------------------------------------------------
+
+cmd_fetch() {
+	local force=0
+	local -a want=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--force) force=1; shift ;;
+		help | --help | -h) usage; exit 0 ;;
+		-*) die "unknown argument: $1 (try 'help')" ;;
+		*) want+=("$1"); shift ;;
+		esac
+	done
+	[ ${#want[@]} -gt 0 ] || want=("${ALL_TOOLS[@]}")
+	for tool in "${want[@]}"; do known_tool "$tool"; done
+	mkdir -p "$CACHE"
+	for tool in "${want[@]}"; do fetch_tool "$tool" "$force"; done
+}
+
+cmd_status() {
+	local -a want=("$@")
+	[ ${#want[@]} -gt 0 ] || want=("${ALL_TOOLS[@]}")
+	for tool in "${want[@]}"; do known_tool "$tool"; done
+	printf '%-14s %-9s %-14s %s\n' TOOL STATE SHA256 VERSION
+	for tool in "${want[@]}"; do
+		if [ ! -x "$CACHE/$tool" ]; then
+			printf '%-14s %-9s %-14s %s\n' "$tool" missing - -
+			continue
+		fi
+		local sha state recorded
+		sha=$(sha_of "$CACHE/$tool")
+		recorded=$(jq -r --arg t "$tool" '.[$t].sha256 // empty' "$MANIFEST" 2>/dev/null) || recorded=""
+		# `local-test/env` also writes here — it re-caches whatever it
+		# pinned (an operator --flag path, a PATH copy, a source build) so
+		# a later `up --fresh` need not re-resolve. A cached binary that
+		# does not match the manifest is one of those, not our fetch.
+		if [ "$sha" = "$recorded" ]; then
+			state=pinned
+		else
+			state=local
+		fi
+		printf '%-14s %-9s %-14s %s\n' "$tool" "$state" \
+			"$(printf '%s' "$sha" | cut -c1-12)…" \
+			"$(tool_version "$tool" "$CACHE/$tool")"
+	done
+	if [ -x "$GOROOT_CACHE/bin/go" ]; then
+		printf '%-14s %-9s %-14s %s\n' "(go)" vendored - \
+			"$("$GOROOT_CACHE/bin/go" version 2>/dev/null | head -1)"
+	fi
+	echo
+	echo "pinned = this tool's verified fetch; local = supplied by local-test/env"
+	[ -f "$MANIFEST" ] && { echo "last fetch: $MANIFEST"; jq . "$MANIFEST"; } || true
+}
+
+cmd_clean() {
+	local all=0
+	local -a want=()
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--all) all=1; shift ;;
+		help | --help | -h) usage; exit 0 ;;
+		-*) die "unknown argument: $1 (try 'help')" ;;
+		*) want+=("$1"); shift ;;
+		esac
+	done
+	[ ${#want[@]} -gt 0 ] || want=("${ALL_TOOLS[@]}")
+	for tool in "${want[@]}"; do known_tool "$tool"; done
+	for tool in "${want[@]}"; do
+		rm -f "$CACHE/$tool"
+		if [ -f "$MANIFEST" ]; then
+			jq --arg t "$tool" 'del(.[$t])' "$MANIFEST" >"$MANIFEST.tmp" &&
+				mv "$MANIFEST.tmp" "$MANIFEST"
+		fi
+		log "$tool: removed from $CACHE"
+	done
+	if [ "$all" -eq 1 ] && [ -d "$GOROOT_CACHE" ]; then
+		rm -rf "$GOROOT_CACHE"
+		log "vendored Go toolchain removed"
+	fi
+}
+
+case "${1:-help}" in
+fetch) shift; cmd_fetch "$@" ;;
+status) shift; cmd_status "$@" ;;
+clean) shift; cmd_clean "$@" ;;
+help | --help | -h) usage ;;
+*) die "unknown command: $1 (try 'help')" ;;
+esac

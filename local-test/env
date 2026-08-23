@@ -27,8 +27,11 @@
 #                          LOCAL_TEST_LLMVET env) → existing bin copy →
 #                          source build (--my-workshop-src or
 #                          LOCAL_TEST_MY_WORKSHOP_SRC; needs go) → PATH
-#                          copy. Re-pinning: replace the bin copy or rerun
-#                          with an explicit path (a bare re-run keeps it).
+#                          copy → tools cache, which `local-test/tools`
+#                          fills by fetching the pinned build. Nothing has
+#                          to be preinstalled. Re-pinning: replace the bin
+#                          copy or rerun with an explicit path (a bare
+#                          re-run keeps it).
 #   down [--wipe]           stop the daemon (state kept); --wipe also kills
 #                          the state root's gpg-agent and removes the root
 #   status                  daemon health + fakes' state summary
@@ -48,9 +51,12 @@ STATE_ROOT=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
 FORGE=$REPO_ROOT/local-test/forge
 GPG=$REPO_ROOT/local-test/gpg
 FAKES=$REPO_ROOT/local-test/fakes
+TOOLS=$REPO_ROOT/local-test/tools
 
 # Pinned real-tool cache, outside the state root so 'up --fresh' / 'down
-# --wipe' (which wipe the root) never lose the resolved binaries.
+# --wipe' (which wipe the root) never lose the resolved binaries. Owned by
+# local-test/tools, gitignored: these are fetched build artifacts, never
+# committed.
 TOOLS_CACHE=$REPO_ROOT/local-test/.tools
 # Share the resolved root with every sibling CLI this script invokes (they
 # all honor LOCAL_TEST_STATE; the PATH-shimmed fakes need it too, since
@@ -86,7 +92,7 @@ command -v jq   >/dev/null 2>&1 || die "jq is required but not on PATH"
 command -v curl >/dev/null 2>&1 || die "curl is required but not on PATH"
 command -v uv   >/dev/null 2>&1 || die "uv is required but not on PATH"
 
-for f in "$FORGE" "$GPG" "$FAKES/gh" "$FAKES/workshop" "$FAKES/omp"; do
+for f in "$FORGE" "$GPG" "$TOOLS" "$FAKES/gh" "$FAKES/workshop" "$FAKES/omp"; do
 	[ -x "$f" ] || die "missing local-testing piece: $f"
 done
 
@@ -174,13 +180,17 @@ resolve_real_tool() { # resolve_real_tool <tool> <explicit> <src-dir> ; copies i
 	else
 		local found
 		found=$(command -v "$tool" 2>/dev/null || true)
-		if [ -z "$found" ] && [ -x "$TOOLS_CACHE/$tool" ]; then
-			found=$TOOLS_CACHE/$tool
-			src="tools cache: $found"
-		elif [ -n "$found" ]; then
+		if [ -n "$found" ]; then
 			src="PATH copy: $found"
 		else
-			die "cannot resolve real '$tool': pass --$tool <binary>, set LOCAL_TEST_MY_WORKSHOP/LOCAL_TEST_LLMVET, point --my-workshop-src at a source checkout, or put $tool on PATH"
+			# nothing local to pin: fetch the pinned build into the cache
+			if [ ! -x "$TOOLS_CACHE/$tool" ]; then
+				log "tools: $tool is not on PATH — fetching the pinned build"
+				"$TOOLS" fetch "$tool" ||
+					die "cannot resolve real '$tool': the automatic fetch failed. Pass --$tool <binary>, set LOCAL_TEST_MY_WORKSHOP/LOCAL_TEST_LLMVET, point --my-workshop-src at a source checkout, or put $tool on PATH"
+			fi
+			found=$TOOLS_CACHE/$tool
+			src="tools cache: $found"
 		fi
 		[ -f "$found" ] && [ -x "$found" ] || die "resolved $tool '$found' is not an executable file"
 		explicit=$found
