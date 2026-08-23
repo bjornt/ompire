@@ -54,12 +54,12 @@ Durable knowledge goes to:
 
 | Kind | Location |
 |---|---|
-| Current behavior | [`docs/features/`](docs/features/) |
+| Current behavior | [`docs/use/`](docs/use/) (operator) and [`docs/develop/`](docs/develop/) (contributor), in the category that owns it |
 | Durable rationale | [`docs/adr/`](docs/adr/) |
 | Long-term direction | [`VISION.md`](docs/VISION.md) |
 
 See [The change workflow](docs/develop/explanation/change-workflow.md),
-[Write a feature document](docs/develop/how-to/write-a-feature-doc.md), and
+[Write documentation](docs/develop/how-to/write-documentation.md), and
 [Write an ADR](docs/develop/how-to/write-an-adr.md).
 
 OpenSpec is being retired; `openspec/` is a migration source, not a live

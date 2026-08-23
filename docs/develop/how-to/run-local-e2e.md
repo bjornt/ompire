@@ -24,7 +24,7 @@ local-test/tools fetch --force  # re-fetch after a pin bump
 
 Supplying your own build still wins: `local-test/env up --my-workshop PATH`,
 `--llmvet PATH`, `--my-workshop-src DIR`, or the matching `LOCAL_TEST_*`
-variables. See [Local testing harness](../../features/local-testing.md).
+variables. See [Local testing harness](../reference/local-testing.md).
 
 ## Run the scenarios
 

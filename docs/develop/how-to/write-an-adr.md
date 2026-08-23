@@ -10,8 +10,8 @@ Write an ADR for a decision a future maintainer could reasonably reverse
 without knowing the original constraints.
 
 Do not write one for current UI behavior, endpoint inventories, task ordering,
-or mechanical implementation choices. Those belong in [feature
-documentation](write-a-feature-doc.md) or in the code.
+or mechanical implementation choices. Those belong in the
+[documentation](write-documentation.md) or in the code.
 
 The placement test:
 
@@ -20,7 +20,7 @@ The placement test:
 | Long-term product principle | `VISION.md` |
 | Desired behavior for active work | `changes/<name>/SPEC.md` |
 | Implementation order and affected code | `changes/<name>/PLAN.md` |
-| Current user or operator behavior | Feature documentation |
+| Current user or operator behavior | The reference section of the audience it serves |
 | Reason for a durable architecture choice | ADR |
 | Historical implementation discussion | Git commit or pull request |
 

@@ -1,8 +1,10 @@
 # Architecture decision records
 
 ADRs capture durable architectural choices, their rationale, consequences, and
-rejected alternatives. Current feature behavior and ordinary implementation
-details belong in [feature documentation](../features/README.md) or in the code.
+rejected alternatives. Current behavior and ordinary implementation details
+belong in the reference section of the audience they serve —
+[operator](../use/index.md#reference) or
+[contributor](../develop/index.md#reference) — or in the code.
 
 The full authoring procedure and rules are in [Write an architecture decision
 record](../develop/how-to/write-an-adr.md).

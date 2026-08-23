@@ -8,7 +8,7 @@ The model separates temporary coordination from durable project knowledge:
                          durable project knowledge
                     ┌───────────────────────────────┐
                     │ docs/VISION.md     optional   │
-                    │ feature documentation         │
+                    │ the project's documentation   │
                     │ architecture decision records │
                     └───────────────▲───────────────┘
                                     │ reconcile
@@ -22,11 +22,11 @@ idea ──▶ changes/<name>/SPEC.md ──▶ PLAN.md ──▶ implementation
 docs/VISION.md                    optional long-term direction
 changes/<name>/SPEC.md            temporary desired experience and requirements
 changes/<name>/PLAN.md            temporary implementation approach and task list
-docs/features/*.md                default location for current feature documentation
+docs/**                           the project's own documentation, in its own structure
 docs/adr/NNNN-*.md                default location for architectural decisions
 ```
 
-Existing repository conventions take precedence over the default `docs/features/` and `docs/adr/` locations. Do not create a second documentation or ADR convention beside one already in use.
+Durable product knowledge goes into the documentation the project already maintains, in the place that documentation's own structure assigns to it. The workflow defines no documentation location of its own and creates no side tree of change- or feature-specific pages. `docs/adr/` is a default only when the repository has not already established an ADR location.
 
 `changes/<name>/` contains exactly the active planning artifacts needed for the workflow. Once the change is complete and its durable knowledge is reconciled, the directory is deleted. Git and the associated commit or pull request retain history.
 
@@ -43,7 +43,7 @@ changes/<name>/SPEC.md
 changes/<name>/PLAN.md
 ```
 
-It reads current documentation, ADRs, relevant code, and `VISION.md` when present. It reviews requirement coverage, scope, documentation impact, architecture decisions, risks, and plan completeness. It does not implement application code.
+It reads the project's documentation, ADRs, relevant code, and `VISION.md` when present. It reviews requirement coverage, scope, documentation impact—naming the exact pages that will change—architecture decisions, risks, and plan completeness. It does not implement application code.
 
 Invoke explicitly with:
 
@@ -53,7 +53,7 @@ Invoke explicitly with:
 
 ### `change-implement`
 
-Implements every unchecked task in an existing `PLAN.md`, verifies the specified behavior, updates current feature documentation, and creates or supersedes ADRs when durable decisions emerge. It keeps `SPEC.md` and `PLAN.md` accurate when implementation discoveries invalidate assumptions.
+Implements every unchecked task in an existing `PLAN.md`, verifies the specified behavior, updates the project's documentation in the categories that own the change, and creates or supersedes ADRs when durable decisions emerge. It keeps `SPEC.md` and `PLAN.md` accurate when implementation discoveries invalidate assumptions.
 
 Invoke with:
 
@@ -65,7 +65,7 @@ It leaves the completed change directory in place for the final audit.
 
 ### `change-finish`
 
-Independently audits the completed behavior against the spec and plan, reconciles current feature documentation and ADRs, performs final verification, and removes `changes/<name>/`. It never archives the directory.
+Independently audits the completed behavior against the spec and plan, reconciles the project's documentation and ADRs, performs final verification, and removes `changes/<name>/`. It never archives the directory.
 
 Invoke with:
 
@@ -89,7 +89,7 @@ There is no separate review skill. Proposal, implementation, and finishing each 
 - What happens on success, failure, unavailability, and recovery?
 - What observable requirements and invariants apply?
 - What is in scope and explicitly out of scope?
-- Which current feature documentation changes?
+- Which documentation pages change, and in which category of the project's documentation?
 - When a vision exists, how does the change align with it?
 
 `PLAN.md` answers:
@@ -111,7 +111,7 @@ Implementation discoveries go to the artifact that owns them:
 | Implementation approach changes, behavior does not | Update `PLAN.md` |
 | Desired observable behavior or scope changes | Update `SPEC.md` first |
 | Durable architectural decision emerges | Add or supersede an ADR |
-| Product behavior changes | Update current feature documentation |
+| Product behavior changes | Update the project's documentation |
 | Transient investigation detail | Leave it in the working conversation or Git history |
 
 A spec is never weakened after the fact to excuse incomplete implementation.
@@ -122,7 +122,7 @@ A spec is never weakened after the fact to excuse incomplete implementation.
 
 - implementation satisfies every spec requirement;
 - the plan is complete and no obsolete path remains;
-- current feature documentation stands alone without the change files;
+- the project's documentation stands alone without the change files and each part sits in the category that owns it;
 - durable architectural decisions are recorded as ADRs;
 - the delivered result aligns with `VISION.md` when one exists;
 - focused tests and the real changed surface pass.
@@ -204,29 +204,33 @@ The spec focuses on observable experience. Implementation files, classes, databa
 
 Every requirement maps to one or more tasks, and every task maps back to stated scope. Applicable documentation, ADR work, behavioral tests, and real-surface verification are tasks rather than afterthoughts.
 
-## Feature documentation
+## Product documentation
 
-Feature documentation replaces cumulative capability specifications. It describes the product as it currently works and should be useful to users, operators, and agents.
+The project's documentation replaces cumulative capability specifications. It describes the product as it currently works and should be useful to users, operators, and agents.
 
-A feature document normally covers:
+This workflow does not define where that documentation lives; the project does. Each skill finds the destination the same way:
 
-```markdown
-# <Feature>
+1. Read the documentation entry point—`docs/index.md`, `docs/README.md`, the repository README, or a contributing guide—to learn how the set is organized.
+2. Identify the framework and any audience split it uses. Diátaxis (`tutorials/`, `how-to/`, `reference/`, `explanation/`) and per-audience roots such as `docs/use/` and `docs/develop/` are common; a project may use its own structure.
+3. Read the pages that already cover the affected area. They are the default destination.
 
-## Overview
+Each piece of information goes to the category that owns it. With Diátaxis:
 
-## Using <feature>
+| Information the change produces | Category |
+|---|---|
+| Precise current behavior: interfaces, options, states, errors, schemas | Reference |
+| A goal the reader now accomplishes differently, or at all | How-to |
+| A changed mental model, concept, or rationale that is not architectural | Explanation |
+| A first-run path that no longer works as written | Tutorial |
+| Why a durable architectural choice was made | ADR |
 
-## States and behavior
+An audience split is respected the same way: operator-facing behavior goes to the operator set, contributor-facing behavior to the contributor set, and behavior serving both is written once for its primary audience and linked from the other.
 
-## Failures and recovery
+Between them, the updated pages should cover the applicable purpose, normal flow, states and actions, failures and recovery, configuration, and public interfaces—distributed across categories rather than concentrated in a single page per feature.
 
-## Configuration
+Existing pages are updated in place. A new page is added only when the change introduces something the current structure has no home for, and it is then placed in the correct category and linked from that category's index. Superseded claims are removed rather than accumulating historical deltas. The change spec explains the intended delta while active; the project's documentation explains the resulting current state permanently.
 
-## Interfaces
-```
-
-Use only applicable sections. Update or remove superseded claims instead of appending historical deltas. The change spec explains the intended delta while active; feature documentation explains the resulting current state permanently.
+If a repository has no documentation set at all, the skills create the smallest useful set under `docs/` for the affected area and say so. They do not impose a framework the project has not chosen.
 
 ## Architecture decision records
 
@@ -258,7 +262,7 @@ A placement test:
 | Long-term product principle | `VISION.md`, when the project uses one |
 | Desired behavior for active work | `changes/<name>/SPEC.md` |
 | Implementation order and affected code | `changes/<name>/PLAN.md` |
-| Current user or operator behavior | Feature documentation |
+| Current user or operator behavior | The project's documentation, in the category its framework assigns |
 | Reason for a durable architecture choice | ADR |
 | Historical implementation discussion | Git commit or pull request |
 
@@ -268,14 +272,14 @@ A placement test:
 |---|---|---|
 | Change intent | Proposal plus delta specs | `SPEC.md` |
 | Technical design and tasks | Separate design and task artifacts | `PLAN.md` with embedded tasks |
-| Current behavior | Cumulative capability specs | User- and agent-useful feature documentation |
+| Current behavior | Cumulative capability specs | The project's own documentation, in its own structure |
 | Architecture history | Often embedded in change design | ADRs |
 | Long-term direction | External configured context | Optional `VISION.md` |
 | Status | CLI and artifact schema | Plan checkboxes |
 | Completion | Validate, sync, archive | Reconcile durable docs, then delete |
 | Historical record | Archived change tree | Git and ADRs |
 
-The workflow trades machine-validated delta semantics for readability and a smaller number of authoritative places. Its rigor comes from semantic checks in every skill: scope, requirement-to-task coverage, current documentation, durable decisions, real verification, and optional vision alignment.
+The workflow trades machine-validated delta semantics for readability and a smaller number of authoritative places. Its rigor comes from semantic checks in every skill: scope, requirement-to-task coverage, correctly placed documentation, durable decisions, real verification, and optional vision alignment.
 
 ## Non-goals
 
@@ -286,5 +290,6 @@ This workflow intentionally provides no:
 - archived or completed change directory;
 - sync operation;
 - formal requirement language requirement;
+- documentation location of its own;
 - separate review skill;
 - automatic `VISION.md` creation.

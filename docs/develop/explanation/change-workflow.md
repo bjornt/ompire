@@ -12,8 +12,9 @@ This page explains why the workflow has this shape.
 ```text
                          durable project knowledge
                     ┌───────────────────────────────┐
-                    │ VISION.md                     │
-                    │ docs/features/  (behavior)    │
+                    │ VISION.md       (direction)   │
+                    │ docs/use/       (behavior)    │
+                    │ docs/develop/   (behavior)    │
                     │ docs/adr/       (rationale)   │
                     └───────────────▲───────────────┘
                                     │ reconcile
@@ -43,7 +44,7 @@ Neither survives the change.
 | Skill | Does |
 |---|---|
 | `change-propose` | Researches the repository, writes `SPEC.md` and `PLAN.md`. Never touches application code. |
-| `change-implement` | Implements every unchecked task, updates feature documentation, creates ADRs when durable decisions emerge. |
+| `change-implement` | Implements every unchecked task, updates the documentation in the category that owns it, creates ADRs when durable decisions emerge. |
 | `change-finish` | Independently audits behavior against the spec, reconciles docs and ADRs, deletes the change directory. |
 
 There is no separate review skill. Each stage contains the review appropriate
@@ -57,7 +58,7 @@ cheaper than review bolted on at the end.
 | Approach changes, behavior does not | Update `PLAN.md` |
 | Desired behavior or scope changes | Update `SPEC.md` **first** |
 | A durable architectural decision emerges | Add or supersede an [ADR](../how-to/write-an-adr.md) |
-| Product behavior changes | Update [feature documentation](../how-to/write-a-feature-doc.md) |
+| Product behavior changes | Update [the documentation](../how-to/write-documentation.md) |
 | Transient investigation detail | Leave it in the conversation or Git history |
 
 **A spec is never weakened after the fact to excuse an incomplete

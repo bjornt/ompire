@@ -106,7 +106,7 @@ it would hide that.
 
 | Key | Default | Effect |
 |---|---|---|
-| `agent_env` | `{}` | Forwarded into the agent's command line. See [the trust boundary](../use/explanation/trust-boundary.md) before using it. |
+| `agent_env` | `{}` | Forwarded into the agent's command line. See [the trust boundary](../../use/explanation/trust-boundary.md) before using it. |
 | `agent_ready_timeout` | `30` | Bound on the ready handshake |
 | `agent_ring_buffer_size` | `1000` | Retained raw events per session |
 | `shutdown_grace` | `10.0` | SIGTERM-to-SIGKILL grace on daemon shutdown |
@@ -115,11 +115,11 @@ it would hide that.
 
 The daemon exposes no REST endpoint to start or prompt an agent. Starting
 sessions and delivering prompts belong to the [workflow
-engine](workflow-engine.md).
+engine](../../use/reference/workflow-engine.md).
 
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/tasks/{id}/sessions/{name}/agent/stop` | Terminate the child |
 
 Other session-addressed endpoints are covered in [agent
-interaction](agent-interaction.md).
+interaction](../../use/reference/agent-interaction.md).

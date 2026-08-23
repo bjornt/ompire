@@ -35,7 +35,7 @@ container, and re-establishes session tracking.
 
 A resumed agent is **not** re-prompted with the task's stored prompt. Whether
 and what to re-deliver is the workflow engine's per-step decision — see
-[restart recovery](workflow-engine.md#restart-recovery).
+[restart recovery](../../use/reference/workflow-engine.md#restart-recovery).
 
 A recovered session presents as `starting` while its agent is being resumed
 and lands `idle` once ready. The in-flight turn is lost; the session is not.
@@ -98,7 +98,7 @@ re-triggers.
 | Ship progress other than `pr_url` | Discarded |
 | Attention entries | Rebuilt from recovered session status |
 
-The durable boundary is narrower than [`VISION.md`](../VISION.md) calls
+The durable boundary is narrower than [`VISION.md`](../../VISION.md) calls
 for. Widening it is an open architectural decision rather than a settled
 design.
 

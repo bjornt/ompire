@@ -21,7 +21,7 @@ If that directory already exists, read it and continue refining it; never overwr
 
 1. Read repository instructions and relevant existing documentation.
 2. If `docs/VISION.md` exists, read it. If it does not exist, skip all vision-alignment work: do not create it, require it, or add a placeholder vision section.
-3. Read relevant current feature documentation. Prefer the repository's established documentation location; otherwise use `docs/features/`.
+3. Read the project's documentation and learn how it is organized. Start at its entry point—`docs/index.md`, `docs/README.md`, the repository README, or a contributing guide—and identify the framework and any audience split it uses. Diátaxis categories (`tutorials/`, `how-to/`, `reference/`, `explanation/`) and per-audience roots (`docs/use/`, `docs/develop/`) are common; a project may use its own structure. Then read the existing pages that cover the affected area.
 4. Read relevant ADRs. Prefer the established ADR location; otherwise use `docs/adr/`.
 5. Inspect the affected implementation and its tests enough to make the plan concrete and to reuse existing patterns.
 6. Resolve product ambiguity from available context first. Ask the user only about decisions with materially different product outcomes or tradeoffs.
@@ -58,9 +58,9 @@ Content rules:
 - Describe the normal flow plus observable failure, unavailable, empty, and recovery behavior where relevant.
 - State requirements as observable behavior and important invariants. Use examples when they remove ambiguity; do not mechanically turn every requirement into formal WHEN/THEN scenarios.
 - Keep implementation files, symbols, database columns, and task ordering out of the spec unless they are themselves a public interface.
-- Link to current feature documentation instead of restating the whole existing feature.
+- Link to the existing documentation pages instead of restating the whole existing feature.
 - Make scope and non-goals explicit. Do not add adjacent improvements that the user did not request.
-- State which current feature documents will be added or changed. `None` is valid only with a concrete reason.
+- Name, by path, the documentation pages that will change, and the category each belongs to. Prefer updating existing pages; justify every new page. `None` is valid only with a concrete reason.
 
 ### Vision handling
 
@@ -74,6 +74,20 @@ Classify the change in substance, without requiring classification labels in the
 - vision-changing: intentionally changes long-term direction.
 
 For a tension, first find an implementation or UX shape that satisfies both the requested outcome and the vision. If that is impossible, surface the exact conflict and ask the user to choose between changing the proposal and changing the vision. Never weaken or rewrite `VISION.md` merely to make a proposal appear aligned. Edit it only after an explicit strategic decision from the user, and record the decision in the spec.
+
+## Documentation destination
+
+The change must land in the project's own documentation, in the place that documentation's own structure assigns to it. Never route product documentation into a change-specific or feature-specific side tree.
+
+Decide the destination while writing the spec, and record it under `## Documentation impact`:
+
+- Prefer the pages that already cover the affected area. They are the default destination.
+- Respect the framework the project uses. With Diátaxis, precise current behavior—interfaces, options, states, errors, schemas—belongs to reference; a goal the reader now accomplishes differently belongs to how-to; a changed mental model or rationale belongs to explanation; a first-run path that no longer works as written belongs to a tutorial.
+- Respect any audience split. Operator-facing behavior goes to the operator set, contributor-facing behavior to the contributor set. Behavior that serves both is written once for its primary audience and linked from the other.
+- Propose a new page only when the change introduces something the current structure has no home for. Place it in the correct category and link it from that category's index.
+- Reasons for durable architectural choices go to an ADR, not to the documentation set.
+
+If the repository has no documentation set at all, plan the smallest useful set of pages under `docs/` for the affected area and say so. Do not impose a full framework the project has not chosen.
 
 ## Create `PLAN.md`
 
@@ -98,12 +112,12 @@ Create the plan after `SPEC.md` is coherent. Use:
 Content rules:
 
 - Explain the smallest coherent implementation approach and why it fits existing architecture.
-- Name affected components, interfaces, persistence, operations, tests, and documentation where applicable.
+- Name affected components, interfaces, persistence, operations, tests, and documentation pages where applicable.
 - Identify durable architectural decisions that require a new ADR or supersede an existing ADR. Routine implementation choices do not require ADRs. If no ADR is expected, say why.
 - Include only material risks and pair each with mitigation or verification.
 - Embed tasks directly in the plan. Tasks must be ordered, implementation-sized, and independently checkable.
 - Map every spec requirement to one or more tasks, and every task back to stated scope.
-- Include applicable behavioral verification, real-surface smoke testing, feature-documentation updates, and ADR work in the tasks.
+- Include applicable behavioral verification, real-surface smoke testing, documentation updates in the project's own documentation set, and ADR work in the tasks.
 - If `VISION.md` exists, include a final task to re-check the completed behavior against it. If it does not exist, include no vision task.
 - Do not add archive, sync, generated metadata, or CLI-validation tasks.
 
@@ -115,7 +129,7 @@ Before finishing:
 2. Confirm the spec contains the complete desired experience without implementation leakage.
 3. Confirm every requirement is covered by the plan.
 4. Confirm the plan introduces no unstated product scope.
-5. Confirm documentation and ADR effects are explicit.
+5. Confirm documentation and ADR effects are explicit, and that every named documentation page is a real path in the project's documentation set.
 6. If `VISION.md` exists, independently re-check alignment; if absent, confirm neither artifact invented vision work.
 7. Confirm there are no placeholders, deferred design decisions needed to start, or contradictory statements.
 

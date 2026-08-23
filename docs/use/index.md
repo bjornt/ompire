@@ -39,25 +39,39 @@ Task-oriented. Each one assumes you already have Ompire running.
 
 Precise detail, looked up rather than read through.
 
+Cross-cutting:
+
 - [Configuration](reference/configuration.md) — every `config.toml` key
 - [States](reference/states.md) — task, session, attention, GPG, and PR states
 - [HTTP and WebSocket API](reference/api.md)
 
-Current behavior, feature by feature:
+Projects and tasks:
 
-- [Projects](../features/projects.md) · [Templates](../features/templates.md)
-- [Tasks](../features/tasks.md) · [Task spawn](../features/task-spawn.md) ·
-  [Task detail](../features/task-detail.md) · [Web UI](../features/web-ui.md)
-- [Session states](../features/session-states.md) ·
-  [Agent interaction](../features/agent-interaction.md) ·
-  [Session advisories](../features/session-advisories.md)
-- [Attention and notifications](../features/attention-notifications.md)
-- [Workflow engine](../features/workflow-engine.md) ·
-  [The bugfix workflow](../features/bugfix-workflow.md)
-- [Review](../features/review.md) · [Ship flow](../features/ship-flow.md) ·
-  [GPG signing](../features/gpg-signing.md) ·
-  [Merge polling](../features/merge-poll.md)
-- [Daemon settings](../features/daemon-settings.md)
+- [Projects](reference/projects.md) · [Templates](reference/templates.md)
+- [Tasks](reference/tasks.md) · [Task spawn](reference/task-spawn.md) ·
+  [Task detail](reference/task-detail.md) · [Web UI](reference/web-ui.md)
+
+Sessions and attention:
+
+- [Session states](reference/session-states.md) ·
+  [Agent interaction](reference/agent-interaction.md) ·
+  [Session advisories](reference/session-advisories.md)
+- [Attention and notifications](reference/attention-notifications.md)
+
+Workflows:
+
+- [Workflow engine](reference/workflow-engine.md) ·
+  [The bugfix workflow](reference/bugfix-workflow.md)
+
+Review and publishing:
+
+- [Review](reference/review.md) · [Ship flow](reference/ship-flow.md) ·
+  [GPG signing](reference/gpg-signing.md) ·
+  [Merge polling](reference/merge-poll.md)
+
+Settings:
+
+- [Daemon settings](reference/daemon-settings.md)
 
 ## Explanation
 

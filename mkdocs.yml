@@ -63,25 +63,23 @@ nav:
           - Configuration: use/reference/configuration.md
           - States: use/reference/states.md
           - HTTP and WebSocket API: use/reference/api.md
-      - Feature reference:
-          - Overview: features/README.md
-          - Projects: features/projects.md
-          - Templates: features/templates.md
-          - Tasks: features/tasks.md
-          - Task spawn: features/task-spawn.md
-          - Task detail: features/task-detail.md
-          - Web UI: features/web-ui.md
-          - Session states: features/session-states.md
-          - Agent interaction: features/agent-interaction.md
-          - Session advisories: features/session-advisories.md
-          - Attention and notifications: features/attention-notifications.md
-          - Workflow engine: features/workflow-engine.md
-          - The bugfix workflow: features/bugfix-workflow.md
-          - Review: features/review.md
-          - Ship flow: features/ship-flow.md
-          - GPG signing: features/gpg-signing.md
-          - Merge polling: features/merge-poll.md
-          - Daemon settings: features/daemon-settings.md
+          - Projects: use/reference/projects.md
+          - Templates: use/reference/templates.md
+          - Tasks: use/reference/tasks.md
+          - Task spawn: use/reference/task-spawn.md
+          - Task detail: use/reference/task-detail.md
+          - Web UI: use/reference/web-ui.md
+          - Session states: use/reference/session-states.md
+          - Agent interaction: use/reference/agent-interaction.md
+          - Session advisories: use/reference/session-advisories.md
+          - Attention and notifications: use/reference/attention-notifications.md
+          - Workflow engine: use/reference/workflow-engine.md
+          - The bugfix workflow: use/reference/bugfix-workflow.md
+          - Review: use/reference/review.md
+          - Ship flow: use/reference/ship-flow.md
+          - GPG signing: use/reference/gpg-signing.md
+          - Merge polling: use/reference/merge-poll.md
+          - Daemon settings: use/reference/daemon-settings.md
       - Explanation:
           - What Ompire is: use/explanation/what-ompire-is.md
           - The trust boundary: use/explanation/trust-boundary.md
@@ -96,20 +94,19 @@ nav:
           - Build, test, and run: develop/how-to/build-test-run.md
           - Run the local end-to-end harness: develop/how-to/run-local-e2e.md
           - Run the dogfooding QA loop: develop/how-to/run-the-qa-loop.md
-          - Write a feature document: develop/how-to/write-a-feature-doc.md
+          - Write documentation: develop/how-to/write-documentation.md
           - Write an ADR: develop/how-to/write-an-adr.md
       - Reference:
           - Repository layout: develop/reference/repository-layout.md
           - Daemon module map: develop/reference/daemon-modules.md
           - Database schema: develop/reference/database-schema.md
+          - Daemon core: develop/reference/daemon-core.md
+          - Daemon API: develop/reference/daemon-api.md
           - WebSocket protocol: develop/reference/websocket-protocol.md
-      - Internals reference:
-          - Daemon core: features/daemon-core.md
-          - Daemon API: features/daemon-api.md
-          - Agent integration: features/agent-rpc.md
-          - Workshop lifecycle: features/workshop-lifecycle.md
-          - Crash recovery: features/crash-recovery.md
-          - Local testing harness: features/local-testing.md
+          - Agent integration: develop/reference/agent-rpc.md
+          - Workshop lifecycle: develop/reference/workshop-lifecycle.md
+          - Crash recovery: develop/reference/crash-recovery.md
+          - Local testing harness: develop/reference/local-testing.md
       - Explanation:
           - Architecture overview: develop/explanation/architecture.md
           - Trust model: develop/explanation/trust-model.md

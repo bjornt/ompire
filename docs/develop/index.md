@@ -26,26 +26,29 @@ anything structural.
 - [Build, test, and run](how-to/build-test-run.md)
 - [Run the local end-to-end harness](how-to/run-local-e2e.md)
 - [Run the dogfooding QA loop](how-to/run-the-qa-loop.md)
-- [Write a feature document](how-to/write-a-feature-doc.md)
+- [Write documentation](how-to/write-documentation.md)
 - [Write an architecture decision record](how-to/write-an-adr.md)
 
 ## Reference
 
+Repository and schema:
+
 - [Repository layout](reference/repository-layout.md)
 - [Daemon module map](reference/daemon-modules.md)
 - [Database schema](reference/database-schema.md)
-- [WebSocket protocol](reference/websocket-protocol.md)
 
-Internals documented as features:
+Daemon internals:
 
-- [Daemon core](../features/daemon-core.md) ·
-  [Daemon API](../features/daemon-api.md)
-- [Agent integration](../features/agent-rpc.md) ·
-  [Workshop lifecycle](../features/workshop-lifecycle.md)
-- [Crash recovery](../features/crash-recovery.md) ·
-  [Local testing harness](../features/local-testing.md)
+- [Daemon core](reference/daemon-core.md) ·
+  [Daemon API](reference/daemon-api.md) ·
+  [WebSocket protocol](reference/websocket-protocol.md)
+- [Agent integration](reference/agent-rpc.md) ·
+  [Workshop lifecycle](reference/workshop-lifecycle.md)
+- [Crash recovery](reference/crash-recovery.md) ·
+  [Local testing harness](reference/local-testing.md)
 
-The [full feature index](../features/README.md) lists both audiences.
+Behavior an operator sees is documented in the [operator
+reference](../use/index.md#reference), not here.
 
 ## Explanation
 
@@ -57,8 +60,10 @@ The [full feature index](../features/README.md) lists both audiences.
 ## Ground rules
 
 - Durable rationale goes in an [ADR](../adr/README.md). Current behavior goes in
-  [feature documentation](../features/README.md). Neither goes in code comments beyond
-  a short `ADR-NNNN` backlink at the boundary that enforces a decision.
+  the reference section of the audience it serves —
+  [operator](../use/index.md#reference) or [contributor](#reference). Neither
+  goes in code comments beyond a short `ADR-NNNN` backlink at the boundary that
+  enforces a decision.
 - Both test suites and the linter must pass before committing. See
   [Build, test, and run](how-to/build-test-run.md).
 - Changes are delivered through the workflow described in

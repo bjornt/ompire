@@ -29,7 +29,7 @@ non-zero with an error naming the offending key. Failing fast is the point: a
 silently ignored key produces a daemon that runs with settings the operator
 believes are in effect.
 
-See [Configuration](../use/reference/configuration.md).
+See [Configuration](../../use/reference/configuration.md).
 
 ### Registry and migrations
 

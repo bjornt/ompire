@@ -1,6 +1,6 @@
 ---
 name: change-implement
-description: Implement a lightweight change from changes/<name>/SPEC.md and PLAN.md, keeping the plan, current feature documentation, ADRs, tests, and optional vision alignment coherent. Use when the user wants to start or continue an existing planned change.
+description: Implement a lightweight change from changes/<name>/SPEC.md and PLAN.md, keeping the plan, the project's own documentation, ADRs, tests, and optional vision alignment coherent. Use when the user wants to start or continue an existing planned change.
 ---
 
 Implement an existing lightweight change completely. The change is defined by:
@@ -26,7 +26,7 @@ Use the name supplied by the user. Otherwise inspect `changes/`:
 Before editing application code:
 
 1. Read `SPEC.md` and `PLAN.md` completely.
-2. Read repository instructions and the relevant current feature documentation and ADRs.
+2. Read repository instructions, the project's documentation entry point and the pages covering the affected area, and the relevant ADRs.
 3. If `docs/VISION.md` exists, read it and independently compare the proposed outcome and approach against it. If it does not exist, skip vision alignment entirely; do not create a vision file or vision tasks.
 4. Inspect the affected code, interfaces, callers, tests, and existing conventions. Plans are hypotheses until checked against the repository.
 5. Reconcile stale or incorrect plan details before implementation. Preserve the agreed outcome and scope.
@@ -61,19 +61,35 @@ Implementation may reveal incorrect assumptions:
 - If a durable architectural decision emerges, add an ADR task to `PLAN.md`, then create or supersede the ADR as part of the implementation.
 - Never change the spec after the fact merely to describe an incomplete implementation. The implementation must satisfy the agreed spec.
 
-## Current feature documentation
+## Project documentation
 
-Feature documentation describes the product after the change and is useful to both users and agents. Update the repository's existing documentation location; if none exists, use `docs/features/`.
+The change is documented in the project's own documentation, in the place that documentation's own structure assigns to it. Do not create a change-specific or feature-specific side tree beside it.
 
-Document applicable:
+Find the destination before writing:
 
-- purpose and when the feature is used;
-- normal user or operator flow;
-- meaningful states and available actions;
-- failures, unavailable states, and recovery;
-- configuration and externally meaningful interfaces.
+1. Read the documentation entry point—`docs/index.md`, `docs/README.md`, the repository README, or a contributing guide—to learn how the set is organized.
+2. Identify the framework and any audience split. Diátaxis categories (`tutorials/`, `how-to/`, `reference/`, `explanation/`) and per-audience roots (`docs/use/`, `docs/develop/`) are common; a project may use its own structure.
+3. Read the pages that already cover the affected area. They are the default destination, and `SPEC.md`'s documentation impact should already name them.
+
+Place each piece of information in the category that owns it. With Diátaxis:
+
+| Information the change produces | Category |
+|---|---|
+| Precise current behavior: interfaces, options, states, errors, schemas | Reference |
+| A goal the reader now accomplishes differently, or at all | How-to |
+| A changed mental model, concept, or rationale that is not architectural | Explanation |
+| A first-run path that no longer works as written | Tutorial |
+| Why a durable architectural choice was made | ADR |
+
+Respect an audience split: operator-facing behavior goes to the operator set, contributor-facing behavior to the contributor set. Behavior serving both is written once for its primary audience and linked from the other.
+
+Update existing pages in place. Add a page only when the change introduces something the current structure has no home for; then place it in the correct category and link it from that category's index. Keep whatever conventions the set already uses for headings, cross-links, and terminology.
+
+Cover the applicable purpose, normal user or operator flow, meaningful states and actions, failures and recovery, configuration, and externally meaningful interfaces—distributed across the categories above rather than concentrated in one page.
 
 Describe current behavior, not the history of this change. Remove or revise superseded statements rather than appending contradictory deltas.
+
+If the repository has no documentation set at all, create the smallest useful set under `docs/` for the affected area and say so in the report. Do not impose a full framework the project has not chosen.
 
 ## ADRs
 
@@ -106,7 +122,7 @@ Verification must match the changed surface:
 - Web UI: exercise the actual UI in a browser.
 - CLI or TUI: run the program and exercise the interaction.
 - Feature or API: run focused changed-contract tests and an applicable smoke scenario.
-- Documentation-only change: validate links, examples, and consistency against current behavior.
+- Documentation-only change: validate links, examples, and consistency against current behavior, including links from the owning category index.
 
 Run broader applicable checks after focused behavior passes. Record concrete verification in the final response; do not fabricate evidence or treat checkbox state as proof.
 
@@ -117,8 +133,8 @@ This skill is complete when:
 - every requirement in `SPEC.md` is implemented;
 - every `PLAN.md` task is checked;
 - required tests and real-surface verification pass;
-- current feature documentation is updated;
+- the project's documentation describes the new behavior in the correct place;
 - required ADRs are accepted or superseded;
 - optional vision alignment still holds when `VISION.md` exists.
 
-Do not delete the change directory. Deletion and final reconciliation belong to `change-finish`. Report implemented behavior, documentation and ADR changes, and exact verification results.
+Do not delete the change directory. Deletion and final reconciliation belong to `change-finish`. Report implemented behavior, the documentation pages and ADRs changed by path, and exact verification results.

@@ -11,7 +11,9 @@ exist so a dashboard client is not made to receive every transcript frame of
 every running agent.
 
 The rationale is in
-[ADR-0004](../../adr/0004-use-rest-and-websocket-snapshot-deltas.md).
+[ADR-0004](../../adr/0004-use-rest-and-websocket-snapshot-deltas.md). The REST
+half of the surface, and the failure responses both halves share, are in
+[Daemon API](daemon-api.md).
 
 ## No commands
 
@@ -51,9 +53,23 @@ there is no "give me everything after N".
 
 ## Snapshot then deltas
 
-On connect, the daemon sends a snapshot containing the current projects,
-tasks, templates, workflow step records, and effective settings. Every frame
-after it is a delta.
+On connect, after authentication, the daemon sends a snapshot carrying the
+full current registry state:
+
+| Key | Contents |
+|---|---|
+| `projects` | All projects |
+| `templates` | All templates |
+| `tasks` | All non-purged tasks, each carrying its workflow fields |
+| `sessions` | Per task, a per-session map of current status |
+| workflow state | Per-task run status, current step, and gate message |
+| `settings` | The effective settings map |
+| `gpg` | Current signing-key state |
+| `reviews` | Per task, review status, URL, and iterations |
+| `ships` | Per task, ship status, mode, draft, commit sha, PR URL |
+| attention | Current attention entries |
+
+Every frame after the snapshot is a delta.
 
 A reconnect produces a fresh snapshot. This is the whole recovery story: a
 client that missed frames does not reconcile or replay, it re-reads. That is
@@ -66,18 +82,27 @@ Published on the dashboard channel:
 
 | Type | Fires when |
 |---|---|
-| `project_created` | A project is registered |
+| `project_created`, `project_renamed` | Project mutations |
+| `template_created`, `template_updated`, `template_deleted` | Template mutations |
+| `task_created`, `task_updated`, `task_deleted` | Task mutations |
 | `spawn_step` | A spawn step starts, succeeds, or fails |
+| `workflow_step` | A workflow step transitions |
 | `status_changed` | A session's status transitions |
-| `workflow_step` | A workflow step advances |
+| `question_posted`, `question_resolved` | A pending question appears or clears |
+| `attention`, `attention_cleared` | A task's attention tier changes |
+| `stats`, `advisory` | Session telemetry and decorations |
+| `review_started`, `review_iteration`, `review_finished` | Review lifecycle |
 | `ship_draft` | A ship draft is ready |
-| `ship_step` | `commit`, `push`, or `pr` starts or completes |
-| `gpg_status` | The signing-key probe completes |
+| `ship_step`, `ship_finished` | `commit`, `push`, or `pr` starts or completes |
+| `gpg_status` | The signing-key probe result changes |
 | `settings_changed` | Effective settings change |
-| `stats` | Token, context, and cost counters, throttled per task |
 
 `spawn_step` and `ship_step` payloads carry `status` — `started`, `ok`, or
 `failed` — and a failure carries the tool's stderr.
+
+`workflow_step` carries the task id, step name, kind, and status of `started`,
+`ok`, `failed`, or `waiting` — with error text on failure and the
+operator-facing gate message on waiting.
 
 `stats` is throttled to at most one frame per task per
 `stats_throttle_interval`, so a chatty agent cannot flood a dashboard.

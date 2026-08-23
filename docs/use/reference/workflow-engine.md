@@ -8,8 +8,8 @@ this evidence, and stop for a human when the evidence is missing".
 
 Workflows are trusted Python definitions registered in the daemon by name. The
 current built-in-only representation boundary is recorded in
-[ADR-0018](../adr/0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md).
-There is no declarative format today — [`VISION.md`](../VISION.md) calls for
+[ADR-0018](../../adr/0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md).
+There is no declarative format today — [`VISION.md`](../../VISION.md) calls for
 versioned declarative workflows, and ADR-0018 defines when that direction
 becomes a requirement rather than current behavior.
 

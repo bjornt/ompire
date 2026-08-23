@@ -40,10 +40,11 @@ Each set uses the four [Diátaxis](https://diataxis.fr) categories:
 | Reference | "What exactly is X?" | You need precise detail |
 | Explanation | "Why does it work this way?" | You want the mental model |
 
-Current product behavior lives in [feature documentation](features/README.md) and is
-surfaced from the reference section of whichever audience it serves. It is
-never restated elsewhere, because only feature documentation is reconciled
-automatically when behavior changes.
+Current product behavior lives in the reference section of whichever audience
+it serves — [operator](use/index.md#reference) or
+[contributor](develop/index.md#reference) — and is never restated in the other
+set. A page that both audiences need is written once for its primary audience
+and linked from the other.
 
 The conventions behind this structure are recorded in
 [ADR-0019](adr/0019-split-documentation-by-audience-using-diataxis.md) and

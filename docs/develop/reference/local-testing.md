@@ -12,10 +12,10 @@ exit codes, streams, and filesystem effects as the tools they replace.
 Production code never learns it is under test: nothing in `daemon/` branches
 on a test flag.
 The process-boundary and fidelity constraints are recorded in
-[ADR-0014](../adr/0014-test-end-to-end-behavior-at-external-process-boundaries.md).
+[ADR-0014](../../adr/0014-test-end-to-end-behavior-at-external-process-boundaries.md).
 
 The operator-facing procedure is in [Run the local end-to-end
-harness](../develop/how-to/run-local-e2e.md).
+harness](../how-to/run-local-e2e.md).
 
 ## Components
 

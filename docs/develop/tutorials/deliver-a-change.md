@@ -52,7 +52,7 @@ When implementation reveals the plan was wrong:
 | The approach changes, behavior does not | `PLAN.md` |
 | Desired behavior or scope changes | `SPEC.md`, **first** |
 | A durable architectural decision emerges | A new or superseding ADR |
-| Product behavior changes | `docs/features/` |
+| Product behavior changes | The reference section of the audience it serves |
 
 The rule that matters: **never weaken the spec afterwards to match what got
 built.** If the implementation cannot satisfy the agreed spec, change the spec
@@ -102,10 +102,11 @@ change directory is already gone.
 ## What you should end up with
 
 - Working, verified behavior.
-- [Feature documentation](../../features/README.md) describing the new current state —
-  revised, not appended to.
+- Documentation describing the new current state, in the category that owns it
+  — revised, not appended to. See [Write
+  documentation](../how-to/write-documentation.md).
 - An [ADR](../../adr/README.md) if a durable decision was made.
 - No `changes/` directory.
 
-If feature documentation still needs the change files to make sense, the
-change is not finished.
+If the documentation still needs the change files to make sense, the change is
+not finished.

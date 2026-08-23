@@ -8,7 +8,7 @@ must not be editable from a browser at all.
 
 Ompire layers a small set of daemon-writable settings over the operator's
 configuration file, and never rewrites that file. The boundary is recorded in
-[ADR-0013](../adr/0013-layer-daemon-writable-settings-over-operator-configuration.md).
+[ADR-0013](../../adr/0013-layer-daemon-writable-settings-over-operator-configuration.md).
 
 ## States and behavior
 

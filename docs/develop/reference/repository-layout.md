@@ -15,7 +15,6 @@ local-test/        end-to-end harness, executable fakes, recordings
 docs/              documentation
   use/             operator documentation set
   develop/         contributor documentation set
-  features/        current behavior, one file per feature
   adr/             architecture decision records
 scripts/           QA and dogfooding scripts
 snap/              classic-confinement snap packaging
