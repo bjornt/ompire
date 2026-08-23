@@ -11,3 +11,6 @@ __pycache__/
 *.db-wal
 .qa-agent/
 local-test/.state/
+
+# Documentation site build output
+site/

@@ -15,6 +15,7 @@ jobs:
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       frontend: ${{ steps.filter.outputs.frontend }}
+      docs: ${{ steps.filter.outputs.docs }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
@@ -28,6 +29,12 @@ jobs:
               - '.workshop/**'
             frontend:
               - 'frontend/**'
+              - 'workshop.yaml'
+              - 'Makefile'
+              - '.workshop/**'
+            docs:
+              - 'docs/**'
+              - 'mkdocs.yml'
               - 'workshop.yaml'
               - 'Makefile'
               - '.workshop/**'
@@ -57,3 +64,12 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: canonical/launch-workshop@b9e184e38f49808ced78e25de19483fe02484c46 # v1
       - run: workshop run -- ${{ matrix.action }}
+
+  docs:
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: canonical/launch-workshop@b9e184e38f49808ced78e25de19483fe02484c46 # v1
+      - run: workshop run -- docs

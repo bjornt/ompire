@@ -102,9 +102,9 @@ change directory is already gone.
 ## What you should end up with
 
 - Working, verified behavior.
-- [Feature documentation](../../features/) describing the new current state —
+- [Feature documentation](../../features/README.md) describing the new current state —
   revised, not appended to.
-- An [ADR](../../adr/) if a durable decision was made.
+- An [ADR](../../adr/README.md) if a durable decision was made.
 - No `changes/` directory.
 
 If feature documentation still needs the change files to make sense, the

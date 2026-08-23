@@ -4,7 +4,7 @@ Changes to Ompire are delivered through three agent skills and ordinary
 Markdown. There is no CLI, no schema, no validation command, no sync
 operation, and no archive.
 
-The operational reference is [`.omp/skills/README.md`](../../../.omp/skills/README.md).
+The operational reference is `.omp/skills/README.md` in the repository root.
 This page explains why the workflow has this shape.
 
 ## The model
@@ -86,7 +86,7 @@ no task except a skill reading carefully.
 ## Vision alignment
 
 Each proposed and delivered change is compared against
-[`VISION.md`](../../../VISION.md). A conflict has exactly two valid
+[`VISION.md`](../../VISION.md). A conflict has exactly two valid
 resolutions:
 
 1. Reshape the change so it respects the vision, or

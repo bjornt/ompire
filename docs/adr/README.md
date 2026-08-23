@@ -2,10 +2,15 @@
 
 ADRs capture durable architectural choices, their rationale, consequences, and
 rejected alternatives. Current feature behavior and ordinary implementation
-details belong in [feature documentation](../features/) or in the code.
+details belong in [feature documentation](../features/README.md) or in the code.
 
 The full authoring procedure and rules are in [Write an architecture decision
 record](../develop/how-to/write-an-adr.md).
+
+`Accepted` means the implementation and current documentation agree.
+`Proposed` means the decision is new, or that the implementation and the
+vision still disagree — check the record's `Context` for the conflict before
+relying on it.
 
 ## Index
 

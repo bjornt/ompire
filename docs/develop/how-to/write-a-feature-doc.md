@@ -9,7 +9,7 @@ the lightweight change workflow.
 
 ## Where it goes
 
-[`docs/features/`](../../features/), one file per feature, flat.
+[`docs/features/`](../../features/README.md), one file per feature, flat.
 
 The directory stays flat because three change skills name that location. A
 feature document is surfaced in the documentation navigation under the

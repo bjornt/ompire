@@ -10,6 +10,7 @@ ARGS ?=
         test test-backend test-frontend \
         lint lint-backend lint-frontend \
         typecheck typecheck-backend typecheck-frontend \
+        docs docs-serve \
         update-adr-index
 
 help: ## Show available targets
@@ -73,3 +74,11 @@ clean: ## Remove build artifacts and caches
 	rm -rf daemon/.venv
 	find daemon -type d -name __pycache__ -prune -exec rm -rf {} +
 	rm -rf daemon/.pytest_cache daemon/.mypy_cache daemon/.ruff_cache
+
+## Docs
+
+docs: ## Build the documentation site (strict)
+	NO_MKDOCS_2_WARNING=1 uvx --with mkdocs-material mkdocs build --strict $(ARGS)
+
+docs-serve: ## Serve the documentation site with live reload
+	NO_MKDOCS_2_WARNING=1 uvx --with mkdocs-material mkdocs serve $(ARGS)

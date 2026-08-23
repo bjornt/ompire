@@ -1,0 +1,139 @@
+# Documentation site. Authoring rules: ADR-0020
+# (docs/adr/0020-author-documentation-as-portable-markdown.md)
+#
+# The generator is a presentation layer only. Every page must remain readable
+# as plain Markdown without it — no admonitions, no generator-specific
+# directives in page bodies. Mermaid fences are the one exception: GitHub
+# renders them natively too.
+
+site_name: Ompire
+site_description: Local-first control plane for coding-agent work
+docs_dir: docs
+site_dir: site
+
+# Structure: ADR-0019
+# (docs/adr/0019-split-documentation-by-audience-using-diataxis.md)
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - toc:
+      permalink: true
+  - tables
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Home: index.md
+  - Vision: VISION.md
+
+  - Use Ompire:
+      - use/index.md
+      - Tutorials:
+          - Install and run your first task: use/tutorials/install-and-first-task.md
+      - How-to:
+          - Install Ompire: use/how-to/install.md
+          - Configure GPG signing: use/how-to/configure-gpg-signing.md
+          - Register a project: use/how-to/register-a-project.md
+          - Spawn a task: use/how-to/spawn-a-task.md
+          - Review and ship a task: use/how-to/review-and-ship.md
+          - Troubleshoot the daemon: use/how-to/troubleshoot.md
+      - Reference:
+          - Configuration: use/reference/configuration.md
+          - States: use/reference/states.md
+          - HTTP and WebSocket API: use/reference/api.md
+      - Feature reference:
+          - Overview: features/README.md
+          - Projects: features/projects.md
+          - Templates: features/templates.md
+          - Tasks: features/tasks.md
+          - Task spawn: features/task-spawn.md
+          - Task detail: features/task-detail.md
+          - Web UI: features/web-ui.md
+          - Session states: features/session-states.md
+          - Agent interaction: features/agent-interaction.md
+          - Session advisories: features/session-advisories.md
+          - Attention and notifications: features/attention-notifications.md
+          - Workflow engine: features/workflow-engine.md
+          - The bugfix workflow: features/bugfix-workflow.md
+          - Review: features/review.md
+          - Ship flow: features/ship-flow.md
+          - GPG signing: features/gpg-signing.md
+          - Merge polling: features/merge-poll.md
+          - Daemon settings: features/daemon-settings.md
+      - Explanation:
+          - What Ompire is: use/explanation/what-ompire-is.md
+          - The trust boundary: use/explanation/trust-boundary.md
+          - The attention model: use/explanation/attention.md
+
+  - Build Ompire:
+      - develop/index.md
+      - Tutorials:
+          - Set up a development environment: develop/tutorials/development-environment.md
+          - Deliver a change end to end: develop/tutorials/deliver-a-change.md
+      - How-to:
+          - Build, test, and run: develop/how-to/build-test-run.md
+          - Run the local end-to-end harness: develop/how-to/run-local-e2e.md
+          - Run the dogfooding QA loop: develop/how-to/run-the-qa-loop.md
+          - Write a feature document: develop/how-to/write-a-feature-doc.md
+          - Write an ADR: develop/how-to/write-an-adr.md
+      - Reference:
+          - Repository layout: develop/reference/repository-layout.md
+          - Daemon module map: develop/reference/daemon-modules.md
+          - Database schema: develop/reference/database-schema.md
+          - WebSocket protocol: develop/reference/websocket-protocol.md
+      - Internals reference:
+          - Daemon core: features/daemon-core.md
+          - Daemon API: features/daemon-api.md
+          - Agent integration: features/agent-rpc.md
+          - Workshop lifecycle: features/workshop-lifecycle.md
+          - Crash recovery: features/crash-recovery.md
+          - Local testing harness: features/local-testing.md
+      - Explanation:
+          - Architecture overview: develop/explanation/architecture.md
+          - Trust model: develop/explanation/trust-model.md
+          - The change workflow: develop/explanation/change-workflow.md
+          - Decision log: develop/explanation/decisions.md
+      - Decision records:
+          - Overview: adr/README.md
+          - 0001 Lightweight change workflow: adr/0001-adopt-lightweight-skills-based-change-workflow.md
+          - 0002 Local daemon, stateless UI: adr/0002-run-as-local-daemon-with-stateless-web-ui.md
+          - 0003 Python control plane: adr/0003-implement-trusted-control-plane-in-python.md
+          - 0004 REST and WebSocket deltas: adr/0004-use-rest-and-websocket-snapshot-deltas.md
+          - 0005 SQLite Core and Alembic: adr/0005-persist-local-state-with-sqlite-core-and-alembic.md
+          - 0006 Clone and Workshop per task: adr/0006-give-every-task-a-separate-clone-and-workshop.md
+          - 0007 Native agent RPC: adr/0007-use-native-omp-rpc.md
+          - 0008 Tasks as workflows over sessions: adr/0008-model-tasks-as-workflows-over-named-sessions.md
+          - 0009 Structured Git-excluded outcomes: adr/0009-use-structured-git-excluded-outcomes.md
+          - 0010 Projects, templates, snapshots: adr/0010-separate-projects-templates-and-task-snapshots.md
+          - 0011 Publishing authority outside the sandbox: adr/0011-keep-review-and-publishing-authority-outside-agent-sandbox.md
+          - 0012 Central attention derivation: adr/0012-derive-attention-centrally-from-session-state.md
+          - 0013 Layered daemon settings: adr/0013-layer-daemon-writable-settings-over-operator-configuration.md
+          - 0014 End-to-end at process boundaries: adr/0014-test-end-to-end-behavior-at-external-process-boundaries.md
+          - 0015 Credentials behind brokers: adr/0015-keep-agent-credentials-behind-narrow-brokers.md
+          - 0016 Durable history and provenance: adr/0016-persist-authority-bearing-task-history-and-provenance.md
+          - 0017 Bot publishing identity: adr/0017-use-dedicated-bot-as-default-publishing-identity.md
+          - 0018 Python workflows for now: adr/0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md
+          - 0019 Documentation by audience: adr/0019-split-documentation-by-audience-using-diataxis.md
+          - 0020 Portable Markdown: adr/0020-author-documentation-as-portable-markdown.md

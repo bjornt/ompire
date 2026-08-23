@@ -45,7 +45,7 @@ Internals documented as features:
 - [Crash recovery](../features/crash-recovery.md) ·
   [Local testing harness](../features/local-testing.md)
 
-The [full feature index](../features/) lists both audiences.
+The [full feature index](../features/README.md) lists both audiences.
 
 ## Explanation
 
@@ -56,8 +56,8 @@ The [full feature index](../features/) lists both audiences.
 
 ## Ground rules
 
-- Durable rationale goes in an [ADR](../adr/). Current behavior goes in
-  [feature documentation](../features/). Neither goes in code comments beyond
+- Durable rationale goes in an [ADR](../adr/README.md). Current behavior goes in
+  [feature documentation](../features/README.md). Neither goes in code comments beyond
   a short `ADR-NNNN` backlink at the boundary that enforces a decision.
 - Both test suites and the linter must pass before committing. See
   [Build, test, and run](how-to/build-test-run.md).

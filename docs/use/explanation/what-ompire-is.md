@@ -80,7 +80,7 @@ and which identity performed it. See [The trust boundary](trust-boundary.md).
 
 ## Where it is going
 
-[`VISION.md`](../../../VISION.md) describes the intended destination —
+[`VISION.md`](../../VISION.md) describes the intended destination —
 versioned declarative workflows, roadmaps of dependent tasks, credential
 brokers, provenance from commit back to the reasoning that produced it. Much
 of it is not built. Read it as direction, and this documentation as what

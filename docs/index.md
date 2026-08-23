@@ -24,9 +24,9 @@ environment](develop/tutorials/development-environment.md).
 
 Two collections sit outside both sets and are referenced by each:
 
-- [Architecture decision records](adr/) — why durable architectural choices
+- [Architecture decision records](adr/README.md) — why durable architectural choices
   exist, their consequences, and the alternatives rejected.
-- [`VISION.md`](../VISION.md) — long-term product direction. It describes
+- [`VISION.md`](VISION.md) — long-term product direction. It describes
   where Ompire is going, not what it currently does.
 
 ## How this documentation is organized
@@ -40,7 +40,7 @@ Each set uses the four [Diátaxis](https://diataxis.fr) categories:
 | Reference | "What exactly is X?" | You need precise detail |
 | Explanation | "Why does it work this way?" | You want the mental model |
 
-Current product behavior lives in [feature documentation](features/) and is
+Current product behavior lives in [feature documentation](features/README.md) and is
 surfaced from the reference section of whichever audience it serves. It is
 never restated elsewhere, because only feature documentation is reconciled
 automatically when behavior changes.

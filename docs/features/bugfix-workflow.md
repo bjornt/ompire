@@ -30,6 +30,22 @@ Splitting reproduction and fixing across two sessions is deliberate: the
 session that decides whether the bug still reproduces is not the session that
 wrote the fix.
 
+```mermaid
+flowchart TD
+    R[reproduce] --> T{triage}
+    T -->|success| F[fix]
+    T -->|failed| E[escalate]
+    F --> RV{route-validate}
+    RV -->|repro_command| VS[validate-script]
+    RV -->|no script| VA[validate-agent]
+    VS --> C{check}
+    VA --> C
+    C -->|validated| DONE([run complete])
+    C -->|rejected, under 3 attempts| F
+    C -->|rejected, 3 attempts| E
+    E --> DONE
+```
+
 ## States and behavior
 
 ### 1. Reproduce

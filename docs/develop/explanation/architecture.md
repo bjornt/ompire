@@ -113,7 +113,7 @@ Workflows are startup-validated Python definitions with sequential `agent`,
 durable; in-memory runners re-drive them after a restart.
 
 Python definitions are the current form, not the intended end state.
-[`VISION.md`](../../../VISION.md) calls for versioned declarative workflows.
+[`VISION.md`](../../VISION.md) calls for versioned declarative workflows.
 
 See [ADR-0008](../../adr/0008-model-tasks-as-workflows-over-named-sessions.md).
 

@@ -1,7 +1,7 @@
 # Decision log
 
 Every durable architectural choice in Ompire is recorded as an ADR in
-[`docs/adr/`](../../adr/). This page is a reading guide — the records
+[`docs/adr/`](../../adr/README.md). This page is a reading guide — the records
 themselves are authoritative.
 
 ## Read these first
@@ -30,15 +30,15 @@ tool-enforced structure. It also explains the shape of this documentation.
 |---|---|
 | Process and topology | 0002, 0003 |
 | Client protocol | 0004 |
-| State | 0005 |
-| Isolation | 0006 |
-| Agent integration | 0007, 0015 |
-| Work model | 0008 |
+| State and durability | 0005, 0016 |
+| Isolation and credentials | 0006, 0015 |
+| Agent integration | 0007 |
+| Work model | 0008, 0009, 0010, 0018 |
+| Review and publishing | 0011, 0017 |
+| Attention | 0012 |
 | Settings | 0013 |
+| Testing | 0014 |
 | Process and documentation | 0001, 0019, 0020 |
-
-Numbers 0016–0018 are reserved for the remaining OpenSpec migration decisions
-described in `ADR.PLAN.md`.
 
 ## How to read one
 
@@ -73,13 +73,19 @@ disagree:
 - **[Publishing identity](../../adr/0017-use-dedicated-bot-as-default-publishing-identity.md)** —
   ADR-0017 proposes a dedicated bot as the default while current shipping
   inherits host identity.
-- **Workflow format** — Python definitions are unversioned; the vision calls
-  for versioned declarative workflows.
+- **[Workflow format](../../adr/0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md)** —
+  ADR-0018 is `Accepted`: it takes Python definitions for the current system
+  and states the trigger that supersedes them.
 
-The credential, durability, and publishing-identity decisions remain proposed
-until their implementation conflicts are resolved. Workflow format does not
-yet have an ADR. All four are tracked in `ADR.PLAN.md`; changes that touch one
-should raise the decision rather than resolve it incidentally.
+The credential, durability, and publishing-identity decisions remain
+`Proposed` until their implementation conflicts are resolved. Changes that
+touch one should move the ADR forward deliberately rather than resolving the
+gap incidentally — a `Proposed` record is a decision waiting for an
+implementation, not a suggestion.
+
+ADR-0018 is the one to copy when a decision is knowingly provisional: it
+commits to the current choice while naming, in advance, what would overturn
+it.
 
 ## Adding a record
 

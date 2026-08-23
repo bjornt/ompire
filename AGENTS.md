@@ -56,7 +56,7 @@ Durable knowledge goes to:
 |---|---|
 | Current behavior | [`docs/features/`](docs/features/) |
 | Durable rationale | [`docs/adr/`](docs/adr/) |
-| Long-term direction | [`VISION.md`](VISION.md) |
+| Long-term direction | [`VISION.md`](docs/VISION.md) |
 
 See [The change workflow](docs/develop/explanation/change-workflow.md),
 [Write a feature document](docs/develop/how-to/write-a-feature-doc.md), and

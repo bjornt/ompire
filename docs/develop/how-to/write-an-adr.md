@@ -27,7 +27,7 @@ The placement test:
 ## Create the file
 
 Use the next available zero-padded number and a kebab-case filename in
-[`docs/adr/`](../../adr/):
+[`docs/adr/`](../../adr/README.md):
 
 ```text
 docs/adr/0021-short-decision-title.md

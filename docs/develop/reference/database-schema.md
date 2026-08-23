@@ -110,7 +110,7 @@ An unknown key or a wrong value type is rejected with `422` naming the key.
 
 Session status, review history, attention state, and most ship progress are
 in-memory. The durable boundary is narrower than
-[`VISION.md`](../../../VISION.md) calls for, and widening it is an open
+[`VISION.md`](../../VISION.md) calls for, and widening it is an open
 decision in the ADR migration rather than a settled design.
 
 ## Migrations
