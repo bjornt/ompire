@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -73,3 +74,19 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: canonical/launch-workshop@b9e184e38f49808ced78e25de19483fe02484c46 # v1
       - run: workshop run -- docs
+
+  ci:
+    if: always()
+    needs: [changes, backend, frontend, docs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check dependency results
+        run: |
+          results='${{ join(needs.*.result, ' ') }}'
+          echo "results: $results"
+          for r in $results; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::a required job did not succeed ($r)"; exit 1 ;;
+            esac
+          done
