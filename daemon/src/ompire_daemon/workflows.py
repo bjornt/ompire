@@ -1,7 +1,8 @@
 """Workflow engine (SPEC Decision 8; design D-1..D-10).
 
-Architecture: ADR-0008
-(docs/adr/0008-model-tasks-as-workflows-over-named-sessions.md)
+Architecture: ADR-0008 and ADR-0018
+(docs/adr/0008-model-tasks-as-workflows-over-named-sessions.md,
+docs/adr/0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md)
 
 Workflows are frozen Python dataclasses registered by name in a module-level
 registry — no declarative DSL in v1. A run executes its steps sequentially

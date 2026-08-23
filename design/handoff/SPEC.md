@@ -571,6 +571,7 @@ lives only in the agent's memory, never in the daemon.
 
 ## Decision 8: Task model — tasks are workflows of steps
 <!-- Durable decision: [ADR-0008](../../docs/adr/0008-model-tasks-as-workflows-over-named-sessions.md) -->
+<!-- Workflow representation: [ADR-0018](../../docs/adr/0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md) -->
 
 **Decision:** The operator-facing unit is the **task** ("fix bug #123"),
 not the omp session. A task owns the workspace (clone + workshop container
