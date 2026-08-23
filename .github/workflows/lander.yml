@@ -41,6 +41,11 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PR_NUMBER: ${{ github.event.issue.number }}
       BASE_BRANCH: ${{ github.event.repository.default_branch }}
+      # GitHub does not let you approve your own PR, so on a single-maintainer repo
+      # an approval gate can never be satisfied. Here the `/merge` comment from a
+      # write-capable user *is* the approval. Set the repository variable
+      # REQUIRE_APPROVAL to 'true' as soon as there is a second maintainer.
+      REQUIRE_APPROVAL: ${{ vars.REQUIRE_APPROVAL || 'false' }}
     outputs:
       go: ${{ steps.cmd.outputs.go }}
       head_sha: ${{ steps.pr.outputs.head_sha }}
@@ -100,6 +105,12 @@ jobs:
           head_sha=$(jq -r '.headRefOid'  <<<"$pr_json")
           review=$(jq -r '.reviewDecision' <<<"$pr_json")
 
+          # head_sha gates every check below and is the exact commit we merge. An
+          # empty or malformed value must never reach a permissive comparison.
+          # (40 hex today; the upper bound leaves room for a future sha256 repo.)
+          [[ "$head_sha" =~ ^[0-9a-f]{40,64}$ ]] \
+            || fail "❌ Cannot merge: could not resolve the PR head SHA (got \`$head_sha\`)."
+
           [[ "$state" == "OPEN" ]] \
             || fail "❌ Cannot merge: this PR is \`$state\`."
           [[ "$draft" == "false" ]] \
@@ -107,10 +118,27 @@ jobs:
           # Guard against fast-forwarding the default branch to a PR aimed elsewhere.
           [[ "$base" == "$BASE_BRANCH" ]] \
             || fail "❌ Cannot merge: this PR targets \`$base\`, not \`$BASE_BRANCH\`."
-          # reviewDecision is null unless branch protection actually *requires*
-          # approving reviews -- even when an approval is present.
-          [[ "$review" == "APPROVED" ]] \
-            || fail "❌ Cannot merge: review decision is \`$review\` (expected \`APPROVED\`). If this is unexpected, confirm the ruleset requires approving reviews."
+          if [[ "$REQUIRE_APPROVAL" == "true" ]]; then
+            # reviewDecision is null unless branch protection actually *requires*
+            # approving reviews -- even when an approval is present.
+            [[ "$review" == "APPROVED" ]] \
+              || fail "❌ Cannot merge: review decision is \`$review\` (expected \`APPROVED\`). If this is unexpected, confirm the ruleset requires approving reviews."
+
+            # reviewDecision alone can still be APPROVED for a commit nobody looked
+            # at, if stale-approval dismissal is off. Require an approval on *this*
+            # SHA, so "approved" means "approved the exact commit we are landing".
+            approved_on=$(gh api --paginate "/repos/$GH_REPO/pulls/$PR_NUMBER/reviews" \
+              --jq '.[] | select(.state == "APPROVED") | .commit_id')
+            if ! grep -qxF "$head_sha" <<<"$approved_on"; then
+              approved_short=$(awk '{ printf "%s ", substr($0, 1, 8) }' <<<"$approved_on" | sed 's/ *$//')
+              [[ -n "$approved_short" ]] || approved_short="none"
+              fail "❌ Cannot merge: no approving review covers \`${head_sha:0:8}\`, the current head. Approvals on record: \`$approved_short\`. Please re-approve after the latest push."
+            fi
+          else
+            echo "REQUIRE_APPROVAL is not 'true': skipping approval checks." \
+                 "Authorization for this merge is the /merge comment from a user" \
+                 "with write access. (reviewDecision was: $review)"
+          fi
 
           if ! checks=$(gh pr checks "$PR_NUMBER" --required 2>&1); then
             printf '%s\n' "$checks"
@@ -194,5 +222,14 @@ jobs:
             fail "❌ Push rejected: \`$BASE_BRANCH\` moved while this merge was running. Comment \`/merge\` again."
           fi
 
-          gh pr comment "$PR_NUMBER" \
-            --body "✅ Fast-forwarded \`$BASE_BRANCH\` to \`${HEAD_SHA:0:8}\`. The author's GPG signatures are preserved."
+          msg="✅ Fast-forwarded \`$BASE_BRANCH\` to \`${HEAD_SHA:0:8}\`. The author's GPG signatures are preserved."
+
+          # Commits pushed after the gate pinned HEAD_SHA are deliberately left behind
+          # -- they were never reviewed or signature-checked. Say so, because the PR
+          # stays open and a bare success message would read as "fully merged".
+          final_head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid')
+          if [[ "$final_head" != "$HEAD_SHA" ]]; then
+            msg+=$'\n\n'"⚠️ **This PR is not fully merged.** Commits pushed after \`/merge\` (the head is now \`${final_head:0:8}\`) were **not** included, because they were never reviewed or signature-checked. This PR stays open: rebase onto \`$BASE_BRANCH\` and comment \`/merge\` again to land the rest."
+          fi
+
+          gh pr comment "$PR_NUMBER" --body "$msg"
