@@ -1,0 +1,122 @@
+.reviewSummary {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.reviewSummaryStatus {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.reviewStatusBadge {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 2px 7px;
+  border-radius: 4px;
+}
+
+.reviewStatusBadge.no-review,
+.reviewStatusBadge.aborted {
+  border: 1px solid var(--line);
+  color: var(--faint);
+}
+
+.reviewStatusBadge.open,
+.reviewStatusBadge.comments {
+  border: 1px solid color-mix(in srgb, var(--violet) 50%, transparent);
+  color: var(--violet);
+}
+
+.reviewStatusBadge.approved {
+  background: var(--green);
+  color: var(--on-hue);
+}
+
+.reviewStatusBadge.error {
+  background: var(--red);
+  color: var(--on-hue);
+}
+
+.reviewSummaryHint {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.reviewExternalLink {
+  width: fit-content;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--violet);
+  overflow-wrap: anywhere;
+  text-decoration: underline;
+}
+
+.reviewIterationList {
+  list-style: decimal;
+  margin: 0;
+  padding-left: 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.reviewIteration {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 5px;
+  background: var(--surface2);
+  font-size: 12px;
+}
+
+.reviewIterationOutcome {
+  font-weight: 650;
+}
+
+.reviewIterationTime,
+.reviewIterationCount {
+  color: var(--muted);
+}
+
+.reviewIterationError {
+  width: 100%;
+  color: var(--red);
+}
+
+.reviewIterationError summary {
+  width: fit-content;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.reviewIterationError pre {
+  max-height: 180px;
+  margin: 6px 0 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+}
+
+.reviewSummary.compact {
+  gap: 4px;
+}
+
+.reviewSummary.compact .reviewSummaryHint {
+  display: none;
+}
+
+.reviewSummary.compact .reviewExternalLink {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}

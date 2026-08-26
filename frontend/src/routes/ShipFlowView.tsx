@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useDaemonState } from "../lib/useDaemonState";
-import { defaultSessionName } from "../lib/daemonReducer";
+import { primarySessionName } from "../lib/daemonReducer";
+import { projectReview } from "../lib/reviewPresentation";
 import { cleanupTask, draftShip, recheckGpg, shipCommit } from "../lib/api";
 import { confirmCleanup } from "../lib/cleanup";
 import { formatElapsed } from "../lib/formatElapsed";
-import type { GpgStatus, ReviewIteration, ReviewState, SessionInfo, ShipState, Task } from "../types";
+import { ReviewSummary } from "../components/ReviewSummary";
+import type { GpgStatus, ReviewState, SessionInfo, ShipState, Task } from "../types";
 import "./ShipFlowView.css";
 
 function StepIcon({
@@ -35,59 +37,23 @@ function ReviewStep({
   session: SessionInfo | undefined;
   review: ReviewState | undefined;
 }) {
-  if (!review) {
-    return (
-      <div className="shipStep" data-testid="ship-step-review">
-        <div className="stepHeader">
-          <StepIcon index={1} active={false} done={false} error={false} />
-          <span className="stepTitle">Review</span>
-        </div>
-        <p className="stepHint">No review started yet. Start one from the task card when idle.</p>
-      </div>
-    );
-  }
-
-  const open = review.status === "open";
-  const done = review.status === "approved";
-  const error = review.status === "error";
+  const presentation = projectReview(review, session);
 
   return (
-    <div className={`shipStep ${open ? "stepOpen" : ""}`} data-testid="ship-step-review">
+    <div
+      className={`shipStep ${presentation.state === "open" ? "stepOpen" : ""}`}
+      data-testid="ship-step-review"
+    >
       <div className="stepHeader">
-        <StepIcon index={1} active={open} done={done} error={error} />
+        <StepIcon
+          index={1}
+          active={presentation.state === "open"}
+          done={presentation.state === "approved"}
+          error={presentation.state === "error"}
+        />
         <span className="stepTitle">Review</span>
-        <span className={`stepStatusBadge ${review.status}`}>{review.status}</span>
       </div>
-      {open && (
-        <a
-          className="reviewReopenLink"
-          href={review.url}
-          target="_blank"
-          rel="noreferrer"
-          data-testid="review-reopen-link"
-        >
-          reopen {review.url.replace("http://", "")}
-        </a>
-      )}
-      {review.iterations.length > 0 && (
-        <ul className="iterationList" data-testid="review-iterations">
-          {review.iterations.map((it: ReviewIteration, idx: number) => (
-            <li key={idx} className={`iterationItem ${it.outcome}`}>
-              <span className="iterationOutcome">{it.outcome}</span>
-              {it.outcome === "comments" &&
-                (it.comment_count != null ? (
-                  <span className="iterationCount">{it.comment_count} comments</span>
-                ) : (
-                  <span className="iterationCount">comments submitted</span>
-                ))}
-              {it.stderr && <span className="iterationError" title={it.stderr}>error details</span>}
-            </li>
-          ))}
-        </ul>
-      )}
-      {session?.status === "reviewing" && (
-        <p className="stepHint">Review is open. Use the link to reopen the llmvet UI.</p>
-      )}
+      <ReviewSummary review={review} primarySession={session} />
     </div>
   );
 }
@@ -407,10 +373,10 @@ export function ShipFlowView() {
   const { tasks, sessions, workflows, reviews, ships, gpg } = useDaemonState();
 
   const task = tasks.find((t) => t.id === taskId);
-  // The ship flow acts on the workflow's relevant session (workflow-engine
-  // design D-9): the in-flight step's session, else the primary.
+  // Ship is task-scoped: review and publishing always use the workflow's
+  // primary session, never an in-flight step's focused session.
   const taskSessions = sessions[taskId];
-  const session = taskSessions?.[defaultSessionName(taskSessions, workflows[taskId])];
+  const session = taskSessions?.[primarySessionName(taskSessions, workflows[taskId])];
   const review = reviews[taskId];
   const ship = ships[taskId];
 

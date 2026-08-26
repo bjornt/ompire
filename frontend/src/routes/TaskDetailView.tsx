@@ -1,16 +1,19 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { ReviewSummary } from "../components/ReviewSummary";
 import { useAgentChannel } from "../lib/agentChannel";
 import { isStreaming, useAgentStatus } from "../lib/agentStatus";
-import { getTaskDetail, resumeWorkflow } from "../lib/api";
+import { cancelReview, getTaskDetail, resumeWorkflow, startReview } from "../lib/api";
 import {
   currentStepRecord,
   defaultSessionName,
+  primarySessionName,
   taskSessionNames,
   workflowActive,
 } from "../lib/daemonReducer";
+import { projectReview } from "../lib/reviewPresentation";
 import { useDaemonState } from "../lib/useDaemonState";
-import type { SessionInfo, StepRecord, TaskDetail, WorkflowState, WorkshopStatus } from "../types";
+import type { ReviewState, SessionInfo, StepRecord, TaskDetail, WorkflowState, WorkshopStatus } from "../types";
 import { formatElapsed } from "../lib/formatElapsed";
 import { QuestionCard } from "./QuestionCard";
 import { TaskComposer } from "./TaskComposer";
@@ -140,6 +143,112 @@ function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowStat
   );
 }
 
+function ReviewPanel({
+  taskId,
+  review,
+  primarySession,
+}: {
+  taskId: number;
+  review: ReviewState | undefined;
+  primarySession: SessionInfo | undefined;
+}) {
+  const presentation = projectReview(review, primarySession);
+  const [pending, setPending] = useState<"starting" | "cancelling" | null>(null);
+  const [error, setError] = useState<{ action: "start" | "cancel"; message: string } | null>(null);
+  const commandLocked = useRef(false);
+
+  useEffect(() => {
+    const started = pending === "starting" && primarySession?.status === "reviewing";
+    const cancelled = pending === "cancelling" && presentation.state !== "open";
+    if (started || cancelled) {
+      commandLocked.current = false;
+      setPending(null);
+      setError(null);
+    }
+  }, [pending, presentation.state, primarySession?.status]);
+
+  useEffect(() => {
+    if (
+      (error?.action === "start" && primarySession?.status === "reviewing") ||
+      (error?.action === "cancel" && presentation.state !== "open")
+    ) {
+      setError(null);
+    }
+  }, [error?.action, presentation.state, primarySession?.status]);
+
+  async function command(action: "start" | "cancel") {
+    if (commandLocked.current || (action === "start" ? !presentation.canStart : !presentation.canCancel)) {
+      return;
+    }
+    commandLocked.current = true;
+    setPending(action === "start" ? "starting" : "cancelling");
+    setError(null);
+    try {
+      if (action === "start") await startReview(taskId);
+      else await cancelReview(taskId);
+    } catch (caught: unknown) {
+      commandLocked.current = false;
+      setPending(null);
+      setError({
+        action,
+        message: caught instanceof Error ? caught.message : String(caught),
+      });
+    }
+  }
+
+  return (
+    <section className="panel reviewPanel" data-testid="task-detail-review">
+      <h2 className="panelTitle">Review</h2>
+      <ReviewSummary review={review} primarySession={primarySession} />
+      {pending && (
+        <p className="reviewCommandState" data-testid="review-command-state">
+          {pending === "starting"
+            ? "Starting review… Waiting for daemon status."
+            : "Cancelling review… Waiting for daemon status."}
+        </p>
+      )}
+      {error && (
+        <div className="composerError" data-testid="review-command-error">
+          {error.message}
+        </div>
+      )}
+      <div className="reviewActions">
+        {presentation.canStart && (
+          <button
+            type="button"
+            className="reviewAction"
+            disabled={pending !== null}
+            onClick={() => void command("start")}
+            data-testid="task-detail-start-review"
+          >
+            {pending === "starting"
+              ? "Starting…"
+              : review
+                ? "Start another review"
+                : "Start review"}
+          </button>
+        )}
+        {presentation.canCancel && (
+          <button
+            type="button"
+            className="reviewAction cancel"
+            disabled={pending !== null}
+            onClick={() => void command("cancel")}
+            data-testid="task-detail-cancel-review"
+          >
+            {pending === "cancelling" ? "Cancelling…" : "Cancel review"}
+          </button>
+        )}
+        {presentation.state === "approved" && (
+          <Link className="reviewAction ship" to={`/ship/${taskId}`} data-testid="task-detail-ship-link">
+            Continue to Ship flow
+          </Link>
+        )}
+      </div>
+    </section>
+  );
+}
+
 /** Session tab bar (workflow-engine design D-9): one tab per known session,
  * hidden for single-session workflows. A tab is disabled while its session
  * is unspawned (no tracker entry), and shows a question dot when another
@@ -194,7 +303,7 @@ function workshopLabel(detail: TaskDetail): { text: string; status: WorkshopStat
 export function TaskDetailView() {
   const { id } = useParams();
   const taskId = Number(id);
-  const { tasks, sessions, workflows } = useDaemonState();
+  const { tasks, sessions, workflows, reviews } = useDaemonState();
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Tab selection is local UI state (design D-9); null means "follow the
@@ -206,6 +315,8 @@ export function TaskDetailView() {
   const liveTask = tasks.find((t) => t.id === taskId) ?? null;
   const taskSessions = sessions[taskId] ?? null;
   const workflow = workflows[taskId] ?? null;
+  const primarySession = taskSessions?.[primarySessionName(taskSessions, workflow ?? undefined)];
+  const review = reviews[taskId];
   const sessionNames = taskSessionNames(taskSessions ?? undefined, workflow ?? undefined);
   const activeName =
     selected !== null && sessionNames.includes(selected)
@@ -327,6 +438,8 @@ export function TaskDetailView() {
       </div>
 
       <TaskStatusStrip session={session} status={status} />
+      <ReviewPanel taskId={taskId} review={review} primarySession={primarySession} />
+
 
       {workflow !== null && workflow.status === "waiting" && (
         <GateCard taskId={taskId} workflow={workflow} />

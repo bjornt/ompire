@@ -21,6 +21,35 @@ regions degrade to an inactive or empty state rather than disappearing. A
 region that vanishes reads as a bug; one that says "nothing here" reads as an
 answer.
 
+### Review panel
+
+Every task detail shows one Review panel for the task's **primary session**.
+It does not follow the selected transcript tab or the session currently used
+by a workflow step. This keeps review and the next publishing handoff attached
+to the task that owns them.
+
+Before review starts, the panel says why it is unavailable or offers **Start
+review** only when the primary session is idle and has a live agent. Starting
+locks the action as **Starting…** until the daemon reports the review. If the
+command is refused or fails, its error remains inline and the operator can
+retry when the displayed state permits it.
+
+While independent review is open, the full llmvet URL is a keyboard-accessible
+external link and **Cancel review** is available. Cancellation similarly stays
+locked until the daemon reports its outcome; a failed cancellation leaves the
+observed review visible and restores the valid action.
+
+The panel updates from the main daemon stream without a reload. It distinguishes
+an open review, comments returned to the agent, approval, abort, and review
+error. When comments are returned, it says the primary agent is addressing
+them; after that session returns to idle, **Start another review** becomes
+available. An approved review shows **Continue to Ship flow**, which links to
+`/ship/<task-id>`.
+
+Every iteration is ordered from oldest to newest and records its outcome,
+recorded time, optional comment count, and any captured reviewer stderr. Error
+output is available in an expandable, readable disclosure.
+
 ### Escape-hatch instructions
 
 Copyable instructions for entering the task's container by hand: change to the
@@ -118,5 +147,6 @@ per-session channel at `/api/ws/agents/{task_id}/{session}` for the selected
 session's transcript only.
 
 Actions post to the session-addressed endpoints described in [agent
-interaction](agent-interaction.md), and to
-`/api/tasks/{id}/workflow/resume` for gates.
+interaction](agent-interaction.md), to `/api/tasks/{id}/workflow/resume` for
+gates, and to `POST /api/tasks/{id}/review` or
+`POST /api/tasks/{id}/review/cancel` for the Review panel.

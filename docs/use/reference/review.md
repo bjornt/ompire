@@ -11,6 +11,28 @@ agent that could grade its own work would make it ceremonial.
 
 ## Using review
 
+### Operator interface
+
+The task-detail Review panel is the normal operator interface. It always uses
+the workflow's primary session, even when another session tab is selected.
+When that session is idle with a live agent, use **Start review**. The action
+locks until daemon state reports the result; a command failure is shown inline
+and can be retried only after the panel returns to an eligible observed state.
+
+An open review is labelled **Review open**, keeps the full llmvet URL as its
+external action, and offers **Cancel review**. If an iteration submits
+comments, the panel labels it **Comments submitted** and says that the primary
+agent is addressing them. Once that agent becomes idle, **Start another
+review** is available. Terminal labels are **Approved**, **Aborted**, and
+**Error**. Approved task detail also links directly to its Ship flow.
+
+Tasks cards and the Ship flow use the same labels and ordered iteration
+formatting, but task detail owns the complete start, reopen, cancel, retry,
+and ship handoff. Iteration rows show their recorded time, optional comment
+count, and expandable captured stderr.
+
+### REST interface
+
 `POST /api/tasks/{id}/review` opens a review for a task whose **primary
 session** is `idle` with a live agent and no review already open. Other
 sessions of the task neither gate nor block it.

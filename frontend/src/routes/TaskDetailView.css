@@ -99,6 +99,57 @@
 
 /* --- Single-session cockpit: status strip, transcript, composer --- */
 
+.reviewPanel {
+  margin-top: 20px;
+}
+
+.reviewActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.reviewAction {
+  border: 1px solid color-mix(in srgb, var(--violet) 45%, transparent);
+  border-radius: 5px;
+  padding: 5px 10px;
+  background: color-mix(in srgb, var(--violet) 10%, var(--surface));
+  color: var(--violet);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.4;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.reviewAction:hover {
+  border-color: var(--violet);
+}
+
+.reviewAction:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.reviewAction.cancel {
+  border-color: color-mix(in srgb, var(--red) 45%, transparent);
+  background: color-mix(in srgb, var(--red) 8%, var(--surface));
+  color: var(--red);
+}
+
+.reviewAction.ship {
+  border-color: color-mix(in srgb, var(--green) 45%, transparent);
+  background: color-mix(in srgb, var(--green) 8%, var(--surface));
+  color: var(--green);
+}
+
+.reviewCommandState {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .statusStrip {
   margin-top: 20px;
   display: flex;

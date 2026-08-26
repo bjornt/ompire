@@ -553,9 +553,21 @@ export function currentStepRecord(workflow: WorkflowState | undefined): StepReco
   return [...workflow.steps].reverse().find((record) => record.step === workflow.step);
 }
 
+/** The workflow-declared primary session for task-scoped operations such as
+ * review and publishing. The first known session is the primary: workflow
+ * records retain declaration/execution order, then tracker-only sessions are
+ * appended. It deliberately ignores the current workflow step and any UI tab
+ * selection. */
+export function primarySessionName(
+  taskSessions: Record<string, SessionInfo> | undefined,
+  workflow: WorkflowState | undefined,
+): string {
+  return taskSessionNames(taskSessions, workflow)[0];
+}
+
 /** The session a task's surfaces focus by default (workflow-engine design
  * D-9): the current step's session while the run is in flight, else the
- * primary (first) session name. */
+ * primary session. */
 export function defaultSessionName(
   taskSessions: Record<string, SessionInfo> | undefined,
   workflow: WorkflowState | undefined,
@@ -564,5 +576,5 @@ export function defaultSessionName(
     const current = currentStepRecord(workflow);
     if (current?.session) return current.session;
   }
-  return taskSessionNames(taskSessions, workflow)[0];
+  return primarySessionName(taskSessions, workflow);
 }

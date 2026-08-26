@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { ContextRing } from "../components/ContextRing";
+import { ReviewSummary } from "../components/ReviewSummary";
 import { answerAgent, cleanupTask, startReview } from "../lib/api";
 import {
   attentionSection,
@@ -13,8 +14,10 @@ import {
   currentStepRecord,
   defaultSessionName,
   isSpawning,
+  primarySessionName,
   workflowActive,
 } from "../lib/daemonReducer";
+import { projectReview } from "../lib/reviewPresentation";
 import { useDaemonState } from "../lib/useDaemonState";
 import type {
   AdvisoryKind,
@@ -90,11 +93,9 @@ import { formatElapsed } from "../lib/formatElapsed";
  * spec); after completion it renders the bare session status as before. */
 function SessionPill({
   session,
-  review,
   prefix,
 }: {
   session: SessionInfo;
-  review?: ReviewState;
   prefix?: string | null;
 }) {
   const label = prefix ? `${prefix}: ${session.status}` : session.status;
@@ -118,17 +119,7 @@ function SessionPill({
       <span className="statePill review" title={session.reason}>
         <span className="notifyDot" />
         {label}
-        {review && (
-          <a
-            className="reviewPillLink"
-            href={review.url}
-            target="_blank"
-            rel="noreferrer"
-            onClick={(e) => e.stopPropagation()}
-          >
-            reopen
-          </a>
-        )}
+
       </span>
     );
   }
@@ -185,6 +176,8 @@ function TaskCard({
   // current step's session while the run is in flight, else the primary.
   const sessionName = defaultSessionName(sessions, workflow);
   const session = sessions?.[sessionName];
+  const primarySession = sessions?.[primarySessionName(sessions, workflow)];
+  const reviewPresentation = projectReview(review, primarySession);
   const runPill = workflowPill(workflow);
   const stepPrefix = workflowActive(workflow) ? workflow?.step : null;
   const sessionFailed = session?.status === "failed";
@@ -202,17 +195,26 @@ function TaskCard({
   const maybeWaiting = advisories?.[sessionName]?.["maybe-waiting"];
   const tokensCost = formatTokensCost(stats?.[sessionName]);
   const [startingReview, setStartingReview] = useState(false);
+  const startLocked = useRef(false);
+
+  useEffect(() => {
+    if (startingReview && primarySession?.status === "reviewing") {
+      startLocked.current = false;
+      setStartingReview(false);
+    }
+  }, [primarySession?.status, startingReview]);
 
   async function onReview() {
-    if (!session || session.status !== "idle") return;
+    if (startLocked.current || !reviewPresentation.canStart) return;
+    startLocked.current = true;
     setStartingReview(true);
     try {
       await startReview(task.id);
-    } finally {
+    } catch {
+      startLocked.current = false;
       setStartingReview(false);
     }
   }
-
   async function onCleanup() {
     if (!confirmCleanup(task)) return;
     await cleanupTask(task.id);
@@ -242,7 +244,7 @@ function TaskCard({
             {runPill.label}
           </span>
         ) : session ? (
-          <SessionPill session={session} review={review} prefix={stepPrefix} />
+          <SessionPill session={session} prefix={stepPrefix} />
         ) : (
           <span className={`statePill ${failed ? "failed" : spawning ? "spawning" : "neutral"}`}>
             {spawning && <span className="pillDot" />}
@@ -282,8 +284,13 @@ function TaskCard({
           {contextHigh && <span className="compactHint">consider compacting or handing off</span>}
         </div>
       )}
+      {review && (
+        <div className="cardReview">
+          <ReviewSummary review={review} primarySession={primarySession} compact />
+        </div>
+      )}
       <div className="cardActions">
-        {session?.status === "idle" && (
+        {reviewPresentation.canStart && (
           <button
             type="button"
             className="reviewButton"

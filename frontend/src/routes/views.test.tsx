@@ -3,6 +3,15 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import type { Task, Template } from "../types";
+type DeferredPromise<T> = {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+};
+
+const nativePromiseWithResolvers = Promise as PromiseConstructor & {
+  withResolvers<T>(): DeferredPromise<T>;
+};
+
 
 class MockWebSocket {
   static instances: MockWebSocket[] = [];
@@ -1177,6 +1186,271 @@ describe("TaskDetailView", () => {
     await user.click(screen.getByTestId("task-link-1"));
     expect(await screen.findByTestId("task-metadata")).toBeInTheDocument();
   });
+  it("keeps the task-scoped review panel independent from the selected session tab", async () => {
+    const task = makeTask();
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", {
+      projects: [project],
+      tasks: [task],
+      sessions: {
+        "1": {
+          main: { status: "idle", reason: "agent_end", since: "t0" },
+          checker: { status: "working", reason: "validation", since: "t0" },
+        },
+      },
+    });
+
+    await screen.findByTestId("task-detail-review");
+    expect(screen.getByTestId("task-detail-start-review")).toBeEnabled();
+    await userEvent.setup().click(screen.getByTestId("session-tab-checker"));
+    expect(screen.getByTestId("task-detail-start-review")).toBeEnabled();
+  });
+
+  it("renders comment feedback live and restores re-review when the primary session idles", async () => {
+    const task = makeTask();
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", {
+      projects: [project],
+      tasks: [task],
+      sessions: { "1": { main: { status: "working", reason: "review comments", since: "t0" } } },
+      reviews: {
+        "1": {
+          status: "open",
+          url: "http://127.0.0.1:7180",
+          port: 7180,
+          iterations: [
+            {
+              outcome: "comments",
+              comment_count: 2,
+              stderr: null,
+              recorded_at: "2026-08-26T10:00:00Z",
+            },
+          ],
+        },
+      },
+    });
+
+    expect(await screen.findByTestId("task-detail-review")).toHaveTextContent(
+      "The primary agent is addressing review comments.",
+    );
+    expect(screen.queryByTestId("task-detail-start-review")).not.toBeInTheDocument();
+    act(() => {
+      socket().emit("status_changed", {
+        task_id: 1,
+        session: "main",
+        from: "working",
+        to: "idle",
+        reason: "agent_end",
+      });
+    });
+    expect(await screen.findByTestId("task-detail-start-review")).toHaveTextContent("Start another review");
+  });
+
+  it("locks review start until observed state, then exposes cancellation", async () => {
+    const task = makeTask();
+    const { promise: reviewResponse, resolve: resolveReview } =
+      nativePromiseWithResolvers.withResolvers<unknown>();
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/tasks/1") {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ ...task, workshop_status: "present" }) });
+      }
+      if (url === "/api/tasks/1/review") return reviewResponse;
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await renderAt("/tasks/1", {
+      projects: [project],
+      tasks: [task],
+      sessions: { "1": { main: { status: "idle", reason: "agent_end", since: "t0" } } },
+    });
+
+    const start = await screen.findByTestId("task-detail-start-review");
+    const user = userEvent.setup();
+    await user.dblClick(start);
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/review")).toHaveLength(1);
+    expect(start).toBeDisabled();
+    await act(async () => {
+      resolveReview({
+        ok: true,
+        json: () => Promise.resolve({ status: "open", url: "http://127.0.0.1:7180", port: 7180, iterations: [] }),
+      });
+    });
+    expect(start).toBeDisabled();
+    act(() => {
+      socket().emit("status_changed", {
+        task_id: 1,
+        session: "main",
+        from: "idle",
+        to: "reviewing",
+        reason: "llmvet review",
+      });
+      socket().emit("review_started", { task_id: 1, url: "http://127.0.0.1:7180", port: 7180 });
+    });
+    expect(await screen.findByTestId("task-detail-cancel-review")).toBeEnabled();
+    expect(screen.getByTestId("review-external-link")).toHaveTextContent("http://127.0.0.1:7180");
+  });
+
+  it("shows terminal iteration evidence and the approved Ship flow handoff", async () => {
+    const task = makeTask();
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", {
+      projects: [project],
+      tasks: [task],
+      sessions: { "1": { main: { status: "idle", reason: "review approved", since: "t0" } } },
+      reviews: {
+        "1": {
+          status: "approved",
+          url: "http://127.0.0.1:7180",
+          port: 7180,
+          iterations: [
+            {
+              outcome: "error",
+              comment_count: null,
+              stderr: "reviewer stderr",
+              recorded_at: "2026-08-26T10:00:00Z",
+            },
+            {
+              outcome: "approved",
+              comment_count: null,
+              stderr: null,
+              recorded_at: "2026-08-26T11:00:00Z",
+            },
+          ],
+        },
+      },
+    });
+
+    const review = await screen.findByTestId("task-detail-review");
+    expect(within(review).getByTestId("review-iterations")).toHaveTextContent("reviewer stderr");
+    expect(within(review).getByText("Show error details")).toBeInTheDocument();
+    expect(review.querySelector(".reviewStatusBadge.approved")).toBeInTheDocument();
+    expect(within(review).getByTestId("task-detail-ship-link")).toHaveAttribute("href", "/ship/1");
+    expect(review.querySelector('time[datetime="2026-08-26T10:00:00Z"]')).toBeInTheDocument();
+  });
+
+  it("shows a failed start, permits retry, and accepts observation before the retry response", async () => {
+    const task = makeTask();
+    const { promise: retryResponse, resolve: resolveRetry } =
+      nativePromiseWithResolvers.withResolvers<unknown>();
+    let reviewAttempts = 0;
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/tasks/1") {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ ...task, workshop_status: "present" }) });
+      }
+      if (url === "/api/tasks/1/review") {
+        reviewAttempts += 1;
+        return reviewAttempts === 1 ? Promise.reject(new Error("llmvet unavailable")) : retryResponse;
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await renderAt("/tasks/1", {
+      projects: [project],
+      tasks: [task],
+      sessions: { "1": { main: { status: "idle", reason: "agent_end", since: "t0" } } },
+    });
+
+    const user = userEvent.setup();
+    await user.click(await screen.findByTestId("task-detail-start-review"));
+    expect(await screen.findByTestId("review-command-error")).toHaveTextContent("llmvet unavailable");
+    await user.click(screen.getByTestId("task-detail-start-review"));
+    act(() => {
+      socket().emit("status_changed", {
+        task_id: 1,
+        session: "main",
+        from: "idle",
+        to: "reviewing",
+        reason: "llmvet review",
+      });
+      socket().emit("review_started", { task_id: 1, url: "http://127.0.0.1:7180", port: 7180 });
+    });
+    await act(async () => {
+      resolveRetry({
+        ok: true,
+        json: () => Promise.resolve({ status: "open", url: "http://127.0.0.1:7180", port: 7180, iterations: [] }),
+      });
+    });
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/review")).toHaveLength(2);
+    expect(screen.queryByTestId("review-command-error")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-detail-cancel-review")).toBeEnabled();
+  });
+
+  it("shows a failed cancellation, permits retry, and follows the live aborted outcome", async () => {
+    const task = makeTask();
+    let cancelAttempts = 0;
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/tasks/1") {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ ...task, workshop_status: "present" }) });
+      }
+      if (url === "/api/tasks/1/review/cancel") {
+        cancelAttempts += 1;
+        return cancelAttempts === 1
+          ? Promise.reject(new Error("review process did not stop"))
+          : Promise.resolve({ ok: true, json: () => Promise.resolve({ status: "open" }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await renderAt("/tasks/1", {
+      projects: [project],
+      tasks: [task],
+      sessions: { "1": { main: { status: "reviewing", reason: "llmvet review", since: "t0" } } },
+      reviews: { "1": { status: "open", url: "http://127.0.0.1:7180", port: 7180, iterations: [] } },
+    });
+
+    const user = userEvent.setup();
+    await user.click(await screen.findByTestId("task-detail-cancel-review"));
+    expect(await screen.findByTestId("review-command-error")).toHaveTextContent("review process did not stop");
+    await user.click(screen.getByTestId("task-detail-cancel-review"));
+    expect(screen.getByTestId("task-detail-cancel-review")).toBeDisabled();
+    act(() => {
+      socket().emit("review_iteration", {
+        task_id: 1,
+        iteration: { outcome: "aborted", comment_count: null, stderr: null, recorded_at: "2026-08-26T12:00:00Z" },
+      });
+      socket().emit("review_finished", { task_id: 1, status: "aborted" });
+      socket().emit("status_changed", {
+        task_id: 1,
+        session: "main",
+        from: "reviewing",
+        to: "idle",
+        reason: "review aborted",
+      });
+    });
+    expect(await screen.findByTestId("task-detail-start-review")).toHaveTextContent("Start another review");
+    expect(screen.getByTestId("task-detail-review")).toHaveTextContent("Aborted");
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/review/cancel")).toHaveLength(2);
+  });
+
+  it.each(["aborted", "error"] as const)("renders the %s terminal review state", async (outcome) => {
+    const task = makeTask();
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", {
+      projects: [project],
+      tasks: [task],
+      sessions: { "1": { main: { status: "idle", reason: `review ${outcome}`, since: "t0" } } },
+      reviews: {
+        "1": {
+          status: outcome,
+          url: "http://127.0.0.1:7180",
+          port: 7180,
+          iterations: [
+            {
+              outcome,
+              comment_count: null,
+              stderr: outcome === "error" ? "review command failed" : null,
+              recorded_at: "2026-08-26T12:00:00Z",
+            },
+          ],
+        },
+      },
+    });
+
+    const review = await screen.findByTestId("task-detail-review");
+    expect(review.querySelector(`.reviewStatusBadge.${outcome}`)).toBeInTheDocument();
+    expect(within(review).getByTestId("task-detail-start-review")).toHaveTextContent("Start another review");
+  });
+
 });
 
 describe("Review capability (TasksView)", () => {
@@ -1229,6 +1503,91 @@ describe("Review capability (TasksView)", () => {
 
     await user.click(screen.getByTestId("review-button-1"));
     expect(fetchMock).toHaveBeenCalledWith("/api/tasks/1/review", expect.objectContaining({ method: "POST" }));
+  });
+  it("makes a card-started review available from task detail without reloading", async () => {
+    const task = makeTask();
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/tasks/1") {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ ...task, workshop_status: "present" }) });
+      }
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ status: "open", url: "http://127.0.0.1:7180", port: 7180, iterations: [] }),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [task],
+      sessions: { "1": { main: { status: "idle", reason: "agent_end", since: "t0" } } },
+    });
+
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId("review-button-1"));
+    act(() => {
+      socket().emit("status_changed", {
+        task_id: 1,
+        session: "main",
+        from: "idle",
+        to: "reviewing",
+        reason: "llmvet review",
+      });
+      socket().emit("review_started", { task_id: 1, url: "http://127.0.0.1:7180", port: 7180 });
+    });
+    await user.click(screen.getByTestId("task-link-1"));
+    expect(await screen.findByTestId("task-detail-review")).toHaveTextContent("Review open");
+    expect(screen.getByTestId("review-external-link")).toHaveAttribute("href", "http://127.0.0.1:7180");
+  });
+
+  it("uses the primary session for review eligibility while another session is active", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask({ workflow_status: "running", workflow_step: "validate" })],
+      sessions: {
+        "1": {
+          main: { status: "idle", reason: "agent_end", since: "t0" },
+          checker: { status: "working", reason: "validation", since: "t0" },
+        },
+      },
+      workflows: {
+        "1": {
+          name: "multi-session",
+          status: "running",
+          step: "validate",
+          steps: [
+            {
+              task_id: 1,
+              seq: 1,
+              step: "implement",
+              kind: "agent",
+              session: "main",
+              status: "ok",
+              outcome: null,
+              error: null,
+              prompted_at: null,
+              started_at: "t0",
+              finished_at: "t1",
+            },
+            {
+              task_id: 1,
+              seq: 2,
+              step: "validate",
+              kind: "agent",
+              session: "checker",
+              status: "running",
+              outcome: null,
+              error: null,
+              prompted_at: null,
+              started_at: "t2",
+              finished_at: null,
+            },
+          ],
+        },
+      },
+    });
+
+    expect(screen.getByTestId("task-card-1")).toHaveTextContent("validate: working");
+    expect(screen.getByTestId("review-button-1")).toBeEnabled();
   });
 });
 

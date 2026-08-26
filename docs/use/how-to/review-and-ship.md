@@ -10,12 +10,35 @@ Starting a review opens a real review tool against the host side of the task's
 clone. The agent being reviewed does not run it and cannot influence the
 verdict.
 
+### Start, inspect, and continue from task detail
+
+1. Open the task card, then its task detail.
+2. In **Review**, wait for the primary session to become idle and select
+   **Start review**. The panel keeps the action locked while the daemon starts
+   the reviewer.
+3. Select the full llmvet URL from the open Review panel to inspect the
+   independent review. Use **Cancel review** only to stop an open review; the
+   panel shows a failed command and allows retry when the daemon's state still
+   permits it.
+4. If comments return, let the primary agent address them. When it is idle
+   again, select **Start another review**. The ordered history retains every
+   iteration, including reviewer error detail.
+5. After **Approved**, select **Continue to Ship flow**. It opens
+   `/ship/<task-id>` directly at the task's publishing flow.
+
+The Review panel remains task-scoped when task detail is showing another
+session tab, and it updates from the daemon stream without reloading the page.
+
+### REST alternative
+
 To show the complete task delta rather than only the most recent commit, the
 review temporarily resets the clone against the base branch. Before doing so it
 records the original `HEAD` under the durable Git ref `refs/ompire/review-orig`.
 That ref is the recovery artifact: if the daemon dies mid-review, the original
 state is restored from it at the next startup, and the ref is deleted only
 after a successful restore.
+
+The same action remains available through the authenticated REST API:
 
 ```sh
 TOKEN=$(cat ~/.local/share/ompire/token)
@@ -28,8 +51,9 @@ Approving or aborting returns it to `idle`. Feeding a review comment back to
 the agent moves it to `working` — the comment becomes the agent's next prompt,
 and the review loop continues from there.
 
-Cancel with `POST /api/tasks/{id}/review/cancel`. Cancellation restores the
-clone from the saved ref.
+Cancel from task detail with **Cancel review**. The equivalent REST operation
+is `POST /api/tasks/{id}/review/cancel`; cancellation restores the clone from
+the saved ref.
 
 ## Ship
 

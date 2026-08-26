@@ -358,6 +358,10 @@
   overflow-x: auto;
 }
 
+.cardReview {
+  margin-top: 8px;
+}
+
 .cardActions {
   display: flex;
   gap: 8px;
