@@ -82,7 +82,7 @@ export function projectReview(
     };
   }
 
-  if (latest?.outcome === "comments") {
+  if (latest?.outcome === "comments" && primarySession?.status !== "reviewing") {
     const hint =
       primarySession?.status === "idle"
         ? "Review comments were returned and the primary agent is ready for another review."

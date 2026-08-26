@@ -528,10 +528,10 @@ export function workflowActive(workflow: WorkflowState | undefined): boolean {
 }
 
 /** Ordered session names for a task's tabs and cards (workflow-engine design
- * D-9): workflow step order first (the first executed step's session is the
- * primary), then any tracker-only sessions, defaulting to the single-step
- * workflow's lone `main` session. The daemon doesn't expose a workflow's
- * declared sessions before its steps run, so the list grows as records land. */
+ * D-9): workflow step order first, then any tracker-only sessions, defaulting
+ * to the single-step workflow's lone `main` session. The daemon doesn't expose
+ * a workflow's declared sessions before its steps run, so the list grows as
+ * records land. */
 export function taskSessionNames(
   taskSessions: Record<string, SessionInfo> | undefined,
   workflow: WorkflowState | undefined,
@@ -553,16 +553,23 @@ export function currentStepRecord(workflow: WorkflowState | undefined): StepReco
   return [...workflow.steps].reverse().find((record) => record.step === workflow.step);
 }
 
+/** Built-in workflow primaries are not part of the current WebSocket payload.
+ * Keep the task-scoped selector explicit for those workflows; unknown or
+ * legacy workflows retain the first known session fallback. */
+const PRIMARY_SESSION_BY_WORKFLOW: Record<string, string> = {
+  "single-step": "main",
+  bugfix: "coder",
+};
+
 /** The workflow-declared primary session for task-scoped operations such as
- * review and publishing. The first known session is the primary: workflow
- * records retain declaration/execution order, then tracker-only sessions are
- * appended. It deliberately ignores the current workflow step and any UI tab
- * selection. */
+ * review and publishing. It deliberately ignores the current workflow step
+ * and any UI tab selection. */
 export function primarySessionName(
   taskSessions: Record<string, SessionInfo> | undefined,
   workflow: WorkflowState | undefined,
 ): string {
-  return taskSessionNames(taskSessions, workflow)[0];
+  const configured = workflow === undefined ? undefined : PRIMARY_SESSION_BY_WORKFLOW[workflow.name];
+  return configured ?? taskSessionNames(taskSessions, workflow)[0];
 }
 
 /** The session a task's surfaces focus by default (workflow-engine design

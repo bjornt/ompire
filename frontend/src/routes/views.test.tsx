@@ -1589,6 +1589,42 @@ describe("Review capability (TasksView)", () => {
     expect(screen.getByTestId("task-card-1")).toHaveTextContent("validate: working");
     expect(screen.getByTestId("review-button-1")).toBeEnabled();
   });
+  it("withholds review while the bugfix primary is working", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask({ workflow_name: "bugfix", workflow_status: "running", workflow_step: "reproduce" })],
+      sessions: {
+        "1": {
+          reproducer: { status: "idle", reason: "reproduction complete", since: "t0" },
+          coder: { status: "working", reason: "fixing issue", since: "t0" },
+        },
+      },
+      workflows: {
+        "1": {
+          name: "bugfix",
+          status: "running",
+          step: "reproduce",
+          steps: [
+            {
+              task_id: 1,
+              seq: 1,
+              step: "reproduce",
+              kind: "agent",
+              session: "reproducer",
+              status: "ok",
+              outcome: null,
+              error: null,
+              prompted_at: null,
+              started_at: "t0",
+              finished_at: "t1",
+            },
+          ],
+        },
+      },
+    });
+
+    expect(screen.queryByTestId("review-button-1")).not.toBeInTheDocument();
+  });
 });
 
 describe("ShipFlowView", () => {

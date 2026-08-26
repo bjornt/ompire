@@ -73,6 +73,18 @@ describe("review presentation", () => {
       canStart: false,
     });
   });
+  it("keeps a reopened review open after earlier comments", () => {
+    const state = review({
+      iterations: [
+        { outcome: "comments", comment_count: 1, stderr: null, recorded_at: "2026-08-26T10:00:00Z" },
+      ],
+    });
+    expect(projectReview(state, { ...idle, status: "reviewing" })).toMatchObject({
+      state: "open",
+      canStart: false,
+      canCancel: true,
+    });
+  });
 
   it("uses the workflow primary session rather than the active workflow step", () => {
     const workflow: WorkflowState = {
@@ -109,5 +121,28 @@ describe("review presentation", () => {
       ],
     };
     expect(primarySessionName({ main: idle, checker: working }, workflow)).toBe("main");
+  });
+  it("uses the bugfix primary even before that session has spawned", () => {
+    const workflow: WorkflowState = {
+      name: "bugfix",
+      status: "running",
+      step: "reproduce",
+      steps: [
+        {
+          task_id: 1,
+          seq: 1,
+          step: "reproduce",
+          kind: "agent",
+          session: "reproducer",
+          status: "ok",
+          outcome: null,
+          error: null,
+          prompted_at: null,
+          started_at: "t0",
+          finished_at: "t1",
+        },
+      ],
+    };
+    expect(primarySessionName({ reproducer: idle }, workflow)).toBe("coder");
   });
 });
