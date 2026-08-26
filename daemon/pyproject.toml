@@ -6,6 +6,7 @@ name = "ompire-daemon"
 version = "0.1.0"
 description = "ompire daemon: process lifecycle, registry, REST/WS API"
 readme = "README.md"
+license = "AGPL-3.0-only"
 authors = [
     { name = "Bjorn Tillenius", email = "bjorn@tillenius.me" }
 ]
