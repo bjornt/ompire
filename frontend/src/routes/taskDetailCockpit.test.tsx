@@ -338,6 +338,35 @@ describe("cockpit transcript follow", () => {
     expect(geo.scrollTop).toBe(geo.end());
   });
 
+  it("follows a subagent item nested under an existing tool call", async () => {
+    const { agent, geo } = await renderFollowingTranscript();
+    act(() => {
+      agent.emit("message_end", {
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "spawn-3", name: "task" }],
+        },
+      });
+    });
+
+    const stream = screen.getByTestId("transcript-stream");
+    const rootItems = stream.childElementCount;
+    geo.readerScrollsTo(geo.end());
+    act(() => {
+      geo.grow(600);
+      agent.emit("message_end", {
+        parentToolUseId: "spawn-3",
+        message: { role: "assistant", content: [{ type: "text", text: "sub result" }] },
+      });
+    });
+
+    // Nested under the card, so no new root item — the other half of the growth
+    // an item-count trigger would miss.
+    expect(stream.childElementCount).toBe(rootItems);
+    expect(within(stream).getByTestId("subagent-spawn-3")).toHaveTextContent("sub result");
+    expect(geo.scrollTop).toBe(geo.end());
+  });
+
   it("does not follow when the reader expands a tool card", async () => {
     const { agent, geo } = await renderFollowingTranscript();
     act(() => {

@@ -88,7 +88,8 @@ agent thinking renders as distinct thinking blocks, and subagent activity is
 grouped under the parent tool call that spawned it.
 
 The panel occupies a bounded, viewport-relative region: its heading stays put
-and only the stream below it scrolls. A conversation of any length therefore
+and the stream below it is what scrolls, rather than the page growing. Wide
+tool input and output still scroll horizontally inside their own cards. A conversation of any length therefore
 leaves the rest of the cockpit — metadata, review panel, status strip, workflow
 strip — where the operator left it, instead of pushing it further off-screen
 with every tool call. On the narrow one-column layout the panel is bounded more
