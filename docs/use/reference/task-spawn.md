@@ -36,9 +36,33 @@ template's workflow, model and thinking override controls each defaulting to
 "template default (…)", a slug field with a live branch-name preview, and a
 prompt editor.
 
-After submit, per-step pipeline progress renders inline, followed by the
-workflow's own step progress in the same list. A failed step expands its
+Submitting locks the form. Every input and the submit button are disabled
+from the moment the button is activated, so one activation creates at most one
+task; the button reads `Creating…` until the daemon accepts the request, then
+`Launching…` while the pipeline runs. The locked fields keep the submitted
+values, so the request stays readable while the workspace is built.
+
+The panel beside the form reads `Creating the task…` until the daemon accepts
+the request, then renders per-step pipeline progress. A failed step expands its
 stderr or error text in place — there is no separate failure screen.
+
+When the daemon records spawn completion, Ompire opens the task's detail view
+at `/tasks/<task-id>`, replacing the Spawn view in browser history. It does not
+wait for the agent's first turn: the transcript may open empty. The workflow
+run starts at the same moment, and its step progress belongs to task detail's
+workflow strip rather than the Spawn view.
+
+A failed pipeline keeps the operator on the Spawn view with the form still
+locked to that task, the failing step and its captured text visible, and two
+actions: **Open failed task**, which opens `/tasks/<task-id>`, and **Start
+another task**, which clears the pipeline and unlocks the form while keeping
+the entered template, slug, prompt, and overrides.
+
+A request the daemon refuses — an unknown template, a duplicate or invalid
+slug, a clone path outside the task root, or a transport failure — creates
+nothing. The form unlocks immediately, keeps everything that was typed, and
+shows the daemon's message. If the accepted task is deleted or purged while the
+form is locked, the form unlocks and says so.
 
 ## States and behavior
 

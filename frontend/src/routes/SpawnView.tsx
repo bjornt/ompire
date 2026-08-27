@@ -1,9 +1,9 @@
-import { useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import { spawnTask } from "../lib/api";
 import { useDaemonState } from "../lib/useDaemonState";
 import { REGISTERED_WORKFLOWS, THINKING_LEVELS, templateCheckout } from "../lib/templates";
-import type { SpawnStepName, SpawnStepPayload, StepRecord, Task, ThinkingLevel } from "../types";
+import type { SpawnStepName, SpawnStepPayload, Task, ThinkingLevel } from "../types";
 import "./SpawnView.css";
 
 const PIPELINE_STEPS: { name: SpawnStepName; label: string; detail: (task: Task) => string }[] = [
@@ -33,21 +33,31 @@ function statusOf(steps: SpawnStepPayload[], name: SpawnStepName): StepStatus {
   return last.status;
 }
 
-/** A workflow step record maps onto the pipeline's visual row states; a
- * parked gate reads as running (the row pulses like any in-flight step). */
-function workflowRowStatus(record: StepRecord): StepStatus {
-  return record.status === "waiting" ? "running" : record.status;
-}
+/** The form owns one submission at a time. Every non-idle phase locks it; the
+ * terminal edge is read from the daemon's task projection rather than from the
+ * events that delivered it. */
+type SpawnPhase =
+  | { kind: "idle" }
+  | { kind: "creating" }
+  | { kind: "launching"; taskId: number }
+  | { kind: "failed"; taskId: number };
 
 export function SpawnView() {
-  const { projects, templates, tasks, spawnProgress, workflows } = useDaemonState();
+  const { snapshotReady, projects, templates, tasks, spawnProgress } = useDaemonState();
+  const navigate = useNavigate();
   const [templateName, setTemplateName] = useState("");
   const [slug, setSlug] = useState("");
   const [prompt, setPrompt] = useState("");
   const [model, setModel] = useState("");
   const [thinking, setThinking] = useState<ThinkingLevel | "">("");
-  const [spawnedId, setSpawnedId] = useState<number | null>(null);
+  const [phase, setPhase] = useState<SpawnPhase>({ kind: "idle" });
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // A second activation in the same tick must not reach the daemon: the
+  // disabled button cannot stop it before React has re-rendered.
+  const submitLockRef = useRef(false);
+  // Absence means "gone" only once the projection has actually carried the
+  // task — the REST response can win the race against `task_created`.
+  const seenRef = useRef(false);
 
   const template = templates.find((t) => t.name === templateName) ?? templates[0];
   const branchPreview = useMemo(() => {
@@ -58,16 +68,48 @@ export function SpawnView() {
     ? (REGISTERED_WORKFLOWS.find((w) => w.name === template.workflow)?.label ?? template.workflow)
     : null;
 
+  const locked = phase.kind !== "idle";
+  const spawnedId = phase.kind === "launching" || phase.kind === "failed" ? phase.taskId : null;
   const spawnedTask = spawnedId === null ? null : tasks.find((t) => t.id === spawnedId) ?? null;
   const steps = spawnedId === null ? [] : spawnProgress[spawnedId] ?? [];
-  // Once the spawn pipeline hands off, the workflow run's `workflow_step`
-  // events keep reporting in the same inline list (task-spawn spec).
-  const workflowSteps = spawnedId === null ? [] : (workflows[spawnedId]?.steps ?? []);
+
+  // `spawn_completed_at` is stamped for success and failure alike and `state`
+  // separates them, so one projection read covers both terminal edges. Reading
+  // state rather than events is what makes REST/`task_created` ordering and a
+  // reconnect — which drops transient `spawn_step` events but not the task —
+  // irrelevant here.
+  useEffect(() => {
+    if (phase.kind !== "launching") return;
+    const task = tasks.find((candidate) => candidate.id === phase.taskId);
+    if (task === undefined) {
+      // Absence is snapshot-gated like the ship routes: never decide it from a
+      // projection the current connection has not authoritatively replaced.
+      if (!snapshotReady || !seenRef.current) return;
+      submitLockRef.current = false;
+      seenRef.current = false;
+      setPhase({ kind: "idle" });
+      setSubmitError(`Task ${phase.taskId} is no longer present — it was deleted or purged.`);
+      return;
+    }
+    seenRef.current = true;
+    if (task.spawn_completed_at === null) return;
+    if (task.state === "failed") {
+      setPhase({ kind: "failed", taskId: phase.taskId });
+      return;
+    }
+    // The workspace is ready and the run has been handed to the workflow
+    // engine: the transcript is the earliest useful surface. Replace, because
+    // the submitted form is spent.
+    navigate(`/tasks/${phase.taskId}`, { replace: true });
+  }, [phase, tasks, snapshotReady, navigate]);
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
-    if (!template) return;
+    if (!template || submitLockRef.current) return;
+    submitLockRef.current = true;
+    seenRef.current = false;
     setSubmitError(null);
+    setPhase({ kind: "creating" });
     // Empty overrides are omitted from the POST so the daemon falls back to
     // the template value, then to the omp default (task-spawn capability).
     const modelOverride = model.trim();
@@ -79,10 +121,21 @@ export function SpawnView() {
         ...(modelOverride ? { model: modelOverride } : {}),
         ...(thinking ? { thinking } : {}),
       });
-      setSpawnedId(task.id);
+      setPhase({ kind: "launching", taskId: task.id });
     } catch (error) {
+      // Nothing was created, so the form is immediately usable again with
+      // everything the operator typed still in place.
+      submitLockRef.current = false;
+      setPhase({ kind: "idle" });
       setSubmitError(error instanceof Error ? error.message : String(error));
     }
+  }
+
+  function startAnother() {
+    submitLockRef.current = false;
+    seenRef.current = false;
+    setPhase({ kind: "idle" });
+    setSubmitError(null);
   }
 
   return (
@@ -102,6 +155,7 @@ export function SpawnView() {
               id="spawn-template"
               value={template?.name ?? ""}
               onChange={(e) => setTemplateName(e.target.value)}
+              disabled={locked}
               data-testid="spawn-template"
             >
               {templates.length === 0 ? (
@@ -138,6 +192,7 @@ export function SpawnView() {
               type="text"
               value={slug}
               onChange={(e) => setSlug(e.target.value)}
+              disabled={locked}
               placeholder="fix-the-bug"
             />
             {branchPreview && template && (
@@ -162,6 +217,7 @@ export function SpawnView() {
               rows={9}
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
+              disabled={locked}
               placeholder="What should the agent do? (delivered once the agent is ready)"
             />
           </div>
@@ -176,6 +232,7 @@ export function SpawnView() {
                   type="text"
                   value={model}
                   onChange={(e) => setModel(e.target.value)}
+                  disabled={locked}
                   placeholder={`template default (${template.model ?? "omp default"})`}
                 />
               </div>
@@ -185,6 +242,7 @@ export function SpawnView() {
                   id="spawn-thinking"
                   value={thinking}
                   onChange={(e) => setThinking(e.target.value as ThinkingLevel | "")}
+                  disabled={locked}
                 >
                   <option value="">
                     template default ({template.thinking ?? "omp default"})
@@ -199,8 +257,12 @@ export function SpawnView() {
             </div>
           )}
 
-          <button className="primary" type="submit" disabled={!template || !slug}>
-            Spawn task
+          <button className="primary" type="submit" disabled={locked || !template || !slug}>
+            {phase.kind === "creating"
+              ? "Creating…"
+              : phase.kind === "launching"
+                ? "Launching…"
+                : "Spawn task"}
           </button>
           {submitError && (
             <div className="submitError" role="alert">
@@ -217,7 +279,9 @@ export function SpawnView() {
           </h2>
           {spawnedTask === null ? (
             <p className="hint">
-              Submit to run the spawn pipeline; each step reports here as it runs.
+              {phase.kind === "creating"
+                ? "Creating the task…"
+                : "Submit to run the spawn pipeline; each step reports here as it runs."}
             </p>
           ) : (
             <div className="pipeline">
@@ -226,9 +290,7 @@ export function SpawnView() {
                 const failed = stepStatus(steps, stepDef.name);
                 return (
                   <div className="step" key={stepDef.name} data-step-status={status}>
-                    {(index < pipelineSteps.length - 1 || workflowSteps.length > 0) && (
-                      <span className="rail" />
-                    )}
+                    {index < pipelineSteps.length - 1 && <span className="rail" />}
                     <span className={`bullet ${status}`}>
                       {status === "ok" ? "✓" : status === "failed" ? "✕" : index + 1}
                     </span>
@@ -244,50 +306,31 @@ export function SpawnView() {
                   </div>
                 );
               })}
-              {workflowSteps.map((record, index) => {
-                const status = workflowRowStatus(record);
-                return (
-                  <div
-                    className="step"
-                    key={`workflow-${record.seq}`}
-                    data-step-status={status}
-                    data-testid={`workflow-step-${record.step}`}
-                  >
-                    {index < workflowSteps.length - 1 && <span className="rail" />}
-                    <span className={`bullet ${status}`}>
-                      {status === "ok" ? "✓" : status === "failed" ? "✕" : "▸"}
-                    </span>
-                    <div className="stepBody">
-                      <div className={`stepLabel ${status}`}>
-                        {record.step}
-                        {record.status === "waiting" ? " — waiting at gate" : ""}
-                      </div>
-                      <div className="stepDetail">
-                        {record.kind}
-                        {record.session ? ` · session ${record.session}` : ""}
-                      </div>
-                      {record.status === "failed" && record.error && (
-                        <pre className="stderr" data-testid={`stderr-workflow-${record.step}`}>
-                          {record.error}
-                        </pre>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
             </div>
           )}
-          {spawnedTask?.state === "failed" && (
-            <div className="failedNote">
-              Task landed as <span className="failedPill">failed</span> —{" "}
-              <Link to="/tasks">see it on the dashboard</Link>
-            </div>
-          )}
-          {spawnedTask && spawnedTask.state === "created" && spawnedTask.spawn_completed_at && (
-            <div className="doneNote">
-              Agent launched in <code>{spawnedTask.clone_path}</code>
-              {spawnedTask.prompt ? " — working on the prompt" : ""} —{" "}
-              <Link to="/tasks">back to Tasks</Link>
+          {phase.kind === "failed" && spawnedTask && (
+            <div className="failedNote" role="status" data-testid="spawn-failed">
+              <div>
+                Task landed as <span className="failedPill">failed</span>
+                {spawnedTask.error ? ` — ${spawnedTask.error}` : ""}
+              </div>
+              <div className="failedActions">
+                <Link
+                  className="failedAction"
+                  to={`/tasks/${spawnedTask.id}`}
+                  data-testid="spawn-open-failed"
+                >
+                  Open failed task
+                </Link>
+                <button
+                  className="failedAction"
+                  type="button"
+                  onClick={startAnother}
+                  data-testid="spawn-start-another"
+                >
+                  Start another task
+                </button>
+              </div>
             </div>
           )}
         </div>

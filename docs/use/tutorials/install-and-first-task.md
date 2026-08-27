@@ -113,13 +113,14 @@ Submit, and watch the four spawn steps run:
 The `workshop` step is slow the first time and much faster afterwards. If it
 fails, your container tooling is the place to look.
 
-When it completes, the task appears with its own clone under
+When it completes, Ompire opens the task for you. It has its own clone under
 `~/tasks/scratch-repo/add-readme-badge` and an agent running inside its own
 container.
 
 ## 8. Watch it work — or don't
 
-Open the task. You will see the agent's output as it works.
+You are now on the task's detail view, where the agent's output appears as it
+works.
 
 The point of Ompire is that you do not have to watch. The task card shows an
 attention tier: silent while the agent is working, a badge when it reaches a

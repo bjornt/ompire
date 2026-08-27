@@ -363,7 +363,7 @@ describe("SpawnView", () => {
     expect(within(progress).queryByText("Prompt")).not.toBeInTheDocument();
   });
 
-  it("expands stderr inline when a step fails and links to the dashboard", async () => {
+  it("keeps a failed launch on the Spawn view with its stderr and both actions", async () => {
     await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
     const user = userEvent.setup();
     const spawned = makeTask({ spawn_completed_at: null });
@@ -392,13 +392,19 @@ describe("SpawnView", () => {
       });
     });
 
+    expect(window.location.pathname).toBe("/spawn");
     expect(screen.getByTestId("stderr-fetch")).toHaveTextContent(
       "fatal: could not read from remote",
     );
-    expect(screen.getByText("see it on the dashboard")).toBeInTheDocument();
+    const failure = screen.getByTestId("spawn-failed");
+    expect(failure).toHaveTextContent("step 'fetch' failed");
+    expect(screen.getByTestId("spawn-open-failed")).toHaveAttribute("href", "/tasks/1");
+    // The form stays locked to the failed task until the operator releases it.
+    expect(screen.getByLabelText("Task slug")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Spawn task" })).toBeDisabled();
   });
 
-  it("keeps reporting workflow_step events as rows in the same progress list", async () => {
+  it("unlocks the form with its values intact when starting another task", async () => {
     await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
     const user = userEvent.setup();
     const spawned = makeTask({ spawn_completed_at: null });
@@ -413,19 +419,58 @@ describe("SpawnView", () => {
 
     act(() => {
       socket().emit("task_created", spawned);
-      for (const step of ["fetch", "clone", "branch", "workshop", "agent", "prompt"]) {
+      socket().emit("task_updated", {
+        ...spawned,
+        state: "failed",
+        error: "step 'fetch' failed",
+        spawn_completed_at: "x",
+      });
+    });
+
+    await user.click(screen.getByTestId("spawn-start-another"));
+
+    expect(screen.queryByTestId("spawn-failed")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Task slug")).toHaveValue("fix-bug");
+    expect(screen.getByLabelText("Prompt")).toHaveValue("fix it");
+    expect(screen.getByLabelText("Task slug")).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Spawn task" })).toBeEnabled();
+    // The spent pipeline is gone, not merely hidden behind the failure note.
+    expect(
+      within(screen.getByTestId("spawn-progress")).getByText(
+        "Submit to run the spawn pipeline; each step reports here as it runs.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("opens task detail once the workspace is ready, replacing the spent form", async () => {
+    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+    const user = userEvent.setup();
+    const spawned = makeTask({ spawn_completed_at: null });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
+    );
+    const historyLength = window.history.length;
+
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+    expect(screen.getByRole("button", { name: "Launching…" })).toBeDisabled();
+
+    await act(async () => {
+      socket().emit("task_created", spawned);
+      for (const step of ["fetch", "clone", "branch", "workshop"]) {
         socket().emit("spawn_step", { task_id: 1, step, status: "started" });
         socket().emit("spawn_step", { task_id: 1, step, status: "ok" });
       }
       socket().emit("task_updated", { ...spawned, spawn_completed_at: "t1" });
-      // The spawn pipeline hands off to the workflow run.
-      socket().emit("workflow_step", {
-        task_id: 1,
-        step: "work",
-        kind: "agent",
-        session: "main",
-        status: "started",
-      });
+    });
+
+    expect(window.location.pathname).toBe("/tasks/1");
+    // Replacing, not stacking: back must not return to a spent form.
+    expect(window.history.length).toBe(historyLength);
+
+    // Later updates for the same task must not navigate a second time.
+    await act(async () => {
       socket().emit("task_updated", {
         ...spawned,
         spawn_completed_at: "t1",
@@ -433,35 +478,135 @@ describe("SpawnView", () => {
         workflow_step: "work",
       });
     });
+    expect(window.location.pathname).toBe("/tasks/1");
+  });
 
-    const progress = screen.getByTestId("spawn-progress");
-    const row = within(progress).getByTestId("workflow-step-work");
-    expect(row).toHaveAttribute("data-step-status", "running");
-    expect(row).toHaveTextContent("work");
-    expect(row).toHaveTextContent("agent · session main");
-    // The pipeline rows above are untouched.
-    expect(progress.querySelectorAll("[data-step-status]")).toHaveLength(7);
+  it("navigates when task_created arrives before the REST response resolves", async () => {
+    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+    const user = userEvent.setup();
+    const spawned = makeTask({ spawn_completed_at: null });
+    const deferred = nativePromiseWithResolvers.withResolvers<unknown>();
+    vi.stubGlobal("fetch", vi.fn().mockReturnValue(deferred.promise));
 
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+    expect(screen.getByRole("button", { name: "Creating…" })).toBeDisabled();
+
+    // The whole pipeline completes before the POST response is delivered.
     act(() => {
-      socket().emit("workflow_step", {
-        task_id: 1,
-        step: "work",
-        kind: "agent",
-        session: "main",
-        status: "failed",
-        error: "agent exited with code 1",
+      socket().emit("task_created", spawned);
+      socket().emit("task_updated", { ...spawned, spawn_completed_at: "t1" });
+    });
+    expect(window.location.pathname).toBe("/spawn");
+
+    await act(async () => {
+      deferred.resolve({ ok: true, json: () => Promise.resolve(spawned) });
+      await deferred.promise;
+    });
+
+    expect(window.location.pathname).toBe("/tasks/1");
+  });
+
+  it("navigates from a reconnect snapshot when the step events were lost", async () => {
+    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+    const user = userEvent.setup();
+    const spawned = makeTask({ spawn_completed_at: null });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
+    );
+
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+
+    // No spawn_step or task_updated deltas survive the reconnect; the
+    // replacement snapshot carries the completed task instead.
+    await act(async () => {
+      socket().emitSnapshot({
+        projects: [project],
+        templates: [makeTemplate()],
+        tasks: [{ ...spawned, spawn_completed_at: "t1" }],
       });
     });
 
-    const failedRow = within(progress).getByTestId("workflow-step-work");
-    expect(failedRow).toHaveAttribute("data-step-status", "failed");
-    expect(
-      within(progress).getByTestId("stderr-workflow-work"),
-    ).toHaveTextContent("agent exited with code 1");
+    expect(window.location.pathname).toBe("/tasks/1");
   });
-});
 
-describe("TasksView cards", () => {
+  it("issues one request for a double activation", async () => {
+    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+    const user = userEvent.setup();
+    const spawned = makeTask({ spawn_completed_at: null });
+    const deferred = nativePromiseWithResolvers.withResolvers<unknown>();
+    const fetchMock = vi.fn().mockReturnValue(deferred.promise);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    const button = screen.getByRole("button", { name: "Spawn task" });
+    await user.dblClick(button);
+    // Submitting the form directly bypasses the disabled button entirely.
+    act(() => {
+      screen.getByTestId("spawn-form").dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      deferred.resolve({ ok: true, json: () => Promise.resolve(spawned) });
+      await deferred.promise;
+    });
+  });
+
+  it("unlocks the form and keeps its values when the daemon rejects the request", async () => {
+    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 409,
+        json: () => Promise.resolve({ detail: "a live task maas/fix-bug already exists" }),
+      }),
+    );
+
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await user.type(screen.getByLabelText("Prompt"), "fix it");
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+
+    expect(window.location.pathname).toBe("/spawn");
+    expect(screen.getByRole("alert")).toHaveTextContent("already exists");
+    expect(screen.getByLabelText("Task slug")).toHaveValue("fix-bug");
+    expect(screen.getByLabelText("Prompt")).toHaveValue("fix it");
+    expect(screen.getByRole("button", { name: "Spawn task" })).toBeEnabled();
+  });
+
+  it("unlocks the form when the accepted task disappears from the snapshot", async () => {
+    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+    const user = userEvent.setup();
+    const spawned = makeTask({ spawn_completed_at: null });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
+    );
+
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+
+    act(() => {
+      socket().emit("task_created", spawned);
+    });
+    expect(screen.getByLabelText("Task slug")).toBeDisabled();
+
+    act(() => {
+      socket().emit("task_deleted", { id: 1 });
+    });
+
+    expect(window.location.pathname).toBe("/spawn");
+    expect(screen.getByRole("alert")).toHaveTextContent("no longer present");
+    expect(screen.getByRole("button", { name: "Spawn task" })).toBeEnabled();
+  });
+
   it("renders cards from the snapshot and hides archived tasks", async () => {
     await renderAt("/tasks", {
       projects: [project],

@@ -35,8 +35,15 @@ template's workflow, and the branch preview updates live as you type the slug.
 Model and thinking controls default to "template default (…)"; leaving them
 alone sends no override.
 
-Pipeline progress is shown per step, and the workflow's own step progress
-continues in the same inline list. A failed step expands its stderr in place.
+Submitting locks the form until the launch resolves, so a second click
+cannot create a second task. Pipeline progress is shown per step, and a failed
+step expands its stderr in place.
+
+When the workspace is ready, Ompire opens the task for you and you watch the
+agent from its detail view. If the pipeline fails instead, you stay on the
+Spawn view: read the failing step, then either open the failed task or select
+**Start another task** to correct the slug or prompt and submit again. Nothing
+you typed is discarded.
 
 ## Spawn through the API
 
