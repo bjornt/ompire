@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
@@ -190,6 +190,234 @@ describe("cockpit transcript", () => {
 
     const nested = screen.getByTestId("subagent-spawn-1");
     expect(nested).toHaveTextContent("sub result");
+  });
+});
+
+/* Follow-the-stream behavior. jsdom performs no layout, so the transcript's
+ * scroll geometry is whatever the test defines: `scrollTop` is backed by a real
+ * variable and clamped the way a browser clamps it, so the component's writes
+ * are observable and "at the end" means here what it means in a browser. The
+ * real bound and the real overflow are verified in the browser, not here. */
+function mockScrollGeometry(el: HTMLElement, clientHeight: number, scrollHeight: number) {
+  let top = 0;
+  let height = scrollHeight;
+  const end = () => Math.max(0, height - clientHeight);
+  const clamp = (v: number) => Math.max(0, Math.min(v, end()));
+  Object.defineProperty(el, "clientHeight", { configurable: true, get: () => clientHeight });
+  Object.defineProperty(el, "scrollHeight", { configurable: true, get: () => height });
+  Object.defineProperty(el, "scrollTop", {
+    configurable: true,
+    get: () => top,
+    set: (v: number) => {
+      top = clamp(v);
+    },
+  });
+  return {
+    get scrollTop() {
+      return top;
+    },
+    end,
+    /** More output arrived: the stream got taller. */
+    grow(by: number) {
+      height += by;
+    },
+    /** The reader moved the scrollbar themselves. */
+    readerScrollsTo(next: number) {
+      top = clamp(next);
+      fireEvent.scroll(el);
+    },
+  };
+}
+
+function lastAgentSocket(): MockWebSocket | undefined {
+  return MockWebSocket.instances.filter((s) => s.url.includes("/api/ws/agents/")).at(-1);
+}
+
+function emitText(agent: MockWebSocket, text: string) {
+  agent.emit("message_end", {
+    message: { role: "assistant", content: [{ type: "text", text }] },
+  });
+}
+
+/** Task detail with a live session, one transcript item so the scroll region
+ * exists, and its geometry under the test's control. */
+async function renderFollowingTranscript(session: unknown = workingSession, workflows?: unknown) {
+  stubFetch();
+  await renderDetail(session, workflows);
+  const agent = lastAgentSocket()!;
+  act(() => {
+    agent.onopen?.();
+    emitText(agent, "first line");
+  });
+  const geo = mockScrollGeometry(screen.getByTestId("transcript-stream"), 400, 1000);
+  return { agent, geo };
+}
+
+describe("cockpit transcript follow", () => {
+  it("keeps the newest output in view while the reader is at the end", async () => {
+    const { agent, geo } = await renderFollowingTranscript();
+
+    act(() => {
+      geo.grow(600);
+      emitText(agent, "second line");
+    });
+
+    expect(geo.scrollTop).toBe(geo.end());
+  });
+
+  it("stays pinned when the reader is within the threshold of the end", async () => {
+    const { agent, geo } = await renderFollowingTranscript();
+
+    geo.readerScrollsTo(geo.end() - 30); // a stray wheel tick, still watching
+    act(() => {
+      geo.grow(600);
+      emitText(agent, "second line");
+    });
+
+    expect(geo.scrollTop).toBe(geo.end());
+  });
+
+  it("suspends following when the reader scrolls away from the end", async () => {
+    const { agent, geo } = await renderFollowingTranscript();
+
+    geo.readerScrollsTo(120); // reading back through earlier output
+    act(() => {
+      geo.grow(600);
+      emitText(agent, "second line");
+    });
+
+    expect(geo.scrollTop).toBe(120); // live output did not move the reader
+  });
+
+  it("resumes following when the reader returns to the end", async () => {
+    const { agent, geo } = await renderFollowingTranscript();
+
+    geo.readerScrollsTo(120);
+    act(() => {
+      geo.grow(600);
+      emitText(agent, "second line");
+    });
+    expect(geo.scrollTop).toBe(120);
+
+    geo.readerScrollsTo(geo.end());
+    act(() => {
+      geo.grow(600);
+      emitText(agent, "third line");
+    });
+    expect(geo.scrollTop).toBe(geo.end());
+  });
+
+  it("follows tool output that attaches to an existing tool card", async () => {
+    const { agent, geo } = await renderFollowingTranscript();
+    act(() => {
+      agent.emit("message_end", {
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "tool-9", name: "bash", input: { cmd: "pytest" } }],
+        },
+      });
+    });
+
+    const stream = screen.getByTestId("transcript-stream");
+    const rootItems = stream.childElementCount;
+    geo.readerScrollsTo(geo.end());
+    act(() => {
+      geo.grow(600);
+      agent.emit("message_end", {
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "tool-9", content: "exit 0" }],
+        },
+      });
+    });
+
+    // The card grew without a new root item — the case an item-count trigger
+    // would miss.
+    expect(stream.childElementCount).toBe(rootItems);
+    expect(within(stream).getByTestId("tool-card-tool-9")).toHaveTextContent("exit 0");
+    expect(geo.scrollTop).toBe(geo.end());
+  });
+
+  it("does not follow when the reader expands a tool card", async () => {
+    const { agent, geo } = await renderFollowingTranscript();
+    act(() => {
+      agent.emit("message_end", {
+        message: {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "tool-7", name: "bash", input: { cmd: "pytest" } }],
+        },
+      });
+    });
+
+    geo.readerScrollsTo(120);
+    const user = userEvent.setup();
+    await user.click(within(screen.getByTestId("transcript-stream")).getByText("bash"));
+
+    expect(geo.scrollTop).toBe(120); // expanding is a reader action, not output
+  });
+
+  it("resets to the newest output when the session tab changes", async () => {
+    const { geo } = await renderFollowingTranscript(
+      twoSessionSnapshots.sessions,
+      twoSessionSnapshots.workflows,
+    );
+    geo.readerScrollsTo(0); // following suspended in the coder stream
+
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId("session-tab-reproducer"));
+
+    const agent = lastAgentSocket()!;
+    act(() => {
+      agent.onopen?.();
+      emitText(agent, "reproducer line");
+    });
+    const next = mockScrollGeometry(screen.getByTestId("transcript-stream"), 400, 1000);
+    act(() => {
+      next.grow(600);
+      emitText(agent, "another reproducer line");
+    });
+
+    expect(next.scrollTop).toBe(next.end()); // suspension did not follow the tab
+  });
+
+  it("returns to the newest output when the channel reconnects and replays", async () => {
+    const { agent, geo } = await renderFollowingTranscript();
+    geo.readerScrollsTo(0); // reading back when the transport drops
+
+    vi.useFakeTimers();
+    try {
+      act(() => agent.onclose?.({ code: 1006 })); // not 1000, so the channel retries
+      act(() => {
+        vi.advanceTimersByTime(1000); // INITIAL_BACKOFF_MS
+      });
+      const replayed = lastAgentSocket()!;
+      expect(replayed).not.toBe(agent);
+
+      // The channel resets to an empty transcript and the daemon replays the
+      // buffer from the top; the reader must not be left at the beginning.
+      act(() => {
+        replayed.onopen?.();
+        emitText(replayed, "replayed line");
+      });
+      const next = mockScrollGeometry(screen.getByTestId("transcript-stream"), 400, 1000);
+      act(() => {
+        next.grow(600);
+        emitText(replayed, "newest line");
+      });
+
+      expect(next.scrollTop).toBe(next.end());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("exposes the stream as a focusable, named scroll region", async () => {
+    await renderFollowingTranscript();
+
+    const stream = screen.getByRole("region", { name: "Transcript stream" });
+    expect(stream).toHaveAttribute("tabindex", "0");
+    stream.focus();
+    expect(stream).toHaveFocus();
   });
 });
 

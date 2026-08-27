@@ -87,6 +87,32 @@ collapsible tool cards showing the tool identity and expandable to detail,
 agent thinking renders as distinct thinking blocks, and subagent activity is
 grouped under the parent tool call that spawned it.
 
+The panel occupies a bounded, viewport-relative region: its heading stays put
+and only the stream below it scrolls. A conversation of any length therefore
+leaves the rest of the cockpit — metadata, review panel, status strip, workflow
+strip — where the operator left it, instead of pushing it further off-screen
+with every tool call. On the narrow one-column layout the panel is bounded more
+tightly so the composer below it stays reachable.
+
+The stream follows the live output. It starts at the newest output and stays
+there as text, tool cards, and tool output arriving on an existing tool card
+extend it. Scrolling away from the end suspends that: output keeps arriving and
+the stream keeps growing, but the view stays exactly where the operator put it.
+Scrolling back to the end resumes following. "At the end" is deliberately
+forgiving, so a stray wheel tick does not silently strand the operator behind a
+live stream.
+
+A stream that starts over starts at the newest output again — selecting a
+different session tab, opening a different task, or the event channel
+reconnecting and replaying the session buffer. Expanding a tool card is a
+reader action, not new output, and never moves the view.
+
+The stream is a keyboard-focusable scroll region with its own accessible name,
+so it can be reached and scrolled from the keyboard and shows a visible focus
+ring. Following is instant and never animated: no motion is introduced for an
+operator who has reduced motion enabled. Streamed output is not announced
+continuously to assistive technology.
+
 ### Question and approval cards
 
 The selected session's pending question renders from the normalized `question`
