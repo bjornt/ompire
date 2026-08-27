@@ -39,6 +39,16 @@ A reconnect loses nothing, because the client never held anything the daemon
 did not also hold. The daemon chip reflects connection state so the operator
 can tell "nothing is happening" from "I am not being told what is happening".
 
+### Snapshot-gated routes
+
+A route that needs to decide whether a task exists waits for the current
+connection's first full snapshot. Socket open alone is not enough: it happens
+before that message, and a reconnect replaces any previous projection. The
+Ship flow index and `/ship/<task-id>` therefore render loading until a
+snapshot; an unknown or non-numeric ship id after it provides recovery links
+to Ship flow and Tasks. Any other unmatched application address renders a
+**Page not found** surface inside the normal chrome rather than a blank view.
+
 ### Task sections
 
 The Tasks view partitions visible tasks into three sections. A heading is

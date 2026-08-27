@@ -12,6 +12,7 @@ import {
   workflowActive,
 } from "../lib/daemonReducer";
 import { projectReview } from "../lib/reviewPresentation";
+import { hasShipFlowHandoff } from "../lib/shipPresentation";
 import { useDaemonState } from "../lib/useDaemonState";
 import type { ReviewState, SessionInfo, StepRecord, TaskDetail, WorkflowState, WorkshopStatus } from "../types";
 import { formatElapsed } from "../lib/formatElapsed";
@@ -147,10 +148,12 @@ function ReviewPanel({
   taskId,
   review,
   primarySession,
+  showShipFlow,
 }: {
   taskId: number;
   review: ReviewState | undefined;
   primarySession: SessionInfo | undefined;
+  showShipFlow: boolean;
 }) {
   const presentation = projectReview(review, primarySession);
   const [pending, setPending] = useState<"starting" | "cancelling" | null>(null);
@@ -239,9 +242,9 @@ function ReviewPanel({
             {pending === "cancelling" ? "Cancelling…" : "Cancel review"}
           </button>
         )}
-        {presentation.state === "approved" && (
+        {showShipFlow && (
           <Link className="reviewAction ship" to={`/ship/${taskId}`} data-testid="task-detail-ship-link">
-            Continue to Ship flow
+            {presentation.state === "approved" ? "Continue to Ship flow" : "Open Ship flow"}
           </Link>
         )}
       </div>
@@ -303,7 +306,7 @@ function workshopLabel(detail: TaskDetail): { text: string; status: WorkshopStat
 export function TaskDetailView() {
   const { id } = useParams();
   const taskId = Number(id);
-  const { tasks, sessions, workflows, reviews } = useDaemonState();
+  const { tasks, sessions, workflows, reviews, ships } = useDaemonState();
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Tab selection is local UI state (design D-9); null means "follow the
@@ -317,6 +320,7 @@ export function TaskDetailView() {
   const workflow = workflows[taskId] ?? null;
   const primarySession = taskSessions?.[primarySessionName(taskSessions, workflow ?? undefined)];
   const review = reviews[taskId];
+  const ship = ships[taskId];
   const sessionNames = taskSessionNames(taskSessions ?? undefined, workflow ?? undefined);
   const activeName =
     selected !== null && sessionNames.includes(selected)
@@ -357,6 +361,9 @@ export function TaskDetailView() {
   if (detail === null) {
     return <div className="empty">Loading…</div>;
   }
+
+  const taskForShipFlow = liveTask ?? detail;
+  const showShipFlow = hasShipFlowHandoff(taskForShipFlow, review, ship);
 
   const workshop = workshopLabel(detail);
   const escapeHatch = [
@@ -438,7 +445,12 @@ export function TaskDetailView() {
       </div>
 
       <TaskStatusStrip session={session} status={status} />
-      <ReviewPanel taskId={taskId} review={review} primarySession={primarySession} />
+      <ReviewPanel
+        taskId={taskId}
+        review={review}
+        primarySession={primarySession}
+        showShipFlow={showShipFlow}
+      />
 
 
       {workflow !== null && workflow.status === "waiting" && (

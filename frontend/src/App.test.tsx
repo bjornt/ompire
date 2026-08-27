@@ -86,4 +86,17 @@ describe("App", () => {
     expect(screen.queryByTestId("stub-page")).not.toBeInTheDocument();
     expect(screen.getByTestId("chrome-header")).toBeInTheDocument();
   });
+
+  it("renders an explicit recovery surface for an unmatched route", async () => {
+    window.history.pushState({}, "", "/not-a-real-route");
+    render(<App />);
+    act(() => {
+      MockWebSocket.instances[0].emitSnapshot({ projects: [], tasks: [] });
+    });
+
+    const notFound = await screen.findByTestId("app-not-found");
+    expect(notFound).toHaveTextContent("Page not found");
+    expect(within(notFound).getByRole("link", { name: "Tasks" })).toHaveAttribute("href", "/tasks");
+    expect(screen.getByTestId("chrome-header")).toBeInTheDocument();
+  });
 });

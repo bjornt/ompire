@@ -369,22 +369,34 @@ function CleanupStep({ task }: { task: Task }) {
 
 export function ShipFlowView() {
   const { id } = useParams();
-  const taskId = Number(id);
-  const { tasks, sessions, workflows, reviews, ships, gpg } = useDaemonState();
+  const taskId = id !== undefined && /^\d+$/.test(id) ? Number(id) : null;
+  const { snapshotReady, tasks, sessions, workflows, reviews, ships, gpg } = useDaemonState();
 
-  const task = tasks.find((t) => t.id === taskId);
+  const task = taskId === null ? undefined : tasks.find((candidate) => candidate.id === taskId);
   // Ship is task-scoped: review and publishing always use the workflow's
   // primary session, never an in-flight step's focused session.
-  const taskSessions = sessions[taskId];
-  const session = taskSessions?.[primarySessionName(taskSessions, workflows[taskId])];
-  const review = reviews[taskId];
-  const ship = ships[taskId];
+  const taskSessions = taskId === null ? undefined : sessions[taskId];
+  const session = taskSessions?.[primarySessionName(taskSessions, taskId === null ? undefined : workflows[taskId])];
+  const review = taskId === null ? undefined : reviews[taskId];
+  const ship = taskId === null ? undefined : ships[taskId];
 
-  if (!task) {
+  if (!snapshotReady) {
+    return (
+      <div className="empty" data-testid="ship-flow-loading">
+        <strong>Loading…</strong>
+        <span>Waiting for the daemon snapshot.</span>
+      </div>
+    );
+  }
+
+  if (taskId === null || !task) {
     return (
       <div className="empty" data-testid="ship-flow-not-found">
         <strong>Task not found</strong>
-        <Link to="/tasks">Back to Tasks</Link>
+        <span>The task is not available in the current daemon snapshot.</span>
+        <span>
+          <Link to="/ship">Ship flow</Link> · <Link to="/tasks">Tasks</Link>
+        </span>
       </div>
     );
   }

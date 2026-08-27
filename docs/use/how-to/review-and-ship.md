@@ -26,6 +26,13 @@ verdict.
 5. After **Approved**, select **Continue to Ship flow**. It opens
    `/ship/<task-id>` directly at the task's publishing flow.
 
+To resume publishing later without returning through a task card, select
+**Ship flow** in the global navigation. The chooser lists tasks that can enter
+or resume the handoff before recent shipped history, identifies the next stage,
+and opens the same task-specific flow. It never publishes anything by itself;
+the review, draft, signing, push, pull-request, and cleanup controls remain on
+that task's page.
+
 The Review panel remains task-scoped when task detail is showing another
 session tab, and it updates from the daemon stream without reloading the page.
 

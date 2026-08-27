@@ -28,10 +28,11 @@ class MockWebSocket {
 }
 
 function Probe() {
-  const { connectionState, projects, tasks } = useDaemonState();
+  const { connectionState, snapshotReady, projects, tasks } = useDaemonState();
   return (
     <div>
       <div data-testid="conn">{connectionState}</div>
+      <div data-testid="snapshot-ready">{String(snapshotReady)}</div>
       <div data-testid="projects">{JSON.stringify(projects)}</div>
       <div data-testid="tasks">{JSON.stringify(tasks)}</div>
     </div>
@@ -63,6 +64,30 @@ describe("DaemonProvider", () => {
     window.localStorage.removeItem("ompire_token");
   });
 
+  it("waits for the first snapshot before marking a connection ready", () => {
+    render(
+      <DaemonProvider>
+        <Probe />
+      </DaemonProvider>,
+    );
+
+    const socket = MockWebSocket.instances[0];
+    expect(screen.getByTestId("snapshot-ready")).toHaveTextContent("false");
+
+    act(() => {
+      socket.onopen?.();
+    });
+    expect(screen.getByTestId("conn")).toHaveTextContent("connected");
+    expect(screen.getByTestId("snapshot-ready")).toHaveTextContent("false");
+
+    act(() => {
+      socket.onmessage?.({
+        data: JSON.stringify({ seq: 0, ts: "", type: "snapshot", payload: { projects: [], tasks: [] } }),
+      });
+    });
+    expect(screen.getByTestId("snapshot-ready")).toHaveTextContent("true");
+  });
+
   it("populates state from the initial snapshot", () => {
     render(
       <DaemonProvider>
@@ -77,6 +102,7 @@ describe("DaemonProvider", () => {
 
     expect(screen.getByTestId("conn").textContent).toBe("connected");
     expect(screen.getByTestId("projects").textContent).toContain("maas");
+    expect(screen.getByTestId("snapshot-ready")).toHaveTextContent("true");
   });
 
   it("flips connection state on disconnect and reconnects with backoff", () => {
@@ -95,6 +121,7 @@ describe("DaemonProvider", () => {
       first.onclose?.();
     });
     expect(screen.getByTestId("conn").textContent).toBe("reconnecting");
+    expect(screen.getByTestId("snapshot-ready")).toHaveTextContent("false");
     expect(MockWebSocket.instances).toHaveLength(1);
 
     act(() => {
@@ -108,6 +135,7 @@ describe("DaemonProvider", () => {
     });
 
     expect(screen.getByTestId("conn").textContent).toBe("connected");
+    expect(screen.getByTestId("snapshot-ready")).toHaveTextContent("true");
     const projectsText = screen.getByTestId("projects").textContent ?? "";
     expect(projectsText).toContain("different-project");
     expect(projectsText).not.toContain("\"maas\"");

@@ -32,10 +32,12 @@ describe("applyEnvelope", () => {
       type: "snapshot",
       payload: { projects: [project], templates: [template], tasks: [] },
     };
+    expect(initialDaemonState.snapshotReady).toBe(false);
     const next = applyEnvelope(initialDaemonState, envelope);
     expect(next.projects).toEqual([project]);
     expect(next.templates).toEqual([template]);
     expect(next.tasks).toEqual([]);
+    expect(next.snapshotReady).toBe(true);
   });
 
   it("tolerates a snapshot without a templates list", () => {

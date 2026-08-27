@@ -36,6 +36,10 @@ import type {
 
 export interface DaemonState {
   connectionState: ConnectionState;
+  /** A route may make an absence decision only after the current main socket
+   * has delivered its authoritative replacement snapshot. Connection open
+   * alone is insufficient: it precedes that first message. */
+  snapshotReady: boolean;
   projects: Project[];
   /** Template registry (templates capability), keyed by name like projects:
    * loaded from the snapshot, upserted by `template_created`/
@@ -83,6 +87,7 @@ export interface DaemonState {
 
 export const initialDaemonState: DaemonState = {
   connectionState: "connecting",
+  snapshotReady: false,
   projects: [],
   templates: [],
   tasks: [],
@@ -129,6 +134,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       }
       return {
         ...state,
+        snapshotReady: true,
         projects: payload.projects,
         templates: payload.templates ?? [],
         tasks: payload.tasks,

@@ -43,7 +43,10 @@ The panel updates from the main daemon stream without a reload. It distinguishes
 an open review, comments returned to the agent, approval, abort, and review
 error. When comments are returned, it says the primary agent is addressing
 them; after that session returns to idle, **Start another review** becomes
-available. An approved review shows **Continue to Ship flow**, which links to
+available. It exposes the task's Ship flow link when review is approved, the
+daemon has recorded ship progress, or the task has a pull request. When the
+review display is approved the link reads **Continue to Ship flow**; otherwise
+a recorded ship or pull-request handoff reads **Open Ship flow**. Both open
 `/ship/<task-id>`.
 
 Every iteration is ordered from oldest to newest and records its outcome,

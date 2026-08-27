@@ -27,6 +27,7 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     closedByUnmountRef.current = false;
 
     function connect() {
+      setState((prev) => ({ ...prev, snapshotReady: false }));
       const token = getDaemonToken();
       const url = new URL(daemonWsUrl());
       if (token) url.searchParams.set("token", token);
@@ -35,18 +36,20 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
       socketRef.current = socket;
 
       socket.onopen = () => {
+        if (socketRef.current !== socket) return;
         backoffRef.current = INITIAL_BACKOFF_MS;
-        setState((prev) => ({ ...prev, connectionState: "connected" }));
+        setState((prev) => ({ ...prev, connectionState: "connected", snapshotReady: false }));
       };
 
       socket.onmessage = (event: MessageEvent<string>) => {
+        if (socketRef.current !== socket) return;
         const envelope = JSON.parse(event.data) as Envelope;
         setState((prev) => applyEnvelope(prev, envelope));
       };
 
       socket.onclose = () => {
-        if (closedByUnmountRef.current) return;
-        setState((prev) => ({ ...prev, connectionState: "reconnecting" }));
+        if (socketRef.current !== socket || closedByUnmountRef.current) return;
+        setState((prev) => ({ ...prev, connectionState: "reconnecting", snapshotReady: false }));
         const delay = backoffRef.current;
         backoffRef.current = Math.min(backoffRef.current * 2, MAX_BACKOFF_MS);
         timeoutRef.current = setTimeout(connect, delay);

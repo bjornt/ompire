@@ -389,6 +389,23 @@
   cursor: not-allowed;
 }
 
+.shipFlowButton {
+  border: 1px solid var(--line);
+  background: var(--surface2);
+  border-radius: 5px;
+  padding: 3px 10px;
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1.5;
+  text-decoration: none;
+}
+
+.shipFlowButton:hover {
+  border-color: var(--faint);
+  text-decoration: none;
+}
+
 .cardFooter {
   display: flex;
   align-items: center;

@@ -1,0 +1,126 @@
+.shipIndex {
+  display: grid;
+  gap: 20px;
+  max-width: 860px;
+}
+
+.shipIndexSection {
+  min-width: 0;
+}
+
+.shipIndexList {
+  display: grid;
+  gap: 10px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.shipIndexRow {
+  min-width: 0;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.shipIndexRow.in-progress {
+  border-color: color-mix(in srgb, var(--violet) 45%, var(--line));
+}
+
+.shipIndexRow.error {
+  border-color: color-mix(in srgb, var(--red) 45%, var(--line));
+}
+
+.shipIndexRow.complete {
+  opacity: 0.72;
+}
+
+.shipIndexLink {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 13px 15px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.shipIndexLink:hover {
+  background: color-mix(in srgb, var(--surface2) 70%, var(--surface));
+  border-radius: 8px;
+}
+
+.shipIndexLink:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+.shipIndexTopline {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  min-width: 0;
+}
+
+.shipIndexTask {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.shipIndexStage {
+  flex: none;
+  margin-left: auto;
+  border-radius: 4px;
+  padding: 2px 7px;
+  background: var(--surface2);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.shipIndexStage.in-progress {
+  color: var(--violet);
+}
+
+.shipIndexStage.error {
+  color: var(--red);
+}
+
+.shipIndexStage.complete {
+  color: var(--green);
+}
+
+.shipIndexDetail,
+.shipIndexError {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.shipIndexDetail {
+  color: var(--muted);
+}
+
+.shipIndexError {
+  color: var(--red);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+@media (max-width: 520px) {
+  .shipIndexTopline {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .shipIndexStage {
+    margin-left: 0;
+  }
+}

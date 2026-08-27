@@ -137,6 +137,14 @@ A card offers a Review action when the task's primary session is `idle` with a
 live agent and no review is open. While a review is open the card surfaces the
 review link and the `reviewing` pill instead.
 
+### Ship flow action
+
+A non-archived task card exposes **Ship flow** when its review is approved,
+the daemon has recorded ship progress, or the task has a pull-request URL. It
+opens that task's existing `/ship/<task-id>` workflow so the operator can
+resume drafting, signing, publication, merge waiting, or cleanup. The link
+does not start a review or publishing command.
+
 ### The Shipped section
 
 Below the active cards, one collapsed row per task with a `pr_url`, archived

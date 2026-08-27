@@ -18,6 +18,7 @@ import {
   workflowActive,
 } from "../lib/daemonReducer";
 import { projectReview } from "../lib/reviewPresentation";
+import { hasShipFlowHandoff } from "../lib/shipPresentation";
 import { useDaemonState } from "../lib/useDaemonState";
 import type {
   AdvisoryKind,
@@ -25,6 +26,7 @@ import type {
   PendingQuestion,
   ReviewState,
   SessionInfo,
+  ShipState,
   StatsPayload,
   Task,
   WorkflowState,
@@ -162,6 +164,7 @@ function TaskCard({
   stats,
   advisories,
   review,
+  ship,
 }: {
   task: Task;
   sessions: Record<string, SessionInfo> | undefined;
@@ -169,6 +172,7 @@ function TaskCard({
   stats: Record<string, StatsPayload> | undefined;
   advisories: Record<string, Partial<Record<AdvisoryKind, AdvisoryPayload>>> | undefined;
   review: ReviewState | undefined;
+  ship: ShipState | undefined;
 }) {
   const [showError, setShowError] = useState(false);
   const spawning = isSpawning(task);
@@ -178,6 +182,7 @@ function TaskCard({
   const session = sessions?.[sessionName];
   const primarySession = sessions?.[primarySessionName(sessions, workflow)];
   const reviewPresentation = projectReview(review, primarySession);
+  const showShipFlow = hasShipFlowHandoff(task, review, ship);
   const runPill = workflowPill(workflow);
   const stepPrefix = workflowActive(workflow) ? workflow?.step : null;
   const sessionFailed = session?.status === "failed";
@@ -301,6 +306,11 @@ function TaskCard({
             {startingReview ? "Starting review…" : "Review"}
           </button>
         )}
+        {showShipFlow && (
+          <Link className="shipFlowButton" to={`/ship/${task.id}`} data-testid={`ship-link-${task.id}`}>
+            Ship flow
+          </Link>
+        )}
       </div>
       {session?.status === "idle" && maybeWaiting && (
         <div className="maybeWaiting" data-testid={`maybe-waiting-${task.id}`}>
@@ -358,7 +368,7 @@ function TaskCard({
 }
 
 export function TasksView() {
-  const { tasks, projects, sessions, workflows, stats, advisories, reviews, attention, settings } =
+  const { tasks, projects, sessions, workflows, stats, advisories, reviews, ships, attention, settings } =
     useDaemonState();
   const [searchParams] = useSearchParams();
   // Project filter (projects-view capability): the Projects card's
@@ -443,6 +453,7 @@ export function TasksView() {
                     stats={stats[task.id]}
                     advisories={advisories[task.id]}
                     review={reviews[task.id]}
+                    ship={ships[task.id]}
                   />
                 ))}
               </div>
@@ -461,6 +472,7 @@ export function TasksView() {
                     stats={stats[task.id]}
                     advisories={advisories[task.id]}
                     review={reviews[task.id]}
+                    ship={ships[task.id]}
                   />
                 ))}
               </div>
@@ -479,6 +491,7 @@ export function TasksView() {
                     stats={stats[task.id]}
                     advisories={advisories[task.id]}
                     review={reviews[task.id]}
+                    ship={ships[task.id]}
                   />
                 ))}
               </div>

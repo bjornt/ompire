@@ -9,6 +9,36 @@ host-side credentials the agent never sees.
 The flow has four steps — Review, Commit, Push + PR, Cleanup — surfaced as a
 stepper in the Ship Flow view.
 
+## Ship flow index
+
+The global **Ship flow** navigation item opens `/ship`, a chooser for the
+existing task-specific publishing workflows. It sends no command and does not
+relax review, signing, Git, forge, or cleanup preconditions.
+
+The chooser waits for the current daemon snapshot before deciding what is
+available. Until then it shows loading rather than an empty or missing-task
+state. Once the snapshot arrives, it shows non-archived tasks with an approved
+review, recorded ship state, or pull request in **Ready or in progress**, then
+the remaining pull-request records — including archived records — in **Recently
+shipped**. A task appears once in its most relevant group; each group is
+ordered by the task's `updated_at` value, newest first.
+
+Each row links to `/ship/<task-id>` and names the next stage from daemon state:
+
+| Label | Meaning |
+|---|---|
+| Review | The recorded handoff has not reached approved review. |
+| Draft | Review is approved but publication text is not ready. |
+| Sign | A draft is ready, or the signed commit is in progress. |
+| Push / PR | A signed commit exists or publication is in progress. |
+| Wait for merge | A pull request exists but has not resolved. |
+| Cleanup | A merged or closed pull request can have its workspace removed. |
+| Cleanup complete | An archived task remains as shipped history. |
+
+A failed ship state remains visible at its retry stage with the daemon's
+captured error. The chooser updates from snapshot deltas without reloading. If
+it has no qualifying task after a snapshot, it links back to Tasks.
+
 ## Using ship flow
 
 ### 1. Draft
@@ -117,6 +147,10 @@ resulting pull-request link.
 pull-request state.
 
 All four update without a page reload.
+
+Direct `/ship/<task-id>` navigation also waits for the current snapshot. An
+unknown or non-numeric id after that snapshot shows **Task not found** with
+links to both Ship flow and Tasks, rather than a transient false 404.
 
 ## Configuration
 

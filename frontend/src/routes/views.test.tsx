@@ -1451,6 +1451,55 @@ describe("TaskDetailView", () => {
     expect(within(review).getByTestId("task-detail-start-review")).toHaveTextContent("Start another review");
   });
 
+  it("exposes Ship flow for recorded ship progress without an approved review", async () => {
+    const task = makeTask();
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", {
+      projects: [project],
+      tasks: [task],
+      ships: {
+        "1": {
+          status: "drafted",
+          draft: {
+            commit_message: "draft commit",
+            pr_title: "draft title",
+            pr_body: "draft body",
+            source: "agent",
+          },
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t0",
+        },
+      },
+    });
+
+    const review = await screen.findByTestId("task-detail-review");
+    expect(within(review).getByTestId("task-detail-ship-link")).toHaveAttribute("href", "/ship/1");
+    expect(within(review).getByTestId("task-detail-ship-link")).toHaveTextContent("Open Ship flow");
+  });
+
+  it("exposes Ship flow when a pull request arrives live", async () => {
+    const task = makeTask();
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", { projects: [project], tasks: [task] });
+
+    const review = await screen.findByTestId("task-detail-review");
+    expect(within(review).queryByTestId("task-detail-ship-link")).not.toBeInTheDocument();
+
+    act(() => {
+      socket().emit(
+        "task_updated",
+        makeTask({
+          pr_url: "https://github.com/ompire/maas/pull/1",
+          updated_at: "2026-08-20T00:02:00Z",
+        }),
+      );
+    });
+
+    expect(within(review).getByTestId("task-detail-ship-link")).toHaveAttribute("href", "/ship/1");
+  });
+
 });
 
 describe("Review capability (TasksView)", () => {
@@ -1625,9 +1674,218 @@ describe("Review capability (TasksView)", () => {
 
     expect(screen.queryByTestId("review-button-1")).not.toBeInTheDocument();
   });
+
+  it("links task cards with approved reviews, ship progress, or pull requests", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [
+        makeTask({ id: 1, slug: "approved" }),
+        makeTask({ id: 2, slug: "drafted" }),
+        makeTask({ id: 3, slug: "pull-request", pr_url: "https://github.com/ompire/maas/pull/3" }),
+      ],
+      reviews: {
+        "1": { status: "approved", url: "http://127.0.0.1:7180", port: 7180, iterations: [] },
+      },
+      ships: {
+        "2": {
+          status: "drafted",
+          draft: {
+            commit_message: "draft commit",
+            pr_title: "draft title",
+            pr_body: "draft body",
+            source: "agent",
+          },
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t0",
+        },
+      },
+    });
+
+    for (const id of [1, 2, 3]) {
+      expect(screen.getByTestId(`ship-link-${id}`)).toHaveAttribute("href", `/ship/${id}`);
+    }
+  });
+
+  it("adds card Ship flow links from live review, ship, and task deltas", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [
+        makeTask({ id: 1, slug: "review-live" }),
+        makeTask({ id: 2, slug: "ship-live" }),
+        makeTask({ id: 3, slug: "pr-live" }),
+      ],
+    });
+
+    for (const id of [1, 2, 3]) {
+      expect(screen.queryByTestId(`ship-link-${id}`)).not.toBeInTheDocument();
+    }
+
+    act(() => {
+      socket().emit("review_started", { task_id: 1, url: "http://127.0.0.1:7180", port: 7180 });
+      socket().emit("review_finished", { task_id: 1, status: "approved" });
+      socket().emit("ship_draft", {
+        task_id: 2,
+        draft: {
+          commit_message: "draft commit",
+          pr_title: "draft title",
+          pr_body: "draft body",
+          source: "agent",
+        },
+      });
+      socket().emit(
+        "task_updated",
+        makeTask({
+          id: 3,
+          slug: "pr-live",
+          pr_url: "https://github.com/ompire/maas/pull/3",
+          updated_at: "2026-08-20T00:02:00Z",
+        }),
+      );
+    });
+
+    for (const id of [1, 2, 3]) {
+      expect(screen.getByTestId(`ship-link-${id}`)).toHaveAttribute("href", `/ship/${id}`);
+    }
+  });
 });
 
 describe("ShipFlowView", () => {
+  it("renders the bare Ship flow chooser from the snapshot and updates it live", async () => {
+    await renderAt("/ship", { projects: [project], tasks: [makeTask()] });
+
+    expect(screen.getByTestId("ship-index-empty")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Ship flow" }).className).toContain("navLinkActive");
+
+    act(() => {
+      socket().emit("ship_draft", {
+        task_id: 1,
+        draft: {
+          commit_message: "draft commit",
+          pr_title: "draft title",
+          pr_body: "draft body",
+          source: "agent",
+        },
+      });
+    });
+
+    const row = await screen.findByTestId("ship-index-row-1");
+    expect(row).toHaveAttribute("href", "/ship/1");
+    expect(row).toHaveTextContent("Next: Sign");
+    expect(row).toHaveTextContent("Create the signed publication commit.");
+  });
+
+  it("waits for the daemon snapshot before rendering the bare Ship flow index", () => {
+    window.history.pushState({}, "", "/ship");
+    render(<App />);
+
+    expect(screen.getByTestId("ship-index-loading")).toBeInTheDocument();
+
+    act(() => {
+      socket().emitSnapshot({ projects: [project], tasks: [] });
+    });
+    expect(screen.getByTestId("ship-index-empty")).toBeInTheDocument();
+  });
+
+  it("lists active handoffs before retained shipped history without duplicates", async () => {
+    await renderAt("/ship", {
+      projects: [project],
+      tasks: [
+        makeTask({
+          id: 1,
+          slug: "approved",
+          updated_at: "2026-08-20T00:01:00Z",
+        }),
+        makeTask({
+          id: 2,
+          slug: "cleanup",
+          updated_at: "2026-08-20T00:03:00Z",
+          pr_url: "https://github.com/ompire/maas/pull/2",
+          pr_state: "merged",
+        }),
+        makeTask({
+          id: 3,
+          slug: "failed-push",
+          updated_at: "2026-08-20T00:02:00Z",
+        }),
+        makeTask({
+          id: 4,
+          slug: "archived",
+          state: "archived",
+          updated_at: "2026-08-20T00:04:00Z",
+          pr_url: "https://github.com/ompire/maas/pull/4",
+          pr_state: "merged",
+        }),
+      ],
+      reviews: {
+        "1": { status: "approved", url: "http://127.0.0.1:7180", port: 7180, iterations: [] },
+      },
+      ships: {
+        "3": {
+          status: "error",
+          draft: null,
+          commit_sha: "abc123",
+          pr_url: null,
+          error: "push/PR failed: forbidden",
+          updated_at: "2026-08-20T00:02:00Z",
+          lastStep: { step: "pr", status: "failed", detail: "forbidden" },
+        },
+      },
+    });
+
+    const active = screen.getByTestId("ship-index-active");
+    expect(within(active).getAllByRole("link").map((link) => link.getAttribute("href"))).toEqual([
+      "/ship/2",
+      "/ship/3",
+      "/ship/1",
+    ]);
+    expect(within(active).getByTestId("ship-index-row-2")).toHaveTextContent("Next: Cleanup");
+    expect(within(active).getByTestId("ship-index-row-3")).toHaveTextContent("Next: Push / PR");
+    expect(within(active).getByTestId("ship-index-error-3")).toHaveTextContent("push/PR failed: forbidden");
+
+    const recent = screen.getByTestId("ship-index-recent");
+    expect(within(recent).getByTestId("ship-index-row-4")).toHaveTextContent("Next: Cleanup complete");
+    expect(screen.getAllByTestId(/ship-index-row-/)).toHaveLength(4);
+  });
+
+  it("waits for the current snapshot before resolving a direct ship route", async () => {
+    window.history.pushState({}, "", "/ship/1");
+    render(<App />);
+
+    expect(screen.getByTestId("ship-flow-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("ship-flow-not-found")).not.toBeInTheDocument();
+
+    act(() => {
+      socket().emitSnapshot({ projects: [project], tasks: [makeTask()] });
+    });
+
+    expect(await screen.findByTestId("ship-flow")).toBeInTheDocument();
+  });
+
+  it("offers Ship flow and Tasks recovery links for an unknown task route", async () => {
+    await renderAt("/ship/999", { projects: [project], tasks: [makeTask()] });
+
+    const unknown = screen.getByTestId("ship-flow-not-found");
+    expect(within(unknown).getByRole("link", { name: "Ship flow" })).toHaveAttribute("href", "/ship");
+    expect(within(unknown).getByRole("link", { name: "Tasks" })).toHaveAttribute("href", "/tasks");
+  });
+
+  it("shows task recovery after the snapshot for a non-numeric task route", async () => {
+    await renderAt("/ship/not-a-task", { projects: [project], tasks: [makeTask()] });
+    expect(screen.getByTestId("ship-flow-not-found")).toBeInTheDocument();
+  });
+
+  it("moves a loaded ship route to its recovery state when the task is purged", async () => {
+    await renderAt("/ship/1", { projects: [project], tasks: [makeTask()] });
+    expect(screen.getByTestId("ship-flow")).toBeInTheDocument();
+
+    act(() => {
+      socket().emit("task_deleted", { id: 1 });
+    });
+
+    expect(await screen.findByTestId("ship-flow-not-found")).toBeInTheDocument();
+  });
   it("renders the live review step and live commit/push steps", async () => {
     await renderAt("/ship/1", {
       projects: [project],
