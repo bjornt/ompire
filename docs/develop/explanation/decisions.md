@@ -36,7 +36,7 @@ tool-enforced structure. It also explains the shape of this documentation.
 | Work model | 0008, 0009, 0010, 0018 |
 | Review and publishing | 0011, 0017 |
 | Attention | 0012 |
-| Settings | 0013 |
+| Settings | 0013, 0021 |
 | Testing | 0014 |
 | Process and documentation | 0001, 0019, 0020 |
 

@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonProvider } from "../lib/daemonSocket";
 import { SettingsView } from "./SettingsView";
-import type { DaemonInfo, DaemonSettings, GitHubStatus } from "../types";
+import type { DaemonInfo, DaemonSettings, GitHubStatus, GpgStatus } from "../types";
 
 type Provenance = Record<string, "default" | "config" | "override">;
 
@@ -32,6 +32,7 @@ class MockWebSocket {
     tasks?: unknown[];
     settings?: DaemonSettings;
     gh?: GitHubStatus;
+    gpg?: GpgStatus;
   }) {
     this.onopen?.();
     this.emit("snapshot", payload);
@@ -60,6 +61,7 @@ function buildFetchHandler({
   token = "ompire_tok_existingtoken123",
   rotateToken = "ompire_tok_rotatedtoken456",
   githubStatus,
+  gpgStatus,
 }: {
   settings?: DaemonSettings;
   provenance?: Provenance;
@@ -67,6 +69,7 @@ function buildFetchHandler({
   token?: string;
   rotateToken?: string;
   githubStatus?: GitHubStatus;
+  gpgStatus?: GpgStatus;
 } = {}) {
   return async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
@@ -89,6 +92,16 @@ function buildFetchHandler({
     if (url === "/api/settings/token/rotate" && method === "POST") {
       return jsonResponse({ token: rotateToken });
     }
+    if (url === "/api/gpg/recheck" && method === "POST") {
+      return jsonResponse(gpgStatus ?? { state: "unknown" });
+    }
+    if (url.startsWith("/api/settings/gpg_signing_key") && method === "DELETE") {
+      const nextProvenance = { ...provenance, gpg_signing_key: "default" as const };
+      return jsonResponse({
+        settings: { ...settings, gpg_signing_key: null },
+        provenance: nextProvenance,
+      });
+    }
     if (url === "/api/gh/recheck" && method === "POST") {
       return jsonResponse(githubStatus ?? { identity: { state: "unknown" }, targets: {} });
     }
@@ -96,7 +109,11 @@ function buildFetchHandler({
   };
 }
 
-function renderSettings(snapshotSettings: DaemonSettings = {}, githubStatus?: GitHubStatus) {
+function renderSettings(
+  snapshotSettings: DaemonSettings = {},
+  githubStatus?: GitHubStatus,
+  gpgStatus?: GpgStatus,
+) {
   render(
     <DaemonProvider>
       <SettingsView />
@@ -109,6 +126,7 @@ function renderSettings(snapshotSettings: DaemonSettings = {}, githubStatus?: Gi
       templates: [],
       settings: snapshotSettings,
       gh: githubStatus,
+      gpg: gpgStatus,
     });
   });
 }
@@ -295,5 +313,172 @@ describe("SettingsView GitHub CLI panel", () => {
 
     resolveRecheck?.(jsonResponse(readyGitHub));
     await waitFor(() => expect(button).not.toBeDisabled());
+  });
+});
+
+describe("SettingsView commit-signing panel", () => {
+  beforeEach(() => {
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    window.localStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    window.localStorage.clear();
+    MockWebSocket.instances = [];
+  });
+
+  const KEY_A = "A".repeat(40);
+  const KEY_B = "B".repeat(40);
+
+  const candidate = (fingerprint: string, uid: string) => ({
+    fingerprint,
+    key_id: fingerprint.slice(-16),
+    uid,
+    keygrip: `grip-${fingerprint.slice(0, 4)}`,
+    created_at: null,
+    expires_at: null,
+    primary_fingerprint: fingerprint,
+  });
+
+  const ambiguous: GpgStatus = {
+    state: "ambiguous",
+    selected: null,
+    candidates: [
+      candidate(KEY_A, "Alice <alice@example.com>"),
+      candidate(KEY_B, "Bob <bob@example.com>"),
+    ],
+    cache_ttl: null,
+    detail: "2 usable signing keys; choose one in Templates & settings",
+    checked_at: "t0",
+  };
+
+  const ready: GpgStatus = {
+    state: "ready",
+    selected: {
+      ...candidate(KEY_B, "Bob <bob@example.com>"),
+      source: "override",
+      protection: "protected",
+    },
+    candidates: ambiguous.candidates,
+    cache_ttl: null,
+    detail: null,
+    checked_at: "t1",
+  };
+
+  it("offers every usable key when the daemon cannot choose", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(buildFetchHandler()));
+    renderSettings({}, undefined, ambiguous);
+
+    expect(await screen.findByTestId("daemon-gpg-state")).toHaveTextContent(
+      "gpg unselected",
+    );
+    // The selector below is the action; repeating "choose one in Settings"
+    // to someone already in Settings is noise.
+    expect(screen.queryByTestId("daemon-gpg-recovery")).not.toBeInTheDocument();
+    expect(screen.getByTestId("daemon-gpg-detail")).toHaveTextContent(
+      "2 usable signing keys",
+    );
+    const select = screen.getByTestId("gpg-key-select") as HTMLSelectElement;
+    expect([...select.options].map((o) => o.value)).toEqual(["", KEY_A, KEY_B]);
+  });
+
+  it("persists a selection through the settings API", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockImplementation(buildFetchHandler());
+    vi.stubGlobal("fetch", fetchMock);
+    renderSettings({}, undefined, ambiguous);
+
+    await user.selectOptions(await screen.findByTestId("gpg-key-select"), KEY_B);
+
+    await waitFor(() => {
+      const put = fetchMock.mock.calls.find(
+        ([url, init]) => url === "/api/settings" && init?.method === "PUT",
+      );
+      expect(put).toBeDefined();
+      expect(JSON.parse(put![1].body as string)).toEqual({
+        gpg_signing_key: KEY_B,
+      });
+    });
+  });
+
+  it("clearing the selection returns the daemon to auto-detection", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockImplementation(buildFetchHandler());
+    vi.stubGlobal("fetch", fetchMock);
+    renderSettings({}, undefined, ready);
+
+    await user.selectOptions(await screen.findByTestId("gpg-key-select"), "");
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/gpg_signing_key",
+        expect.objectContaining({ method: "DELETE" }),
+      );
+    });
+  });
+
+  it("shows the selected key and how it was chosen, without key material", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(buildFetchHandler()));
+    renderSettings({}, undefined, ready);
+
+    expect(await screen.findByTestId("daemon-gpg-fingerprint")).toHaveTextContent(
+      KEY_B,
+    );
+    expect(screen.getByTestId("daemon-gpg-uid")).toHaveTextContent("Bob");
+    expect(screen.getByTestId("daemon-gpg-source")).toHaveTextContent(
+      "Selected here",
+    );
+    const panel = screen.getByTestId("daemon-signing-panel");
+    expect(panel.textContent).not.toMatch(/passphrase|PRIVATE KEY|pinentry/i);
+  });
+
+  it("re-checks the key on demand and disables the control while in flight", async () => {
+    const user = userEvent.setup();
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const base = buildFetchHandler();
+    const fetchMock = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/gpg/recheck") {
+        await gate;
+        return jsonResponse(ready);
+      }
+      return base(url, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderSettings({}, undefined, ambiguous);
+
+    const button = await screen.findByTestId("recheck-gpg-button");
+    await user.click(button);
+
+    await waitFor(() => expect(button).toBeDisabled());
+    expect(button).toHaveTextContent("Checking key…");
+
+    await act(async () => {
+      release!();
+      await gate;
+    });
+    await waitFor(() => expect(button).not.toBeDisabled());
+  });
+
+  it("shows the terminal helper when the agent is unreachable", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(buildFetchHandler()));
+    renderSettings({}, undefined, {
+      ...ready,
+      state: "agent_unavailable",
+      detail: "gpg-agent is not reachable",
+    });
+
+    expect(await screen.findByTestId("daemon-gpg-command")).toHaveTextContent(
+      "gpg-connect-agent /bye",
+    );
+    // Recovery that happens outside this panel is still shown.
+    expect(screen.getByTestId("daemon-gpg-recovery")).toHaveTextContent(
+      "Start the agent",
+    );
   });
 });

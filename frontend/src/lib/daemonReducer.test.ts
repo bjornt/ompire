@@ -695,7 +695,7 @@ describe("applyEnvelope ship/gpg events", () => {
             updated_at: "t0",
           },
         },
-        gpg: { state: "cached", key: "ABC", keygrip: "abc", detail: null, checked_at: "t0" },
+        gpg: { state: "ready", selected: { fingerprint: "A".repeat(40), key_id: "ABC", uid: null, keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
       },
     });
     expect(state.ships[1]).toEqual({
@@ -706,7 +706,7 @@ describe("applyEnvelope ship/gpg events", () => {
       error: null,
       updated_at: "t0",
     });
-    expect(state.gpg).toEqual({ state: "cached", key: "ABC", keygrip: "abc", detail: null, checked_at: "t0" });
+    expect(state.gpg).toEqual({ state: "ready", selected: { fingerprint: "A".repeat(40), key_id: "ABC", uid: null, keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" });
   });
 
   it("upserts a ship on ship_draft", () => {

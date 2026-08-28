@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from ompire_daemon.config import Config
 from ompire_daemon.db import settings as settings_table
+from ompire_daemon.gpg import FINGERPRINT_RE
 
 
 class SettingsValidationError(Exception):
@@ -55,6 +56,10 @@ _DEFAULTS: dict[str, Any] = {
     "renotify_interval": 300,
     "stall_threshold": 300,
     "context_advisory_threshold": 80,
+    # ADR-0021: the one setting that selects an identity. Its override is
+    # bounded to a full fingerprint here and to a key the host keyring already
+    # holds at the REST boundary, so it can never name a key off this host.
+    "gpg_signing_key": None,
 }
 
 # Keys that may be seeded from config.toml and the Config attribute that
@@ -63,6 +68,7 @@ _CONFIG_KEYS: dict[str, str] = {
     "renotify_interval": "renotify_interval",
     "stall_threshold": "stall_threshold",
     "context_advisory_threshold": "context_advisory_threshold",
+    "gpg_signing_key": "gpg_signing_key",
 }
 
 
@@ -113,6 +119,17 @@ def _validate(key: str, value: Any) -> Any:
                 key, f"{key} must be between 1 and 100, got {value!r}"
             )
         return value
+
+    if key == "gpg_signing_key":
+        # Only a full fingerprint identifies exactly one key. Key IDs and
+        # user-ID substrings stay a config.toml convenience; a stored
+        # selection must be unambiguous (ADR-0021).
+        if not isinstance(value, str) or not FINGERPRINT_RE.match(value):
+            raise SettingsValidationError(
+                key,
+                f"{key} must be a 40-character OpenPGP fingerprint, got {value!r}",
+            )
+        return value.upper()
 
     # Unreachable because of the key check above, but keep exhaustive.
     raise SettingsValidationError(key, f"{key} has no validator")

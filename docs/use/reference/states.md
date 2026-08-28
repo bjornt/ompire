@@ -80,9 +80,18 @@ interval until it is dealt with.
 
 | State | Meaning | Shipping |
 |---|---|---|
-| `cached` | Passphrase cached in the agent | Allowed |
-| `locked` | Key present, passphrase not cached | Refused |
-| `unknown` | Key, agent, or probe unresolved | Refused |
+| `ready` | The selected key can sign now — cached, or unprotected | Allowed |
+| `locked` | Protected key present, passphrase not cached | Refused |
+| `ambiguous` | Several usable signing keys, none selected | Refused |
+| `no_key` | No signing-capable secret key in the keyring | Refused |
+| `missing` | `gpg` or `gpg-connect-agent` is not executable | Refused |
+| `agent_unavailable` | The tools run but `gpg-agent` is unreachable | Refused |
+| `error` | Any other indeterminate result; carries a reason | Refused |
+| `unknown` | No probe has completed yet | Refused |
+
+Only `ready` allows a commit; every other state fails closed and carries its
+own recovery action. An unprotected key is `ready` rather than `locked`: it has
+nothing to cache. See [GPG signing](gpg-signing.md).
 
 ## GitHub states
 
@@ -108,7 +117,7 @@ credential-source tuple that produced it.
 | State | Meaning | Shipping |
 |---|---|---|
 | `unchecked` | The target has not been checked under a ready identity. | Refused |
-| `allowed` | Read-only repository, pull-request policy, and effective-access checks passed. | Allowed with a ready GPG gate |
+| `allowed` | Read-only repository, pull-request policy, and effective-access checks passed. | Allowed with a `ready` GPG gate |
 | `denied` | The known account cannot use the registered upstream target. | Refused |
 | `error` | Target response or eligibility evidence was incomplete or indeterminate. | Refused |
 

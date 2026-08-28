@@ -2248,7 +2248,7 @@ describe("ShipFlowView", () => {
     await renderAt("/ship/1", {
       projects: [githubProject],
       tasks: [makeTask()],
-      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
       gh: readyGitHub,
     });
 
@@ -2484,7 +2484,7 @@ describe("ShipFlowView", () => {
       sessions: {
         "1": { main: { status: "reviewing", reason: "llmvet review", since: "t0" } },
       },
-      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
       gh: readyGitHub,
       reviews: {
         "1": {
@@ -2524,17 +2524,83 @@ describe("ShipFlowView", () => {
     expect(screen.getByTestId("ship-step-cleanup")).toBeInTheDocument();
   });
 
+  const signingSelection = {
+    fingerprint: "ABC1230000000000000000000000000000000000",
+    key_id: "ABC123",
+    uid: "Test Key <t@example.com>",
+    keygrip: "abc",
+    source: "auto" as const,
+    protection: "protected" as const,
+  };
+
   it("blocks Sign & commit and shows the GPG locked banner with unlock command", async () => {
     await renderAt("/ship/1", {
       projects: [project],
       tasks: [makeTask()],
-      gpg: { state: "locked", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gpg: {
+        state: "locked",
+        selected: signingSelection,
+        candidates: [],
+        cache_ttl: null,
+        detail: null,
+        checked_at: "t0",
+      },
     });
 
     expect(screen.getByTestId("sign-commit-button")).toBeDisabled();
-    expect(screen.getByTestId("gpg-locked-banner")).toBeInTheDocument();
+    expect(screen.getByTestId("gpg-blocked-banner")).toBeInTheDocument();
     expect(screen.getByTestId("gpg-unlock-command")).toHaveTextContent(
-      "echo | gpg --clearsign -u ABC123 >/dev/null",
+      "echo | gpg --clearsign -u ABC1230000000000000000000000000000000000 >/dev/null",
+    );
+  });
+
+  it.each([
+    ["ambiguous", "Several usable GPG signing keys", "Choose which key signs"],
+    ["no_key", "No signing-capable GPG key", "Generate or import a signing key"],
+    ["missing", "GPG command-line tools are unavailable", "Install GnuPG"],
+    ["agent_unavailable", "gpg-agent is unreachable", "Start the agent"],
+    ["unknown", "has not been checked yet", ""],
+  ])(
+    "blocks Sign & commit for %s and names the condition",
+    async (state, reason, recovery) => {
+      await renderAt("/ship/1", {
+        projects: [project],
+        tasks: [makeTask()],
+        gpg: {
+          state,
+          selected: state === "ambiguous" ? null : signingSelection,
+          candidates: [],
+          cache_ttl: null,
+          detail: null,
+          checked_at: "t0",
+        },
+      });
+
+      expect(screen.getByTestId("sign-commit-button")).toBeDisabled();
+      expect(screen.getByTestId("gpg-blocked-reason")).toHaveTextContent(reason);
+      if (recovery) {
+        expect(screen.getByTestId("gpg-blocked-banner")).toHaveTextContent(recovery);
+      }
+    },
+  );
+
+  it("names the signing key when the gate is open", async () => {
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      gpg: {
+        state: "ready",
+        selected: signingSelection,
+        candidates: [],
+        cache_ttl: null,
+        detail: null,
+        checked_at: "t0",
+      },
+    });
+
+    expect(screen.queryByTestId("gpg-blocked-banner")).not.toBeInTheDocument();
+    expect(screen.getByTestId("gpg-signer")).toHaveTextContent(
+      "Signing as Test Key <t@example.com>",
     );
   });
 
@@ -2557,7 +2623,7 @@ describe("ShipFlowView", () => {
     await renderAt("/ship/1", {
       projects: [githubProject],
       tasks: [makeTask()],
-      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
       gh: readyGitHub,
       ships: {
         "1": {
@@ -2635,7 +2701,7 @@ describe("ShipFlowView", () => {
     await renderAt("/ship/1", {
       projects: [githubProject],
       tasks: [makeTask()],
-      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
       gh: readyGitHub,
       ships: {
         "1": {
@@ -2685,7 +2751,7 @@ describe("ShipFlowView", () => {
     await renderAt("/ship/1", {
       projects: [githubProject],
       tasks: [makeTask()],
-      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
       gh: readyGitHub,
       ships: {
         "1": {
@@ -2799,7 +2865,7 @@ describe("ShipFlowView", () => {
     await renderAt("/ship/1", {
       projects: [githubProject],
       tasks: [makeTask()],
-      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
       gh,
     });
 
@@ -2823,7 +2889,7 @@ describe("ShipFlowView", () => {
     await renderAt("/ship/1", {
       projects: [githubProject],
       tasks: [makeTask()],
-      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
       gh: { ...readyGitHub, identity: { ...readyGitHub.identity, state: "unknown", login: null }, targets: {} },
     });
 
@@ -2856,7 +2922,7 @@ describe("ShipFlowView", () => {
     await renderAt("/ship/1", {
       projects: [githubProject],
       tasks: [makeTask()],
-      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
       gh: otherTarget,
     });
 
@@ -2897,7 +2963,7 @@ describe("ShipFlowView", () => {
     await renderAt("/ship/1", {
       projects: [githubProject],
       tasks: [makeTask()],
-      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
       gh: readyGitHub,
     });
 
@@ -2913,30 +2979,61 @@ describe("ShipFlowView", () => {
 });
 
 describe("Chrome GPG chip", () => {
-  it("shows cached when the daemon reports a cached key", async () => {
-    await renderAt("/tasks", {
-      projects: [project],
-      tasks: [makeTask()],
-      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0", ttl: 10500 },
-    });
-
-    const chip = screen.getByTestId("gpg-chip");
-    expect(chip).toHaveTextContent("gpg cached 2h 55m");
+  const selected = {
+    fingerprint: "ABC1230000000000000000000000000000000000",
+    key_id: "ABC123",
+    uid: "Test Key <t@example.com>",
+    keygrip: "abc",
+    source: "auto" as const,
+    protection: "protected" as const,
+  };
+  const status = (state: string, extra: Record<string, unknown> = {}) => ({
+    state,
+    selected,
+    candidates: [],
+    cache_ttl: null,
+    detail: null,
+    checked_at: "t0",
+    ...extra,
   });
 
-  it("shows locked with an unlock instruction in the title", async () => {
+  it.each([
+    ["ready", "gpg ready", "Signing key is ready"],
+    ["locked", "gpg locked", "GPG signing key is locked"],
+    ["ambiguous", "gpg unselected", "Several usable GPG signing keys"],
+    ["no_key", "gpg no key", "No signing-capable GPG key"],
+    ["missing", "gpg missing", "GPG command-line tools are unavailable"],
+    ["agent_unavailable", "gpg agent", "gpg-agent is unreachable"],
+    ["error", "gpg error", "indeterminate"],
+  ])("labels %s and describes it accessibly", async (state, label, described) => {
     await renderAt("/tasks", {
       projects: [project],
       tasks: [makeTask()],
-      gpg: { state: "locked", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gpg: status(state),
     });
 
     const chip = screen.getByTestId("gpg-chip");
-    expect(chip).toHaveTextContent("gpg locked");
-    expect(chip).toHaveAttribute(
-      "title",
-      "GPG signing key is locked. Warm the cache with: echo | gpg --clearsign -u ABC123 >/dev/null",
-    );
+    expect(chip).toHaveTextContent(label);
+    expect(chip.getAttribute("aria-label")).toContain(described);
+  });
+
+  it("shows a remaining cache lifetime only when the agent reports one", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      gpg: status("ready", { cache_ttl: 10500 }),
+    });
+    expect(screen.getByTestId("gpg-chip")).toHaveTextContent("gpg ready 2h 55m");
+  });
+
+  it("shows no lifetime when the agent reports none", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      gpg: status("ready"),
+    });
+    expect(screen.getByTestId("gpg-chip")).toHaveTextContent("gpg ready");
+    expect(screen.getByTestId("gpg-chip")).not.toHaveTextContent("2h");
   });
 
   it("shows a faint placeholder when gpg state is unknown", async () => {

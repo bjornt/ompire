@@ -38,6 +38,7 @@ relying on it.
 | [0018](0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md) | Keep built-in workflows in Python until portable versioning is required | Accepted |
 | [0019](0019-split-documentation-by-audience-using-diataxis.md) | Split documentation into operator and contributor sets organized by Diátaxis | Proposed |
 | [0020](0020-author-documentation-as-portable-markdown.md) | Author documentation as portable Markdown and treat the site generator as a presentation layer | Proposed |
+| [0021](0021-admit-signing-key-selection-as-bounded-daemon-writable-setting.md) | Admit signing-key selection as a bounded daemon-writable setting | Accepted |
 
 ## Template
 

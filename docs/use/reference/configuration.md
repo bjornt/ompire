@@ -82,7 +82,7 @@ your user account.
 |---|---|---|---|
 | `llmvet_command` | list of strings | `["llmvet"]` | Must be non-empty. |
 | `review_port_range` | `[low, high]` | `[7180, 7280]` | Positive integers, `low <= high`. Probed with an ephemeral bind so concurrent reviews do not collide. |
-| `gpg_signing_key` | string or unset | unset | Required before any task can ship. |
+| `gpg_signing_key` | string or unset | unset | The signing key, as a fingerprint, key ID, or user-ID substring. Also a daemon-writable setting: a selection made in Templates & settings takes precedence over this file. Unset auto-detects when the host holds exactly one usable signing key. See [daemon settings](daemon-settings.md). |
 | `gh_command` | list of strings | `["gh"]` | Non-empty GitHub CLI prefix. The daemon uses it non-interactively for version detection, explicit-host identity/repository reads, PR creation, and PR polling. |
 | `pr_poll_interval` | number (s) | `60` | Positive. Spacing between pull-request state polls. |
 
@@ -139,7 +139,8 @@ credentials — are not editable from a browser.
 ## Example
 
 ```toml
-# Signing is required before any task can ship.
+# Optional: only needed when the host holds more than one signing key and you
+# would rather seed the choice here than pick it in Templates & settings.
 gpg_signing_key = "3AA5C34371567BD2"
 
 checkout_root = "~/src"

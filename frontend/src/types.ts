@@ -357,14 +357,54 @@ export interface ShipFinishedPayload {
   pr_url?: string;
 }
 
+export type GpgState =
+  /** No probe has completed yet. */
+  | "unknown"
+  /** The selected key can sign right now. */
+  | "ready"
+  /** Passphrase-protected key with a cold agent cache. */
+  | "locked"
+  /** Several usable signing keys and no selection. */
+  | "ambiguous"
+  /** No signing-capable secret key in the daemon's keyring. */
+  | "no_key"
+  /** gpg or gpg-connect-agent is not executable. */
+  | "missing"
+  /** The tools run but gpg-agent is unreachable. */
+  | "agent_unavailable"
+  /** Any other indeterminate result; always carries a detail. */
+  | "error";
+
+/** A signing-capable secret key. Public identifiers only — never key material. */
+export interface GpgCandidate {
+  fingerprint: string;
+  key_id: string;
+  uid: string | null;
+  keygrip: string;
+  created_at: string | null;
+  expires_at: string | null;
+  /** The primary key this one belongs to; itself for a signing primary. */
+  primary_fingerprint: string;
+}
+
+/** The key the daemon will sign with, and where that choice came from. */
+export interface GpgSelection {
+  fingerprint: string;
+  key_id: string;
+  uid: string | null;
+  keygrip: string;
+  source: "override" | "config" | "git" | "auto";
+  protection: "protected" | "unprotected" | null;
+}
+
 export interface GpgStatus {
-  state: "cached" | "locked" | "unknown";
-  key: string | null;
-  keygrip: string | null;
+  state: GpgState;
+  selected: GpgSelection | null;
+  candidates: GpgCandidate[];
+  /** Seconds left in the agent cache, only when the agent reports one. */
+  cache_ttl: number | null;
   detail: string | null;
   checked_at: string;
-  /** Seconds remaining in the gpg-agent cache, when reported. */
-  ttl?: number | null;
 }
 
 export interface GpgStatusPayload {
@@ -420,7 +460,7 @@ export interface GitHubStatusPayload {
 
 /** Effective daemon settings map (daemon-settings capability). Values are
  * booleans for tier prefs or numbers for intervals/thresholds. */
-export type DaemonSettings = Record<string, boolean | number>;
+export type DaemonSettings = Record<string, boolean | number | string | null>;
 
 export interface SettingsChangedPayload {
   settings: DaemonSettings;

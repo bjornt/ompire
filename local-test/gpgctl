@@ -17,7 +17,7 @@
 #
 # Commands:
 #   lock         drop the passphrase cache (gate probes locked)
-#   warm         cache the passphrase (gate probes cached)
+#   warm         cache the passphrase (gate probes ready)
 #   fingerprint  print the ephemeral key's fingerprint
 #   status       local probe verdict + the daemon's /api/gpg verdict
 #                (daemon line says "unreachable" when it is down)
@@ -109,8 +109,8 @@ cmd_selfcheck() {
 	[ "$out" = "$(gpg_run fingerprint)" ] ||
 		fail "fingerprint matches the gpg tool's" "$out"
 	ctl_run warm >/dev/null || fail "warm"
-	[ "$(gpg_run status | awk '{print $1}')" = cached ] ||
-		fail "warm delegated: probe reports cached"
+	[ "$(gpg_run status | awk '{print $1}')" = ready ] ||
+		fail "warm delegated: probe reports ready"
 	ctl_run lock >/dev/null || fail "lock"
 	[ "$(gpg_run status | awk '{print $1}')" = locked ] ||
 		fail "lock delegated: probe reports locked"
@@ -119,7 +119,7 @@ cmd_selfcheck() {
 	log "2/4 status reports the local probe and the daemon verdict"
 	gpg_run warm >/dev/null
 	out=$(ctl_run status) || fail "status" "$out"
-	grep -qE '^local:   (cached|locked) [0-9A-F]+$' <<<"$out" ||
+	grep -qE '^local:   (ready|locked) [0-9A-F]+$' <<<"$out" ||
 		fail "status shows the local verdict + fingerprint" "$out"
 	ok "status: local verdict present"
 

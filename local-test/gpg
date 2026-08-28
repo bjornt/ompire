@@ -11,13 +11,16 @@
 # locked). No fakes, no daemon changes, no network.
 #
 # Key facts this tool is built on (empirically verified against gpg
-# 2.4.8 — see openspec/changes/local-testing-real-gpg/findings.md):
+# 2.4.8):
 #   - KEYINFO's cached field only reflects passphrase-cached keys, so a
-#     passphrase-less key probes locked forever → the ephemeral key is
-#     passphrase-protected (like the QA bot key).
-#   - The daemon's keygrip derivation only reads signing *subkey*
-#     (ssb) lines → the key must carry a dedicated signing subkey, and
-#     with a cert-only primary every warm-up caches exactly the
+#     passphrase-less key never reports cached. The daemon reads the
+#     *protection* field alongside it, so such a key is `ready` (nothing
+#     to cache) rather than locked. This key stays passphrase-protected
+#     anyway, because only a protected key can reach `locked` — the
+#     state the ship-gate refusal scenario needs.
+#   - The daemon enumerates any signing-capable secret key, primary or
+#     subkey. A cert-only primary with a dedicated signing subkey is
+#     still the shape used here, so every warm-up caches exactly the
 #     keygrip the gate probes.
 #
 # State root: $LOCAL_TEST_STATE if set, else <repo>/local-test/.state.
@@ -28,7 +31,7 @@
 #
 # Commands:
 #   init          generate the key (idempotent; leaves it cold/locked)
-#   warm          cache the passphrase in gpg-agent (gate: cached)
+#   warm          cache the passphrase in gpg-agent (gate: ready)
 #   lock          restart gpg-agent, dropping the cache (gate: locked)
 #   status        print the daemon's own probe verdict + fingerprint
 #   fingerprint   print the fingerprint (for gitconfig / config.toml)
@@ -68,30 +71,45 @@ fingerprint_of_key_json() { jq -r '.fingerprint // empty' "$KEY_JSON"; }
 # The signing subkey's keygrip, derived exactly the way the daemon
 # derives it: the first Keygrip line after an 'ssb' line with S
 # capability in `gpg --with-keygrip --list-secret-keys <fpr>` output.
+# The daemon's own rule: a sec/ssb record whose *lowercase* capability
+# letters include "s" (uppercase ones summarize the whole keypair and
+# would wrongly promote a cert-only primary).
 signing_keygrip() { # signing_keygrip <fpr>
-	GNUPGHOME=$GNUPGHOME_DIR gpg --with-keygrip --list-secret-keys "$1" |
-		awk '/^ssb/ { inssb = ($0 ~ /\[.*S.*\]/) } inssb && /Keygrip =/ { print $3; exit }'
+	GNUPGHOME=$GNUPGHOME_DIR gpg --with-keygrip --with-colons --list-secret-keys "$1" |
+		awk -F: '
+			/^(sec|ssb):/ {
+				caps = $12; gsub(/[^a-z]/, "", caps)
+				want = (caps ~ /s/)
+			}
+			want && /^grp:/ { print $10; exit }
+		'
 }
 
-# KEYINFO field 7 (the daemon's cached rule): "1" = cached, "-" = not.
+# KEYINFO fields 7 and 8: cached ("1"/"-") and protection ("P" = needs a
+# passphrase, "C" = none, "-" = unstated).
 # Probing is safe against a dead agent — gpg-connect-agent starts one.
-keyinfo_cached() { # keyinfo_cached <keygrip>
+keyinfo_fields() { # keyinfo_fields <keygrip> -> "<cached> <protection>"
 	GNUPGHOME=$GNUPGHOME_DIR gpg-connect-agent "KEYINFO --no-ask $1" /bye 2>/dev/null |
-		awk '/^S KEYINFO/ { print $7; exit }'
+		awk '/^S KEYINFO/ { print $7, $8; exit }'
+}
+
+keyinfo_cached() { # keyinfo_cached <keygrip>
+	keyinfo_fields "$1" | awk '{print $1}'
 }
 
 # The daemon's full probe chain, reimplemented only as orchestration:
-# same argv, same classification (field 7 == "1" -> cached, present
-# otherwise -> locked, anything else -> unknown).
-gate_state() { # gate_state <fpr> -> cached|locked|unknown
-	local fpr=$1 kg out
+# same argv, same classification. An unprotected key is `ready` because
+# there is nothing to cache; only a protected, cold key is `locked`.
+gate_state() { # gate_state <fpr> -> ready|locked|error
+	local fpr=$1 kg cached protection
 	kg=$(signing_keygrip "$fpr")
-	[ -n "$kg" ] || { echo unknown; return; }
-	out=$(keyinfo_cached "$kg")
-	case "$out" in
-	1) echo cached ;;
-	-) echo locked ;;
-	*) echo unknown ;;
+	[ -n "$kg" ] || { echo error; return; }
+	read -r cached protection <<<"$(keyinfo_fields "$kg")"
+	case "$cached:$protection" in
+	*:C) echo ready ;;
+	1:*) echo ready ;;
+	-:*) echo locked ;;
+	*) echo error ;;
 	esac
 }
 
@@ -135,7 +153,7 @@ cmd_init() {
 		--quick-add-key "$fpr" ed25519 sign never 2>/dev/null
 
 	[ -n "$(signing_keygrip "$fpr")" ] ||
-		die "generated key has no signing subkey keygrip — the daemon's probe would report unknown"
+		die "generated key has no signing-capable keygrip — the daemon would report no_key"
 
 	jq -n --arg fpr "$fpr" --arg uid "$UID_NAME <$UID_EMAIL>" \
 		--arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -159,7 +177,7 @@ cmd_warm() {
 		die "clearsign warm-up failed (passphrase file changed?)"
 	kg=$(signing_keygrip "$fpr")
 	[ "$(keyinfo_cached "$kg")" = 1 ] ||
-		die "warm-up ran but KEYINFO still reports not cached — see findings.md (passphrase-less wrinkle)"
+		die "warm-up ran but KEYINFO still reports not cached (passphrase file changed?)"
 	printf 'cached (%s)\n' "$fpr"
 }
 
@@ -218,27 +236,33 @@ cmd_selfcheck() {
 	# A pinentry-launching failure would hang, not fail — force the
 	# loopback pinentry everywhere in the checks.
 	export GNUPGHOME=$root/gnupg
+	# Point this process's own helpers at the throwaway root too; the
+	# gpg_run subprocesses re-derive it from LOCAL_TEST_STATE.
+	GNUPGHOME_DIR=$root/gnupg
 
-	# ---- 1/6 the wrinkle: a passphrase-less key never reports cached
-	log "1/6 passphrase-less control key never probes cached"
+	# ---- 1/6 a passphrase-less key never caches, yet is still signing-ready
+	log "1/6 passphrase-less control key is ready, never cached"
 	mkdir -m 700 -p "$root/gnupg"
 	gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
 		--quick-generate-key "Selfcheck None <$UID_EMAIL>" ed25519 sign never 2>/dev/null
-	local nfpr nkg
+	local nfpr nkg ncached nprot
 	nfpr=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
-	nkg=$(gpg --with-keygrip --list-secret-keys "$nfpr" |
-		awk '/^ssb/ { inssb = 1 } inssb && /Keygrip =/ { print $3; exit }')
-	# primary-only quick-generate: no ssb line, so probe the primary
-	[ -n "$nkg" ] || nkg=$(gpg --with-keygrip --list-secret-keys "$nfpr" |
-		awk '/Keygrip =/ { print $3; exit }')
-	[ "$(gpg-connect-agent "KEYINFO --no-ask $nkg" /bye 2>/dev/null |
-		awk '/^S KEYINFO/ {print $7; exit}')" = "-" ] ||
+	# The daemon finds a signing-capable *primary* too, so no ssb fallback.
+	nkg=$(signing_keygrip "$nfpr")
+	[ -n "$nkg" ] ||
+		fail "signing-capable primary was not enumerated (daemon would say no_key)"
+	read -r ncached nprot <<<"$(keyinfo_fields "$nkg")"
+	[ "$ncached" = "-" ] ||
 		fail "passphrase-less key probes cached cold (unexpected)"
+	[ "$nprot" = C ] ||
+		fail "passphrase-less key does not report unprotected protection" "got $nprot"
 	gpg --batch --yes --quiet --clearsign <<<warm >/dev/null 2>&1 || true
-	[ "$(gpg-connect-agent "KEYINFO --no-ask $nkg" /bye 2>/dev/null |
-		awk '/^S KEYINFO/ {print $7; exit}')" = "-" ] ||
+	[ "$(keyinfo_cached "$nkg")" = "-" ] ||
 		fail "passphrase-less key probes cached after signing (unexpected)"
-	ok "passphrase-less key stays not-cached (cold and after signing)"
+	# The correction this pins: never-cached is not the same as unusable.
+	[ "$(gate_state "$nfpr")" = ready ] ||
+		fail "passphrase-less key is not classified ready" "$(gate_state "$nfpr")"
+	ok "passphrase-less key: never cached, still ready"
 
 	# ---- 2/6 init: idempotent, keygrip-derivable, starts locked
 	log "2/6 init provisions a signing subkey and starts locked"
@@ -254,14 +278,14 @@ cmd_selfcheck() {
 	[ "$(gpg_run fingerprint)" = "$fpr" ] || fail "re-init preserves the key"
 	ok "init: idempotent, daemon-derivable keygrip, starts locked"
 
-	# ---- 3/6 warm flips to cached
-	log "3/6 warm flips the probe to cached"
+	# ---- 3/6 warm flips to ready
+	log "3/6 warm flips the probe to ready"
 	out=$(gpg_run warm) || fail "warm exits 0" "$out"
-	[ "$(gpg_run status | awk '{print $1}')" = cached ] ||
-		fail "warm makes the daemon-shaped probe report cached" "$(gpg_run status)"
-	ok "warm: cached"
+	[ "$(gpg_run status | awk '{print $1}')" = ready ] ||
+		fail "warm makes the daemon-shaped probe report ready" "$(gpg_run status)"
+	ok "warm: ready"
 
-	# ---- 4/6 git commit -S while cached, signature verifies
+	# ---- 4/6 git commit -S while warm, signature verifies
 	log "4/6 git commit -S produces a verifiable signature"
 	local repo=$SELF_TMP/gitrepo
 	git init -q "$repo" -b main
@@ -270,10 +294,10 @@ cmd_selfcheck() {
 	git -C "$repo" config user.signingkey "$fpr"
 	echo hi >"$repo/f.txt"
 	( cd "$repo" && git add f.txt && git -c commit.gpgsign=true commit -q -S -m signed ) ||
-		fail "git commit -S succeeds while cached"
+		fail "git commit -S succeeds while warm"
 	git -C "$repo" verify-commit HEAD >/dev/null 2>&1 ||
 		fail "git verify-commit reports a good signature"
-	ok "commit -S while cached: signed and verified"
+	ok "commit -S while warm: signed and verified"
 
 	# ---- 5/6 lock flips back to locked
 	log "5/6 lock drops the cache"
@@ -285,9 +309,9 @@ cmd_selfcheck() {
 	# ---- 6/6 re-warm (the cycle a runbook actually drives)
 	log "6/6 warm again after lock"
 	out=$(gpg_run warm) || fail "re-warm exits 0" "$out"
-	[ "$(gpg_run status | awk '{print $1}')" = cached ] ||
-		fail "re-warm makes the probe report cached" "$(gpg_run status)"
-	ok "warm after lock: cached again"
+	[ "$(gpg_run status | awk '{print $1}')" = ready ] ||
+		fail "re-warm makes the probe report ready" "$(gpg_run status)"
+	ok "warm after lock: ready again"
 
 	printf 'selfcheck passed (6/6)\n'
 }

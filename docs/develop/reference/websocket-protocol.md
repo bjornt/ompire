@@ -64,7 +64,7 @@ full current registry state:
 | `sessions` | Per task, a per-session map of current status |
 | workflow state | Per-task run status, current step, and gate message |
 | `settings` | The effective settings map |
-| `gpg` | Current signing-key state |
+| `gpg` | Current signing status: `state`, `selected` key, `candidates`, `cache_ttl`, `detail`, `checked_at` — public identifiers only |
 | `gh` | Current in-memory GitHub CLI identity plus canonical target eligibility map; no credential value or token fragment |
 | `reviews` | Per task, durable review status and iterations, plus the live reviewer's URL and port when one is running (`null` otherwise) |
 | `ships` | Per task, in-memory ship status, mode, draft, commit sha, PR URL, error, and latest `last_step` projection |

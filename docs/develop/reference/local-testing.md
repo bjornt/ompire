@@ -76,12 +76,17 @@ testing.
 ### GPG
 
 Signing stays real, against a throwaway passphrase-protected key. Both
-ship-gate lock states are reachable on demand, status reports the daemon's own
-probe verdict, and commits produced while cached carry verifiable signatures.
+ship-gate states are reachable on demand — `ready` and `locked` — status
+reports the daemon's own probe verdict, and commits produced while warm carry
+verifiable signatures.
 
-A passphrase-less key behaves differently from a passphrase-protected one;
-that wrinkle is pinned as an explicit fidelity check rather than left to
-surprise someone.
+The key is passphrase-protected because only a protected key can reach
+`locked`, which is the state the ship-gate refusal scenario needs. A
+passphrase-less key never reports cached, since it has nothing to cache; the
+daemon reads the agent's protection field alongside the cache flag and
+classifies it `ready`. The selfcheck pins both halves of that — never cached,
+still ready — against a real control key, so the distinction cannot regress
+back into "locked forever".
 
 ## States and behavior
 
@@ -137,7 +142,7 @@ Steering happens through published surfaces only:
 | `ghctl` | GitHub fake identity/authentication, repository policy/permission, credential-shaped output, pull-request lifecycle, and one-shot create/view failures |
 | `wsctl` | Workshop registry and launch injection |
 | `ompctl` | One-shot agent scenarios by task, clone, session, or global key; lists sessions and transcripts |
-| `gpgctl` | The ship-gate lock state |
+| `gpgctl` | The ship-gate signing state |
 
 All share the state root.
 

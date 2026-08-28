@@ -26,7 +26,7 @@ from ompire_daemon.gh import (
     parse_github_slug,
     parse_github_target,
 )
-from ompire_daemon.gpg import GpgProbe, GpgStatus
+from ompire_daemon.gpg import GpgProbe, GpgSelection, GpgStatus, parse_candidates
 from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.tasks import (
     create_task,
@@ -211,8 +211,15 @@ def _run_git(cwd: Path, *args: str) -> None:
     )
 
 
-def _setup_signing_gpg(clone_path: Path, bin_dir: Path) -> Path:
-    """Generate a throwaway GPG key and return a wrapper script that uses it."""
+def _setup_signing_gpg(
+    bin_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, str]:
+    """Generate a throwaway GPG key.
+
+    Returns the wrapper script that reaches its keyring and the key's real
+    fingerprint, which the daemon now passes to `git commit -S<key>` and
+    verifies afterwards.
+    """
     gnupg_home = bin_dir / "gnupg"
     gnupg_home.mkdir(parents=True, exist_ok=True)
     gpg_bin = subprocess.run(
@@ -225,8 +232,10 @@ def _setup_signing_gpg(clone_path: Path, bin_dir: Path) -> Path:
             %echo generating
             Key-Type: RSA
             Key-Length: 2048
+            Key-Usage: cert
             Subkey-Type: RSA
             Subkey-Length: 2048
+            Subkey-Usage: sign
             Name-Real: Test User
             Name-Email: test@example.com
             Expire-Date: 0
@@ -249,16 +258,38 @@ def _setup_signing_gpg(clone_path: Path, bin_dir: Path) -> Path:
         encoding="utf-8",
     )
     wrapper.chmod(0o755)
-    _run_git(clone_path, "config", "gpg.program", str(wrapper))
-    _run_git(clone_path, "config", "user.signingkey", "test@example.com")
-    return wrapper
+    listing = subprocess.run(
+        [
+            gpg_bin, "--list-secret-keys", "--with-colons", "--with-keygrip",
+            "test@example.com",
+        ],
+        check=True,
+        env={**os.environ, "GNUPGHOME": str(gnupg_home)},
+        capture_output=True,
+        text=True,
+    ).stdout
+    # Use the daemon's own parser: the key git actually signs with is the
+    # signing subkey, which is exactly the candidate the probe would select.
+    candidates = parse_candidates(listing)
+    assert len(candidates) == 1, candidates
+    fingerprint = candidates[0].fingerprint
+    # The daemon reads gpg.program from operator-owned config, never the
+    # clone's. Redirect the global scope to a temp file so the suite cannot
+    # touch the developer's real ~/.gitconfig.
+    _set_operator_signing_program(bin_dir, wrapper, monkeypatch)
+    return wrapper, fingerprint
 
 
-def _setup_git_clone(
-    origin_path: Path,
-    clone_path: Path,
-    fake_gpg: Path | None = None,
+def _set_operator_signing_program(
+    bin_dir: Path, program: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Point operator-owned Git config at `program`, never the clone's."""
+    global_config = bin_dir / "gitconfig"
+    global_config.write_text(f"[gpg]\n\tprogram = {program}\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+
+
+def _setup_git_clone(origin_path: Path, clone_path: Path) -> None:
     """Create a bare `origin`, clone it, put a base branch and a task branch
     with multiple commits plus an uncommitted working-tree edit.
     """
@@ -268,9 +299,6 @@ def _setup_git_clone(
     _run_git(clone_path.parent, "clone", str(origin_path), clone_path.name)
     _run_git(clone_path, "config", "user.email", "test@example.com")
     _run_git(clone_path, "config", "user.name", "Test User")
-    if fake_gpg is not None:
-        _run_git(clone_path, "config", "gpg.program", str(fake_gpg))
-        _run_git(clone_path, "config", "user.signingkey", "test@example.com")
 
     (clone_path / "base.txt").write_text("base\n", encoding="utf-8")
     _run_git(clone_path, "add", ".")
@@ -288,26 +316,30 @@ def _setup_git_clone(
     (clone_path / "file3.txt").write_text("three\n", encoding="utf-8")
 
 
-def _cached_gpg_probe():
+_TEST_FINGERPRINT = "B4C4207720270E2FB99002559F1C030DE2985A55"
+
+
+def _selection(fingerprint: str) -> GpgSelection:
+    return GpgSelection(
+        fingerprint=fingerprint,
+        key_id=fingerprint[-16:],
+        uid="Test User <test@example.com>",
+        keygrip="8C9301DF2FFD432192448A04C8F2A6BA372A1830",
+        source="auto",
+        protection="unprotected",
+    )
+
+
+def _ready_gpg_probe(fingerprint: str = _TEST_FINGERPRINT):
     async def probe():
-        return GpgStatus(
-            state="cached",
-            key="test@example.com",
-            keygrip="8C9301DF2FFD432192448A04C8F2A6BA372A1830",
-            detail=None,
-        )
+        return GpgStatus(state="ready", selected=_selection(fingerprint))
 
     return probe
 
 
-def _locked_gpg_probe():
+def _blocked_gpg_probe(state: str = "locked"):
     async def probe():
-        return GpgStatus(
-            state="locked",
-            key="test@example.com",
-            keygrip="8C9301DF2FFD432192448A04C8F2A6BA372A1830",
-            detail=None,
-        )
+        return GpgStatus(state=state, selected=_selection(_TEST_FINGERPRINT))
 
     return probe
 
@@ -492,7 +524,7 @@ def test_parse_draft_returns_none_on_missing_marker():
 async def test_commit_and_ship_squashes_delta(
     tmp_root, engine, ships, gpg, monkeypatch
 ):
-    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
 
     origin = tmp_root / "origin.git"
     _project, task = _make_project_and_task(
@@ -513,8 +545,9 @@ async def test_commit_and_ship_squashes_delta(
     )
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
 
-    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
-    _setup_signing_gpg(Path(task.clone_path), bin_dir)
+    _setup_git_clone(origin, Path(task.clone_path))
+    _wrapper, _fingerprint = _setup_signing_gpg(bin_dir, monkeypatch)
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(_fingerprint))
 
     # Assert the ship flow pushes to the project's upstream_url (not the
     # clone's local-path origin), then redirect the transport to the local
@@ -558,10 +591,69 @@ async def test_commit_and_ship_squashes_delta(
     assert (clone / "file3.txt").read_text() == "three\n"
 
 
+async def test_clone_local_signing_config_cannot_redirect_the_commit(
+    tmp_root, engine, ships, gpg, monkeypatch
+):
+    """The clone is agent-writable, so nothing it says about signing counts.
+
+    A clone-local `gpg.program` would otherwise make the daemon execute an
+    arbitrary binary on the host, outside the sandbox, as the operator.
+    """
+    origin = tmp_root / "origin.git"
+    _project, task = _make_project_and_task(engine, tmp_root)
+
+    bin_dir = tmp_root / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    _write_script(
+        bin_dir, "gh", "#!/bin/sh\necho 'https://github.com/owner/repo/pull/42'\n"
+    )
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    _setup_git_clone(origin, Path(task.clone_path))
+    _wrapper, fingerprint = _setup_signing_gpg(bin_dir, monkeypatch)
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(fingerprint))
+
+    # What a compromised agent would write into the task clone.
+    tripwire = tmp_root / "tripwire"
+    hostile = _write_script(
+        bin_dir,
+        "hostile-gpg",
+        f"#!/bin/sh\ntouch {tripwire}\nexit 1\n",
+    )
+    clone = Path(task.clone_path)
+    _run_git(clone, "config", "gpg.program", str(hostile))
+    _run_git(clone, "config", "gpg.format", "ssh")
+    _run_git(clone, "config", "user.signingkey", "DEADBEEFDEADBEEF")
+
+    real_ensure = ships._ensure_ship_remote
+
+    async def ensure_local(clone_path, url, timeout):
+        return await real_ensure(clone_path, str(origin), timeout)
+
+    monkeypatch.setattr(ships, "_ensure_ship_remote", ensure_local)
+
+    state = await ships.commit_and_ship(
+        task, message="Signed", pr_title="Title", pr_body="Body"
+    )
+
+    assert state.status == "shipped", state.error
+    assert not tripwire.exists(), "clone-local gpg.program was executed"
+
+    signer = subprocess.run(
+        [
+            "git", "-C", task.clone_path,
+            "-c", "gpg.format=openpgp", "-c", f"gpg.program={_wrapper}",
+            "log", "-1", "--format=%GF",
+        ],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert signer == fingerprint
+
+
 async def test_commit_failure_restores_head_and_cleans_ref(
     tmp_root, engine, ships, gpg, monkeypatch
 ):
-    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
 
     origin = tmp_root / "origin.git"
     _project, task = _make_project_and_task(engine, tmp_root)
@@ -575,8 +667,8 @@ async def test_commit_failure_restores_head_and_cleans_ref(
     )
     monkeypatch.setenv("PATH", f"{tmp_root / 'bin'}{os.pathsep}{os.environ['PATH']}")
 
-    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
-    _run_git(Path(task.clone_path), "config", "gpg.program", str(fake_gpg))
+    _setup_git_clone(origin, Path(task.clone_path))
+    _set_operator_signing_program(tmp_root / "bin", fake_gpg, monkeypatch)
 
     orig_sha = subprocess.run(
         ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
@@ -624,7 +716,7 @@ async def test_commit_failure_restores_head_and_cleans_ref(
 async def test_commit_and_ship_retain_rewrites_range(
     tmp_root, engine, ships, gpg, monkeypatch
 ):
-    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
 
     origin = tmp_root / "origin.git"
     _project, task = _make_project_and_task(
@@ -640,8 +732,9 @@ async def test_commit_and_ship_retain_rewrites_range(
     )
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
 
-    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
-    _setup_signing_gpg(Path(task.clone_path), bin_dir)
+    _setup_git_clone(origin, Path(task.clone_path))
+    _wrapper, _fingerprint = _setup_signing_gpg(bin_dir, monkeypatch)
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(_fingerprint))
     # Clean up the working tree so retain mode accepts the clone.
     _run_git(Path(task.clone_path), "add", "file3.txt")
     _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
@@ -725,12 +818,12 @@ async def test_commit_and_ship_retain_rewrites_range(
 async def test_commit_and_ship_retain_refuses_dirty_tree(
     tmp_root, engine, ships, gpg, monkeypatch
 ):
-    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
 
     origin = tmp_root / "origin.git"
     _project, task = _make_project_and_task(engine, tmp_root)
 
-    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _setup_git_clone(origin, Path(task.clone_path))
 
     state = await ships.commit_and_ship(
         task,
@@ -747,12 +840,12 @@ async def test_commit_and_ship_retain_refuses_dirty_tree(
 async def test_commit_and_ship_retain_refuses_merge_commits(
     tmp_root, engine, ships, gpg, monkeypatch
 ):
-    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
 
     origin = tmp_root / "origin.git"
     _project, task = _make_project_and_task(engine, tmp_root)
 
-    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _setup_git_clone(origin, Path(task.clone_path))
     _run_git(Path(task.clone_path), "add", "file3.txt")
     _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
 
@@ -779,12 +872,12 @@ async def test_commit_and_ship_retain_refuses_merge_commits(
 async def test_commit_and_ship_retain_refuses_empty_range(
     tmp_root, engine, ships, gpg, monkeypatch
 ):
-    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
 
     origin = tmp_root / "origin.git"
     _project, task = _make_project_and_task(engine, tmp_root)
 
-    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _setup_git_clone(origin, Path(task.clone_path))
     # Drop the uncommitted change and reset the branch to main.
     (Path(task.clone_path) / "file3.txt").unlink()
     _run_git(Path(task.clone_path), "checkout", "main")
@@ -805,7 +898,7 @@ async def test_commit_and_ship_retain_refuses_empty_range(
 async def test_commit_and_ship_retain_amend_failure_restores_head(
     tmp_root, engine, ships, gpg, monkeypatch
 ):
-    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
 
     origin = tmp_root / "origin.git"
     _project, task = _make_project_and_task(engine, tmp_root)
@@ -818,12 +911,13 @@ async def test_commit_and_ship_retain_amend_failure_restores_head(
     )
     monkeypatch.setenv("PATH", f"{tmp_root / 'bin'}{os.pathsep}{os.environ['PATH']}")
 
-    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
-    _setup_signing_gpg(Path(task.clone_path), tmp_root / "bin")
+    _setup_git_clone(origin, Path(task.clone_path))
+    _wrapper, _fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(_fingerprint))
     _run_git(Path(task.clone_path), "add", "file3.txt")
     _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
     # Swap to failing gpg so the rebase amend fails mid-range.
-    _run_git(Path(task.clone_path), "config", "gpg.program", str(fake_gpg))
+    _set_operator_signing_program(tmp_root / "bin", fake_gpg, monkeypatch)
 
     orig_sha = subprocess.run(
         ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
@@ -882,13 +976,14 @@ async def test_commit_and_ship_retain_amend_failure_restores_head(
 async def test_commit_and_ship_retain_verification_failure_restores_head(
     tmp_root, engine, ships, gpg, monkeypatch
 ):
-    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
 
     origin = tmp_root / "origin.git"
     _project, task = _make_project_and_task(engine, tmp_root)
 
-    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
-    _setup_signing_gpg(Path(task.clone_path), tmp_root / "bin")
+    _setup_git_clone(origin, Path(task.clone_path))
+    _wrapper, _fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(_fingerprint))
     _run_git(Path(task.clone_path), "add", "file3.txt")
     _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
 
@@ -897,8 +992,8 @@ async def test_commit_and_ship_retain_verification_failure_restores_head(
     real_run = ship_module._run_git_output
 
     async def fake_sigs(argv, cwd, timeout, step_name):
-        if step_name == "ship-retain-sigs":
-            return "G\nX\n"
+        if step_name == "ship-verify-signatures":
+            return f"{'a' * 40} G {_fingerprint}\n{'b' * 40} X {_fingerprint}\n"
         return await real_run(argv, cwd, timeout, step_name)
 
     monkeypatch.setattr(ship_module, "_run_git_output", fake_sigs)
@@ -934,7 +1029,7 @@ async def test_commit_and_ship_retain_verification_failure_restores_head(
 
 
 async def test_push_and_pr_routes_to_fork(tmp_root, engine, ships, gpg, monkeypatch):
-    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
 
     project, task = _make_project_and_task(
         engine,
@@ -983,7 +1078,7 @@ async def test_push_and_pr_routes_to_upstream_without_fork(
     """Task clones have origin = the local checkout path, so a non-fork push
     must target the project's upstream URL, never the `origin` name (found via
     dogfooding: pushes to `origin` updated only the local checkout)."""
-    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
 
     project, task = _make_project_and_task(
         engine,
@@ -1120,7 +1215,7 @@ async def test_ssh_authentication_during_ship_remote_setup_is_a_push_failure(
 async def test_commit_records_push_failure_as_push_stage(
     tmp_root, engine, ships, gpg, monkeypatch
 ):
-    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
     project, task = _make_project_and_task(
         engine, tmp_root, upstream_url="git@github.com:owner/repo.git"
     )
@@ -1129,7 +1224,8 @@ async def test_commit_records_push_failure_as_push_stage(
     hook = origin / "hooks" / "pre-receive"
     hook.write_text("#!/bin/sh\necho 'forge: rejecting push (injected)' >&2\nexit 1\n")
     hook.chmod(0o755)
-    _setup_signing_gpg(Path(task.clone_path), tmp_root / "bin")
+    _wrapper, _fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(_fingerprint))
 
     real_ensure = ships._ensure_ship_remote
 
@@ -1150,7 +1246,7 @@ async def test_commit_records_push_failure_as_push_stage(
 async def test_pr_creation_failure_sanitizes_state_and_events(
     tmp_root, engine, ships, gpg, hub, monkeypatch
 ):
-    monkeypatch.setattr(gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
     project, task = _make_project_and_task(
         engine, tmp_root, upstream_url="git@github.com:owner/repo.git"
     )
@@ -1169,7 +1265,8 @@ async def test_pr_creation_failure_sanitizes_state_and_events(
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("GH_TOKEN", secret)
     _setup_git_clone(origin, Path(task.clone_path))
-    _setup_signing_gpg(Path(task.clone_path), bin_dir)
+    _wrapper, _fingerprint = _setup_signing_gpg(bin_dir, monkeypatch)
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(_fingerprint))
     real_ensure = ships._ensure_ship_remote
 
     async def ensure_local(clone_path, url, timeout):
@@ -1685,11 +1782,11 @@ def test_commit_preflight_refusal_redacts_rest_and_websocket(
     assert app.state.ships.get(task.id) is None
 
 
-def test_commit_route_409_gpg_locked(
+def test_commit_route_409_gpg_not_ready(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _locked_gpg_probe())
+    monkeypatch.setattr(app.state.gpg, "probe", _blocked_gpg_probe())
     response = client.post(
         f"/api/tasks/{task.id}/ship/commit",
         headers=auth_header,
@@ -1704,11 +1801,53 @@ def test_commit_route_409_gpg_locked(
     assert data["detail"]["gpg"]["state"] == "locked"
 
 
+@pytest.mark.parametrize(
+    "state",
+    ["locked", "ambiguous", "no_key", "missing", "agent_unavailable", "unknown", "error"],
+)
+def test_commit_route_refuses_every_state_but_ready_without_touching_the_clone(
+    client, auth_header, engine, tmp_root, app, monkeypatch, state
+):
+    """Fail closed, and prove the refusal happened before any Git mutation."""
+    origin = tmp_root / "origin.git"
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(origin, Path(task.clone_path))
+    monkeypatch.setattr(app.state.gpg, "probe", _blocked_gpg_probe(state))
+
+    before = subprocess.run(
+        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    response = client.post(
+        f"/api/tasks/{task.id}/ship/commit",
+        headers=auth_header,
+        json={"message": "m", "pr_title": "t", "pr_body": "b"},
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["gpg"]["state"] == state
+    # The message names the actual condition, not a generic "not cached".
+    assert detail["message"] and "not cached" not in detail["message"]
+
+    after = subprocess.run(
+        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert after == before
+    orig_ref = subprocess.run(
+        ["git", "-C", task.clone_path, "rev-parse", "--verify", "refs/ompire/ship-orig"],
+        capture_output=True, text=True, check=False,
+    )
+    assert orig_ref.returncode != 0
+
+
 def test_commit_route_409_unsupported_mode(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(app.state.gpg, "probe", _ready_gpg_probe())
     response = client.post(
         f"/api/tasks/{task.id}/ship/commit",
         headers=auth_header,
@@ -1726,9 +1865,9 @@ def test_commit_route_409_retain_dirty_tree(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(app.state.gpg, "probe", _ready_gpg_probe())
     origin = tmp_root / "origin.git"
-    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _setup_git_clone(origin, Path(task.clone_path))
 
     response = client.post(
         f"/api/tasks/{task.id}/ship/commit",
@@ -1748,9 +1887,9 @@ def test_commit_route_409_retain_merge_commits(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(app.state.gpg, "probe", _ready_gpg_probe())
     origin = tmp_root / "origin.git"
-    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _setup_git_clone(origin, Path(task.clone_path))
     _run_git(Path(task.clone_path), "add", "file3.txt")
     _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
 
@@ -1780,9 +1919,9 @@ def test_commit_route_409_retain_empty_range(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(app.state.gpg, "probe", _ready_gpg_probe())
     origin = tmp_root / "origin.git"
-    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _setup_git_clone(origin, Path(task.clone_path))
     (Path(task.clone_path) / "file3.txt").unlink()
     _run_git(Path(task.clone_path), "checkout", "main")
     _run_git(Path(task.clone_path), "checkout", "-B", "ompire/task-1")
@@ -1805,9 +1944,9 @@ def test_commit_route_accepts_retain_mode(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(app.state.gpg, "probe", _ready_gpg_probe())
     origin = tmp_root / "origin.git"
-    _setup_git_clone(origin, Path(task.clone_path), fake_gpg=None)
+    _setup_git_clone(origin, Path(task.clone_path))
     _run_git(Path(task.clone_path), "add", "file3.txt")
     _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
 
@@ -1831,7 +1970,7 @@ def test_commit_route_409_when_ship_in_flight(
     client, auth_header, engine, tmp_root, app, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _cached_gpg_probe())
+    monkeypatch.setattr(app.state.gpg, "probe", _ready_gpg_probe())
     app.state.ships.seed_commit(task.id)
     response = client.post(
         f"/api/tasks/{task.id}/ship/commit",
@@ -1859,7 +1998,17 @@ def test_snapshot_carries_ships_and_gpg(client, auth_header, engine, tmp_root, a
     assert "ships" in message["payload"]
     assert str(task.id) in message["payload"]["ships"]
     assert "gpg" in message["payload"]
-    assert message["payload"]["gpg"]["state"] in ("cached", "locked", "unknown")
+    assert message["payload"]["gpg"]["state"] in (
+        "ready",
+        "locked",
+        "ambiguous",
+        "no_key",
+        "missing",
+        "agent_unavailable",
+        "unknown",
+        "error",
+    )
+    assert "candidates" in message["payload"]["gpg"]
 
 
 # --- cleanup/purge hooks --------------------------------------------------
@@ -1900,18 +2049,20 @@ async def test_purge_calls_drop_ship(
 
 
 def test_gpg_get_returns_current_status(client, auth_header, app, monkeypatch):
-    status = GpgStatus(state="cached", key="test-key", keygrip="AB", detail=None)
+    status = GpgStatus(state="ready", selected=_selection(_TEST_FINGERPRINT))
     monkeypatch.setattr(app.state.gpg, "current", lambda: status)
 
     response = client.get("/api/gpg", headers=auth_header)
     assert response.status_code == 200
     data = response.json()
-    assert data["state"] == "cached"
-    assert data["key"] == "test-key"
+    assert data["state"] == "ready"
+    assert data["selected"]["fingerprint"] == _TEST_FINGERPRINT
 
 
 def test_gpg_recheck_returns_probed_status(client, auth_header, app, monkeypatch):
-    status = GpgStatus(state="locked", key="test-key", keygrip="AB", detail="locked")
+    status = GpgStatus(
+        state="locked", selected=_selection(_TEST_FINGERPRINT), detail="cold cache"
+    )
 
     async def fake_probe() -> GpgStatus:
         return status
@@ -1922,4 +2073,4 @@ def test_gpg_recheck_returns_probed_status(client, auth_header, app, monkeypatch
     assert response.status_code == 200
     data = response.json()
     assert data["state"] == "locked"
-    assert data["key"] == "test-key"
+    assert data["selected"]["fingerprint"] == _TEST_FINGERPRINT

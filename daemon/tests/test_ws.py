@@ -34,7 +34,16 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         assert payload["attention"] == {}
         assert payload["reviews"] == {}
         assert payload["ships"] == {}
-        assert payload["gpg"]["state"] in ("cached", "locked", "unknown")
+        assert payload["gpg"]["state"] in (
+            "ready",
+            "locked",
+            "ambiguous",
+            "no_key",
+            "missing",
+            "agent_unavailable",
+            "unknown",
+            "error",
+        )
         assert payload["gh"]["identity"]["state"] in (
             "unknown",
             "missing",

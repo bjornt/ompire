@@ -50,29 +50,27 @@ connection. If the chip shows disconnected, the daemon is not running.
 
 ## 4. Configure signing
 
-Shipping is blocked until Ompire has a usable signing key. Find yours:
+Shipping is blocked until Ompire has a usable signing key. Open **Templates &
+settings → Daemon → Commit signing** and look at the state.
+
+If you have exactly one signing key, Ompire has already picked it and there is
+nothing to configure. If you have several, the panel says `gpg unselected` and
+offers a **Signing key** selector — choose the one you want published commits
+to carry.
+
+If the state is `gpg locked`, the key is passphrase-protected and the agent's
+cache is cold. Warm it in a terminal with the command the panel shows:
 
 ```sh
-gpg --list-secret-keys --keyid-format=long
+echo | gpg --clearsign -u YOUR_FINGERPRINT >/dev/null
 ```
 
-Put it in `~/.config/ompire/config.toml`:
+Then press **Re-check key**. The chip in the header should turn green and read
+`gpg ready`.
 
-```toml
-gpg_signing_key = "YOUR_KEY_ID"
-```
-
-Restart the daemon — configuration is read once at startup.
-
-Now cache the passphrase, so the GPG chip reports `cached` rather than
-`locked`:
-
-```sh
-echo test | gpg --clearsign > /dev/null
-```
-
-Re-probe from the UI. The chip should turn green. If it says `unknown`, the
-key ID in your config does not match a key the agent can see.
+A key with no passphrase is ready as soon as it is selected — there is nothing
+to cache. Any other state names its own problem and its own fix; see
+[Configure GPG signing](../how-to/configure-gpg-signing.md).
 
 ## 5. Prepare a checkout
 

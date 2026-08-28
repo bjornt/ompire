@@ -86,14 +86,24 @@ $GHCTL repository allow >/dev/null
 $GPGCTL lock
 _api_run POST "/api/tasks/$tid/ship/commit" "$(ship_body squash fail-1)"
 body=$API_BODY
-[ "$API_CODE" = 409 ] && jq -e '.detail.message == "GPG signing key is not cached"' <<<"$body" >/dev/null &&
-	ok "locked gate refused with 409 + gate message" ||
+[ "$API_CODE" = 409 ] &&
+	[ "$(jq -r '.detail.gpg.state' <<<"$body")" = locked ] &&
+	jq -e '.detail.message | test("locked")' <<<"$body" >/dev/null &&
+	ok "locked gate refused with 409 naming the state" ||
 	fail "locked gate refusal" "code $API_CODE: $body"
+assert "locked-gate clone remains unchanged" _clone_unchanged \
+	"$clone" "$baseline_head" "$baseline_status"
 $GPGCTL warm
 api_json POST /api/gpg/recheck >/dev/null
-[ "$(jq -r .state <<<"$API_BODY")" = cached ] &&
-	ok "recheck says cached after warm" ||
+[ "$(jq -r .state <<<"$API_BODY")" = ready ] &&
+	ok "recheck says ready after warm" ||
 	fail "gpg recheck after warm" "$API_BODY"
+# The gate names the key it will sign with, not just that it can. gpgctl
+# reports the primary; the daemon selects that primary's signing subkey.
+[ "$(jq -r '.candidates[0].primary_fingerprint' <<<"$API_BODY")" = "$($GPGCTL fingerprint)" ] &&
+	[ -n "$(jq -r '.selected.fingerprint' <<<"$API_BODY")" ] &&
+	ok "recheck names the signing subkey of the configured primary" ||
+	fail "gpg selected fingerprint" "$API_BODY"
 # --- leg 4: injected gh create failure → ship error → retry ships --------------
 
 $GHCTL fail-next create >/dev/null

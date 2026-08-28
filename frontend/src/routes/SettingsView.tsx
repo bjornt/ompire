@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   createTemplate,
+  deleteSetting,
   deleteTemplate,
   getDaemonInfo,
   getSettings,
   getToken,
   recheckGitHub,
+  recheckGpg,
   rotateToken,
   updateSettings,
   updateTemplate,
@@ -14,6 +16,7 @@ import {
 import { setDaemonToken } from "../lib/token";
 import { useDaemonState } from "../lib/useDaemonState";
 import { githubIdentityPresentation, safeGitHubDetail } from "../lib/githubPresentation";
+import { gpgPresentation, selectionSourceLabel } from "../lib/gpgPresentation";
 import { REGISTERED_WORKFLOWS, THINKING_LEVELS, templateCheckout } from "../lib/templates";
 import type {
   AttentionTier,
@@ -211,6 +214,137 @@ function maskToken(token: string): string {
   return `${prefix}${first}${filler}${last}`;
 }
 
+function CommitSigningPanel() {
+  const { gpg } = useDaemonState();
+  const [rechecking, setRechecking] = useState(false);
+  const [selecting, setSelecting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const busy = useRef(false);
+
+  const signing = gpgPresentation(gpg);
+  const selected = gpg?.selected ?? null;
+  const candidates = gpg?.candidates ?? [];
+  const source = selectionSourceLabel(gpg);
+  const detail = error ?? gpg?.detail ?? null;
+
+  async function guarded(work: () => Promise<void>, flag: (v: boolean) => void) {
+    if (busy.current) return;
+    busy.current = true;
+    flag(true);
+    setError(null);
+    try {
+      await work();
+    } catch (err: unknown) {
+      setError(errorText(err));
+    } finally {
+      busy.current = false;
+      flag(false);
+    }
+  }
+
+  // Selecting re-probes on the daemon side, so the shared chip and Ship flow
+  // follow from the broadcast rather than from local state here.
+  const onSelect = (value: string) =>
+    void guarded(
+      () =>
+        value
+          ? updateSettings({ gpg_signing_key: value }).then(() => undefined)
+          : deleteSetting("gpg_signing_key").then(() => undefined),
+      setSelecting,
+    );
+
+  return (
+    <div className="daemonGithub" data-testid="daemon-signing-panel">
+      <h3 className="daemonGithubTitle">Commit signing</h3>
+      <div
+        className="daemonGithubStatus"
+        role="status"
+        aria-live="polite"
+        aria-label={signing.description}
+        data-testid="daemon-gpg-state"
+      >
+        <span className="dot" style={{ background: signing.dot }} />
+        {signing.label}
+      </div>
+
+      {candidates.length > 0 && (
+        <label className="daemonInfoRow" htmlFor="gpg-signing-key">
+          <span>Signing key</span>
+          <select
+            id="gpg-signing-key"
+            value={selected?.fingerprint ?? ""}
+            disabled={selecting}
+            onChange={(e) => onSelect(e.target.value)}
+            data-testid="gpg-key-select"
+          >
+            <option value="">Detect automatically</option>
+            {candidates.map((candidate) => (
+              <option key={candidate.fingerprint} value={candidate.fingerprint}>
+                {candidate.uid ?? candidate.key_id} · {candidate.key_id}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
+
+      <div className="daemonInfoGrid">
+        {selected && (
+          <div className="daemonInfoRow" data-testid="daemon-gpg-fingerprint">
+            <span>Fingerprint</span>
+            <code>{selected.fingerprint}</code>
+          </div>
+        )}
+        {selected?.uid && (
+          <div className="daemonInfoRow" data-testid="daemon-gpg-uid">
+            <span>User ID</span>
+            <code>{selected.uid}</code>
+          </div>
+        )}
+        {source && (
+          <div className="daemonInfoRow" data-testid="daemon-gpg-source">
+            <span>Chosen by</span>
+            <code>{source}</code>
+          </div>
+        )}
+        <div className="daemonInfoRow" data-testid="daemon-gpg-checked-at">
+          <span>Last checked</span>
+          <code>{gpg?.checked_at ?? "Not checked yet"}</code>
+        </div>
+      </div>
+
+      {/* The ambiguous recovery is "choose a key in Settings" — pointless
+          here, where the selector above already is the action. Every other
+          state's recovery happens elsewhere, so it still belongs. */}
+      {signing.recovery && gpg?.state !== "ambiguous" && (
+        <p className="daemonGithubDetail" data-testid="daemon-gpg-recovery">
+          {signing.recovery}
+        </p>
+      )}
+      {signing.command && (
+        <code data-testid="daemon-gpg-command">{signing.command}</code>
+      )}
+      {detail && (
+        <p className="daemonGithubDetail" role="alert" data-testid="daemon-gpg-detail">
+          {detail}
+        </p>
+      )}
+
+      <button
+        type="button"
+        className="ghostButton"
+        disabled={rechecking}
+        onClick={() =>
+          void guarded(() => recheckGpg().then(() => undefined), setRechecking)
+        }
+        data-testid="recheck-gpg-button"
+      >
+        {rechecking ? "Checking key…" : "Re-check key"}
+      </button>
+    </div>
+  );
+}
+
+
 function DaemonPanel() {
   const { gh } = useDaemonState();
   const [info, setInfo] = useState<DaemonInfo | null>(null);
@@ -358,6 +492,8 @@ function DaemonPanel() {
           {recheckingGitHub ? "Checking GitHub…" : "Re-check GitHub"}
         </button>
       </div>
+
+      <CommitSigningPanel />
 
       <div className="tokenRow">
         <code className="tokenValue" data-testid="daemon-token">

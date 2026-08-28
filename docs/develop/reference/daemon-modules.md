@@ -53,7 +53,7 @@ All paths are under `daemon/src/ompire_daemon/`.
 |---|---|
 | `review.py` | Host-side review: the reset dance, the llmvet subprocess, and startup interruption handling. The record lives in `registry/reviews.py`. |
 | `ship.py` | Draft, signed commit, push, PR. Owns `refs/ompire/ship-orig`. |
-| `gpg.py` | Signing-key state probe: `cached`, `locked`, `unknown`. |
+| `gpg.py` | Signing-key enumeration, selection (override → config → git → auto), and non-prompting agent classification: `ready`, `locked`, `ambiguous`, `no_key`, `missing`, `agent_unavailable`, `error`, `unknown`. |
 | `gh.py` | The only daemon-owned GitHub CLI boundary: configured executable discovery, non-interactive bounded execution, credential redaction, ambient identity probe, canonical upstream eligibility checks, and in-memory `gh_status` projection. |
 | `prwatch.py` | Polls pull requests to a terminal state. |
 

@@ -25,6 +25,8 @@ EXPECTED_DEFAULTS = {
     "renotify_interval": 300,
     "stall_threshold": 300,
     "context_advisory_threshold": 80,
+    # No selection stored: the probe auto-detects (ADR-0021).
+    "gpg_signing_key": None,
 }
 
 
@@ -221,3 +223,127 @@ def test_rotate_closes_open_websocket(client: TestClient, auth_token: str) -> No
         # WebSocketDisconnect from receive_json().
         with pytest.raises(Exception):  # noqa: B017 — any disconnect wrapper
             ws.receive_json()
+
+
+# --- signing-key selection (ADR-0021) --------------------------------------
+
+
+def _seed_candidates(app, *fingerprints: str) -> None:
+    """Give the probe a keyring without running gpg."""
+    from ompire_daemon.gpg import GpgCandidate, GpgStatus
+
+    app.state.gpg._status = GpgStatus(
+        state="ambiguous",
+        candidates=tuple(
+            GpgCandidate(
+                fingerprint=fpr,
+                key_id=fpr[-16:],
+                uid=f"Key {index} <k{index}@example.com>",
+                keygrip=f"{index:040d}",
+                created_at=None,
+                expires_at=None,
+                primary_fingerprint=fpr,
+            )
+            for index, fpr in enumerate(fingerprints)
+        ),
+    )
+
+
+_FPR_A = "A" * 40
+_FPR_B = "B" * 40
+
+
+def test_selecting_a_key_in_the_keyring_persists_as_an_override(
+    client: TestClient, auth_headers: dict[str, str], app, monkeypatch
+) -> None:
+    _seed_candidates(app, _FPR_A, _FPR_B)
+    probes: list[int] = []
+
+    async def fake_probe():
+        probes.append(1)
+        return app.state.gpg.current()
+
+    monkeypatch.setattr(app.state.gpg, "probe", fake_probe)
+
+    response = client.put(
+        "/api/settings", json={"gpg_signing_key": _FPR_B}, headers=auth_headers
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["settings"]["gpg_signing_key"] == _FPR_B
+    assert body["provenance"]["gpg_signing_key"] == "override"
+    # Selecting a key re-probes immediately so the chip and ship gate follow.
+    assert probes == [1]
+
+
+def test_selecting_a_key_not_in_the_keyring_is_refused(
+    client: TestClient, auth_headers: dict[str, str], app
+) -> None:
+    _seed_candidates(app, _FPR_A)
+
+    response = client.put(
+        "/api/settings", json={"gpg_signing_key": _FPR_B}, headers=auth_headers
+    )
+
+    assert response.status_code == 422
+    assert _FPR_B in response.json()["detail"]
+    # Nothing was persisted.
+    body = client.get("/api/settings", headers=auth_headers).json()
+    assert body["settings"]["gpg_signing_key"] is None
+
+
+@pytest.mark.parametrize(
+    "value", ["865639DBB930B899", "not-a-fingerprint", 42, None]
+)
+def test_selection_must_be_a_full_fingerprint(
+    client: TestClient, auth_headers: dict[str, str], app, value
+) -> None:
+    _seed_candidates(app, _FPR_A)
+
+    response = client.put(
+        "/api/settings", json={"gpg_signing_key": value}, headers=auth_headers
+    )
+
+    assert response.status_code == 422
+
+
+def test_a_rejected_selection_does_not_persist_its_batch(
+    client: TestClient, auth_headers: dict[str, str], app
+) -> None:
+    """Validation stays all-or-nothing across a multi-key update."""
+    _seed_candidates(app, _FPR_A)
+
+    response = client.put(
+        "/api/settings",
+        json={"stall_threshold": 600, "gpg_signing_key": _FPR_B},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 422
+    body = client.get("/api/settings", headers=auth_headers).json()
+    assert body["settings"]["stall_threshold"] == 300
+
+
+def test_clearing_the_selection_returns_to_auto_detection(
+    client: TestClient, auth_headers: dict[str, str], app, monkeypatch
+) -> None:
+    _seed_candidates(app, _FPR_A)
+    probes: list[str] = []
+
+    async def fake_probe():
+        probes.append("probe")
+        return app.state.gpg.current()
+
+    monkeypatch.setattr(app.state.gpg, "probe", fake_probe)
+    client.put(
+        "/api/settings", json={"gpg_signing_key": _FPR_A}, headers=auth_headers
+    )
+
+    response = client.delete("/api/settings/gpg_signing_key", headers=auth_headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["settings"]["gpg_signing_key"] is None
+    assert body["provenance"]["gpg_signing_key"] == "default"
+    assert len(probes) == 2

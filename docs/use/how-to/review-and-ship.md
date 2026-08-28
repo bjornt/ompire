@@ -160,7 +160,7 @@ sequence is interrupted.
 
 | Condition | Response |
 |---|---|
-| GPG key not `cached` | `409` with the current GPG state attached |
+| GPG key not `ready` | `409` naming the state and its recovery, with the current GPG status attached |
 | GitHub CLI missing, unauthenticated, denied for the upstream, or indeterminate | `409` with a safe GitHub status; no Git state changes |
 | A commit or push is already in flight | `409` |
 | Mode other than `squash` or `retain` | `409` |

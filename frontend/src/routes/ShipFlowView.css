@@ -208,6 +208,12 @@
   color: var(--amber);
 }
 
+/* Names the identity a successful commit will carry. */
+.gpgSigner {
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .gpgBanner code {
   font-family: var(--mono);
   font-size: 11px;

@@ -376,11 +376,12 @@ EOF
 		smoke_fail "project '$NAME' not visible via daemon API"
 	fi
 
-	local gpg_state
+	local gpg_state gpg_key
 	gpg_state=$(api_daemon GET /api/gpg 2>/dev/null | jq -r '.state // empty' 2>/dev/null || true)
+	gpg_key=$(api_daemon GET /api/gpg 2>/dev/null | jq -r '.selected.fingerprint // empty' 2>/dev/null || true)
 	case "$gpg_state" in
-	cached) smoke_ok "daemon GPG probe: cached (ship gate allows Sign & commit)" ;;
-	*) smoke_fail "daemon GPG probe: ${gpg_state:-no response} — expected cached" ;;
+	ready) smoke_ok "daemon GPG probe: ready as ${gpg_key:-?} (ship gate allows Sign & commit)" ;;
+	*) smoke_fail "daemon GPG probe: ${gpg_state:-no response} — expected ready" ;;
 	esac
 
 	local gh_state gh_login

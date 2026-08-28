@@ -26,10 +26,18 @@ not from a menu.
 | GPG | Real signing-key lock state |
 | GitHub | Current daemon GitHub CLI identity state |
 
-The GPG chip renders a cached state (optionally with a remaining-TTL label), a
-locked state with the terminal-helper unlock instruction accessible, or an
-unknown state — sourced from the snapshot's `gpg` entry and `gpg_status`
-events, never a static placeholder.
+The GPG chip renders one label per signing state — `gpg ready` (with a
+remaining cache lifetime only when the agent reports one), `gpg locked`,
+`gpg unselected`, `gpg no key`, `gpg missing`, `gpg agent`, `gpg error`, or
+`gpg —` — sourced from the snapshot's `gpg` entry and `gpg_status` events,
+never a static placeholder. Its accessible description names the condition.
+
+**Templates & settings → Daemon → Commit signing** shows the same state with
+the selected key's fingerprint and user ID, how it was chosen, the last-check
+time, the recovery action and terminal helper for the current state, and a
+**Re-check key** control disabled while a request is in flight. When the host
+holds more than one usable signing key it also offers a selector; choosing one
+persists it and re-probes. No secret key material or passphrase appears there.
 
 The GitHub chip renders `gh @login`, `gh missing`, `gh auth`, `gh error`, or
 `gh —` from snapshot `gh` state and `gh_status` events. Its accessible
@@ -54,7 +62,7 @@ registered upstream changes. The banner compares the daemon result to that
 specific upstream and current identity; it never reuses an allowed result for
 another target or account. It shows checking, ready, missing/authentication,
 denied, and error recovery states, and **Sign & commit** requires both this
-ready target result and a cached GPG key.
+ready target result and a `ready` GPG key.
 
 The banner says explicitly that GitHub API eligibility does not prove SSH or
 HTTPS `git push` authentication. The daemon repeats every preflight; browser

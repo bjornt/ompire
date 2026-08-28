@@ -84,7 +84,7 @@ non-idle primary agent, an archived or already-published task, or an explicit
 replacement while a ship attempt is active. See [Ship flow](ship-flow.md) for
 draft lifecycle and field behavior. `ship/commit` returns `409` when GitHub
 CLI identity or target eligibility cannot be established, the GPG key is not
-`cached`, a ship is already in flight, the mode is not `squash` or `retain`, or
+`ready`, a ship is already in flight, the mode is not `squash` or `retain`, or
 `retain` preconditions are unmet. GitHub refusal uses
 `{"detail":{"message":...,"gh":...}}`; it is safe to show but creates no
 ship job or local Git mutation.
@@ -94,7 +94,7 @@ ship job or local Git mutation.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/daemon/info` | Version, bind, port, config path, data dir, audit log path |
-| `GET` | `/api/gpg` | Last probed signing-key state |
+| `GET` | `/api/gpg` | Last probed signing status: state, selected key, and candidates |
 | `POST` | `/api/gpg/recheck` | Re-probe and broadcast |
 | `GET` | `/api/gh` | Latest safe in-memory GitHub CLI identity and target eligibility status |
 | `POST` | `/api/gh/recheck` | Re-probe global identity with no body; `{"task_id": id}` additionally checks that task's registered upstream. A completed observation remains `200`; only an unknown task is `404`. |

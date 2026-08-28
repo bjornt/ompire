@@ -4,6 +4,7 @@ import { useDaemonState } from "../lib/useDaemonState";
 import { primarySessionName } from "../lib/daemonReducer";
 import { projectReview } from "../lib/reviewPresentation";
 import { cleanupTask, draftShip, recheckGitHub, recheckGpg, shipCommit } from "../lib/api";
+import { canSign, gpgPresentation, keyLabel } from "../lib/gpgPresentation";
 import { confirmCleanup } from "../lib/cleanup";
 import { formatElapsed } from "../lib/formatElapsed";
 import {
@@ -303,15 +304,14 @@ function CommitStep({
     void requestGitHubCheck();
   }, [checkingGitHub, published, requestGitHubCheck, targetRequestKey, upstreamUrl]);
 
-  const gpgCached = gpg?.state === "cached";
-  const gpgLocked = gpg?.state === "locked";
+  const gpgReady = canSign(gpg);
+  const signing = gpgPresentation(gpg);
   const canCommit =
-    gpgCached &&
+    gpgReady &&
     githubReady &&
     !drafting &&
     !publishing &&
     (mode === "retain" || message.trim().length > 0);
-  const unlockCommand = gpg?.key ? `echo | gpg --clearsign -u ${gpg.key} >/dev/null` : "";
   const retainSelected = mode === "retain";
 
   async function onRedraft() {
@@ -507,11 +507,13 @@ function CommitStep({
         </div>
       )}
 
-      {gpgLocked && unlockCommand && (
-        <div className="gpgBanner" data-testid="gpg-locked-banner">
-          <strong>GPG signing key is locked</strong>
-          <p>Warm the passphrase cache in a terminal, then re-check:</p>
-          <code data-testid="gpg-unlock-command">{unlockCommand}</code>
+      {!gpgReady && (
+        <div className="gpgBanner" data-testid="gpg-blocked-banner">
+          <strong data-testid="gpg-blocked-reason">{signing.description}</strong>
+          {signing.recovery && <p>{signing.recovery}</p>}
+          {signing.command && (
+            <code data-testid="gpg-unlock-command">{signing.command}</code>
+          )}
           <button
             type="button"
             disabled={recheckingGpg}
@@ -521,6 +523,11 @@ function CommitStep({
             {recheckingGpg ? "Checking…" : "Re-check key"}
           </button>
         </div>
+      )}
+      {gpgReady && signing.description && (
+        <p className="gpgSigner" data-testid="gpg-signer">
+          Signing as {keyLabel(gpg)}
+        </p>
       )}
 
       {!published && (

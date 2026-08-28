@@ -30,6 +30,7 @@ from ompire_daemon.gh import (
     GitHubTargetStatus,
     parse_github_owner,
 )
+from ompire_daemon.gpg import STATE_READY, gpg_signing_refusal
 from ompire_daemon.registry.projects import Project, get_project
 from ompire_daemon.registry.tasks import Task, mark_pr_url
 from ompire_daemon.registry.templates import get_template
@@ -46,6 +47,13 @@ logger = logging.getLogger(__name__)
 
 _SHIP_ORIGIN_NAME = "origin"
 _SHIP_GIT_REF = "refs/ompire/ship-orig"
+
+# The per-task clone is agent-writable, so nothing it says about signing is
+# trusted (ADR-0011: identity selection stays in the control plane). A
+# clone-local `gpg.program` is the sharpest edge: `git commit -S` would
+# execute it on the host, outside the sandbox, as the operator.
+_SIGNING_FORMAT = "openpgp"
+_DEFAULT_SIGNING_PROGRAM = "gpg"
 
 _PR_URL_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/\d+")
 
@@ -104,9 +112,11 @@ class ShipError(Exception):
     """Base for ship-manager errors surfaced as ship outcomes."""
 
 
-class GpgLockedError(ShipError):
+class GpgNotReadyError(ShipError):
+    """Signing is refused. Carries the state so callers can explain which one."""
+
     def __init__(self, status: GpgStatus) -> None:
-        super().__init__("GPG signing key is not cached")
+        super().__init__(gpg_signing_refusal(status))
         self.status = status
 
 
@@ -351,8 +361,9 @@ class ShipManager:
         await self.preflight(task)
 
         status = await self._gpg.probe()
-        if status.state != "cached":
-            raise GpgLockedError(status)
+        if status.state != STATE_READY or status.selected is None:
+            raise GpgNotReadyError(status)
+        signing_key = status.selected.fingerprint
 
         if mode not in ("squash", "retain"):
             raise ShipError(f"ship mode {mode!r} is not supported")
@@ -373,11 +384,11 @@ class ShipManager:
             base = await self._merge_base(clone_path, base_branch, timeout)
             if mode == "squash":
                 sha, commit_count = await self._squash_commit(
-                    clone_path, base, message, timeout
+                    clone_path, base, message, signing_key, timeout
                 )
             else:
                 sha, commit_count = await self._retain_rewrite(
-                    task, clone_path, base, timeout
+                    task, clone_path, base, signing_key, timeout
                 )
 
             self._set_state(task.id, commit_sha=sha)
@@ -500,7 +511,9 @@ class ShipManager:
             )
         )
 
-    async def _commit(self, clone_path: str, message: str, timeout: int) -> str:
+    async def _commit(
+        self, clone_path: str, message: str, signing_key: str, timeout: int
+    ) -> str:
         name = await self._git_config(clone_path, "user.name")
         email = await self._git_config(clone_path, "user.email")
 
@@ -514,12 +527,14 @@ class ShipManager:
 
         msg_path = await asyncio.to_thread(write_message)
         try:
-            argv: list[str] = ["git", "-C", clone_path]
+            argv: list[str] = ["git", "-C", clone_path, *await self._signing_config()]
             if name:
                 argv += ["-c", f"user.name={name}"]
             if email:
                 argv += ["-c", f"user.email={email}"]
-            argv += ["commit", "-S", "-F", msg_path]
+            # The probed key, named explicitly: the clone's own config is
+            # agent-writable and must not choose the signing identity.
+            argv += ["commit", f"-S{signing_key}", "-F", msg_path]
 
             await _run_step(Step("ship-commit", argv, timeout))
             sha = (
@@ -537,12 +552,13 @@ class ShipManager:
             await asyncio.to_thread(Path(msg_path).unlink)
 
     async def _squash_commit(
-        self, clone_path: str, base: str, message: str, timeout: int
+        self, clone_path: str, base: str, message: str, signing_key: str, timeout: int
     ) -> tuple[str, int]:
         """Soft-reset to merge-base and create one signed operator commit."""
         await self._soft_reset(clone_path, base, timeout)
         try:
-            sha = await self._commit(clone_path, message, timeout)
+            sha = await self._commit(clone_path, message, signing_key, timeout)
+            await self._assert_signed_by(clone_path, base, signing_key, timeout)
         except Exception:
             await self._restore_ship_orig(clone_path, timeout)
             raise
@@ -596,7 +612,7 @@ class ShipManager:
             raise ShipError("range contains merge commits; use squash mode")
 
     async def _retain_rewrite(
-        self, task: Task, clone_path: str, base: str, timeout: int
+        self, task: Task, clone_path: str, base: str, signing_key: str, timeout: int
     ) -> tuple[str, int]:
         """Rewrite merge-base..HEAD in place with operator-authored signed commits."""
         await self._assert_retain_preconditions(clone_path, base, timeout)
@@ -614,7 +630,14 @@ class ShipManager:
         name = await self._git_config(clone_path, "user.name")
         email = await self._git_config(clone_path, "user.email")
 
-        argv = ["git", "-C", clone_path, "-c", "sequence.editor=true"]
+        argv = [
+            "git",
+            "-C",
+            clone_path,
+            "-c",
+            "sequence.editor=true",
+            *await self._signing_config(),
+        ]
         if name:
             argv += ["-c", f"user.name={name}"]
         if email:
@@ -625,7 +648,9 @@ class ShipManager:
             "--keep-empty",
             "--empty=keep",
             "--exec",
-            "git commit --amend --no-edit --reset-author -S",
+            # `-c` reaches the nested git through GIT_CONFIG_PARAMETERS, but
+            # the key is named here too so the exec line is self-describing.
+            f"git commit --amend --no-edit --reset-author -S{signing_key}",
         ]
 
         try:
@@ -647,22 +672,11 @@ class ShipManager:
                 f"retain rewrite changed commit count: {post_count} != {pre_count}"
             )
 
-        sigs = (
-            (
-                await _run_git_output(
-                    ["git", "-C", clone_path, "log", "--format=%G?", f"{base}..HEAD"],
-                    clone_path,
-                    timeout,
-                    "ship-retain-sigs",
-                )
-            )
-            .strip()
-            .splitlines()
-        )
-        bad = [s for s in sigs if s not in ("G", "U")]
-        if bad:
+        try:
+            await self._assert_signed_by(clone_path, base, signing_key, timeout)
+        except Exception:
             await self._retain_restore(clone_path, timeout)
-            raise ShipError("retain rewrite produced commits without good signatures")
+            raise
 
         sha = (
             await _run_git_output(
@@ -713,6 +727,81 @@ class ShipManager:
             return None
         value = out.strip()
         return value if value else None
+
+    async def _signing_config(self) -> list[str]:
+        """Command-local signing settings taken from operator-owned config.
+
+        Read from the operator's global/system Git configuration rather than
+        the clone's, so the agent cannot choose the signing program, and pass
+        the result explicitly so the clone's local value is overridden.
+        """
+        program = (
+            await self._operator_git_config("gpg.program")
+            or _DEFAULT_SIGNING_PROGRAM
+        )
+        return [
+            "-c",
+            f"gpg.format={_SIGNING_FORMAT}",
+            "-c",
+            f"gpg.program={program}",
+        ]
+
+    async def _operator_git_config(self, key: str) -> str | None:
+        """Read `key` from operator-owned Git config only, never a clone's."""
+        for scope in ("--global", "--system"):
+            stdout, _stderr, code = await _run_command(
+                ["git", "config", scope, "--get", key], tempfile.gettempdir(), 10
+            )
+            if code == 0 and stdout.strip():
+                return stdout.strip()
+        return None
+
+    async def _assert_signed_by(
+        self, clone_path: str, base: str, signing_key: str, timeout: int
+    ) -> None:
+        """Prove every commit about to be published carries the intended signature.
+
+        `%G?` alone only says a signature verified; `%GF` says *whose* it is.
+        Checking both is what makes the explicit `-S<key>` above verifiable
+        rather than merely requested.
+
+        Verification is itself a GPG invocation, so it runs under the same
+        operator-owned signing config as the commit. Reading it from the
+        clone would let an agent supply the verifier that grades its own
+        commit.
+        """
+        report = await _run_git_output(
+            [
+                "git",
+                "-C",
+                clone_path,
+                *await self._signing_config(),
+                "log",
+                "--format=%H %G? %GF",
+                f"{base}..HEAD",
+            ],
+            clone_path,
+            timeout,
+            "ship-verify-signatures",
+        )
+        wanted = signing_key.upper()
+        for line in report.strip().splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                raise ShipError("could not read signature status for a new commit")
+            sha, status = parts[0], parts[1]
+            signer = parts[2].upper() if len(parts) > 2 else ""
+            if status not in ("G", "U"):
+                raise ShipError(
+                    f"commit {sha[:12]} has no good signature (status {status!r})"
+                )
+            # `%GF` names the key that actually signed. The probe selects the
+            # signing subkey itself, so this is an exact identity check.
+            if signer != wanted:
+                raise ShipError(
+                    f"commit {sha[:12]} was signed by {signer or 'an unknown key'}, "
+                    f"not the selected signing key {wanted}"
+                )
 
     async def _restore_ship_orig(self, clone_path: str, timeout: int) -> None:
         await _run_step(

@@ -77,7 +77,12 @@ run_one() { # run_one NAME
 }
 
 run_all() {
-	local tmp port persist_hash persist_skip=0 persist_absent=0 failed=0 name
+	# tmp/port stay global: the EXIT trap's cleanup() runs after run_all's
+	# locals are gone, and under `set -u` a local would abort the cleanup
+	# (leaking the throwaway state root) whenever bring-up itself failed.
+	local persist_hash persist_skip=0 persist_absent=0 failed=0 name
+	tmp=""
+	port=""
 	local -a failed_names=()
 	tmp=$(mktemp -d /tmp/ompire-runall-XXXXXX)
 	port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')

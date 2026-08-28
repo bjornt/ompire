@@ -105,7 +105,8 @@ state, organization rules, or every later pull-request condition.
 
 `POST /api/tasks/{id}/ship/commit` accepts `mode` of `squash` or `retain`,
 plus the final message and pull-request fields. Both modes produce host-side,
-GPG-signed commits using the current Git configuration; GitHub CLI identity is
+GPG-signed commits using the operator's own signing configuration, never the
+task clone's; GitHub CLI identity is
 shown and gated separately rather than selected or persisted by this flow.
 
 **Squash** fetches origin, computes the merge-base of `origin/<base>` and
@@ -150,7 +151,7 @@ Ship commit is refused, before any Git operation runs, when:
 | Condition | Response |
 |---|---|
 | Unknown task | `404` |
-| GPG signing key not `cached` | `409` with the lock detail |
+| GPG signing key not `ready` | `409` naming the actual state and its recovery (locked, unselected, absent, agent down, tools missing) |
 | GitHub CLI missing, unauthenticated, target-denied, unchecked, or error | Safe `409` with current `gh` status before local ship mutation |
 | Mode other than `squash` or `retain` | `409` |
 | A ship is already in flight | `409` |
@@ -195,9 +196,10 @@ while drafting; an arriving draft only fills fields the operator has not edited
 since the request began. Re-drafting asks for confirmation only if it would
 replace edited values, and preserves changes made after confirmation while the
 replacement is running. A failed draft shows its captured reason and an
-explicit retry alongside usable manual fields. When the shared GPG state is
-`locked`, it renders an amber blocked banner with the terminal-helper unlock
-instruction and a **Re-check key** control. Alongside it, the GitHub banner
+explicit retry alongside usable manual fields. Whenever the shared GPG state is
+not `ready`, it renders a blocked banner naming that specific condition, its
+recovery action, the terminal helper when one applies, and a **Re-check key**
+control. When it is `ready`, the step names the key that will sign. Alongside it, the GitHub banner
 checks the registered upstream, names the safe selected account and target,
 offers **Re-check GitHub**, explains the Git-transport boundary, and disables
 **Sign & commit** until the current target is allowed.
@@ -218,7 +220,7 @@ links to both Ship flow and Tasks, rather than a transient false 404.
 
 | Key | Effect |
 |---|---|
-| `gpg_signing_key` | The signing key. Required before any ship. |
+| `gpg_signing_key` | The signing key. Selectable in Templates & settings, which takes precedence over this file; auto-detected when the host holds exactly one. |
 | `gh_command` | Non-empty GitHub CLI prefix used for bounded, non-interactive version, API, PR-create, and PR-watch calls. |
 
 ## Interfaces

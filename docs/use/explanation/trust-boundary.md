@@ -62,9 +62,17 @@ The agent drafts the commit message and pull-request text — that is genuinely
 useful writing. The daemon does everything else: the signed commit, the push,
 the pull-request creation, using host-side credentials the agent never sees.
 
-Shipping fails closed. If the signing key is not cached, the attempt is
-refused before any Git operation runs. An unknown key state is treated as
-unusable rather than attempted and failed halfway.
+Shipping fails closed. If the signing key is not ready to sign, the attempt is
+refused before any Git operation runs, and the refusal names which condition it
+was. An indeterminate key state is treated as unusable rather than attempted
+and failed halfway.
+
+The signing key, signature format, and signing program all come from the
+operator's own configuration, never from the task clone. That clone is
+writable by the agent, so trusting its Git configuration would let it choose
+who signs — or, through `gpg.program`, which binary the daemon runs on the
+host. The daemon then verifies that the commits it produced really carry the
+intended key's signature before pushing anything.
 
 ## Where the boundary is currently weaker than intended
 

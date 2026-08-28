@@ -25,7 +25,12 @@ from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
-from ompire_daemon.gpg import GpgProbe
+from ompire_daemon.gpg import (
+    FINGERPRINT_RE,
+    STATE_READY,
+    GpgProbe,
+    gpg_signing_refusal,
+)
 from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.projectfiles import (
     DEFAULT_LIMIT as FILE_SEARCH_DEFAULT_LIMIT,
@@ -179,6 +184,28 @@ def _ships(request: Request) -> ShipManager:
 
 def _gpg(request: Request) -> GpgProbe:
     return request.app.state.gpg
+
+
+def _assert_selectable_signing_key(value: Any, gpg: GpgProbe) -> None:
+    """Bound a stored signing selection to the host keyring (ADR-0021).
+
+    The settings store validates the fingerprint's *form*; only the probe
+    knows which keys actually exist, so membership is checked here — before
+    anything is persisted.
+    """
+    if not isinstance(value, str) or not FINGERPRINT_RE.match(value):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "gpg_signing_key: must be a 40-character OpenPGP fingerprint",
+        )
+    wanted = value.upper()
+    known = {candidate.fingerprint for candidate in gpg.candidates()}
+    if wanted not in known:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"gpg_signing_key: {wanted} is not a usable signing key in the "
+            "daemon's keyring",
+        )
 
 
 def _gh(request: Request) -> GitHubProbe:
@@ -1107,11 +1134,11 @@ async def commit_ship_route(
         ) from exc
 
     gpg_status = await gpg.probe()
-    if gpg_status.state != "cached":
+    if gpg_status.state != STATE_READY:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail={
-                "message": "GPG signing key is not cached",
+                "message": gpg_signing_refusal(gpg_status),
                 "gpg": asdict(gpg_status),
             },
         )
@@ -1229,7 +1256,10 @@ async def update_settings_route(
     notifications: AttentionNotifier = Depends(_notifications),
     advisories: AdvisorySampler = Depends(_advisories),
     sessions: SessionTracker = Depends(_sessions),
+    gpg: GpgProbe = Depends(_gpg),
 ) -> SettingsOut:
+    if "gpg_signing_key" in body:
+        _assert_selectable_signing_key(body["gpg_signing_key"], gpg)
     try:
         result = settings_store.update(body)
     except SettingsValidationError as exc:
@@ -1238,6 +1268,8 @@ async def update_settings_route(
             f"{exc.key}: {exc.message}",
         ) from exc
     _apply_settings_live(result.settings, events, notifications, advisories, sessions)
+    if "gpg_signing_key" in body:
+        await gpg.probe()
     return SettingsOut(settings=result.settings, provenance=result.provenance)
 
 
@@ -1249,6 +1281,7 @@ async def delete_settings_route(
     notifications: AttentionNotifier = Depends(_notifications),
     advisories: AdvisorySampler = Depends(_advisories),
     sessions: SessionTracker = Depends(_sessions),
+    gpg: GpgProbe = Depends(_gpg),
 ) -> SettingsOut:
     deleted = settings_store.delete(key)
     if not deleted:
@@ -1258,6 +1291,8 @@ async def delete_settings_route(
         )
     result = settings_store.get()
     _apply_settings_live(result.settings, events, notifications, advisories, sessions)
+    if key == "gpg_signing_key":
+        await gpg.probe()
     return SettingsOut(settings=result.settings, provenance=result.provenance)
 
 

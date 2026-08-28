@@ -51,9 +51,15 @@ started but did not register; the lock file was missing or unreadable.
 
 ## Shipping is refused
 
-Almost always the GPG key. `GET /api/gpg` reports the current state; anything
-other than `cached` blocks a commit. See [Configure GPG
-signing](configure-gpg-signing.md).
+Usually the GPG key. `GET /api/gpg` reports the current state, and anything
+other than `ready` blocks a commit. The state names which problem it is —
+`locked` (cold passphrase cache), `ambiguous` (several keys, none selected),
+`no_key`, `missing` (GnuPG not installed), `agent_unavailable`, or `error` —
+and each has a different fix. See [Configure GPG
+signing](configure-gpg-signing.md) for the table.
+
+The GitHub CLI identity is the other common cause; it is refused separately and
+names the account and repository.
 
 The other refusals are a ship already in flight for that task, an unsupported
 mode, or unmet `retain` preconditions. All are reported with a reason, and all

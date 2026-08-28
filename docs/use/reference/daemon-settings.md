@@ -29,7 +29,7 @@ with a daemon that will not boot.
 
 ### The recognized settings
 
-Fifteen keys, in two groups.
+Sixteen keys, in three groups.
 
 **Numeric, also seedable from `config.toml`:**
 
@@ -38,6 +38,23 @@ Fifteen keys, in two groups.
 | `renotify_interval` | `300` |
 | `stall_threshold` | `300` |
 | `context_advisory_threshold` | `80` |
+
+**Signing-key selection, also seedable from `config.toml`:**
+
+| Key | Default |
+|---|---|
+| `gpg_signing_key` | unset — auto-detect |
+
+An override must be a full 40-character OpenPGP fingerprint naming a key the
+daemon currently enumerates as usable for signing. Anything else is rejected
+with `422` before any value is written. Clearing it returns to `config.toml`,
+then to `git config user.signingkey`, then to automatic detection.
+
+This is the one setting that selects an identity, and it is admitted under an
+explicit bound: it can only ever name a key the operator's own host keyring
+already holds, and it never carries or reaches credential material. See
+[ADR-0021](../../adr/0021-admit-signing-key-selection-as-bounded-daemon-writable-setting.md)
+and [GPG signing](gpg-signing.md).
 
 **Attention-tier preferences, default-only:**
 
@@ -72,6 +89,8 @@ Live application is not uniform, and the differences are deliberate:
 - **`context_advisory_threshold`** applies to the next sample and clears the
   per-session fired latch, so a lowered threshold can fire without waiting for
   a drop below the old one.
+- **`gpg_signing_key`** re-probes immediately on set and on clear, so the
+  chrome chip, the Settings panel, and the ship gate follow from one broadcast.
 
 ### What is not editable at runtime
 
@@ -82,12 +101,19 @@ The line is drawn at infrastructure: a setting that could point the daemon at
 a different binary, a different directory, or a different network interface is
 not something a browser should be able to change.
 
+`gpg_signing_key` is the one deliberate exception, and the shape of that
+exception is what keeps the line intact. It chooses among identities the host
+keyring already holds; it cannot introduce a key, reach a passphrase, or move
+signing off the host agent. Admitting another identity- or credential-adjacent
+setting requires its own architectural decision, not this precedent.
+
 ## Failures and recovery
 
 | Condition | Response |
 |---|---|
 | Unknown key | `422` naming the key |
 | Wrong value type — a non-boolean tier preference, for instance | `422` naming the key |
+| A `gpg_signing_key` that is not a full fingerprint, or names no usable signing key | `422` naming the key; nothing in the update is persisted |
 
 Clearing an override falls back to `config.toml`, or to the built-in default
 when the file says nothing.
@@ -99,6 +125,8 @@ when the file says nothing.
 | `GET` | `/api/settings` | The effective settings map |
 | `PUT` | `/api/settings` | Set overrides |
 | `DELETE` | `/api/settings/{key}` | Clear one override |
+
+Selecting or clearing `gpg_signing_key` also broadcasts a fresh `gpg_status`.
 
 Changes broadcast `settings_changed` with the full effective map. The
 WebSocket snapshot carries the current effective settings.

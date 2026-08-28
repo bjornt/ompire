@@ -189,7 +189,7 @@ def create_app(
     app.state.reviews = ReviewManager(
         config, app.state.engine, app.state.events, app.state.sessions, app.state.agents
     )
-    app.state.gpg = GpgProbe(config, app.state.events)
+    app.state.gpg = GpgProbe(config, app.state.events, app.state.settings_store)
     app.state.gh = GitHubProbe(config, app.state.events)
     app.state.ships = ShipManager(
         config,
