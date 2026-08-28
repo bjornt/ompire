@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/file-mentions — spawn-prompt `@file` mentions.
+#
+# Covers the operator path end to end against the real daemon: discover a
+# repository path through the search endpoint, spawn with that path as an
+# `@` mention, and confirm the daemon delivered the literal mention to the
+# agent. Also confirms the two refusals that must happen before anything is
+# created — a file that does not exist, and one present in the checkout but
+# absent from the base branch (and therefore from the task's clone).
+#
+# The fake omp records every prompt message it is served, which is what makes
+# the delivered text assertable without a model.
+#
+# Preconditions: `local-test/env up` (daemon + project + template).
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+slug=$(unique_slug mentions)
+# API_CODE only survives in the current shell, so refusal bodies land in a
+# file rather than a command substitution (the happy-path convention).
+REFUSAL=$(mktemp /tmp/ompire-mentions-XXXXXX.json)
+_remove_refusal() { rm -f "$REFUSAL"; }
+register_cleanup _remove_refusal
+
+checkout=$(api_json GET "/api/projects/$PROJECT" | jq -r .checkout_path)
+[ -d "$checkout" ] || die "project checkout missing: $checkout"
+
+# --- search: the seeded README is discoverable -------------------------------
+
+files=$(api_json GET "/api/projects/$PROJECT/files?q=README")
+jq -e '.paths | index("README.md")' <<<"$files" >/dev/null &&
+	ok "file search offers README.md" ||
+	fail "file search" "$files"
+jq -e '[.paths[] | select(startswith("/"))] | length == 0' <<<"$files" >/dev/null &&
+	ok "search returns repository-relative paths only" ||
+	fail "search leaked an absolute path" "$files"
+
+# An unknown project is a 404, not an empty listing.
+[ "$(api_code GET "/api/projects/no-such-project/files")" = 404 ] &&
+	ok "unknown project search is 404" ||
+	fail "unknown project search" "expected 404"
+
+# --- refusal: a mention that does not exist ----------------------------------
+
+before=$(api_json GET /api/tasks | jq 'length')
+body=$(jq -n --arg t "$PROJECT" --arg s "$slug-missing" \
+	'{template_name: $t, slug: $s, prompt: "read @no-such-file.md"}')
+api_json POST /api/tasks "$body" >"$REFUSAL"
+[ "$API_CODE" = 422 ] || fail "missing-file mention refused" "got $API_CODE: $(cat "$REFUSAL")"
+grep -q 'no such file' "$REFUSAL" &&
+	ok "missing-file mention refused with its reason" ||
+	fail "refusal names the reason" "$(cat "$REFUSAL")"
+
+# --- refusal: present in the checkout but not on the base branch -------------
+
+uncommitted="scratch-$slug.md"
+printf 'not committed\n' >"$checkout/$uncommitted"
+_remove_scratch() { rm -f "$checkout/$uncommitted"; }
+register_cleanup _remove_scratch
+
+files=$(api_json GET "/api/projects/$PROJECT/files?q=$uncommitted")
+jq -e --arg p "$uncommitted" '.paths | index($p)' <<<"$files" >/dev/null &&
+	ok "search offers the uncommitted file (working-tree scope)" ||
+	fail "uncommitted file not listed" "$files"
+
+body=$(jq -n --arg t "$PROJECT" --arg s "$slug-uncommitted" --arg p "read @$uncommitted" \
+	'{template_name: $t, slug: $s, prompt: $p}')
+api_json POST /api/tasks "$body" >"$REFUSAL"
+[ "$API_CODE" = 422 ] || fail "uncommitted mention refused" "got $API_CODE: $(cat "$REFUSAL")"
+grep -q 'base branch' "$REFUSAL" &&
+	ok "uncommitted mention refused: not on the base branch" ||
+	fail "refusal explains the base branch" "$(cat "$REFUSAL")"
+
+after=$(api_json GET /api/tasks | jq 'length')
+[ "$before" = "$after" ] &&
+	ok "no task row created by either refusal" ||
+	fail "a refusal created a task" "before $before, after $after"
+
+# --- delivery: the literal mention reaches the agent -------------------------
+
+tid=$(spawn_task "$slug" "Read @README.md and summarize it.")
+wait_for "work step completes (session idle)" 180 workflow_complete "$tid"
+assert "task never failed" task_not_failed "$tid"
+
+clone=$(task_field "$tid" clone_path)
+# Captured first: an early `exit` in awk would SIGPIPE ompctl, and pipefail
+# would read that as the lookup failing.
+sessions=$("$OMPCTL" sessions)
+sid=$(awk -v clone="$clone" '$3 == clone { print $1 }' <<<"$sessions" | head -1)
+[ -n "$sid" ] || fail "no fake-omp session recorded for $clone" "$sessions"
+
+transcript=$("$OMPCTL" transcript "$sid")
+delivered=$(jq -r 'select(.kind == "prompt") | .message' <<<"$transcript" | head -1)
+grep -q '@README.md' <<<"$delivered" &&
+	ok "agent received the literal mention (@README.md)" ||
+	fail "delivered prompt lost the mention" "$delivered"
+
+# The mention only means anything because the file is really in the clone —
+# that is what omp resolves it against.
+[ -f "$clone/README.md" ] &&
+	ok "the mentioned file is present in the task clone" ||
+	fail "mentioned file missing from clone" "$clone/README.md"

@@ -6,6 +6,13 @@ export interface Project {
   checkout_path: string;
 }
 
+/** Repository-relative paths for the Spawn prompt's `@` mentions. Names
+ * only — the daemon never returns file contents (add-spawn-file-mentions). */
+export interface ProjectFiles {
+  paths: string[];
+  truncated: boolean;
+}
+
 /** Thinking levels omp accepts (`--thinking`, verified against omp
  * v17.2.12); null on a template or unset on a spawn override means the omp
  * default. */

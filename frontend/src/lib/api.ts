@@ -5,6 +5,7 @@ import type {
   DaemonSettings,
   GpgStatus,
   Project,
+  ProjectFiles,
   ReviewState,
   ShipState,
   Task,
@@ -168,6 +169,22 @@ export function updateProject(
   },
 ): Promise<Project> {
   return request<Project>("PUT", `/api/projects/${encodeURIComponent(name)}`, input);
+}
+
+/** Repository paths for the Spawn prompt's `@` mentions. Rooted at the
+ * project's checkout and filtered by `q`; the daemon caps `limit` itself and
+ * answers 409 when the checkout is missing or is not a git repository. */
+export function searchProjectFiles(
+  name: string,
+  q: string,
+  limit?: number,
+): Promise<ProjectFiles> {
+  const params = new URLSearchParams({ q });
+  if (limit !== undefined) params.set("limit", String(limit));
+  return request<ProjectFiles>(
+    "GET",
+    `/api/projects/${encodeURIComponent(name)}/files?${params}`,
+  );
 }
 
 export function deleteProject(name: string): Promise<{ deleted: string }> {

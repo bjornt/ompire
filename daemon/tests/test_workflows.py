@@ -1526,3 +1526,60 @@ async def test_bugfix_escalate_gate_survives_restart(
 
     runner2.resume_gate(task.id, note=None)
     await wait_for_run(engine, task.id, {"complete"})
+
+
+# --- prompt file mentions (add-spawn-file-mentions) -------------------------
+
+
+async def test_mention_resolving_in_the_clone_is_delivered_verbatim(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """Omp parses `@path` out of the `message` field itself, so the daemon
+    delivers the literal mention (findings-omp-file-mentions.md)."""
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    template = _make_template(engine)
+    task = _make_task(engine, tmp_path, template, prompt="read @notes.md")
+    (Path(task.clone_path) / "notes.md").write_text("notes\n")
+
+    runner.start_run(task, template)
+    final = await wait_for_run(engine, task.id, {"complete"})
+
+    assert final.workflow_status == "complete"
+    assert user_prompts(supervisor, task.id, "main") == ["read @notes.md"]
+
+
+async def test_mention_missing_from_the_clone_fails_the_step_without_prompting(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """The base checkout moved between submit and clone. Omp would drop the
+    mention silently, so the daemon refuses to send the prompt at all."""
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    template = _make_template(engine)
+    task = _make_task(engine, tmp_path, template, prompt="read @gone.md")
+
+    runner.start_run(task, template)
+    final = await wait_for_run(engine, task.id, {"failed"})
+
+    assert final.state == "created"
+    records = list_step_records(engine, task.id)
+    assert records[0].status == "failed"
+    assert "@gone.md" in (records[0].error or "")
+    assert "does not resolve in the task clone" in (records[0].error or "")
+    # Nothing was sent: the agent never saw a prompt with a dead reference.
+    assert user_prompts(supervisor, task.id, "main") == []
+
+
+async def test_a_preamble_at_sign_is_prose_and_never_fails_the_step(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """Only the operator's own mentions are gated; template text is not a
+    place where `@word` means a file."""
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    template = _make_template(engine, preamble="ping @nobody about this")
+    task = _make_task(engine, tmp_path, template, prompt="do it")
+
+    runner.start_run(task, template)
+    final = await wait_for_run(engine, task.id, {"complete"})
+
+    assert final.workflow_status == "complete"
+    assert user_prompts(supervisor, task.id, "main") == ["ping @nobody about this\n\ndo it"]

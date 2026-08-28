@@ -51,6 +51,7 @@ from sqlalchemy import Engine as SAEngine
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
+from ompire_daemon.projectfiles import mention_tokens, unresolved_mentions
 from ompire_daemon.registry.sessions import mark_session_id, record_session_spawned
 from ompire_daemon.registry.workflows import (
     StepRecord,
@@ -1106,6 +1107,24 @@ class WorkflowRunner:
             # validate-agent skip relies on this).
             self._tracker.prompt_skipped(task.id, step.session)
             return _StepResult()
+
+        # Omp resolves `@path` mentions against the child's working directory
+        # and drops silently what it cannot find (findings-omp-file-mentions.md),
+        # so a mention the clone no longer carries would cost the operator
+        # context with nothing anywhere saying so. Only the operator's own
+        # mentions are gated; a template preamble's stray `@word` is prose.
+        operator_mentions = set(mention_tokens(task.prompt))
+        if operator_mentions:
+            dangling = [
+                token
+                for token in unresolved_mentions(prompt, task.clone_path)
+                if token in operator_mentions
+            ]
+            if dangling:
+                listed = ", ".join(f"@{token}" for token in dangling)
+                raise _StepInfraFailure(
+                    f"prompt file mention does not resolve in the task clone: {listed}"
+                )
 
         try:
             # The ack is a receipt ("queued"), not turn completion.

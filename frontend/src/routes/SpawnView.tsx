@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { spawnTask } from "../lib/api";
+import { PromptMentions } from "./PromptMentions";
 import { useDaemonState } from "../lib/useDaemonState";
 import { REGISTERED_WORKFLOWS, THINKING_LEVELS, templateCheckout } from "../lib/templates";
 import type { SpawnStepName, SpawnStepPayload, Task, ThinkingLevel } from "../types";
@@ -211,15 +212,18 @@ export function SpawnView() {
 
           <div className="field">
             <label htmlFor="spawn-prompt">Prompt</label>
-            <textarea
+            <PromptMentions
               id="spawn-prompt"
-              className="mono"
               rows={9}
               value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
+              onChange={setPrompt}
+              projectName={template?.project_name ?? null}
               disabled={locked}
               placeholder="What should the agent do? (delivered once the agent is ready)"
             />
+            <div className="hint">
+              Type <code>@</code> to attach a file from the template's repository.
+            </div>
           </div>
 
           {template && (

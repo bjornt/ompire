@@ -47,6 +47,7 @@ the daemon, and `cleanup` runs last.
 | Scenario | Covers |
 |---|---|
 | `happy-path` | Spawn through review, ship, and pull request |
+| `file-mentions` | Prompt `@file` search, the submit refusals, and literal delivery |
 | `ask-approval` | Agent questions and approval gates |
 | `review-comments` | Feeding review comments back into the session |
 | `ship-retain` | `retain` mode commit rewriting and signature verification |

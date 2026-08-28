@@ -149,6 +149,7 @@ to assertions.
 | Runbook | Proves |
 |---|---|
 | `happy-path` | Spawn through shipped |
+| `file-mentions` | Prompt `@file` search, refusal, and delivery |
 | `ask-approval` | Interactive gates |
 | `review-comments` | Comment loopback through the real reviewer UI |
 | `ship-retain` | Multi-commit re-signing |

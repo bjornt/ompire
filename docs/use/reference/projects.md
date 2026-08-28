@@ -74,6 +74,20 @@ and the full updated payload is broadcast.
 While a project is referenced, the name field in the Edit panel is disabled
 and annotated with the referencing count.
 
+### File search
+
+`GET /api/projects/{name}/files` lists the checkout's repository-relative
+paths, so the Spawn view can offer them for a prompt's
+[`@file` mentions](task-spawn.md#file-mentions).
+
+`q` filters; `limit` bounds the result count and is capped by the daemon, and
+the response reports whether the result was truncated. The listing follows the
+repository's ignore rules: tracked files and files present but not yet
+committed are listed, ignored files are not.
+
+Only names are returned — never file contents, never absolute paths, and
+nothing under `.git`.
+
 ## Failures and recovery
 
 | Condition | Response |
@@ -83,6 +97,8 @@ and annotated with the referencing count.
 | Delete or rename while tasks reference it | `409` naming the tasks |
 | Delete or rename while templates reference it | `409` naming the templates |
 | Rename to a name already in use | `409`, both projects unchanged |
+| File search for an unknown project | `404` |
+| File search when `checkout_path` is missing or is not a git repository | `409` naming the path |
 
 Every rejection leaves the registry unchanged. Rejections surface inline in
 the form or Edit panel, which stays open with the daemon's detail rather than
@@ -102,6 +118,7 @@ project's `checkout_path`. It defaults to `~/proj`.
 | `GET` | `/api/projects/{name}` |
 | `PUT` | `/api/projects/{name}` |
 | `DELETE` | `/api/projects/{name}` |
+| `GET` | `/api/projects/{name}/files` |
 
 Projects appear in the WebSocket snapshot. Mutations broadcast
 `project_created` and `project_renamed`.

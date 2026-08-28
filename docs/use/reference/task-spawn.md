@@ -18,12 +18,14 @@ workflow all come from the template.
 |---|---|---|
 | `template_name` | yes | Resolves the project and all spawn configuration |
 | `slug` | yes | Task slug; the branch is derived from it |
-| `prompt` | yes | The operator's instruction |
+| `prompt` | yes | The operator's instruction, including any `@file` mentions |
 | `model` | no | Per-spawn override of the template's model |
 | `thinking` | no | Per-spawn override of the template's thinking level |
 
 The call returns `202` with the new task id and the pipeline runs
 asynchronously. An unknown `template_name` returns `404` and creates nothing.
+A prompt whose `@file` mention cannot become file context returns `422` and
+also creates nothing — see [File mentions](#file-mentions).
 
 ### The Spawn view
 
@@ -34,7 +36,7 @@ templates" link to `/settings`.
 Below it, a read-only "Workflow — from template" block describing the selected
 template's workflow, model and thinking override controls each defaulting to
 "template default (…)", a slug field with a live branch-name preview, and a
-prompt editor.
+prompt editor that offers repository paths when `@` is typed.
 
 Submitting locks the form. Every input and the submit button are disabled
 from the moment the button is activated, so one activation creates at most one
@@ -63,6 +65,61 @@ slug, a clone path outside the task root, or a transport failure — creates
 nothing. The form unlocks immediately, keeps everything that was typed, and
 shows the daemon's message. If the accepted task is deleted or purged while the
 form is locked, the form unlocks and says so.
+
+## File mentions
+
+A prompt may name files from the project's repository. The agent receives each
+mentioned file as context, so it starts from the right file instead of
+searching for it.
+
+### Writing one
+
+Typing `@` at the start of the prompt or after whitespace opens a suggestion
+list of repository-relative paths from the template's project; the characters
+typed after it narrow the list. `@` inside a word — an email address, a
+decorator — opens nothing.
+
+| Key | Effect |
+|---|---|
+| ↑ / ↓ | Move through the suggestions |
+| Enter or Tab | Insert the highlighted path |
+| Escape | Close the list, leaving the typed text exactly as written |
+
+Escape keeps the list closed while you go on typing that mention. Moving off it
+and starting another `@` opens suggestions again.
+
+Selecting inserts `@` plus the path at the caret, replacing the partial token
+wherever it sits in the prompt, followed by a separating space. A prompt may
+carry several mentions. Choosing a different template closes the list and
+points later lookups at the new template's project without touching text
+already written.
+
+The list offers what the repository tracks plus files present but not yet
+committed, and never offers anything the repository ignores. It never shows
+file contents.
+
+The prompt is stored and displayed with the literal mention text, so the
+request stays readable:
+`Fix the redirect in @frontend/src/lib/token.ts`.
+
+### Which files can be attached
+
+The task's clone is made from the template's base branch, so only what that
+branch carries reaches the agent. A file that exists in your checkout but is
+not on the base branch — one you just created, or one committed to another
+branch — is offered by the search but refused at submit, because it would not
+be in the clone.
+
+The refusal names the path and the reason, nothing is created, and the form
+keeps everything you typed.
+
+### Reaching the agent
+
+Omp parses `@path` out of the message it is sent and resolves it against the
+agent's working directory, which is the task's clone. Ompire re-checks every
+mention against the clone immediately before delivering the prompt: a mention
+that no longer resolves fails the step with the path named, rather than being
+delivered as a reference omp would silently drop.
 
 ## States and behavior
 
@@ -119,6 +176,10 @@ manage it later.
 
 | Condition | Result |
 |---|---|
+| Prompt mention is absolute, contains `..`, or resolves outside the checkout | `422`, nothing created |
+| Prompt mention names a missing path or something that is not a regular file | `422`, nothing created |
+| Prompt mention is not on the template's base branch | `422`, nothing created — the clone would not contain it |
+| Prompt mention stops resolving in the clone before delivery | Step fails with the path named; no prompt is sent |
 | Template missing at pipeline start | Task `failed` before any git command |
 | Any step exits non-zero or times out | Pipeline stops, task `failed`, stderr stored on the task |
 | Resolved clone path falls outside the task root | Spawn rejected before any git command |

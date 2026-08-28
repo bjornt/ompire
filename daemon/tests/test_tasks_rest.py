@@ -326,3 +326,84 @@ def test_cleanup_clears_attention_entry(
 
     assert response.status_code == 200
     assert task["id"] not in app.state.notifications.snapshot()
+
+
+# --- prompt file mentions (add-spawn-file-mentions) -------------------------
+
+
+def _spawn_with_prompt(client: TestClient, auth_headers: dict, prompt: str):
+    return client.post(
+        "/api/tasks",
+        headers=auth_headers,
+        json={"template_name": "demo", "slug": "fix-bug", "prompt": prompt},
+    )
+
+
+def test_mention_of_a_committed_file_is_accepted(
+    client: TestClient, auth_headers: dict, demo_template: dict
+) -> None:
+    response = _spawn_with_prompt(client, auth_headers, "look at @README.md please")
+
+    assert response.status_code == 202
+    task = response.json()
+    # Stored verbatim: the literal mention is what reaches the agent.
+    assert task["prompt"] == "look at @README.md please"
+    _wait_settled(client, auth_headers, task["id"])
+
+
+@pytest.mark.parametrize(
+    ("mention", "fragment"),
+    [
+        ("/etc/passwd", "absolute paths"),
+        ("../escape.txt", "'..' is not allowed"),
+        ("no-such-file.md", "no such file"),
+    ],
+)
+def test_bad_mention_rejected_before_anything_is_created(
+    client: TestClient,
+    auth_headers: dict,
+    demo_template: dict,
+    git_checkout: Path,
+    mention: str,
+    fragment: str,
+) -> None:
+    response = _spawn_with_prompt(client, auth_headers, f"read @{mention} now")
+
+    assert response.status_code == 422
+    assert fragment in response.json()["detail"]
+    # No task row, and therefore no pipeline.
+    assert client.get("/api/tasks", headers=auth_headers).json() == []
+
+
+def test_uncommitted_file_mention_is_refused_with_the_base_branch_reason(
+    client: TestClient, auth_headers: dict, demo_template: dict, git_checkout: Path
+) -> None:
+    (git_checkout / "scratch.md").write_text("not committed\n")
+
+    response = _spawn_with_prompt(client, auth_headers, "see @scratch.md")
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "base branch" in detail
+    assert "clone" in detail
+    assert client.get("/api/tasks", headers=auth_headers).json() == []
+
+
+def test_email_address_in_a_prompt_is_not_a_mention(
+    client: TestClient, auth_headers: dict, demo_template: dict
+) -> None:
+    response = _spawn_with_prompt(client, auth_headers, "ask someone@example.com about it")
+
+    assert response.status_code == 202
+    _wait_settled(client, auth_headers, response.json()["id"])
+
+
+def test_every_bad_mention_is_named_in_one_refusal(
+    client: TestClient, auth_headers: dict, demo_template: dict
+) -> None:
+    response = _spawn_with_prompt(client, auth_headers, "see @gone-a.md and @gone-b.md")
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "@gone-a.md" in detail
+    assert "@gone-b.md" in detail

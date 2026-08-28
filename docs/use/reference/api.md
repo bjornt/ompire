@@ -33,6 +33,7 @@ bodies; the tables below are a map, not a schema.
 | `GET` | `/api/projects/{name}` | Fetch |
 | `PUT` | `/api/projects/{name}` | Update |
 | `DELETE` | `/api/projects/{name}` | Delete. `409` if tasks or templates reference it |
+| `GET` | `/api/projects/{name}/files` | Repository paths for prompt `@` mentions. `409` if the checkout is missing or not a git repository |
 
 ## Templates
 
@@ -50,7 +51,7 @@ bodies; the tables below are a map, not a schema.
 |---|---|---|
 | `GET` | `/api/tasks` | List |
 | `GET` | `/api/tasks/{id}` | Detail, including sessions and step records |
-| `POST` | `/api/tasks` | Spawn. Returns `202`; spawning continues in the background |
+| `POST` | `/api/tasks` | Spawn. Returns `202`; spawning continues in the background, or `422` for an unusable prompt mention |
 | `POST` | `/api/tasks/{id}/cleanup` | Remove workshop, delete clone, archive |
 | `DELETE` | `/api/tasks/{id}` | Purge the record |
 

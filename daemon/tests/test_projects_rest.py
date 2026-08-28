@@ -336,3 +336,99 @@ def test_repointing_template_unblocks_project_delete(
 
     deleted = client.delete("/api/projects/ompire", headers=auth_headers)
     assert deleted.status_code == 200
+
+
+# --- file search (add-spawn-file-mentions) ----------------------------------
+
+
+def _register(client: TestClient, auth_headers: dict[str, str], checkout: str) -> None:
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "demo",
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+            "checkout_path": checkout,
+        },
+    )
+    assert response.status_code == 201
+
+
+def test_file_search_requires_the_bearer_token(
+    client: TestClient, auth_headers: dict[str, str], git_checkout: Path
+) -> None:
+    _register(client, auth_headers, str(git_checkout))
+
+    assert client.get("/api/projects/demo/files").status_code == 401
+
+
+def test_file_search_lists_repository_relative_paths(
+    client: TestClient, auth_headers: dict[str, str], git_checkout: Path
+) -> None:
+    _register(client, auth_headers, str(git_checkout))
+
+    response = client.get("/api/projects/demo/files", headers=auth_headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "README.md" in body["paths"]
+    assert body["truncated"] is False
+    # Names only: no contents, no absolute paths, nothing under .git.
+    assert set(body) == {"paths", "truncated"}
+    assert all(not path.startswith("/") for path in body["paths"])
+    assert all(not path.startswith(".git/") for path in body["paths"])
+
+
+def test_file_search_filters_by_query(
+    client: TestClient, auth_headers: dict[str, str], git_checkout: Path
+) -> None:
+    _register(client, auth_headers, str(git_checkout))
+
+    response = client.get("/api/projects/demo/files?q=READ", headers=auth_headers)
+
+    assert response.json()["paths"] == ["README.md"]
+
+
+def test_file_search_caps_a_client_supplied_limit(
+    client: TestClient, auth_headers: dict[str, str], git_checkout: Path
+) -> None:
+    for index in range(5):
+        (git_checkout / f"extra{index}.txt").write_text("x\n")
+    _register(client, auth_headers, str(git_checkout))
+
+    response = client.get("/api/projects/demo/files?limit=2", headers=auth_headers)
+
+    body = response.json()
+    assert len(body["paths"]) == 2
+    assert body["truncated"] is True
+
+
+def test_file_search_unknown_project_404(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    assert client.get("/api/projects/nope/files", headers=auth_headers).status_code == 404
+
+
+def test_file_search_missing_checkout_is_409_not_an_empty_list(
+    client: TestClient, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    _register(client, auth_headers, str(tmp_path / "gone"))
+
+    response = client.get("/api/projects/demo/files", headers=auth_headers)
+
+    assert response.status_code == 409
+    assert "does not exist" in response.json()["detail"]
+
+
+def test_file_search_non_git_checkout_is_409(
+    client: TestClient, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    _register(client, auth_headers, str(plain))
+
+    response = client.get("/api/projects/demo/files", headers=auth_headers)
+
+    assert response.status_code == 409
+    assert "not a git repository" in response.json()["detail"]

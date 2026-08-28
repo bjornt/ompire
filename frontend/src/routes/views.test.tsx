@@ -3077,3 +3077,249 @@ describe("SettingsView (templates capability)", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe("SpawnView file mentions", () => {
+  /** Only the mention popup's options — a `<select>`'s options share the role. */
+  function suggestedPaths(): string[] {
+    const popup = screen.queryByTestId("mention-popup");
+    if (popup === null) return [];
+    return within(popup)
+      .queryAllByRole("option")
+      .map((option) => option.textContent ?? "");
+  }
+
+  function stubFileSearch(
+    responder: (query: string) => { paths: string[]; truncated?: boolean } | "error",
+  ) {
+    const fetchMock = vi.fn((url: unknown) => {
+      const href = String(url);
+      if (href.includes("/files")) {
+        const query = new URL(href, "http://localhost").searchParams.get("q") ?? "";
+        const answer = responder(query);
+        if (answer === "error") {
+          return Promise.resolve({
+            ok: false,
+            status: 409,
+            json: () => Promise.resolve({ detail: "checkout path is not a git repository" }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve({ paths: answer.paths, truncated: answer.truncated ?? false }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  async function spawnViewWithFiles(
+    responder: (query: string) => { paths: string[]; truncated?: boolean } | "error",
+    templates = [makeTemplate()],
+  ) {
+    await renderAt("/spawn", { projects: [project], templates, tasks: [] });
+    const fetchMock = stubFileSearch(responder);
+    return { user: userEvent.setup(), fetchMock, prompt: screen.getByLabelText("Prompt") };
+  }
+
+  it("opens suggestions when @ is typed and queries the template's project", async () => {
+    const { user, fetchMock, prompt } = await spawnViewWithFiles(() => ({
+      paths: ["src/lib/token.ts"],
+    }));
+
+    await user.type(prompt, "read @tok");
+
+    expect(await screen.findByRole("option", { name: "src/lib/token.ts" })).toBeInTheDocument();
+    const requested = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(requested.some((url) => url.startsWith("/api/projects/maas/files?"))).toBe(true);
+  });
+
+  it("narrows the list as the query grows", async () => {
+    const { user, prompt } = await spawnViewWithFiles((query) => ({
+      paths: query === "to" ? ["a/token.ts", "b/tomato.ts"] : ["a/token.ts"],
+    }));
+
+    await user.type(prompt, "@to");
+    await screen.findByTestId("mention-popup");
+    await expect.poll(() => suggestedPaths()).toEqual(["a/token.ts", "b/tomato.ts"]);
+
+    await user.type(prompt, "k");
+    await expect.poll(() => suggestedPaths()).toEqual(["a/token.ts"]);
+  });
+
+  it("does not open on an @ inside a word, so an email address is left alone", async () => {
+    const { user, fetchMock, prompt } = await spawnViewWithFiles(() => ({ paths: ["a.ts"] }));
+
+    await user.type(prompt, "ask someone@example.com");
+
+    expect(screen.queryByTestId("mention-popup")).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.map((call) => String(call[0]))).toEqual([]);
+  });
+
+  it("selects with the keyboard and inserts the literal mention", async () => {
+    const { user, prompt } = await spawnViewWithFiles(() => ({
+      paths: ["a/first.ts", "b/second.ts"],
+    }));
+
+    await user.type(prompt, "read @s");
+    await screen.findByRole("option", { name: "a/first.ts" });
+    await user.keyboard("{ArrowDown}{Enter}");
+
+    expect(prompt).toHaveValue("read @b/second.ts ");
+    expect(screen.queryByTestId("mention-popup")).not.toBeInTheDocument();
+  });
+
+  it("selects with Tab as well as Enter", async () => {
+    const { user, prompt } = await spawnViewWithFiles(() => ({ paths: ["a/first.ts"] }));
+
+    await user.type(prompt, "@f");
+    await screen.findByRole("option", { name: "a/first.ts" });
+    await user.keyboard("{Tab}");
+
+    expect(prompt).toHaveValue("@a/first.ts ");
+  });
+
+  it("selects with the pointer", async () => {
+    const { user, prompt } = await spawnViewWithFiles(() => ({
+      paths: ["a/first.ts", "b/second.ts"],
+    }));
+
+    await user.type(prompt, "@s");
+    await user.click(await screen.findByRole("option", { name: "b/second.ts" }));
+
+    expect(prompt).toHaveValue("@b/second.ts ");
+  });
+
+  it("inserts at the caret in the middle of the prompt, not at the end", async () => {
+    const { user, prompt } = await spawnViewWithFiles(() => ({ paths: ["a/token.ts"] }));
+
+    await user.type(prompt, "read  and then stop");
+    // Put the caret after "read " and open a mention there.
+    await user.click(prompt);
+    (prompt as HTMLTextAreaElement).setSelectionRange(5, 5);
+    await user.keyboard("@tok");
+    await user.click(await screen.findByRole("option", { name: "a/token.ts" }));
+
+    expect(prompt).toHaveValue("read @a/token.ts and then stop");
+  });
+
+  it("supports several mentions in one prompt", async () => {
+    const { user, prompt } = await spawnViewWithFiles((query) => ({
+      paths: query.startsWith("f") ? ["a/first.ts"] : ["b/second.ts"],
+    }));
+
+    await user.type(prompt, "@f");
+    await user.click(await screen.findByRole("option", { name: "a/first.ts" }));
+    await user.type(prompt, "and @s");
+    await user.click(await screen.findByRole("option", { name: "b/second.ts" }));
+
+    expect(prompt).toHaveValue("@a/first.ts and @b/second.ts ");
+  });
+
+  it("Escape closes the list and leaves the typed text exactly as written", async () => {
+    const { user, prompt } = await spawnViewWithFiles(() => ({ paths: ["a/token.ts"] }));
+
+    await user.type(prompt, "read @tok");
+    await screen.findByRole("option", { name: "a/token.ts" });
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByTestId("mention-popup")).not.toBeInTheDocument();
+    expect(prompt).toHaveValue("read @tok");
+
+    // Dismissal sticks: the next keystroke must not reopen the same mention.
+    await user.type(prompt, "en");
+    expect(screen.queryByTestId("mention-popup")).not.toBeInTheDocument();
+
+    // Moving off it and starting another mention opens the list again.
+    await user.type(prompt, " @tok");
+    expect(await screen.findByRole("option", { name: "a/token.ts" })).toBeInTheDocument();
+  });
+
+  it("says so when nothing matches, without touching the prompt", async () => {
+    const { user, prompt } = await spawnViewWithFiles(() => ({ paths: [] }));
+
+    await user.type(prompt, "@zzz");
+
+    expect(await screen.findByText("No matching files")).toBeInTheDocument();
+    expect(prompt).toHaveValue("@zzz");
+  });
+
+  it("shows the daemon's reason when the search fails and keeps the field usable", async () => {
+    const { user, prompt } = await spawnViewWithFiles(() => "error");
+
+    await user.type(prompt, "@a");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "checkout path is not a git repository",
+    );
+    await user.type(prompt, "bc");
+    expect(prompt).toHaveValue("@abc");
+  });
+
+  it("closes the list when the template changes without rewriting the prompt", async () => {
+    const { user, prompt } = await spawnViewWithFiles(() => ({ paths: ["a/token.ts"] }), [
+      makeTemplate(),
+      makeTemplate({ name: "other", project_name: "maas" }),
+    ]);
+
+    await user.type(prompt, "read @tok");
+    await screen.findByRole("option", { name: "a/token.ts" });
+
+    await user.selectOptions(screen.getByLabelText("Project template"), "other");
+
+    expect(screen.queryByTestId("mention-popup")).not.toBeInTheDocument();
+    expect(prompt).toHaveValue("read @tok");
+  });
+
+  it("announces the suggestion count for screen readers", async () => {
+    const { user, prompt } = await spawnViewWithFiles(() => ({
+      paths: ["a/first.ts", "b/second.ts"],
+    }));
+
+    await user.type(prompt, "@s");
+
+    await expect
+      .poll(() => screen.getByRole("status").textContent)
+      .toBe("2 file suggestions");
+  });
+
+  it("marks the active option for assistive technology", async () => {
+    const { user, prompt } = await spawnViewWithFiles(() => ({
+      paths: ["a/first.ts", "b/second.ts"],
+    }));
+
+    await user.type(prompt, "@s");
+    await screen.findByRole("option", { name: "a/first.ts" });
+
+    expect(prompt).toHaveAttribute("aria-expanded", "true");
+    const activeId = prompt.getAttribute("aria-activedescendant");
+    expect(screen.getByRole("option", { name: "a/first.ts" })).toHaveAttribute("id", activeId);
+
+    await user.keyboard("{ArrowDown}");
+    await expect
+      .poll(() => prompt.getAttribute("aria-activedescendant"))
+      .toBe(screen.getByRole("option", { name: "b/second.ts" }).id);
+  });
+
+  it("is inert while the form is locked by a submission", async () => {
+    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+    const user = userEvent.setup();
+    const prompt = screen.getByLabelText("Prompt");
+    await user.type(prompt, "fix it");
+
+    const spawned = makeTask({ spawn_completed_at: null });
+    stubFileSearch(() => ({ paths: ["a/token.ts"] }));
+    vi.mocked(fetch).mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(spawned),
+    } as unknown as Response);
+
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+
+    expect(prompt).toBeDisabled();
+    expect(screen.queryByTestId("mention-popup")).not.toBeInTheDocument();
+  });
+});

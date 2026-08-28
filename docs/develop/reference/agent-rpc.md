@@ -49,6 +49,24 @@ agent emits events whenever it likes.
 A `response` reporting `success: false` fails the request with the frame's
 error text.
 
+### File mentions in a prompt
+
+The `message` field is not opaque text to omp. It runs through omp's own
+`@file` parser: `@relative/path` at a word boundary becomes a `fileMention`
+carrying the file's content, resolved against the child's working directory —
+the task's clone. `@` inside a word, such as an email address, is left as
+prose. Verified against omp 17.4.0.
+
+**An unresolvable mention is dropped silently.** The request still answers
+`success: true`, no `fileMention` is produced, and nothing reports the missing
+file. That is why the workflow engine resolves the operator's mentions against
+the clone before delivering a prompt, and fails the step rather than sending
+one omp would quietly strip — see [task spawn](../../use/reference/task-spawn.md#file-mentions).
+
+`daemon/tests/test_omp_file_mentions.py` holds this contract against the real
+binary, driving it through `AgentHandle` with a local capture endpoint in place
+of a model provider.
+
 ### Opaque passthrough
 
 The daemon validates with typed models only the interpreted subset:

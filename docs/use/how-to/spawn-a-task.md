@@ -35,6 +35,23 @@ template's workflow, and the branch preview updates live as you type the slug.
 Model and thinking controls default to "template default (…)"; leaving them
 alone sends no override.
 
+### Attach a file to the prompt
+
+Type `@` in the prompt to search the project's repository, then pick a path
+with the arrow keys and Enter, or with the mouse. The path is inserted where
+you are typing, and the agent receives that file as context — so you can write
+"fix the redirect in @frontend/src/lib/token.ts" instead of describing where
+the code lives.
+
+Escape closes the list and leaves what you typed alone, so an email address or
+any other `@` in your prompt is never rewritten.
+
+If a mention cannot be attached, the spawn is refused before anything is
+created and the message says why. The usual reason is a file that is not on
+the template's base branch: the task's clone is made from that branch, so a
+file you only just created locally would not be there. Commit it to the base
+branch, or drop the mention, and submit again — nothing you typed is lost.
+
 Submitting locks the form until the launch resolves, so a second click
 cannot create a second task. Pipeline progress is shown per step, and a failed
 step expands its stderr in place.
@@ -67,6 +84,10 @@ curl -sS -X POST http://127.0.0.1:4173/api/tasks \
 `template_name`, `slug`, and `prompt` are required. `model` and `thinking` are
 optional per-spawn overrides; omitting them uses the template's values, and a
 template with neither set uses the agent's defaults.
+
+The prompt may contain `@relative/path` mentions. List the paths a project
+offers with `GET /api/projects/{name}/files?q=<query>`. A mention that cannot
+become file context returns `422` and creates nothing.
 
 Returns `202` immediately with the created task. An unknown `template_name`
 returns `404` and creates nothing. Spawning continues in the background; watch

@@ -26,6 +26,17 @@ from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.notifications import AttentionNotifier
+from ompire_daemon.projectfiles import (
+    DEFAULT_LIMIT as FILE_SEARCH_DEFAULT_LIMIT,
+)
+from ompire_daemon.projectfiles import (
+    MAX_LIMIT as FILE_SEARCH_MAX_LIMIT,
+)
+from ompire_daemon.projectfiles import (
+    ProjectFilesError,
+    search_project_files,
+    validate_mentions,
+)
 from ompire_daemon.registry.projects import (
     DuplicateProjectError,
     Project,
@@ -230,6 +241,46 @@ def get_project_route(name: str, engine: Engine = Depends(_engine)) -> Project:
         return get_project(engine, name)
     except ProjectNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+
+class ProjectFilesOut(BaseModel):
+    """Repository-relative path names only — never contents, sizes, or
+    absolute paths (add-spawn-file-mentions)."""
+
+    paths: list[str]
+    truncated: bool
+
+
+@router.get("/projects/{name}/files", response_model=ProjectFilesOut)
+async def search_project_files_route(
+    name: str,
+    q: str = "",
+    limit: int = FILE_SEARCH_DEFAULT_LIMIT,
+    engine: Engine = Depends(_engine),
+    config: Config = Depends(_config),
+) -> ProjectFilesOut:
+    """List the project's repository files for the Spawn view's `@` mentions.
+
+    A client-supplied `limit` cannot exceed the server's hard maximum. An
+    unusable checkout is a 409, never an empty success — "your checkout is
+    gone" and "no matches" must not read the same.
+    """
+    try:
+        project = get_project(engine, name)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    try:
+        result = await search_project_files(
+            project.checkout_path,
+            query=q,
+            limit=min(max(limit, 1), FILE_SEARCH_MAX_LIMIT),
+            timeout=config.spawn_step_timeout,
+        )
+    except ProjectFilesError as exc:
+        # Missing checkout, not-a-repository, git failure, timeout: all state
+        # the operator has to fix, each carrying its own message.
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    return ProjectFilesOut(paths=result.paths, truncated=result.truncated)
 
 
 @router.put("/projects/{name}", response_model=ProjectOut)
@@ -508,6 +559,26 @@ async def spawn_task_route(
     except TemplateNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     project = get_project(engine, template.project_name)
+
+    # Mentions are validated before anything is created: Omp drops one it
+    # cannot resolve without a word (findings-omp-file-mentions.md), so a
+    # mention that will not survive into the clone must be refused here, not
+    # discovered after the workspace is built.
+    try:
+        rejections = await validate_mentions(
+            body.prompt,
+            checkout_path=project.checkout_path,
+            base_branch=template.base_branch,
+            timeout=config.spawn_step_timeout,
+        )
+    except ProjectFilesError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    if rejections:
+        detail = "; ".join(rejection.message() for rejection in rejections)
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"prompt file mention rejected — {detail}",
+        )
 
     try:
         clone_path = clone_path_for(config.task_dir_root, project.name, body.slug)
