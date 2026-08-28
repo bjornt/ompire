@@ -675,6 +675,23 @@ def recording_paths(values: list[str], all_goldens: bool) -> list[Path]:
     return [path for path in paths if path.name != "versions.json"]
 
 
+def manifest_version_entries(entry: Any, tool: str) -> list[dict[str, Any]]:
+    """Read a legacy one-version entry or the multi-version form.
+
+    Recordings are evidence tied to their real executable version. Keeping an
+    older recording when a later real invocation is captured is more honest
+    than rewriting its provenance to match the newer binary.
+    """
+
+    if not isinstance(entry, dict):
+        raise FidelityError(f"versions.json: invalid tool entry {tool!r}")
+    raw = entry.get("versions")
+    entries = raw if raw is not None else [entry]
+    if not isinstance(entries, list) or not entries or not all(isinstance(item, dict) for item in entries):
+        raise FidelityError(f"versions.json: invalid version list for {tool}")
+    return entries
+
+
 def validate_version_manifest(paths: list[Path]) -> None:
     manifest = load_json(VERSIONS_JSON)
     if manifest.get("schema_version") != 1 or not isinstance(manifest.get("tools"), dict):
@@ -682,21 +699,28 @@ def validate_version_manifest(paths: list[Path]) -> None:
     actual_cases: set[str] = set()
     listed_cases: set[str] = set()
     for tool, entry in manifest["tools"].items():
-        if tool not in TOOLS or not isinstance(entry, dict):
+        if tool not in TOOLS:
             raise FidelityError(f"versions.json: invalid tool entry {tool!r}")
-        if not all(isinstance(entry.get(field), str) and entry[field] for field in ("version", "captured_at", "environment")):
-            raise FidelityError(f"versions.json: incomplete provenance for {tool}")
-        cases = entry.get("cases")
-        if not isinstance(cases, list) or not cases or not all(isinstance(case, str) for case in cases):
-            raise FidelityError(f"versions.json: {tool}.cases must be a non-empty string list")
-        for case in cases:
-            listed_cases.add(case)
-            case_path = DEFAULT_GOLDENS / case
-            if not case_path.is_file():
-                raise FidelityError(f"versions.json: missing listed case {case}")
-            case_doc = validate_recording(load_json(case_path), str(case_path))
-            if case_doc["metadata"]["tool"] != tool or case_doc["metadata"]["tool_version"] != entry["version"]:
-                raise FidelityError(f"versions.json: provenance mismatch for {case}")
+        for version_entry in manifest_version_entries(entry, tool):
+            if not all(
+                isinstance(version_entry.get(field), str) and version_entry[field]
+                for field in ("version", "captured_at", "environment")
+            ):
+                raise FidelityError(f"versions.json: incomplete provenance for {tool}")
+            cases = version_entry.get("cases")
+            if not isinstance(cases, list) or not cases or not all(isinstance(case, str) for case in cases):
+                raise FidelityError(f"versions.json: {tool}.cases must be a non-empty string list")
+            for case in cases:
+                listed_cases.add(case)
+                case_path = DEFAULT_GOLDENS / case
+                if not case_path.is_file():
+                    raise FidelityError(f"versions.json: missing listed case {case}")
+                case_doc = validate_recording(load_json(case_path), str(case_path))
+                if (
+                    case_doc["metadata"]["tool"] != tool
+                    or case_doc["metadata"]["tool_version"] != version_entry["version"]
+                ):
+                    raise FidelityError(f"versions.json: provenance mismatch for {case}")
     for path in paths:
         try:
             actual_cases.add(str(path.resolve().relative_to(DEFAULT_GOLDENS.resolve())))
@@ -719,19 +743,26 @@ def update_version_manifest(doc: dict[str, Any], target: Path, environment: str 
         raise FidelityError("versions.json: invalid schema")
     metadata = doc["metadata"]
     tool = metadata["tool"]
-    existing = manifest["tools"].get(tool, {})
+    existing = manifest["tools"].get(tool)
+    entries = manifest_version_entries(existing, tool) if existing is not None else []
     relative = str(target.relative_to(DEFAULT_GOLDENS))
-    cases = list(existing.get("cases", [])) if existing.get("version") == metadata["tool_version"] else []
+    matching = next((entry for entry in entries if entry.get("version") == metadata["tool_version"]), None)
+    if matching is None:
+        matching = {
+            "version": metadata["tool_version"],
+            "captured_at": metadata["captured_at"][:10],
+            "environment": environment or "unspecified",
+            "cases": [],
+        }
+        entries.append(matching)
+    cases = list(matching.get("cases", []))
     if relative not in cases:
         cases.append(relative)
-    captured_at = metadata["captured_at"]
-    capture_date = captured_at[:10] if re.match(r"^\d{4}-\d{2}-\d{2}", captured_at) else utc_now()[:10]
-    manifest["tools"][tool] = {
-        "version": metadata["tool_version"],
-        "captured_at": capture_date,
-        "environment": environment or existing.get("environment") or "unspecified",
-        "cases": sorted(cases),
-    }
+    matching["cases"] = sorted(cases)
+    matching["captured_at"] = metadata["captured_at"][:10]
+    if environment:
+        matching["environment"] = environment
+    manifest["tools"][tool] = entries[0] if len(entries) == 1 else {"versions": entries}
     atomic_json(VERSIONS_JSON, manifest)
 
 
@@ -799,8 +830,9 @@ def cmd_versions(args: argparse.Namespace) -> int:
     if args.wrapper_dir:
         install_manifest = load_json(Path(args.wrapper_dir) / ".fidelity-tools.json").get("tools", {})
     for tool, entry in sorted(tools.items()):
-        expected = entry.get("version") if isinstance(entry, dict) else None
-        print(f"{tool}: {expected}")
+        entries = manifest_version_entries(entry, tool)
+        expected_versions = [item["version"] for item in entries]
+        print(f"{tool}: {', '.join(expected_versions)}")
         if args.check_real:
             if tool in install_manifest:
                 real = Path(install_manifest[tool]["real"])
@@ -812,8 +844,10 @@ def cmd_versions(args: argparse.Namespace) -> int:
                     continue
                 real = Path(resolved)
             actual = probe_version(tool, real)
-            if actual != expected:
-                eprint(f"VERSION DRIFT {tool}: recorded={expected!r} real={actual!r}")
+            if actual not in expected_versions:
+                eprint(
+                    f"VERSION DRIFT {tool}: recorded={expected_versions!r} real={actual!r}"
+                )
                 rc = 1
     return rc
 

@@ -6,7 +6,7 @@ Sanitized real-tool recordings used by `local-test/fidelity`. The machine-readab
 |---|---|---|---|
 | `workshop` | 0.9.5 | QA sandbox host | daemon `launch`; `info-not-project` |
 | `my-workshop` | unversioned binary, SHA-256 prefix `2d579731d0132c8c` | QA sandbox host | version/usage contract (observational) |
-| `gh` | 2.97.0 (2026-07-31) | QA sandbox host | unknown-repository `pr view` |
+| `gh` | 2.97.0 (2026-07-31); 2.98.0 (2026-08-20) | QA sandbox host; local workstation without GitHub credentials | 2.97 unknown-repository `pr view`; 2.98 version and explicit-host `api user`, repository, and pulls authentication-required contracts (observational) |
 | `omp` | 17.4.0 | workstation SDK binary | `config get ask.timeout` |
 | `llmvet` | 0.3.0-37-g421d7fd | workstation SDK binary | version contract (observational) |
 
@@ -40,7 +40,14 @@ local-test/fidelity promote CAPTURE.json --case CASE \
   --redactions-file "$STATE/fidelity-redactions"
 ```
 
-Use `--observational` for real `my-workshop` and `llmvet`, which have no fake replay target. Update `versions.json` and this table in the same change.
+Use `--observational` whenever a real invocation cannot be reconstructed from
+argv alone — including `my-workshop`, `llmvet`, and GitHub's credential-free
+authentication-required checks. Update `versions.json` and this table together.
+
+`versions.json` may retain more than one real version for a tool. Each case is
+validated against the version that produced it; historical evidence is not
+rewritten to make a newer executable appear older. `versions --check-real`
+accepts any recorded version and reports drift only when none match.
 
 ## Verify locally
 

@@ -28,6 +28,7 @@ from ompire_daemon.auth import load_or_create_token
 from ompire_daemon.config import DEFAULT_CONFIG_PATH, Config
 from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.events import EventHub
+from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.notifications import AttentionNotifier
@@ -63,6 +64,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     reviews: ReviewManager = app.state.reviews
     prwatch: PrWatcher = app.state.prwatch
     gpg: GpgProbe = app.state.gpg
+    gh: GitHubProbe = app.state.gh
     await notifier.probe()
     notifier.start()
     advisories.start()
@@ -70,6 +72,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     prwatch.start()
     # Prime the shared GPG lock condition before the first snapshot.
     await gpg.probe()
+    # GitHub observation is bounded and fail-closed, but it must not prevent
+    # the daemon from serving unrelated work when the forge is unavailable.
+    await gh.probe()
     # Slow (real container-side omp startups): runs in the background so it
     # never blocks serving (crash-recovery capability, design D-4/7.3). The
     # fast, must-finish-before-the-first-snapshot classification already ran
@@ -169,7 +174,9 @@ def create_app(
     app.state.settings_store = SettingsStore(app.state.engine, config)
     effective_settings = app.state.settings_store.effective()
     app.state.sessions = SessionTracker(
-        app.state.events, config.session_idle_debounce, effective_settings["stall_threshold"]
+        app.state.events,
+        config.session_idle_debounce,
+        effective_settings["stall_threshold"],
     )
     app.state.agents = AgentSupervisor(config, app.state.events, app.state.sessions)
     app.state.workflow_runner = WorkflowRunner(
@@ -183,6 +190,7 @@ def create_app(
         config, app.state.engine, app.state.events, app.state.sessions, app.state.agents
     )
     app.state.gpg = GpgProbe(config, app.state.events)
+    app.state.gh = GitHubProbe(config, app.state.events)
     app.state.ships = ShipManager(
         config,
         app.state.engine,
@@ -190,6 +198,7 @@ def create_app(
         app.state.sessions,
         app.state.agents,
         app.state.gpg,
+        app.state.gh,
     )
     app.state.notifications = AttentionNotifier(
         app.state.events,
@@ -204,7 +213,9 @@ def create_app(
         stats_throttle_interval=config.stats_throttle_interval,
         context_advisory_threshold=effective_settings["context_advisory_threshold"],
     )
-    app.state.prwatch = PrWatcher(config, app.state.engine, app.state.events)
+    app.state.prwatch = PrWatcher(
+        config, app.state.engine, app.state.events, app.state.gh
+    )
     app.state.advisories.register(app.state.sessions)
 
     # Before any snapshot is served: close out reviews interrupted by the

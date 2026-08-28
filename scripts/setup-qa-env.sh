@@ -32,9 +32,9 @@
 #   8. daemon       write ~/.config/ompire/qa-daemon.sh (sources env.sh, then
 #                   uv run ompire-daemon) and (re)start it; the daemon needs
 #                   the bot env for ship-flow git/gh/gpg operations
-#   9. register     POST /api/projects so the QA repo is a known ompire project
-#  10. smoke        verify: PAT identity, ssh ls-remote, GPG probe (as the
-#                   daemon sees it), project registered, UI being served
+#  10. smoke        verify: PAT and daemon GitHub identity, registered sandbox
+#                   target eligibility, ssh, GPG probe, and UI serving — no
+#                   credential value is printed
 #
 # Options:
 #   --repo OWNER/NAME   QA sandbox repo (default: auto-discover from the PAT)
@@ -377,6 +377,19 @@ login=$(curl -fsS -K "$QA_DIR/.curlrc" https://api.github.com/user | jq -r '.log
 [ "$login" = "$BOT_LOGIN" ] && smoke_ok "agent PAT authenticates as @$BOT_LOGIN" ||
 	smoke_fail "agent PAT returned '$login' (expected $BOT_LOGIN)"
 
+# The daemon derives this from the same launch environment that later runs
+# gh pr create. Compare only safe fields to the bot's immutable setup record.
+daemon_gh=$(api_daemon GET /api/gh 2>/dev/null || true)
+daemon_gh_state=$(jq -r '.identity.state // empty' <<<"$daemon_gh" 2>/dev/null)
+daemon_gh_login=$(jq -r '.identity.login // empty' <<<"$daemon_gh" 2>/dev/null)
+daemon_gh_host=$(jq -r '.identity.host // empty' <<<"$daemon_gh" 2>/dev/null)
+daemon_gh_source=$(jq -r '.identity.credential_source // empty' <<<"$daemon_gh" 2>/dev/null)
+if [ "$daemon_gh_state" = ready ] && [ "$daemon_gh_login" = "$BOT_LOGIN" ] && [ "$daemon_gh_host" = github.com ]; then
+	smoke_ok "daemon GitHub identity: @$daemon_gh_login on $daemon_gh_host (${daemon_gh_source:-unknown source})"
+else
+	smoke_fail "daemon GitHub identity: state=${daemon_gh_state:-no response}, login=${daemon_gh_login:--}, host=${daemon_gh_host:--}; expected @$BOT_LOGIN on github.com"
+fi
+
 if git ls-remote "$SSH_URL" HEAD >/dev/null 2>&1; then
 	smoke_ok "ssh ls-remote $REPO"
 else
@@ -399,6 +412,29 @@ if api_daemon GET /api/projects | jq -e --arg n "$NAME" '.[] | select(.name == $
 	smoke_ok "daemon serves project '$NAME'"
 else
 	smoke_fail "project '$NAME' not visible via daemon API"
+fi
+
+# A task-scoped daemon result is intentionally created only when a real task
+# enters Ship flow. Do not spawn a model task merely for setup smoke; verify
+# the same registered sandbox target through the configured host CLI here.
+registered_upstream=$(api_daemon GET "/api/projects/$NAME" 2>/dev/null | jq -r '.upstream_url // empty' 2>/dev/null || true)
+if [ "$registered_upstream" = "$SSH_URL" ]; then
+	smoke_ok "registered GitHub target: github.com/$REPO"
+else
+	smoke_fail "registered target is '$registered_upstream' (expected '$SSH_URL')"
+fi
+repo_preflight=$(gh api --hostname github.com "repos/$REPO" 2>/dev/null || true)
+if jq -e '
+	.archived == false and .disabled == false and .has_issues == true and
+	(.pull_request_creation_policy == "all" or
+	 (.pull_request_creation_policy == "collaborators_only" and
+	  (.role_name | if type == "string" then (length > 0 and ascii_downcase != "none") else false end) and
+	  .permissions.pull == true))
+' <<<"$repo_preflight" >/dev/null 2>&1 &&
+	gh api --hostname github.com "repos/$REPO/pulls?per_page=1" 2>/dev/null | jq -e 'type == "array"' >/dev/null 2>&1; then
+	smoke_ok "sandbox target eligible for GitHub preflight: github.com/$REPO"
+else
+	smoke_fail "sandbox target is not eligible for GitHub preflight: github.com/$REPO"
 fi
 
 # Do the bot's commits show "Verified" on GitHub?

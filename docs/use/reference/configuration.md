@@ -83,8 +83,15 @@ your user account.
 | `llmvet_command` | list of strings | `["llmvet"]` | Must be non-empty. |
 | `review_port_range` | `[low, high]` | `[7180, 7280]` | Positive integers, `low <= high`. Probed with an ephemeral bind so concurrent reviews do not collide. |
 | `gpg_signing_key` | string or unset | unset | Required before any task can ship. |
-| `gh_command` | list of strings | `["gh"]` | Must be non-empty. |
+| `gh_command` | list of strings | `["gh"]` | Non-empty GitHub CLI prefix. The daemon uses it non-interactively for version detection, explicit-host identity/repository reads, PR creation, and PR polling. |
 | `pr_poll_interval` | number (s) | `60` | Positive. Spacing between pull-request state polls. |
+
+GitHub identity checks target `github.com` explicitly. A non-empty `GH_TOKEN`
+takes precedence over `GITHUB_TOKEN`; either takes precedence over credentials
+stored by GitHub CLI. The daemon reports only the source label, never a value.
+Correct an environment token in the daemon's launch environment and restart;
+use `gh auth login` or `gh auth switch` only when GitHub CLI configuration is
+the selected source.
 
 ## Lifecycle
 

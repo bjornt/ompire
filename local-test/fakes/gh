@@ -1,29 +1,27 @@
 #!/usr/bin/env bash
 #
-# local-test/fakes/gh — a stateful fake of the GitHub CLI covering exactly
-# the two invocations the ompire daemon performs (LOCAL-TESTING.PLAN.md
-# Part 2):
+# local-test/fakes/gh — a stateful fake of exactly the GitHub CLI contracts
+# the production daemon consumes:
 #
+#   gh --version
+#   gh api --hostname github.com user
+#   gh api --hostname github.com repos/<owner>/<repo>
+#   gh api --hostname github.com repos/<owner>/<repo>/pulls?per_page=1
 #   gh pr create --repo <slug> --base <b> --head <h> --title <t> --body-file <f>
 #   gh pr view <pr-url> --json state,mergedAt
 #
-# PRs live in <state>/gh/prs.json — a miniature local "GitHub". Lifecycle
-# transitions (MERGED/CLOSED, mergedAt) are driven by editing that file;
-# one-shot failure injection by the inject.fail_next section (ghctl wraps
-# both in Part 8). Any other invocation fails loudly, so a new daemon
-# callsite can never silently no-op.
-#
-# Error strings mimic real gh 2.97.0, captured against the QA sandbox repo
-# (reference table: openspec/changes/fake-gh/design.md). No network, no
-# GitHub, no credentials.
+# The identity, repository policy, and token-echo fault controls live beside
+# pull-request state in <state>/gh/prs.json. `ghctl` owns those controls.
+# Unsupported argv shapes fail loudly so new production calls cannot silently
+# pass against an incomplete substitute.
 #
 # State root: $LOCAL_TEST_STATE if set, else <repo>/local-test/.state.
 #
 # Commands:
+#   api ...             identity and read-only repository probe contracts
 #   pr create ...       the daemon's create invocation (ship.py:_create_pr)
 #   pr view ...         the daemon's view invocation (prwatch.py:_poll_task)
-#   selfcheck           prove the whole contract offline in a temp root;
-#                       never touches $STATE
+#   selfcheck           prove the whole contract offline in a temp root
 #   --version           plausible banner (marked fake)
 
 set -euo pipefail
@@ -41,10 +39,23 @@ command -v jq >/dev/null 2>&1 || die "jq is required but not on PATH"
 # --- state helpers -------------------------------------------------------------
 
 state_init() {
+	mkdir -p "$(dirname "$PRS_JSON")"
 	if [ ! -f "$PRS_JSON" ]; then
-		mkdir -p "$(dirname "$PRS_JSON")"
-		printf '{"repos":{},"inject":{"fail_next":{"create":null,"view":null}}}\n' \
-			>"$PRS_JSON"
+		printf '%s\n' '{"repos":{},"auth":{"state":"ready","login":"ompire-test","detail":null},"repository":{"archived":false,"disabled":false,"has_issues":true,"pull_request_creation_policy":"all","role_name":"write","permissions":{"pull":true}},"inject":{"fail_next":{"create":null,"view":null},"token_echo":"off"}}' >"$PRS_JSON"
+		return
+	fi
+	# A local state root from an earlier harness version may lack the new
+	# observation controls. Upgrade it once without changing existing PR data.
+	if ! jq -e '.auth and .repository and .inject.fail_next and (.inject | has("token_echo"))' "$PRS_JSON" >/dev/null; then
+		local tmp
+		tmp=$(mktemp "$PRS_JSON.XXXXXX")
+		jq '.repos //= {} |
+			.auth //= {state: "ready", login: "ompire-test", detail: null} |
+			.repository //= {archived: false, disabled: false, has_issues: true, pull_request_creation_policy: "all", role_name: "write", permissions: {pull: true}} |
+			.inject //= {} |
+			.inject.fail_next //= {create: null, view: null} |
+			.inject.token_echo //= "off"' "$PRS_JSON" >"$tmp"
+		state_write "$tmp"
 	fi
 }
 
@@ -67,6 +78,72 @@ consume_fail_next() { # consume_fail_next <create|view>: print armed line, or fa
 }
 
 now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# --- API observation -------------------------------------------------------------
+
+emit_token_echo() {
+	local mode token
+	mode=$(jq -r '.inject.token_echo // "off"' "$PRS_JSON")
+	token=${GH_TOKEN:-${GITHUB_TOKEN:-github_pat_LOCAL_TEST_TOKEN_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789}}
+	case "$mode" in
+	off | "") ;;
+	stdout) printf 'debug token=%s ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\n' "$token" ;;
+	stderr)
+		printf 'Authorization: Bearer %s\nhttps://fake-user:%s@github.com/local-test/sandbox\n' \
+			"$token" "$token" >&2
+		;;
+	both)
+		printf 'debug token=%s ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\n' "$token"
+		printf 'Authorization: Bearer %s\nhttps://fake-user:%s@github.com/local-test/sandbox\n' \
+			"$token" "$token" >&2
+		;;
+	*) die "invalid fake gh token_echo mode '$mode'" ;;
+	esac
+}
+
+cmd_api() {
+	state_init
+	[ "$#" -eq 3 ] || unsupported "api (expected --hostname github.com <endpoint>)"
+	[ "$1" = "--hostname" ] || unsupported "api (expected --hostname first)"
+	[ "$2" = "github.com" ] || unsupported "api (unsupported hostname '$2')"
+	local endpoint=$3 auth_state login slug
+	case "$endpoint" in
+	user)
+		emit_token_echo
+		auth_state=$(jq -r '.auth.state // "error"' "$PRS_JSON")
+		case "$auth_state" in
+		ready)
+			login=$(jq -r '.auth.login // empty' "$PRS_JSON")
+			[ -n "$login" ] || die "fake gh auth ready without login"
+			jq -cn --arg login "$login" '{login: $login}'
+			;;
+        unauthenticated)
+            printf 'HTTP 401: Bad credentials\n' >&2
+            exit 4
+            ;;
+		error)
+			jq -r '.auth.detail // "error connecting to api.github.com"' "$PRS_JSON" >&2
+			exit 1
+			;;
+		*) die "invalid fake gh auth state '$auth_state'" ;;
+		esac
+		;;
+	repos/*/pulls\?per_page=1)
+		slug=${endpoint#repos/}
+		slug=${slug%/pulls?per_page=1}
+		[[ $slug =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || unsupported "api (invalid pulls target)"
+		emit_token_echo
+		printf '[]\n'
+		;;
+	repos/*)
+		slug=${endpoint#repos/}
+		[[ $slug =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || unsupported "api (invalid repository target)"
+		emit_token_echo
+		jq -c '.repository' "$PRS_JSON"
+		;;
+	*) unsupported "api (unsupported endpoint)" ;;
+	esac
+}
 
 # --- pr create -------------------------------------------------------------------
 
@@ -219,8 +296,52 @@ cmd_selfcheck() {
 	# argv shapes, environment inherited, state root via LOCAL_TEST_STATE.
 	gh_run() { LOCAL_TEST_STATE=$root "$0" "$@"; }
 
-	# ---- 1/8 create: the daemon's exact argv, body captured, URL on stdout
-	log "1/8 pr create (daemon argv, body capture, URL on stdout)"
+	# ---- 1/10 discovery and read-only API argv ---------------------------------
+	log "1/10 version, identity, repository, and pull-request API calls"
+	out=$(gh_run --version 2>"$err") || fail "version exits 0" "$(cat "$err")"
+	[ "$out" = "gh version 2.97.0 (fake, local-test)" ] || fail "version banner" "got: $out"
+	out=$(gh_run api --hostname github.com user 2>"$err") || fail "api user exits 0" "$(cat "$err")"
+	jq -e '.login == "ompire-test"' <<<"$out" >/dev/null || fail "api user login" "$out"
+	out=$(gh_run api --hostname github.com "repos/$slug" 2>"$err") || fail "api repository exits 0" "$(cat "$err")"
+	jq -e '.archived == false and .pull_request_creation_policy == "all"' <<<"$out" >/dev/null ||
+		fail "api repository policy" "$out"
+	out=$(gh_run api --hostname github.com "repos/$slug/pulls?per_page=1" 2>"$err") ||
+		fail "api pulls exits 0" "$(cat "$err")"
+	[ "$out" = "[]" ] || fail "api pulls returns an array" "$out"
+	ok "version and exact read-only API contracts"
+
+	# ---- 2/10 identity/policy and token-echo fault states ----------------------
+	log "2/10 identity, repository policy, and token-echo faults"
+	local api_tmp
+	api_tmp=$(mktemp "$root/gh/prs.json.XXXXXX")
+	jq '.auth = {state: "unauthenticated", login: null, detail: null}' "$root/gh/prs.json" >"$api_tmp" &&
+		mv "$api_tmp" "$root/gh/prs.json"
+	local rc=0
+    gh_run api --hostname github.com user >"$SELF_TMP/o" 2>"$err" || rc=$?
+    [ "$rc" = 4 ] && grep -q 'HTTP 401: Bad credentials' "$err" ||
+        fail "unauthenticated user API exits 4" "$(cat "$err")"
+	api_tmp=$(mktemp "$root/gh/prs.json.XXXXXX")
+	jq '.auth = {state: "ready", login: "ompire-test", detail: null} |
+		.repository.pull_request_creation_policy = "collaborators_only" |
+		.repository.role_name = "none" |
+		.repository.permissions.pull = false' "$root/gh/prs.json" >"$api_tmp" &&
+		mv "$api_tmp" "$root/gh/prs.json"
+	out=$(gh_run api --hostname github.com "repos/$slug" 2>"$err") || fail "denied repo metadata exits 0" "$(cat "$err")"
+	jq -e '.pull_request_creation_policy == "collaborators_only" and .role_name == "none" and .permissions.pull == false' \
+		<<<"$out" >/dev/null || fail "denied repository evidence" "$out"
+	api_tmp=$(mktemp "$root/gh/prs.json.XXXXXX")
+	jq '.repository = {archived: false, disabled: false, has_issues: true, pull_request_creation_policy: "all", role_name: "write", permissions: {pull: true}} |
+		.inject.token_echo = "stderr"' "$root/gh/prs.json" >"$api_tmp" &&
+		mv "$api_tmp" "$root/gh/prs.json"
+	out=$(gh_run api --hostname github.com user 2>"$err") || fail "token echo user exits 0" "$(cat "$err")"
+	jq -e '.login == "ompire-test"' <<<"$out" >/dev/null || fail "token echo preserves JSON response" "$out"
+	grep -q '^Authorization: Bearer ' "$err" || fail "token echo emits header-shaped stderr" "$(cat "$err")"
+	api_tmp=$(mktemp "$root/gh/prs.json.XXXXXX")
+	jq '.inject.token_echo = "off"' "$root/gh/prs.json" >"$api_tmp" && mv "$api_tmp" "$root/gh/prs.json"
+	ok "identity, denial, and credential-shaped output controls"
+
+	# ---- 3/10 create: the daemon's exact argv, body captured, URL on stdout
+	log "3/10 pr create (daemon argv, body capture, URL on stdout)"
 	local bodyf=$SELF_TMP/body.md
 	printf 'probe body line 1\nline 2\n' >"$bodyf"
 	local out
@@ -236,8 +357,8 @@ cmd_selfcheck() {
 		fail "create #1 records OPEN state with the body captured"
 	ok "pr create: URL on stdout, OPEN recorded, body captured"
 
-	# ---- 2/8 create: monotonic per-repo numbering
-	log "2/8 monotonic PR numbering"
+	# ---- 4/10 create: monotonic per-repo numbering
+	log "4/10 monotonic PR numbering"
 	out=$(gh_run pr create --repo "$slug" --base main --head ompire/two \
 		--title "Two" --body-file "$bodyf" 2>"$err") ||
 		fail "create #2 exits 0" "$(cat "$err")"
@@ -245,8 +366,8 @@ cmd_selfcheck() {
 		fail "create #2 allocates number 2" "got: $out"
 	ok "pr create: numbers increase monotonically"
 
-	# ---- 3/8 create: already-exists failure, URL recoverable from combined output
-	log "3/8 already-exists failure with recoverable URL"
+	# ---- 5/10 create: already-exists failure, URL recoverable from combined output
+	log "5/10 already-exists failure with recoverable URL"
 	local rc=0
 	out=$(gh_run pr create --repo "$slug" --base main --head ompire/one \
 		--title "Dup" --body-file "$bodyf" 2>"$err") || rc=$?
@@ -265,16 +386,16 @@ cmd_selfcheck() {
 		fail "duplicate create records no new PR"
 	ok "pr create: already-exists fails with a recoverable URL"
 
-	# ---- 4/8 view: OPEN
-	log "4/8 pr view OPEN"
+	# ---- 6/10 view: OPEN
+	log "6/10 pr view OPEN"
 	out=$(gh_run pr view "https://github.com/$slug/pull/1" --json state,mergedAt 2>"$err") ||
 		fail "view #1 exits 0" "$(cat "$err")"
 	[ "$out" = '{"mergedAt":null,"state":"OPEN"}' ] ||
 		fail "view #1 reports OPEN with null mergedAt" "got: $out"
 	ok "pr view: OPEN with null mergedAt"
 
-	# ---- 5/8 view: MERGED and CLOSED via state mutation
-	log "5/8 pr view MERGED/CLOSED via state mutation"
+	# ---- 7/10 view: MERGED and CLOSED via state mutation
+	log "7/10 pr view MERGED/CLOSED via state mutation"
 	local tmpjq
 	tmpjq=$(mktemp "$root/gh/prs.json.XXXXXX")
 	jq --arg repo "$slug" '.repos[$repo].prs[1].state = "MERGED" |
@@ -294,8 +415,8 @@ cmd_selfcheck() {
 		fail "view #2 reports CLOSED with null mergedAt" "got: $out"
 	ok "pr view: state transitions visible through the state file"
 
-	# ---- 6/8 view: both GraphQL not-found errors
-	log "6/8 not-found errors"
+	# ---- 8/10 view: both GraphQL not-found errors
+	log "8/10 not-found errors"
 	rc=0
 	gh_run pr view "https://github.com/$slug/pull/999" --json state,mergedAt \
 		>"$SELF_TMP/o" 2>"$err" || rc=$?
@@ -310,8 +431,8 @@ cmd_selfcheck() {
 		fail "unknown repo matches real gh's Repository error" "$(cat "$err")"
 	ok "pr view: both not-found errors, exit 1"
 
-	# ---- 7/8 one-shot fail_next for view and create
-	log "7/8 one-shot fail_next injection"
+	# ---- 9/10 one-shot fail_next for view and create
+	log "9/10 one-shot fail_next injection"
 	jq '.inject.fail_next.view = "GraphQL: injected view failure (fake)"' \
 		"$root/gh/prs.json" >"$tmpjq" && mv "$tmpjq" "$root/gh/prs.json"
 	rc=0
@@ -343,8 +464,8 @@ cmd_selfcheck() {
 		fail "create after injection continues the numbering" "got: $out"
 	ok "fail_next: one-shot by consumption, both subcommands"
 
-	# ---- 8/8 loud rejection of an unsupported invocation
-	log "8/8 unsupported invocation fails loudly"
+	# ---- 10/10 loud rejection of an unsupported invocation
+	log "10/10 unsupported invocation fails loudly"
 	rc=0
 	gh_run pr list >"$SELF_TMP/o" 2>"$err" || rc=$?
 	[ "$rc" -ne 0 ] || fail "pr list exits non-zero"
@@ -359,6 +480,7 @@ cmd_selfcheck() {
 
 command=${1:-help}
 case "$command" in
+api) shift; cmd_api "$@" ;;
 pr)
 	case "${2:-}" in
 	create) shift 2; cmd_pr_create "$@" ;;

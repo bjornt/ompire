@@ -12,10 +12,22 @@ this is bundled, and the snap uses classic confinement for the same reason.
 | Requirement | Why | Check |
 |---|---|---|
 | Python 3.12 or newer | The daemon runtime | `python3 --version` |
-| `gh`, authenticated | Pull-request creation | `gh auth status` |
+| `gh`, authenticated | GitHub identity and pull-request creation | `gh api --hostname github.com user` |
 | `lxc` and the workshop tooling | Per-task container isolation | `lxc list` |
 | `gpg` with a signing key | Signed commits | `gpg --list-secret-keys` |
 | `notify-send` | Desktop notifications (optional) | `which notify-send` |
+
+### Confirm the daemon's GitHub identity
+
+At startup Ompire runs the configured `gh` non-interactively against
+`github.com` and shows its result as a GitHub chip. Open **Templates &
+settings** to see the selected login, executable, version, credential source,
+and safe failure detail; use **Re-check GitHub** after correcting setup.
+
+`GH_TOKEN` takes precedence over `GITHUB_TOKEN`, and either environment
+variable takes precedence over accounts stored by GitHub CLI. When either is
+set for the daemon service, correct its launch environment and restart the
+daemon rather than switching a stored account. Ompire never displays a token.
 
 Without `notify-send` the daemon logs a warning and keeps working; the badge
 count in the UI still reflects what needs you.
@@ -110,6 +122,8 @@ Every key is listed in [Configuration](../reference/configuration.md).
 3. `curl -H "Authorization: Bearer $(cat ~/.local/share/ompire/token)" \
    http://127.0.0.1:4173/api/daemon/info` returns the version, bind address,
    config path, and data directory.
+4. The GitHub chip is `gh @login`, not `gh missing`, `gh auth`, or `gh error`.
+   Use **Re-check GitHub** in **Templates & settings** if it is not ready.
 
 ## Next
 

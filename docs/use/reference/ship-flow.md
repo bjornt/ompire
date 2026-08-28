@@ -11,6 +11,11 @@ stepper in the Ship Flow view. Opening a task-specific Ship flow prepares an
 eligible agent draft automatically; it never signs, pushes, or creates a pull
 request without the operator's explicit action.
 
+Before a task can sign, the daemon performs a fresh, read-only GitHub
+eligibility preflight for the task's registered upstream. The browser's status
+is advisory; the server repeats this check before it creates ship state,
+background work, or local Git changes.
+
 ## Ship flow index
 
 The global **Ship flow** navigation item opens `/ship`, a chooser for the
@@ -84,11 +89,24 @@ invalid markers leaves the fields intact, records a retryable Draft-stage
 error, and does not retry automatically. Correct the fields manually or use
 the explicit retry action once the session is again eligible.
 
+### GitHub preflight
+
+The task-specific banner requests `gh api --hostname github.com user`, then
+repository and pull-request reads for the canonical upstream target. A result
+is usable only for the exact `host/owner/repository`, login, and credential
+source that produced it. Missing CLI, missing or rejected authentication,
+repository denial, malformed output, and timeouts block shipping.
+
+The check demonstrates GitHub API identity and repository eligibility only. It
+does not verify the SSH key or HTTPS credential used for Git transport, branch
+state, organization rules, or every later pull-request condition.
+
 ### 2. Commit
 
 `POST /api/tasks/{id}/ship/commit` accepts `mode` of `squash` or `retain`,
-plus the final message and pull-request fields. Both modes produce
-operator-authored, GPG-signed commits in the host clone.
+plus the final message and pull-request fields. Both modes produce host-side,
+GPG-signed commits using the current Git configuration; GitHub CLI identity is
+shown and gated separately rather than selected or persisted by this flow.
 
 **Squash** fetches origin, computes the merge-base of `origin/<base>` and
 `HEAD`, runs `git reset --soft` to that merge-base so every agent checkpoint
@@ -105,14 +123,14 @@ modes.
 
 ### 3. Push and open the pull request
 
-After the signed commit the daemon pushes and opens the pull request with host
-credentials only:
+After the signed commit the daemon pushes with host credentials, then performs
+a second GitHub identity/target preflight immediately before `gh pr create`:
 
-- Push goes to the project's `fork_url` when one is set, otherwise to
-  `origin`.
+- Push goes to the project's `fork_url` when one is set, otherwise to the
+  registered upstream URL.
 - Push uses `--force-with-lease`, so a re-ship after review comments can
   rewrite the squashed commit safely.
-- `gh pr create` runs against the project's upstream repository with the
+- `gh pr create` runs against the registered upstream repository with the
   operator's title and body and the correct head reference — fork
   owner-qualified when a fork is configured.
 
@@ -133,6 +151,7 @@ Ship commit is refused, before any Git operation runs, when:
 |---|---|
 | Unknown task | `404` |
 | GPG signing key not `cached` | `409` with the lock detail |
+| GitHub CLI missing, unauthenticated, target-denied, unchecked, or error | Safe `409` with current `gh` status before local ship mutation |
 | Mode other than `squash` or `retain` | `409` |
 | A ship is already in flight | `409` |
 | Retain with a dirty working tree | `409` naming the dirty tree |
@@ -155,9 +174,11 @@ Ship rewrites Git history, so every failure path restores.
   aborts any in-progress rebase and restores `HEAD` and the working tree to
   the pre-ship state.
 
-Push or pull-request failure records `error` with the captured stderr and
-broadcasts `ship_finished` with status `error`. The commit is not rolled back
-at that point — it is a legitimate local commit whose publication failed.
+Push failure records a Push-stage `error`; an SSH-form failure containing the
+public-key authentication signature is labelled SSH authentication. A failed
+GitHub recheck or `gh pr create` records a Pull-request-stage `error`. In all
+three cases the signed local commit remains a legitimate local result; it is
+not rolled back after publication starts.
 
 ### Ship Flow view
 
@@ -175,8 +196,11 @@ since the request began. Re-drafting asks for confirmation only if it would
 replace edited values, and preserves changes made after confirmation while the
 replacement is running. A failed draft shows its captured reason and an
 explicit retry alongside usable manual fields. When the shared GPG state is
-`locked` it renders an amber blocked banner with the terminal-helper unlock
-instruction and a **Re-check key** control, and disables **Sign & commit**.
+`locked`, it renders an amber blocked banner with the terminal-helper unlock
+instruction and a **Re-check key** control. Alongside it, the GitHub banner
+checks the registered upstream, names the safe selected account and target,
+offers **Re-check GitHub**, explains the Git-transport boundary, and disables
+**Sign & commit** until the current target is allowed.
 
 **Push + PR** reflects progress from `ship_step` events and shows the
 resulting pull-request link.
@@ -195,7 +219,7 @@ links to both Ship flow and Tasks, rather than a transient false 404.
 | Key | Effect |
 |---|---|
 | `gpg_signing_key` | The signing key. Required before any ship. |
-| `gh_command` | The forge CLI; must be non-empty |
+| `gh_command` | Non-empty GitHub CLI prefix used for bounded, non-interactive version, API, PR-create, and PR-watch calls. |
 
 ## Interfaces
 
@@ -203,20 +227,23 @@ links to both Ship flow and Tasks, rather than a transient false 404.
 |---|---|
 | `POST` | `/api/tasks/{id}/ship/draft` — body omitted or `{"replace": false}` ensures one initial draft; `{"replace": true}` explicitly regenerates or retries |
 | `POST` | `/api/tasks/{id}/ship/commit` |
+| `GET` | `/api/gh` — latest safe in-memory identity and target status |
+| `POST` | `/api/gh/recheck` — body omitted for global identity, or `{"task_id": id}` for the task's registered upstream |
 
 | Event | Payload |
 |---|---|
 | `ship_step` | `{task_id, step, status, detail?}`; `step` is `draft`, `commit`, `push`, or `pr`, and `status` is `started`, `ok`, or `failed` |
 | `ship_draft` | `{task_id, draft}` after a parsed successful draft |
 | `ship_finished` | `{task_id, status, pr_url}` — `shipped` or `error` |
+| `gh_status` | `{gh: {identity, targets}}` after every completed GitHub probe |
 
 A draft begins with `ship_step` `draft`/`started`. Success publishes
 `ship_draft`, then `draft`/`ok`; failure publishes `draft`/`failed` with its
 reason. The snapshot carries a `ships` map from task id to the current status,
 mode, draft, commit sha, pull-request URL, error, and latest transient
-`last_step`, so a reconnect can render the same retry stage even if it missed a
-delta. REST responses and deltas can arrive in either order; clients render the
-daemon state rather than treating a response as the source of form values.
+`last_step`, plus a current in-memory `gh` identity/target status. REST
+responses and deltas can arrive in either order; clients render daemon state
+rather than treating a response as the source of form values.
 
 Ship state other than the persisted `pr_url` is held in memory and is lost on a
 daemon restart as well as when the task is cleaned up or purged. A durable

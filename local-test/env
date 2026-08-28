@@ -383,6 +383,15 @@ EOF
 	*) smoke_fail "daemon GPG probe: ${gpg_state:-no response} — expected cached" ;;
 	esac
 
+	local gh_state gh_login
+	gh_state=$(api_daemon GET /api/gh 2>/dev/null | jq -r '.identity.state // empty' 2>/dev/null || true)
+	gh_login=$(api_daemon GET /api/gh 2>/dev/null | jq -r '.identity.login // empty' 2>/dev/null || true)
+	if [ "$gh_state" = ready ] && [ "$gh_login" = ompire-test ]; then
+		smoke_ok "daemon GitHub probe: @ompire-test ready"
+	else
+		smoke_fail "daemon GitHub probe: ${gh_state:-no response} ${gh_login:+(@$gh_login)} — expected @ompire-test ready"
+	fi
+
 	if [ "${LOCAL_TEST_SKIP_FRONTEND:-0}" = "1" ] &&
 		[ ! -f "$REPO_ROOT/frontend/dist/index.html" ]; then
 		warn "UI check skipped: no frontend build (LOCAL_TEST_SKIP_FRONTEND=1)"
@@ -436,8 +445,8 @@ EOF
 	    project:  $NAME -> $SLUG (checkout $CHECKOUT, base $BASE_BRANCH)
 	    restart:  $DAEMON_WRAPPER
 	    state:    $STATE_ROOT
-	    steer:    ghctl (PRs) | wsctl (workshops) | ompctl (scenarios) |
-	              gpgctl (ship gate) — the local-test control CLIs
+	    steer:    ghctl (GitHub identity, access, PRs) | wsctl (workshops) |
+	              ompctl (scenarios) | gpgctl (ship gate) — local-test controls
 	$([ $rc -eq 0 ] || printf '\n    NOTE: one or more smoke checks failed — see above.\n')
 	EOF
 	[ "$rc" -eq 0 ] || exit 1

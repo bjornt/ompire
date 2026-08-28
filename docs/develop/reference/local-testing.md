@@ -29,17 +29,19 @@ rejection can be armed per repository to exercise the failure path.
 
 ### `gh`
 
-A fake implementing the daemon's two contracts — pull-request creation and
-pull-request viewing — against local state. Pull-request state is a plain JSON
-file supporting lifecycle transitions and failure injection.
+A fake implementing the daemon's exact `--version`, explicit-host `api user`,
+repository read, pull-request-list read, pull-request creation, and
+pull-request viewing contracts against local state. Its JSON state controls the
+selected identity, repository policy/access evidence, PR lifecycle, and
+credential-shaped output injection without production code knowing it is fake.
 
 Hook-up is the `gh_command` config key. There are **zero daemon changes**: the
 daemon runs the configured command, and the configured command happens to be
 the fake.
 
-An invocation the fake does not recognize fails loudly rather than returning a
-plausible success. A fake that silently absorbs an unknown command is how a
-test passes against behavior nobody implemented.
+Every unsupported argv shape fails loudly rather than returning plausible
+success. A fake that silently absorbs an unknown command is how a test passes
+against behavior nobody implemented.
 
 ### Workshop
 
@@ -132,7 +134,7 @@ Steering happens through published surfaces only:
 
 | Tool | Steers |
 |---|---|
-| `ghctl` | Pull-request lifecycle; arms one-shot create and view failures |
+| `ghctl` | GitHub fake identity/authentication, repository policy/permission, credential-shaped output, pull-request lifecycle, and one-shot create/view failures |
 | `wsctl` | Workshop registry and launch injection |
 | `ompctl` | One-shot agent scenarios by task, clone, session, or global key; lists sessions and transcripts |
 | `gpgctl` | The ship-gate lock state |
@@ -153,7 +155,7 @@ to assertions.
 | `ask-approval` | Interactive gates |
 | `review-comments` | Comment loopback through the real reviewer UI |
 | `ship-retain` | Multi-commit re-signing |
-| `ship-failures` | Each failure path recovers |
+| `ship-failures` | GitHub auth/target denial before clone mutation, redaction, GPG, PR, push, and retain recovery |
 | `merge-poll` | The poll observes merging |
 | `crash-recovery` | Daemon `kill -9` recovery |
 | `cleanup` | Task teardown |
@@ -175,9 +177,12 @@ unsanitized process streams to disk — tokens and passphrases are stripped on
 the way through and the recorded environment is reduced to an allowlist.
 
 Recordings are schema-versioned, sanitized golden fixtures with provenance.
-Conformance replays real invocations against the fakes, with deterministic,
-narrowly scoped normalization. Daemon-observable outcome snapshots can be
-compared across environments.
+One tool can retain evidence from multiple real versions; each case remains
+bound to the version that produced it rather than rewriting historical
+provenance. Conformance replays only cases that can be reconstructed from argv
+and controlled fake state; credential-free real GitHub failures remain
+observational evidence. Daemon-observable outcome snapshots can be compared
+across environments.
 
 Every component ships a self-check proving its contract offline.
 

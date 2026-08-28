@@ -3,11 +3,25 @@ import { Link, useParams } from "react-router-dom";
 import { useDaemonState } from "../lib/useDaemonState";
 import { primarySessionName } from "../lib/daemonReducer";
 import { projectReview } from "../lib/reviewPresentation";
-import { cleanupTask, draftShip, recheckGpg, shipCommit } from "../lib/api";
+import { cleanupTask, draftShip, recheckGitHub, recheckGpg, shipCommit } from "../lib/api";
 import { confirmCleanup } from "../lib/cleanup";
 import { formatElapsed } from "../lib/formatElapsed";
+import {
+  canonicalGitHubTarget,
+  currentGitHubTargetStatus,
+  githubCredentialRecovery,
+  safeGitHubDetail,
+} from "../lib/githubPresentation";
 import { ReviewSummary } from "../components/ReviewSummary";
-import type { GpgStatus, ReviewState, SessionInfo, ShipState, Task } from "../types";
+import type {
+  GitHubStatus,
+  GitHubTargetStatus,
+  GpgStatus,
+  ReviewState,
+  SessionInfo,
+  ShipState,
+  Task,
+} from "../types";
 import "./ShipFlowView.css";
 
 function StepIcon({
@@ -58,18 +72,116 @@ function ReviewStep({
   );
 }
 
+function GitHubPreflightBanner({
+  github,
+  upstreamUrl,
+  target,
+  checking,
+  requestError,
+  onRecheck,
+}: {
+  github: GitHubStatus | null;
+  upstreamUrl: string | null | undefined;
+  target: GitHubTargetStatus | undefined;
+  checking: boolean;
+  requestError: string | null;
+  onRecheck: () => void;
+}) {
+  const identity = github?.identity;
+  const canonicalTarget = canonicalGitHubTarget(upstreamUrl);
+  const targetLabel = target?.target
+    ? `${target.target.host}/${target.target.owner}/${target.target.repository}`
+    : (canonicalTarget ?? "the registered upstream");
+  const account = identity?.login ? `@${identity.login}` : "the selected GitHub account";
+  const detail = requestError ?? safeGitHubDetail(target?.detail) ?? safeGitHubDetail(identity?.detail);
+
+  let tone = "blocked";
+  let title = "GitHub preflight required";
+  let message = `Shipping is blocked before Git changes until ${targetLabel} is checked.`;
+  let recovery: string | null = null;
+  if (checking) {
+    tone = "checking";
+    title = "Checking GitHub access";
+    message = `Checking ${account} for ${targetLabel}.`;
+  } else if (requestError) {
+    title = "GitHub check could not complete";
+    message = `Shipping remains blocked until ${targetLabel} can be re-checked.`;
+  } else if (!identity || identity.state === "unknown") {
+    title = "GitHub identity has not been checked";
+  } else if (identity.state === "missing") {
+    title = "GitHub CLI is unavailable";
+    message = `Install or correct the configured GitHub CLI, then re-check ${targetLabel}.`;
+  } else if (identity.state === "unauthenticated") {
+    title = "GitHub authentication is required";
+    message = `${targetLabel} cannot be checked until the daemon's GitHub CLI authenticates.`;
+    recovery = githubCredentialRecovery(identity);
+  } else if (identity.state === "error") {
+    title = "GitHub identity check failed";
+    message = `Shipping remains blocked until ${targetLabel} can be checked safely.`;
+  } else if (!canonicalTarget) {
+    title = "Registered upstream is unsupported";
+    message = "Shipping is blocked because the registered upstream is not a supported GitHub target.";
+  } else if (!target) {
+    title = "GitHub target needs a current check";
+    message = `${account} has no current eligibility result for ${targetLabel}.`;
+  } else if (target.state === "allowed") {
+    tone = "ready";
+    title = "GitHub preflight ready";
+    message = `${account} is eligible to create a pull request for ${targetLabel}.`;
+  } else if (target.state === "denied") {
+    title = "Repository access is denied";
+    message = `${account} cannot create a pull request for ${targetLabel}.`;
+    recovery = `Grant ${account} the required repository and pull-request access, or deliberately select another identity. Ompire will not switch accounts automatically.`;
+  } else {
+    title = "GitHub target check failed";
+    message = `${account} could not be verified for ${targetLabel}.`;
+    recovery = githubCredentialRecovery(identity);
+  }
+
+  return (
+    <div
+      className={`githubBanner githubBanner${tone[0].toUpperCase()}${tone.slice(1)}`}
+      role={tone === "ready" ? "status" : "alert"}
+      aria-live="polite"
+      data-testid="github-preflight-banner"
+      data-state={tone}
+    >
+      <strong>{title}</strong>
+      <p>{message}</p>
+      {detail && <p className="githubBannerDetail">{detail}</p>}
+      {recovery && <p>{recovery}</p>}
+      <p className="githubBoundaryNote">
+        This checks GitHub API identity and repository eligibility only. It does not verify SSH or HTTPS
+        authentication used by <code>git push</code>.
+      </p>
+      <button
+        type="button"
+        disabled={checking}
+        onClick={onRecheck}
+        data-testid="recheck-github-target-button"
+      >
+        {checking ? "Checking GitHub…" : "Re-check GitHub"}
+      </button>
+    </div>
+  );
+}
+
 function CommitStep({
   task,
   session,
   review,
   ship,
   gpg,
+  github,
+  upstreamUrl,
 }: {
   task: Task;
   session: SessionInfo | undefined;
   review: ReviewState | undefined;
   ship: ShipState | undefined;
   gpg: GpgStatus | null;
+  github: GitHubStatus | null;
+  upstreamUrl: string | null | undefined;
 }) {
   const taskId = task.id;
   const [mode, setMode] = useState<"squash" | "retain">("squash");
@@ -83,8 +195,13 @@ function CommitStep({
   });
   const [draftRequest, setDraftRequest] = useState<"automatic" | "replacement" | null>(null);
   const [draftCommandError, setDraftCommandError] = useState<string | null>(null);
-  const [rechecking, setRechecking] = useState(false);
+  const [commitCommandError, setCommitCommandError] = useState<string | null>(null);
+  const [recheckingGpg, setRecheckingGpg] = useState(false);
+  const [checkingGitHub, setCheckingGitHub] = useState(false);
+  const [gitHubCheckError, setGitHubCheckError] = useState<string | null>(null);
   const draftCommandLocked = useRef(false);
+  const gitHubRecheckLocked = useRef(false);
+  const gitHubCheckedTarget = useRef<string | null>(null);
   const automaticAttempted = useRef(false);
 
   useEffect(() => {
@@ -99,6 +216,9 @@ function CommitStep({
 
   useEffect(() => {
     if (ship?.updated_at) setDraftCommandError(null);
+  }, [ship?.updated_at]);
+  useEffect(() => {
+    if (ship?.updated_at) setCommitCommandError(null);
   }, [ship?.updated_at]);
 
   const published =
@@ -151,10 +271,43 @@ function CommitStep({
     }
   }, [automaticEligible, requestDraft]);
 
+  const githubTarget = currentGitHubTargetStatus(github, upstreamUrl);
+  const githubReady = !checkingGitHub && githubTarget?.state === "allowed";
+  const targetRequestKey = `${taskId}:${upstreamUrl ?? ""}`;
+  const requestGitHubCheck = useCallback(async () => {
+    if (!upstreamUrl || gitHubRecheckLocked.current) return;
+    gitHubRecheckLocked.current = true;
+    setCheckingGitHub(true);
+    setGitHubCheckError(null);
+    try {
+      await recheckGitHub(taskId);
+    } catch (caught: unknown) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      setGitHubCheckError(safeGitHubDetail(message) ?? "GitHub recheck failed");
+    } finally {
+      gitHubRecheckLocked.current = false;
+      setCheckingGitHub(false);
+    }
+  }, [taskId, upstreamUrl]);
+
+  useEffect(() => {
+    if (
+      published ||
+      !upstreamUrl ||
+      gitHubCheckedTarget.current === targetRequestKey ||
+      gitHubRecheckLocked.current
+    ) {
+      return;
+    }
+    gitHubCheckedTarget.current = targetRequestKey;
+    void requestGitHubCheck();
+  }, [checkingGitHub, published, requestGitHubCheck, targetRequestKey, upstreamUrl]);
+
   const gpgCached = gpg?.state === "cached";
   const gpgLocked = gpg?.state === "locked";
   const canCommit =
     gpgCached &&
+    githubReady &&
     !drafting &&
     !publishing &&
     (mode === "retain" || message.trim().length > 0);
@@ -178,21 +331,31 @@ function CommitStep({
 
   async function onCommit() {
     if (!canCommit) return;
-    await shipCommit(taskId, {
-      message: message.trim(),
-      pr_title: prTitle.trim(),
-      pr_body: prBody.trim(),
-      mode,
-    });
+    setCommitCommandError(null);
+    try {
+      await shipCommit(taskId, {
+        message: message.trim(),
+        pr_title: prTitle.trim(),
+        pr_body: prBody.trim(),
+        mode,
+      });
+    } catch (caught: unknown) {
+      const detail = caught instanceof Error ? caught.message : String(caught);
+      setCommitCommandError(safeGitHubDetail(detail) ?? detail);
+    }
   }
 
-  async function onRecheck() {
-    setRechecking(true);
+  async function onRecheckGpg() {
+    setRecheckingGpg(true);
     try {
       await recheckGpg();
     } finally {
-      setRechecking(false);
+      setRecheckingGpg(false);
     }
+  }
+
+  async function onRecheckGitHub() {
+    await requestGitHubCheck();
   }
 
   let draftStatus: string;
@@ -338,6 +501,11 @@ function CommitStep({
           Draft request failed: {draftCommandError}
         </div>
       )}
+      {commitCommandError && (
+        <div className="shipError" data-testid="commit-command-error">
+          {commitCommandError}
+        </div>
+      )}
 
       {gpgLocked && unlockCommand && (
         <div className="gpgBanner" data-testid="gpg-locked-banner">
@@ -346,13 +514,24 @@ function CommitStep({
           <code data-testid="gpg-unlock-command">{unlockCommand}</code>
           <button
             type="button"
-            disabled={rechecking}
-            onClick={() => void onRecheck()}
+            disabled={recheckingGpg}
+            onClick={() => void onRecheckGpg()}
             data-testid="recheck-gpg-button"
           >
-            {rechecking ? "Checking…" : "Re-check key"}
+            {recheckingGpg ? "Checking…" : "Re-check key"}
           </button>
         </div>
+      )}
+
+      {!published && (
+        <GitHubPreflightBanner
+          github={github}
+          upstreamUrl={upstreamUrl}
+          target={githubTarget}
+          checking={checkingGitHub}
+          requestError={gitHubCheckError}
+          onRecheck={() => void onRecheckGitHub()}
+        />
       )}
 
       {ship?.status === "error" && ship.error && (
@@ -480,9 +659,10 @@ function CleanupStep({ task }: { task: Task }) {
 export function ShipFlowView() {
   const { id } = useParams();
   const taskId = id !== undefined && /^\d+$/.test(id) ? Number(id) : null;
-  const { snapshotReady, tasks, sessions, workflows, reviews, ships, gpg } = useDaemonState();
+  const { snapshotReady, projects, tasks, sessions, workflows, reviews, ships, gpg, gh } = useDaemonState();
 
   const task = taskId === null ? undefined : tasks.find((candidate) => candidate.id === taskId);
+  const project = task === undefined ? undefined : projects.find((candidate) => candidate.name === task.project_name);
   // Ship is task-scoped: review and publishing always use the workflow's
   // primary session, never an in-flight step's focused session.
   const taskSessions = taskId === null ? undefined : sessions[taskId];
@@ -526,7 +706,16 @@ export function ShipFlowView() {
 
       <div className="shipFlow" data-testid="ship-flow">
         <ReviewStep session={session} review={review} />
-        <CommitStep key={taskId} task={task} session={session} review={review} ship={ship} gpg={gpg} />
+        <CommitStep
+          key={taskId}
+          task={task}
+          session={session}
+          review={review}
+          ship={ship}
+          gpg={gpg}
+          github={gh}
+          upstreamUrl={project?.upstream_url}
+        />
         <PushPrStep ship={ship} prUrl={task.pr_url} />
         <CleanupStep task={task} />
       </div>

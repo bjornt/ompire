@@ -36,8 +36,12 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-async def _send_envelope(websocket: WebSocket, seq: int, event_type: str, payload: Any) -> None:
-    await websocket.send_json({"seq": seq, "ts": _now_iso(), "type": event_type, "payload": payload})
+async def _send_envelope(
+    websocket: WebSocket, seq: int, event_type: str, payload: Any
+) -> None:
+    await websocket.send_json(
+        {"seq": seq, "ts": _now_iso(), "type": event_type, "payload": payload}
+    )
 
 
 async def _forward_events(
@@ -101,6 +105,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         for task_id, info in websocket.app.state.ships.snapshot().items()
     }
     gpg_payload = asdict(websocket.app.state.gpg.current())
+    gh_payload = asdict(websocket.app.state.gh.current())
     settings = SettingsStore(engine, websocket.app.state.config).effective()
     await _send_envelope(
         websocket,
@@ -116,6 +121,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             "reviews": reviews_payload,
             "ships": ships_payload,
             "gpg": gpg_payload,
+            "gh": gh_payload,
             "settings": settings,
         },
     )
@@ -154,7 +160,9 @@ async def _receive_until_disconnect(websocket: WebSocket) -> None:
 
 
 @router.websocket("/api/ws/agents/{task_id}/{session}")
-async def agent_websocket_endpoint(websocket: WebSocket, task_id: int, session: str) -> None:
+async def agent_websocket_endpoint(
+    websocket: WebSocket, task_id: int, session: str
+) -> None:
     """Per-session agent event channel: replay the ring buffer, then stream
     live (design D-5; workflow-engine design D-1 addresses sessions
     `(task_id, session)`). Same no-commands rule as the main socket."""
@@ -186,7 +194,9 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: int, session: 
 
         forwarder = asyncio.create_task(_forward_agent_events(websocket, queue, seq))
         receiver = asyncio.create_task(_receive_until_disconnect(websocket))
-        done, pending = await asyncio.wait({forwarder, receiver}, return_when=asyncio.FIRST_COMPLETED)
+        done, pending = await asyncio.wait(
+            {forwarder, receiver}, return_when=asyncio.FIRST_COMPLETED
+        )
         for task in pending:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

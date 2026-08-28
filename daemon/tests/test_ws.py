@@ -23,6 +23,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
             "reviews",
             "ships",
             "gpg",
+            "gh",
             "settings",
         }
         assert payload["projects"] == []
@@ -34,16 +35,29 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         assert payload["reviews"] == {}
         assert payload["ships"] == {}
         assert payload["gpg"]["state"] in ("cached", "locked", "unknown")
+        assert payload["gh"]["identity"]["state"] in (
+            "unknown",
+            "missing",
+            "unauthenticated",
+            "ready",
+            "error",
+        )
 
 
-def test_mutation_broadcast(client: TestClient, auth_token: str, auth_headers: dict[str, str]) -> None:
+def test_mutation_broadcast(
+    client: TestClient, auth_token: str, auth_headers: dict[str, str]
+) -> None:
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         snapshot = ws.receive_json()
 
         response = client.post(
             "/api/projects",
             headers=auth_headers,
-            json={"name": "ompire", "title": "Ompire", "upstream_url": "https://example.com/ompire.git"},
+            json={
+                "name": "ompire",
+                "title": "Ompire",
+                "upstream_url": "https://example.com/ompire.git",
+            },
         )
         assert response.status_code == 201
 
@@ -59,7 +73,11 @@ def test_template_events_and_snapshot(
     client.post(
         "/api/projects",
         headers=auth_headers,
-        json={"name": "demo", "title": "Demo", "upstream_url": "https://example.com/demo.git"},
+        json={
+            "name": "demo",
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+        },
     )
 
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
@@ -99,7 +117,11 @@ def test_reconnect_gets_fresh_snapshot(
     client.post(
         "/api/projects",
         headers=auth_headers,
-        json={"name": "ompire", "title": "Ompire", "upstream_url": "https://example.com/ompire.git"},
+        json={
+            "name": "ompire",
+            "title": "Ompire",
+            "upstream_url": "https://example.com/ompire.git",
+        },
     )
 
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
@@ -109,12 +131,18 @@ def test_reconnect_gets_fresh_snapshot(
 
 
 def test_ws_requires_valid_token(client: TestClient) -> None:
-    with pytest.raises(WebSocketDisconnect), client.websocket_connect("/api/ws?token=wrong"):
+    with (
+        pytest.raises(WebSocketDisconnect),
+        client.websocket_connect("/api/ws?token=wrong"),
+    ):
         pass
 
 
 def test_task_events_and_snapshot(
-    client: TestClient, auth_token: str, auth_headers: dict[str, str], demo_template: dict
+    client: TestClient,
+    auth_token: str,
+    auth_headers: dict[str, str],
+    demo_template: dict,
 ) -> None:
 
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
@@ -144,9 +172,17 @@ def test_task_events_and_snapshot(
         steps = []
         while True:
             event = ws.receive_json()
-            if event["type"] == "task_updated" and event["payload"]["spawn_completed_at"] is not None:
+            if (
+                event["type"] == "task_updated"
+                and event["payload"]["spawn_completed_at"] is not None
+            ):
                 break
-            assert event["type"] in ("spawn_step", "status_changed", "task_updated", "workflow_step")
+            assert event["type"] in (
+                "spawn_step",
+                "status_changed",
+                "task_updated",
+                "workflow_step",
+            )
             if event["type"] == "spawn_step":
                 steps.append((event["payload"]["step"], event["payload"]["status"]))
         assert ("clone", "ok") in steps
@@ -157,7 +193,10 @@ def test_task_events_and_snapshot(
         workflow_events = []
         while True:
             event = ws.receive_json()
-            if event["type"] == "workflow_step" and event["payload"]["task_id"] == task_id:
+            if (
+                event["type"] == "workflow_step"
+                and event["payload"]["task_id"] == task_id
+            ):
                 workflow_events.append(event["payload"])
             if (
                 event["type"] == "task_updated"
@@ -165,7 +204,9 @@ def test_task_events_and_snapshot(
                 and event["payload"]["workflow_status"] == "complete"
             ):
                 break
-        assert [(e["step"], e["kind"], e["session"], e["status"]) for e in workflow_events] == [
+        assert [
+            (e["step"], e["kind"], e["session"], e["status"]) for e in workflow_events
+        ] == [
             ("work", "agent", "main", "started"),
             ("work", "agent", "main", "ok"),
         ]
@@ -179,13 +220,16 @@ def test_task_events_and_snapshot(
         assert workflow["name"] == "single-step"
         assert workflow["status"] == "complete"
         assert workflow["step"] is None
-        assert [(s["step"], s["kind"], s["session"], s["status"]) for s in workflow["steps"]] == [
-            ("work", "agent", "main", "ok")
-        ]
+        assert [
+            (s["step"], s["kind"], s["session"], s["status"]) for s in workflow["steps"]
+        ] == [("work", "agent", "main", "ok")]
 
 
 def test_snapshot_carries_session_statuses(
-    client: TestClient, auth_token: str, auth_headers: dict[str, str], demo_template: dict
+    client: TestClient,
+    auth_token: str,
+    auth_headers: dict[str, str],
+    demo_template: dict,
 ) -> None:
 
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
@@ -226,7 +270,10 @@ def test_snapshot_carries_session_statuses(
 
 
 def test_snapshot_serves_durable_review_history_with_no_live_process(
-    client: TestClient, auth_token: str, auth_headers: dict[str, str], demo_template: dict
+    client: TestClient,
+    auth_token: str,
+    auth_headers: dict[str, str],
+    demo_template: dict,
 ) -> None:
     """The `reviews` map is composed from durable rows, so a reconnect after
     a restart serves the restored history — with `url`/`port` null, because

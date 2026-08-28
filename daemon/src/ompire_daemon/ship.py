@@ -24,6 +24,12 @@ from sqlalchemy import Engine
 
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
+from ompire_daemon.gh import (
+    GitHubProbe,
+    GitHubStatus,
+    GitHubTargetStatus,
+    parse_github_owner,
+)
 from ompire_daemon.registry.projects import Project, get_project
 from ompire_daemon.registry.tasks import Task, mark_pr_url
 from ompire_daemon.registry.templates import get_template
@@ -41,8 +47,6 @@ logger = logging.getLogger(__name__)
 _SHIP_ORIGIN_NAME = "origin"
 _SHIP_GIT_REF = "refs/ompire/ship-orig"
 
-_GITHUB_SSH_RE = re.compile(r"^git@github\.com:(.+?)(?:\.git)?/?$")
-_GITHUB_HTTPS_RE = re.compile(r"^https://github\.com/(.+?)(?:\.git)?/?$")
 _PR_URL_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/\d+")
 
 _DRAFT_PROMPT = """You are helping the operator ship this task.
@@ -76,6 +80,7 @@ class ShipDraft:
     pr_body: str
     source: str = "agent"
 
+
 @dataclass
 class ShipStepState:
     step: str
@@ -105,10 +110,58 @@ class GpgLockedError(ShipError):
         self.status = status
 
 
+class GitHubPreflightError(ShipError):
+    """A safe, structured refusal before a ship can mutate local Git state."""
+
+    def __init__(self, status: GitHubStatus, target: GitHubTargetStatus) -> None:
+        self.status = status
+        self.target = target
+        identity = status.identity
+        if identity.state != "ready":
+            source = (
+                f" via {identity.credential_source}"
+                if identity.credential_source
+                else ""
+            )
+            detail = f": {identity.detail}" if identity.detail else ""
+            super().__init__(
+                f"GitHub preflight blocked shipping: GitHub CLI is {identity.state} "
+                f"for {identity.host}{source}{detail}"
+            )
+            return
+
+        account = (
+            f"@{identity.login}" if identity.login else "the selected GitHub account"
+        )
+        target_name = (
+            target.target.canonical
+            if target.target is not None
+            else "the registered upstream"
+        )
+        detail = f": {target.detail}" if target.detail else ""
+        super().__init__(
+            f"GitHub preflight blocked shipping: {account} cannot use {target_name} "
+            f"({target.state}){detail}"
+        )
+
+
+class PushError(ShipError):
+    """A Git transport failure after a local signed commit exists."""
+
+
+class SshAuthenticationError(PushError):
+    """The narrow SSH public-key authentication subset of a push failure."""
+
+
+class PullRequestError(ShipError):
+    """A sanitized pull-request preflight or creation failure."""
+
+
 class NoLiveAgentError(ShipError):
     def __init__(self, task_id: int) -> None:
         super().__init__(f"task {task_id} has no live agent")
         self.task_id = task_id
+
 
 class SessionNotIdleError(ShipError):
     def __init__(self, task_id: int, session: str, current_status: str | None) -> None:
@@ -133,25 +186,6 @@ class ShipInProgressError(ShipError):
         self.task_id = task_id
 
 
-# --- URL parsing helpers --------------------------------------------------
-
-
-def parse_github_slug(url: str) -> str:
-    """`owner/name` from a GitHub SSH or HTTPS URL."""
-    match = _GITHUB_SSH_RE.match(url) or _GITHUB_HTTPS_RE.match(url)
-    if match is None:
-        raise ValueError(f"not a github.com URL: {url!r}")
-    path = match.group(1).strip("/")
-    if path.count("/") != 1 or not all(path.split("/")):
-        raise ValueError(f"could not parse owner/name from {url!r}")
-    return path
-
-
-def parse_github_owner(url: str) -> str:
-    """The owner component of a GitHub SSH or HTTPS URL."""
-    return parse_github_slug(url).split("/", 1)[0]
-
-
 # --- manager --------------------------------------------------------------
 
 
@@ -164,6 +198,7 @@ class ShipManager:
         sessions: SessionTracker,
         agents: AgentSupervisor,
         gpg: GpgProbe,
+        gh: GitHubProbe,
     ) -> None:
         self._config = config
         self._engine = engine
@@ -171,6 +206,7 @@ class ShipManager:
         self._sessions = sessions
         self._agents = agents
         self._gpg = gpg
+        self._gh = gh
         self._ships: dict[int, ShipState] = {}
         self._backgrounds: dict[int, asyncio.Task] = {}
 
@@ -199,6 +235,21 @@ class ShipManager:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+    async def preflight(self, task: Task) -> GitHubStatus:
+        """Freshly prove the trusted task upstream is safe before shipping."""
+
+        status, _target = await self._preflight_target(task)
+        return status
+
+    async def _preflight_target(
+        self, task: Task
+    ) -> tuple[GitHubStatus, GitHubTargetStatus]:
+        project = self._project(task)
+        status, target = await self._gh.probe_target(project.upstream_url)
+        if status.identity.state != "ready" or target.state != "allowed":
+            raise GitHubPreflightError(status, target)
+        return status, target
 
     # --- public operations -------------------------------------------------
 
@@ -264,9 +315,7 @@ class ShipManager:
             if parsed is None:
                 raise ShipError("could not parse draft markers from agent reply")
 
-            state = self._set_state(
-                task.id, status="drafted", draft=parsed, error=None
-            )
+            state = self._set_state(task.id, status="drafted", draft=parsed, error=None)
             self._hub.publish(
                 "ship_draft", {"task_id": task.id, "draft": asdict(parsed)}
             )
@@ -296,6 +345,11 @@ class ShipManager:
         mode: str = "squash",
     ) -> ShipState:
         """Sign, push, and open a PR for `task` in `squash` or `retain` mode."""
+        # The direct manager API is as authoritative as REST.  Always refresh
+        # the trusted upstream before its first Git operation; REST performs
+        # an earlier check before it seeds visible background state.
+        await self.preflight(task)
+
         status = await self._gpg.probe()
         if status.state != "cached":
             raise GpgLockedError(status)
@@ -344,19 +398,31 @@ class ShipManager:
 
         self._set_state(task.id, status="pushing")
         try:
-            pr_url = await self._push_and_pr(task, project, base_branch, pr_title, pr_body)
-        except Exception as exc:  # noqa: BLE001
-            message = f"push/PR failed: {exc}"
-            self._set_state(task.id, status="error", error=message)
-            self._publish_step(task.id, "pr", "failed", message)
-            self._hub.publish("ship_finished", {"task_id": task.id, "status": "error"})
-            return self._ships[task.id]
+            pr_url = await self._push_and_pr(
+                task, project, base_branch, pr_title, pr_body
+            )
+        except SshAuthenticationError as exc:
+            return self._finish_publish_error(
+                task.id, "push", f"SSH authentication failed while pushing: {exc}"
+            )
+        except PushError as exc:
+            return self._finish_publish_error(task.id, "push", f"push failed: {exc}")
+        except GitHubPreflightError as exc:
+            return self._finish_publish_error(
+                task.id, "pr", f"pull-request preflight failed: {exc}"
+            )
+        except PullRequestError as exc:
+            return self._finish_publish_error(
+                task.id, "pr", f"pull-request creation failed: {exc}"
+            )
+        except Exception as exc:  # noqa: BLE001 -- retain a safe terminal ship state
+            return self._finish_publish_error(
+                task.id, "pr", f"pull-request creation failed: {exc}"
+            )
 
         updated = mark_pr_url(self._engine, task.id, pr_url)
         self._hub.publish("task_updated", asdict(updated))
-        state = self._set_state(
-            task.id, status="shipped", pr_url=pr_url, error=None
-        )
+        state = self._set_state(task.id, status="shipped", pr_url=pr_url, error=None)
         self._hub.publish(
             "ship_finished",
             {"task_id": task.id, "status": "shipped", "pr_url": pr_url},
@@ -405,9 +471,7 @@ class ShipManager:
         )
         return orig
 
-    async def _merge_base(
-        self, clone_path: str, base_branch: str, timeout: int
-    ) -> str:
+    async def _merge_base(self, clone_path: str, base_branch: str, timeout: int) -> str:
         base = (
             await _run_git_output(
                 [
@@ -436,9 +500,7 @@ class ShipManager:
             )
         )
 
-    async def _commit(
-        self, clone_path: str, message: str, timeout: int
-    ) -> str:
+    async def _commit(self, clone_path: str, message: str, timeout: int) -> str:
         name = await self._git_config(clone_path, "user.name")
         email = await self._git_config(clone_path, "user.email")
 
@@ -487,7 +549,8 @@ class ShipManager:
         return sha, 1
 
     async def check_retain_preconditions(self, task: Task) -> None:
-        """Fast preflight for retain mode; raises ShipError on 409 conditions."""
+        """Fast preflight for retain mode; refuses before any Git mutation."""
+        await self.preflight(task)
         clone_path = task.clone_path
         timeout = self._config.spawn_step_timeout
         base_branch = self._base_branch(task)
@@ -506,7 +569,9 @@ class ShipManager:
         if code != 0:
             raise ShipError(f"git status failed: {stderr}")
         if stdout.strip():
-            raise ShipError("working tree is dirty; commit or stash changes before retain mode")
+            raise ShipError(
+                "working tree is dirty; commit or stash changes before retain mode"
+            )
 
         range_commits = (
             await _run_git_output(
@@ -583,13 +648,17 @@ class ShipManager:
             )
 
         sigs = (
-            await _run_git_output(
-                ["git", "-C", clone_path, "log", "--format=%G?", f"{base}..HEAD"],
-                clone_path,
-                timeout,
-                "ship-retain-sigs",
+            (
+                await _run_git_output(
+                    ["git", "-C", clone_path, "log", "--format=%G?", f"{base}..HEAD"],
+                    clone_path,
+                    timeout,
+                    "ship-retain-sigs",
+                )
             )
-        ).strip().splitlines()
+            .strip()
+            .splitlines()
+        )
         bad = [s for s in sigs if s not in ("G", "U")]
         if bad:
             await self._retain_restore(clone_path, timeout)
@@ -664,7 +733,12 @@ class ShipManager:
         )
 
     async def _push_and_pr(
-        self, task: Task, project: Project, base_branch: str, pr_title: str, pr_body: str
+        self,
+        task: Task,
+        project: Project,
+        base_branch: str,
+        pr_title: str,
+        pr_body: str,
     ) -> str:
         clone_path = task.clone_path
         branch = task.branch
@@ -683,24 +757,30 @@ class ShipManager:
         await self._push(clone_path, remote_url, branch)
         self._publish_step(task.id, "push", "ok")
 
+        # The ambient account can change while Git is signing and pushing.  A
+        # fresh read-only check is the last point at which a changed identity
+        # can stop the external forge write.
+        _status, target = await self._preflight_target(task)
+        assert target.target is not None
         self._publish_step(task.id, "pr", "started")
-        upstream_slug = parse_github_slug(project.upstream_url)
         pr_url = await self._create_pr(
-            clone_path, upstream_slug, base_branch, head, pr_title, pr_body
+            clone_path, target.target.slug, base_branch, head, pr_title, pr_body
         )
         self._publish_step(task.id, "pr", "ok", pr_url)
         return pr_url
 
-    async def _push(
-        self, clone_path: str, remote_url: str, branch: str
-    ) -> None:
+    async def _push(self, clone_path: str, remote_url: str, branch: str) -> None:
         # Push via a named remote + fetch: `--force-with-lease` needs
         # remote-tracking refs to lease against; git rejects lease pushes to
         # bare URLs with "stale info" (found via dogfooding).
-        name = await self._ensure_ship_remote(
-            clone_path, remote_url, self._config.spawn_step_timeout
-        )
+        #
+        # Remote setup includes a fetch that can fail with the same transport
+        # or SSH-authentication error as `git push`. Keep the entire sequence
+        # in this stage so callers never mislabel that failure as PR creation.
         try:
+            name = await self._ensure_ship_remote(
+                clone_path, remote_url, self._config.spawn_step_timeout
+            )
             await _run_step(
                 Step(
                     "ship-push",
@@ -717,9 +797,13 @@ class ShipManager:
                 )
             )
         except StepFailedError as exc:
-            detail = exc.stderr.strip()
-            raise ShipError(f"push failed: {detail or exc}") from exc
-
+            detail = exc.stderr.strip() or str(exc)
+            if (
+                remote_url.startswith("git@github.com:")
+                and "Permission denied (publickey)" in detail
+            ):
+                raise SshAuthenticationError(detail) from exc
+            raise PushError(detail) from exc
 
     async def _ensure_ship_remote(
         self, clone_path: str, remote_url: str, timeout: int
@@ -772,39 +856,45 @@ class ShipManager:
 
         body_path = await asyncio.to_thread(write_body)
         try:
-            argv = [
-                *self._config.gh_command,
-                "pr",
-                "create",
-                "--repo",
-                upstream_slug,
-                "--base",
-                base_branch,
-                "--head",
-                head,
-                "--title",
-                title,
-                "--body-file",
-                body_path,
-            ]
-            stdout, stderr, code = await _run_command(argv, clone_path, self._config.spawn_step_timeout)
+            result = await self._gh.run(
+                [
+                    "pr",
+                    "create",
+                    "--repo",
+                    upstream_slug,
+                    "--base",
+                    base_branch,
+                    "--head",
+                    head,
+                    "--title",
+                    title,
+                    "--body-file",
+                    body_path,
+                ],
+                clone_path,
+                self._config.spawn_step_timeout,
+            )
         finally:
             await asyncio.to_thread(Path(body_path).unlink)
 
-        if code != 0:
-            combined = f"{stdout}\n{stderr}"
+        if result.returncode != 0:
+            combined = f"{result.stdout}\n{result.stderr}"
             url = _find_pr_url(combined)
             if url:
                 return url
-            raise ShipError(stderr.strip() or stdout.strip() or f"gh exited {code}")
+            raise PullRequestError(
+                result.stderr.strip()
+                or result.stdout.strip()
+                or f"gh exited {result.returncode}"
+            )
 
-        url = _find_pr_url(stdout)
+        url = _find_pr_url(result.stdout)
         if url:
             return url
-        lines = [line for line in stdout.splitlines() if line.strip()]
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
         if lines:
             return lines[-1]
-        raise ShipError("gh pr create succeeded but printed no PR URL")
+        raise PullRequestError("gh pr create succeeded but printed no PR URL")
 
     # --- helpers ------------------------------------------------------------
 
@@ -828,6 +918,12 @@ class ShipManager:
     def _finish_draft_error(self, task_id: int, message: str) -> ShipState:
         state = self._set_state(task_id, status="error", error=message)
         self._publish_step(task_id, "draft", "failed", message)
+        return state
+
+    def _finish_publish_error(self, task_id: int, step: str, message: str) -> ShipState:
+        state = self._set_state(task_id, status="error", error=message)
+        self._publish_step(task_id, step, "failed", message)
+        self._hub.publish("ship_finished", {"task_id": task_id, "status": "error"})
         return state
 
     def _set_state(self, task_id: int, **kwargs: Any) -> ShipState:
@@ -903,9 +999,7 @@ def _find_pr_url(text: str) -> str | None:
     return match.group(0) if match else None
 
 
-async def _run_command(
-    argv: list[str], cwd: str, timeout: int
-) -> tuple[str, str, int]:
+async def _run_command(argv: list[str], cwd: str, timeout: int) -> tuple[str, str, int]:
     """Run a command, capture stdout/stderr, return both plus exit code."""
     try:
         process = await asyncio.create_subprocess_exec(

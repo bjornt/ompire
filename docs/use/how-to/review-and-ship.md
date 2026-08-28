@@ -104,6 +104,23 @@ In the UI, **Re-draft via agent** asks for confirmation only when it would
 replace metadata you edited. After confirmation, newer edits made while the
 replacement is running remain yours.
 
+### GitHub preflight
+
+Opening an actionable task's Ship flow checks the daemon's current GitHub CLI
+identity against the task's registered upstream target. It names the selected
+account and canonical `host/owner/repository`; select **Re-check GitHub** after
+correcting authentication or repository access. **Sign & commit** remains
+disabled until this check and the GPG check are both ready.
+
+For CLI-stored credentials, run `gh auth login` or `gh auth switch` for the
+named host and recheck. If the panel identifies `GH_TOKEN` or `GITHUB_TOKEN`,
+that environment variable overrides stored accounts; correct the daemon's
+launch environment and restart it. Ompire does not change accounts itself.
+
+The check is a read-only GitHub API eligibility check. It does not test the SSH
+key or HTTPS credential used by `git push`; fix a later push authentication
+failure separately.
+
 ### 2. Commit, push, and open the pull request
 
 ```sh
@@ -118,10 +135,11 @@ curl -sS -X POST http://127.0.0.1:4173/api/tasks/42/ship/commit \
       }'
 ```
 
-The daemon performs the rest itself: signed commit, push, then pull-request
-creation through `gh`. Progress is published per step — `draft`, `commit`,
-`push`, `pr` — and the pull-request URL is attached to the task when it
-succeeds.
+The daemon performs the rest itself: it repeats the read-only GitHub preflight
+before local Git mutation, signs and commits, pushes, rechecks GitHub before
+the pull-request write, then creates the pull request through `gh`. Progress
+is published per step — `draft`, `commit`, `push`, `pr` — and the pull-request
+URL is attached to the task when it succeeds.
 
 ## Ship modes
 
@@ -143,6 +161,7 @@ sequence is interrupted.
 | Condition | Response |
 |---|---|
 | GPG key not `cached` | `409` with the current GPG state attached |
+| GitHub CLI missing, unauthenticated, denied for the upstream, or indeterminate | `409` with a safe GitHub status; no Git state changes |
 | A commit or push is already in flight | `409` |
 | Mode other than `squash` or `retain` | `409` |
 | `retain` preconditions unmet | `409` with the reason |

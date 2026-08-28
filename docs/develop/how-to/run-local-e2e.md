@@ -1,9 +1,8 @@
 # Run the local end-to-end harness
 
-The harness in `local-test/` exercises the real daemon, the real frontend,
-real Git, and real GPG, while substituting the dependencies that are slow,
-networked, or nondeterministic: the forge, the container tooling, the agent,
-and the reviewer.
+The harness in `local-test/` exercises the real daemon, real frontend, real
+Git, real GPG, real project launcher, and real reviewer, while substituting
+the networked forge, container tooling, and LLM-backed agent.
 
 The substitutes are executable fakes, not mocks. They honor the same argv,
 exit codes, streams, and filesystem effects as the real tools, so production
@@ -46,12 +45,12 @@ the daemon, and `cleanup` runs last.
 
 | Scenario | Covers |
 |---|---|
-| `happy-path` | Spawn through review, ship, and pull request |
+| `happy-path` | Spawn through review, GitHub preflight, signed ship, and pull request |
 | `file-mentions` | Prompt `@file` search, the submit refusals, and literal delivery |
 | `ask-approval` | Agent questions and approval gates |
 | `review-comments` | Feeding review comments back into the session |
 | `ship-retain` | `retain` mode commit rewriting and signature verification |
-| `ship-failures` | Refusal paths — locked key, in-flight ship, bad mode |
+| `ship-failures` | GitHub authentication/target refusal, redaction, no-mutation proof, GPG, push, PR, and retain recovery |
 | `merge-poll` | Pull-request state polling to a terminal state |
 | `advisories-stalls` | Stall detection and context advisories |
 | `crash-recovery` | Killing the daemon mid-work and recovering |
@@ -73,6 +72,11 @@ Control scripts let a scenario steer the substituted tools:
 | Forge | `local-test/ghctl` |
 | GPG | `local-test/gpgctl` |
 | WebSocket | `local-test/wsctl` |
+
+`ghctl auth`, `ghctl repository`, and `ghctl token-echo` control only the
+fake's selected account, eligibility evidence, and credential-shaped output.
+Use them to set an external condition; observe the daemon's safe REST,
+WebSocket, and browser behavior rather than editing fake state directly.
 
 ## Fidelity
 

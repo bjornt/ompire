@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { useDaemonState } from "../lib/useDaemonState";
 import { countNeedsAttention } from "../lib/attention";
 import { setFaviconBadge } from "../lib/favicon";
+import { githubIdentityPresentation } from "../lib/githubPresentation";
 import type { ConnectionState, GpgStatus } from "../types";
 import "./Chrome.css";
 
@@ -55,10 +56,11 @@ function gpgChip(gpg: GpgStatus | null): { dot: string; label: string; title: st
 }
 
 export function Chrome() {
-  const { connectionState, tasks, attention, gpg, settings } = useDaemonState();
+  const { connectionState, tasks, attention, gpg, gh, settings } = useDaemonState();
   const needsYou = countNeedsAttention(tasks, attention, settings);
   const daemonChip = DAEMON_CHIP_BY_STATE[connectionState];
   const signingChip = gpgChip(gpg);
+  const githubChip = githubIdentityPresentation(gh);
 
   useEffect(() => {
     document.title = needsYou > 0 ? `(${needsYou}) ompire` : "ompire";
@@ -98,6 +100,15 @@ export function Chrome() {
           <span className="chip" title={signingChip.title} data-testid="gpg-chip">
             <span className="dot" style={{ background: signingChip.dot }} />
             {signingChip.label}
+          </span>
+          <span
+            className="chip"
+            title={githubChip.description}
+            aria-label={githubChip.description}
+            data-testid="gh-chip"
+          >
+            <span className="dot" style={{ background: githubChip.dot }} />
+            {githubChip.label}
           </span>
         </div>
       </header>

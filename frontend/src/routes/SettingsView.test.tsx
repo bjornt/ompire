@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonProvider } from "../lib/daemonSocket";
 import { SettingsView } from "./SettingsView";
-import type { DaemonInfo, DaemonSettings } from "../types";
+import type { DaemonInfo, DaemonSettings, GitHubStatus } from "../types";
 
 type Provenance = Record<string, "default" | "config" | "override">;
 
@@ -31,6 +31,7 @@ class MockWebSocket {
     templates?: unknown[];
     tasks?: unknown[];
     settings?: DaemonSettings;
+    gh?: GitHubStatus;
   }) {
     this.onopen?.();
     this.emit("snapshot", payload);
@@ -58,12 +59,14 @@ function buildFetchHandler({
   },
   token = "ompire_tok_existingtoken123",
   rotateToken = "ompire_tok_rotatedtoken456",
+  githubStatus,
 }: {
   settings?: DaemonSettings;
   provenance?: Provenance;
   daemonInfo?: DaemonInfo;
   token?: string;
   rotateToken?: string;
+  githubStatus?: GitHubStatus;
 } = {}) {
   return async (url: string, init?: RequestInit) => {
     const method = init?.method ?? "GET";
@@ -86,11 +89,14 @@ function buildFetchHandler({
     if (url === "/api/settings/token/rotate" && method === "POST") {
       return jsonResponse({ token: rotateToken });
     }
+    if (url === "/api/gh/recheck" && method === "POST") {
+      return jsonResponse(githubStatus ?? { identity: { state: "unknown" }, targets: {} });
+    }
     return jsonResponse({ detail: "not found" }, 404);
   };
 }
 
-function renderSettings(snapshotSettings: DaemonSettings = {}) {
+function renderSettings(snapshotSettings: DaemonSettings = {}, githubStatus?: GitHubStatus) {
   render(
     <DaemonProvider>
       <SettingsView />
@@ -102,6 +108,7 @@ function renderSettings(snapshotSettings: DaemonSettings = {}) {
       tasks: [],
       templates: [],
       settings: snapshotSettings,
+      gh: githubStatus,
     });
   });
 }
@@ -200,5 +207,93 @@ describe("SettingsView daemon-settings panel", () => {
     expect(confirmSpy).toHaveBeenCalledWith(
       expect.stringContaining("invalidate the old token immediately"),
     );
+  });
+});
+
+
+describe("SettingsView GitHub CLI panel", () => {
+  const readyGitHub: GitHubStatus = {
+    identity: {
+      state: "ready",
+      host: "github.com",
+      login: "octo",
+      credential_source: "GitHub CLI configuration",
+      executable_path: "/usr/bin/gh",
+      version: "gh version 2.97.0",
+      detail: null,
+      checked_at: "2026-08-28T12:00:00+00:00",
+    },
+    targets: {},
+  };
+
+  beforeEach(() => {
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    window.localStorage.clear();
+    MockWebSocket.instances = [];
+  });
+
+  it("renders only safe GitHub details and follows live status updates", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(buildFetchHandler()));
+    renderSettings({}, readyGitHub);
+
+    expect(await screen.findByTestId("daemon-gh-state")).toHaveTextContent("gh @octo");
+    expect(screen.getByTestId("daemon-gh-login")).toHaveTextContent("@octo");
+    expect(screen.getByTestId("daemon-gh-host")).toHaveTextContent("github.com");
+    expect(screen.getByTestId("daemon-gh-source")).toHaveTextContent("GitHub CLI configuration");
+    expect(screen.getByTestId("daemon-gh-executable")).toHaveTextContent("/usr/bin/gh");
+    expect(screen.getByTestId("daemon-gh-version")).toHaveTextContent("gh version 2.97.0");
+
+    const leaked = "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    act(() => {
+      socket().emit("gh_status", {
+        gh: {
+          ...readyGitHub,
+          identity: {
+            ...readyGitHub.identity,
+            state: "error",
+            login: null,
+            detail: `Authorization: Bearer ${leaked}`,
+          },
+        },
+      });
+    });
+
+    await waitFor(() => expect(screen.getByTestId("daemon-gh-state")).toHaveTextContent("gh error"));
+    expect(screen.getByTestId("daemon-gh-detail")).toHaveTextContent("Authorization: [redacted]");
+    expect(document.body.textContent).not.toContain(leaked);
+  });
+
+  it("submits one global GitHub recheck while the first request is pending", async () => {
+    const user = userEvent.setup();
+    let resolveRecheck: ((response: ReturnType<typeof jsonResponse>) => void) | undefined;
+    const pendingRecheck = new Promise<ReturnType<typeof jsonResponse>>((resolve) => {
+      resolveRecheck = resolve;
+    });
+    const baseHandler = buildFetchHandler({ githubStatus: readyGitHub });
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url === "/api/gh/recheck" && init?.method === "POST") return pendingRecheck;
+      return baseHandler(url, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderSettings({}, readyGitHub);
+
+    const button = await screen.findByTestId("recheck-github-button");
+    await user.click(button);
+    await waitFor(() => expect(button).toBeDisabled());
+    await user.click(button);
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url, init]) => url === "/api/gh/recheck" && (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(1);
+
+    resolveRecheck?.(jsonResponse(readyGitHub));
+    await waitFor(() => expect(button).not.toBeDisabled());
   });
 });

@@ -4,6 +4,7 @@ import type {
   DaemonInfo,
   DaemonSettings,
   GpgStatus,
+  GitHubStatus,
   Project,
   ProjectFiles,
   ReviewState,
@@ -36,6 +37,14 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     try {
       const data = (await response.json()) as { detail?: unknown };
       if (typeof data.detail === "string") detail = data.detail;
+      else if (
+        typeof data.detail === "object" &&
+        data.detail !== null &&
+        "message" in data.detail &&
+        typeof data.detail.message === "string"
+      ) {
+        detail = data.detail.message;
+      }
     } catch {
       /* non-JSON error body; keep the status code */
     }
@@ -145,6 +154,20 @@ export function shipCommit(
 /** Force a fresh gpg-agent cache probe (ship capability). */
 export function recheckGpg(): Promise<GpgStatus> {
   return request<GpgStatus>("POST", "/api/gpg/recheck");
+}
+
+/** Current daemon-owned GitHub CLI and repository eligibility observation. */
+export function getGitHubStatus(): Promise<GitHubStatus> {
+  return request<GitHubStatus>("GET", "/api/gh");
+}
+
+/** Recheck the global identity, or one task's trusted registered upstream. */
+export function recheckGitHub(taskId?: number): Promise<GitHubStatus> {
+  return request<GitHubStatus>(
+    "POST",
+    "/api/gh/recheck",
+    taskId === undefined ? undefined : { task_id: taskId },
+  );
 }
 
 /** Project CRUD (projects capability). `newName` on update triggers the

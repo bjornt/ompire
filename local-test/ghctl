@@ -1,28 +1,25 @@
 #!/usr/bin/env bash
 #
-# local-test/ghctl — LOCAL-TESTING.PLAN.md Part 8: the steering wheel for
-# the fake gh (Part 2). PR lifecycle and failure injection against the
-# same $STATE/gh/prs.json the fake reads — no parallel state, no daemon
-# changes. The observable contract is the fake gh itself: every
-# transition here is what the daemon's `pr view` poll path must see.
-#
-# State root: $LOCAL_TEST_STATE if set, else <repo>/local-test/.state.
-# This tool owns nothing — it only rewrites the fake's state file with
-# the same atomic jq -> tmp -> rename discipline.
+# local-test/ghctl — control surface for the executable fake GitHub CLI.
+# It rewrites only the fake's state file, so scenarios still cross the
+# production daemon's real process boundary.
 #
 # Commands:
-#   pr [<n>] [--repo <slug>]      list PRs (or show one): number, head,
-#                                 base, state, timestamps
+#   auth [show] | login <login> | unauthenticated | error [--message <text>]
+#                                 configure the fake's selected CLI identity
+#   repository [show] | allow | deny | policy <all|collaborators_only> |
+#              permission <allow|deny> | archived <on|off> | disabled <on|off> |
+#              pull-requests <on|off>
+#                                 configure read-only API eligibility evidence
+#   token-echo [show|off|stdout|stderr|both]
+#                                 inject credential-shaped CLI output
+#   pr [<n>] [--repo <slug>]      list PRs (or show one)
 #   merge <n> [--repo <slug>]     OPEN -> MERGED with mergedAt=now
 #   close <n> [--repo <slug>]     OPEN -> CLOSED, mergedAt=null
 #   reopen <n> [--repo <slug>]    CLOSED -> OPEN
 #   fail-next [create|view] [--message <text>]
-#                                 arm a one-shot failure for the next
-#                                 matching fake invocation (bare: print
-#                                 both slots without changing them)
-#   selfcheck                     prove the whole contract offline in a
-#                                 temp root against the real fake gh;
-#                                 never touches $STATE
+#                                 arm a one-shot failure for the matching call
+#   selfcheck                     prove control and fake contracts offline
 #   help                          this message
 
 set -euo pipefail
@@ -41,6 +38,14 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | se
 
 command -v jq >/dev/null 2>&1 || die "jq is required but not on PATH"
 
+ensure_state() {
+	[ -f "$PRS_JSON" ] && return
+	# The fake's explicit `api user` contract initializes its disposable state.
+	# Ignore a configured failure: successful initialization is the only goal.
+	LOCAL_TEST_STATE="$STATE_ROOT" "$GH" api --hostname github.com user >/dev/null 2>&1 || true
+	[ -f "$PRS_JSON" ] || die "could not initialize fake gh state at $PRS_JSON"
+}
+
 state_write() { # state_write <tmp-path>
 	mv "$1" "$PRS_JSON"
 }
@@ -48,8 +53,7 @@ state_write() { # state_write <tmp-path>
 mutate() { # mutate <jq-options…> <jq-filter>: atomic read-modify-write
 	local filter="${*: -1}"
 	local -a opts=("${@:1:$(( $# - 1 ))}")
-	[ -f "$PRS_JSON" ] ||
-		die "no gh state at $PRS_JSON — run a local-test environment first (env up)"
+	ensure_state
 	local tmp
 	tmp=$(mktemp "$PRS_JSON.XXXXXX")
 	jq "${opts[@]}" "$filter" "$PRS_JSON" >"$tmp" || { rm -f "$tmp"; return 1; }
@@ -97,6 +101,110 @@ require_pr() { # require_pr <n>: prints current state, dies when absent
 
 pr_numbers() {
 	jq -r --arg r "$REPO" '[.repos[$r].prs[]?.number] | map(tostring) | join(", ")' "$PRS_JSON"
+}
+
+# --- identity, eligibility, and redaction controls -----------------------------
+
+cmd_auth() {
+	ensure_state
+	local action=${1:-show}
+	shift || true
+	case "$action" in
+	show)
+		[ "$#" -eq 0 ] || die "auth show takes no arguments"
+		jq -r '.auth | "state: \(.state)\nlogin: \(.login // "-")\ndetail: \(.detail // "-")"' "$PRS_JSON"
+		;;
+	login)
+		[ "$#" -eq 1 ] || die "auth login requires one login"
+		[[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9-]*$ ]] || die "invalid GitHub login '$1'"
+		mutate --arg login "$1" '.auth = {state: "ready", login: $login, detail: null}'
+		printf 'fake gh identity: @%s\n' "$1"
+		;;
+	unauthenticated)
+		[ "$#" -eq 0 ] || die "auth unauthenticated takes no arguments"
+		mutate '.auth = {state: "unauthenticated", login: null, detail: null}'
+		printf 'fake gh identity: unauthenticated\n'
+		;;
+	error)
+		local message="error connecting to api.github.com"
+		while [ "$#" -gt 0 ]; do
+			case "$1" in
+			--message) message=$2; shift 2 ;;
+			*) die "unknown auth error argument: $1" ;;
+			esac
+		done
+		mutate --arg detail "$message" '.auth = {state: "error", login: null, detail: $detail}'
+		printf 'fake gh identity: error\n'
+		;;
+	*) die "unknown auth command: $action" ;;
+	esac
+}
+
+cmd_repository() {
+	ensure_state
+	local action=${1:-show}
+	shift || true
+	case "$action" in
+	show)
+		[ "$#" -eq 0 ] || die "repository show takes no arguments"
+		jq -c '.repository' "$PRS_JSON"
+		;;
+	allow)
+		[ "$#" -eq 0 ] || die "repository allow takes no arguments"
+		mutate '.repository = {archived: false, disabled: false, has_issues: true, pull_request_creation_policy: "all", role_name: "write", permissions: {pull: true}}'
+		printf 'fake gh repository: allowed\n'
+		;;
+	deny)
+		[ "$#" -eq 0 ] || die "repository deny takes no arguments"
+		mutate '.repository.archived = false | .repository.disabled = false | .repository.has_issues = true | .repository.pull_request_creation_policy = "collaborators_only" | .repository.role_name = "none" | .repository.permissions.pull = false'
+		printf 'fake gh repository: denied\n'
+		;;
+	policy)
+		[ "$#" -eq 1 ] || die "repository policy requires all or collaborators_only"
+		case "$1" in all | collaborators_only) ;; *) die "invalid repository policy '$1'" ;; esac
+		mutate --arg policy "$1" '.repository.pull_request_creation_policy = $policy'
+		printf 'fake gh repository policy: %s\n' "$1"
+		;;
+	permission)
+		[ "$#" -eq 1 ] || die "repository permission requires allow or deny"
+		case "$1" in
+		allow)
+			mutate '.repository.role_name = "write" | .repository.permissions.pull = true'
+			;;
+		deny)
+			mutate '.repository.role_name = "none" | .repository.permissions.pull = false'
+			;;
+		*) die "invalid repository permission '$1'" ;;
+		esac
+		printf 'fake gh repository permission: %s\n' "$1"
+		;;
+	archived | disabled | pull-requests)
+		[ "$#" -eq 1 ] || die "repository $action requires on or off"
+		local value
+		case "$1" in on) value=true ;; off) value=false ;; *) die "invalid switch '$1'" ;; esac
+		case "$action" in
+		archived) mutate --argjson value "$value" '.repository.archived = $value' ;;
+		disabled) mutate --argjson value "$value" '.repository.disabled = $value' ;;
+		pull-requests) mutate --argjson value "$value" '.repository.has_issues = $value' ;;
+		esac
+		printf 'fake gh repository %s: %s\n' "$action" "$1"
+		;;
+	*) die "unknown repository command: $action" ;;
+	esac
+}
+
+cmd_token_echo() {
+	ensure_state
+	local mode=${1:-show}
+	shift || true
+	[ "$#" -eq 0 ] || die "token-echo accepts one mode"
+	if [ "$mode" = show ]; then
+		jq -r '.inject.token_echo // "off"' "$PRS_JSON"
+		return
+	fi
+	case "$mode" in off | stdout | stderr | both) ;; *) die "invalid token-echo mode '$mode'" ;; esac
+	mutate --arg mode "$mode" '.inject.token_echo = $mode'
+	printf 'fake gh token echo: %s\n' "$mode"
 }
 
 # --- pr -----------------------------------------------------------------------
@@ -229,8 +337,36 @@ cmd_selfcheck() {
 	gh_run()  { LOCAL_TEST_STATE=$root "$GH" "$@"; }
 	printf 'probe body\n' >"$bodyf"
 
-	# ---- 1/7 create two PRs through the real fake
-	log "1/7 seeding PRs through the real fake gh"
+	# ---- 1/9 identity control drives the fake's exact user API ----------------
+	log "1/9 identity control and user API"
+	out=$(ctl_run auth) || fail "auth show" "$out"
+	grep -q '^state: ready$' <<<"$out" || fail "default auth is ready" "$out"
+	ctl_run auth unauthenticated >/dev/null || fail "set unauthenticated"
+    rc=0
+    gh_run api --hostname github.com user >"$SELF_TMP/o" 2>"$err" || rc=$?
+    [ "$rc" = 4 ] && grep -q 'HTTP 401: Bad credentials' "$err" ||
+        fail "unauthenticated control reaches API with exit 4" "$(cat "$err")"
+	ctl_run auth login local-test-bot >/dev/null || fail "restore ready identity"
+	out=$(gh_run api --hostname github.com user 2>"$err") || fail "ready user API" "$(cat "$err")"
+	jq -e '.login == "local-test-bot"' <<<"$out" >/dev/null || fail "login control reaches API" "$out"
+	ok "auth control changes the selected fake CLI account"
+
+	# ---- 2/9 repository and output controls drive API evidence ----------------
+	log "2/9 repository permission and token echo controls"
+	ctl_run repository deny >/dev/null || fail "deny repository"
+	out=$(gh_run api --hostname github.com "repos/$slug" 2>"$err") || fail "denied repository API" "$(cat "$err")"
+	jq -e '.pull_request_creation_policy == "collaborators_only" and .permissions.pull == false' \
+		<<<"$out" >/dev/null || fail "deny control reaches API" "$out"
+	ctl_run repository allow >/dev/null || fail "allow repository"
+	ctl_run token-echo stderr >/dev/null || fail "enable token echo"
+	out=$(gh_run api --hostname github.com user 2>"$err") || fail "token echo user API" "$(cat "$err")"
+	jq -e '.login == "local-test-bot"' <<<"$out" >/dev/null || fail "token echo preserves user JSON" "$out"
+	grep -q '^Authorization: Bearer ' "$err" || fail "token echo reaches stderr" "$(cat "$err")"
+	ctl_run token-echo off >/dev/null || fail "disable token echo"
+	ok "repository and credential-shaped output controls"
+
+	# ---- 3/9 create two PRs through the real fake
+	log "3/9 seeding PRs through the real fake gh"
 	[ -x "$GH" ] || fail "fake gh missing at $GH"
 	out=$(gh_run pr create --repo "$slug" --base main --head ompire/one \
 		--title "One" --body-file "$bodyf" 2>"$err") ||
@@ -240,8 +376,8 @@ cmd_selfcheck() {
 		fail "create #2" "$(cat "$err")"
 	ok "seeded 2 PRs via the fake gh"
 
-	# ---- 2/7 pr listing and show
-	log "2/7 pr listing and show"
+	# ---- 4/9 pr listing and show
+	log "4/9 pr listing and show"
 	out=$(ctl_run pr) || fail "pr list" "$out"
 	grep -q '#1 OPEN ompire/one -> main' <<<"$out" ||
 		fail "pr list shows PR 1" "$out"
@@ -250,8 +386,8 @@ cmd_selfcheck() {
 	grep -q 'title:    One' <<<"$out" || fail "pr show carries the title" "$out"
 	ok "pr: list and show"
 
-	# ---- 3/7 merge is visible through the daemon's poll path
-	log "3/7 merge visible to pr view"
+	# ---- 5/9 merge is visible through the daemon's poll path
+	log "5/9 merge visible to pr view"
 	ctl_run merge 1 >/dev/null || fail "merge 1"
 	out=$(gh_run pr view "https://github.com/$slug/pull/1" --json state,mergedAt 2>"$err") ||
 		fail "view after merge" "$(cat "$err")"
@@ -259,8 +395,8 @@ cmd_selfcheck() {
 		fail "view reports MERGED with a timestamp" "$out"
 	ok "merge: MERGED + mergedAt visible to the poll path"
 
-	# ---- 4/7 close/reopen and state guards
-	log "4/7 close, reopen, and refused transitions"
+	# ---- 6/9 close, reopen, and state guards
+	log "6/9 close, reopen, and refused transitions"
 	ctl_run close 2 >/dev/null || fail "close 2"
 	out=$(gh_run pr view "https://github.com/$slug/pull/2" --json state,mergedAt 2>"$err") ||
 		fail "view after close" "$(cat "$err")"
@@ -282,8 +418,8 @@ cmd_selfcheck() {
 		fail "unknown PR error names the PR" "$(cat "$err")"
 	ok "close/reopen: transitions and refusals"
 
-	# ---- 5/7 fail-next arming fires once through the real fake
-	log "5/7 fail-next create and view"
+	# ---- 7/9 fail-next arming fires once through the real fake
+	log "7/9 fail-next create and view"
 	ctl_run fail-next create >/dev/null || fail "arm create"
 	rc=0
 	gh_run pr create --repo "$slug" --base main --head ompire/three \
@@ -304,8 +440,8 @@ cmd_selfcheck() {
 		>"$SELF_TMP/o" 2>"$err" || fail "next view succeeds" "$(cat "$err")"
 	ok "fail-next: custom + default messages, one-shot by consumption"
 
-	# ---- 6/7 bare fail-next inspects without mutating
-	log "6/7 fail-next inspection"
+	# ---- 8/9 bare fail-next inspects without mutating
+	log "8/9 fail-next inspection"
 	ctl_run fail-next view >/dev/null # leave view armed
 	out=$(ctl_run fail-next) || fail "bare fail-next" "$out"
 	grep -q '^create: none$' <<<"$out" || fail "create slot reads none" "$out"
@@ -315,8 +451,8 @@ cmd_selfcheck() {
 		>/dev/null 2>&1 || true # consume it so the fake is clean again
 	ok "fail-next (bare): inspection without mutation"
 
-	# ---- 7/7 loud rejection of unknown subcommands
-	log "7/7 unknown subcommand"
+	# ---- 9/9 loud rejection of unknown subcommands
+	log "9/9 unknown subcommand"
 	rc=0
 	ctl_run nonsense >"$SELF_TMP/o" 2>"$err" || rc=$?
 	[ "$rc" -ne 0 ] || fail "unknown subcommand exits non-zero"
@@ -331,6 +467,9 @@ cmd_selfcheck() {
 
 command=${1:-help}
 case "$command" in
+auth) shift; cmd_auth "$@" ;;
+repository) shift; cmd_repository "$@" ;;
+token-echo) shift; cmd_token_echo "$@" ;;
 pr) shift; cmd_pr "$@" ;;
 merge) shift; cmd_merge "$@" ;;
 close) shift; cmd_close "$@" ;;

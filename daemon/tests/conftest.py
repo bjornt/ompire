@@ -23,6 +23,18 @@ case "$*" in
 esac
 """
 
+FAKE_GH_SCRIPT = """#!/bin/sh
+case "$*" in
+  "--version") echo "gh version 2.97.0 (test)" ;;
+  "api --hostname github.com user") echo '{"login":"test-user"}' ;;
+  "api --hostname github.com repos/"*"/pulls?per_page=1") echo '[]' ;;
+  "api --hostname github.com repos/"*) echo '{"archived":false,"disabled":false,"has_issues":true,"pull_request_creation_policy":"all"}' ;;
+  "pr create"*) echo "https://github.com/owner/repo/pull/1" ;;
+  "pr view"*) echo '{"state":"OPEN","mergedAt":null}' ;;
+  *) echo "unsupported gh invocation: $*" >&2; exit 1 ;;
+esac
+"""
+
 
 @pytest.fixture(autouse=True)
 def fake_workshop_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -37,6 +49,9 @@ def fake_workshop_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     script = bin_dir / "workshop"
     script.write_text(FAKE_WORKSHOP_SCRIPT)
     script.chmod(0o755)
+    gh_script = bin_dir / "gh"
+    gh_script.write_text(FAKE_GH_SCRIPT)
+    gh_script.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     return script
 
@@ -111,7 +126,9 @@ def git_checkout(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def demo_template(client: TestClient, auth_headers: dict[str, str], git_checkout: Path) -> dict:
+def demo_template(
+    client: TestClient, auth_headers: dict[str, str], git_checkout: Path
+) -> dict:
     """Project `demo` on the git checkout plus a same-named template — the
     minimum a REST spawn needs (mirrors git_checkout's fixture style)."""
     response = client.post(

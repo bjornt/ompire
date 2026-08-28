@@ -16,6 +16,7 @@ from sqlalchemy import Engine
 from ompire_daemon.config import Config
 from ompire_daemon.db import make_engine
 from ompire_daemon.events import EventHub
+from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.prwatch import PrWatcher, _parse_pr_view
 from ompire_daemon.registry.projects import create_project
@@ -58,7 +59,9 @@ def task(engine: Engine, tmp_path: Path) -> Task:
     return mark_pr_url(engine, created.id, "https://github.com/upowner/uprepo/pull/7")
 
 
-def _fake_gh(tmp_path: Path, payload: dict | None, exit_code: int = 0) -> tuple[str, ...]:
+def _fake_gh(
+    tmp_path: Path, payload: dict | None, exit_code: int = 0
+) -> tuple[str, ...]:
     """A stub `gh` printing `payload` as JSON; `payload=None` emits garbage."""
     script = tmp_path / "fake-gh"
     body = json.dumps(payload) if payload is not None else "not json"
@@ -67,11 +70,13 @@ def _fake_gh(tmp_path: Path, payload: dict | None, exit_code: int = 0) -> tuple[
     return (str(script),)
 
 
-def _watcher(tmp_path: Path, engine: Engine, hub: EventHub, gh: tuple[str, ...]) -> PrWatcher:
+def _watcher(
+    tmp_path: Path, engine: Engine, hub: EventHub, gh: tuple[str, ...]
+) -> PrWatcher:
     data_dir = tmp_path / "data"
     data_dir.mkdir(exist_ok=True)  # the watcher runs gh with data_dir as cwd
     config = Config(data_dir=data_dir, gh_command=gh, pr_poll_interval=60)
-    return PrWatcher(config, engine, hub)
+    return PrWatcher(config, engine, hub, GitHubProbe(config, hub))
 
 
 async def test_open_to_merged_transition_persists_and_broadcasts(
@@ -92,7 +97,9 @@ async def test_open_to_merged_transition_persists_and_broadcasts(
     assert event.payload["pr_state"] == "merged"
 
 
-async def test_open_state_recorded_on_first_poll(engine: Engine, task: Task, tmp_path: Path) -> None:
+async def test_open_state_recorded_on_first_poll(
+    engine: Engine, task: Task, tmp_path: Path
+) -> None:
     hub = EventHub()
     gh = _fake_gh(tmp_path, {"state": "OPEN", "mergedAt": None})
 
@@ -103,7 +110,9 @@ async def test_open_state_recorded_on_first_poll(engine: Engine, task: Task, tmp
     assert updated.pr_merged_at is None
 
 
-async def test_unchanged_state_writes_nothing(engine: Engine, task: Task, tmp_path: Path) -> None:
+async def test_unchanged_state_writes_nothing(
+    engine: Engine, task: Task, tmp_path: Path
+) -> None:
     mark_pr_state(engine, task.id, "open")
     hub = EventHub()
     queue = hub.subscribe()
@@ -115,14 +124,18 @@ async def test_unchanged_state_writes_nothing(engine: Engine, task: Task, tmp_pa
     assert get_task(engine, task.id).pr_state == "open"
 
 
-async def test_terminal_states_are_not_polled(engine: Engine, task: Task, tmp_path: Path) -> None:
+async def test_terminal_states_are_not_polled(
+    engine: Engine, task: Task, tmp_path: Path
+) -> None:
     mark_pr_state(engine, task.id, "merged", "2026-08-13T00:00:00Z")
     hub = EventHub()
     queue = hub.subscribe()
     # A gh that records every invocation: none may happen for a terminal PR.
     counter = tmp_path / "gh-calls"
     script = tmp_path / "fake-gh"
-    script.write_text(f'#!/bin/sh\necho x >> "{counter}"\necho \'{{"state":"OPEN"}}\'\n')
+    script.write_text(
+        f'#!/bin/sh\necho x >> "{counter}"\necho \'{{"state":"OPEN"}}\'\n'
+    )
     script.chmod(0o755)
 
     await _watcher(tmp_path, engine, hub, (str(script),)).poll_once()
@@ -131,12 +144,16 @@ async def test_terminal_states_are_not_polled(engine: Engine, task: Task, tmp_pa
     assert queue.empty()
 
 
-async def test_archived_tasks_are_not_polled(engine: Engine, task: Task, tmp_path: Path) -> None:
+async def test_archived_tasks_are_not_polled(
+    engine: Engine, task: Task, tmp_path: Path
+) -> None:
     mark_archived(engine, task.id)
     hub = EventHub()
     counter = tmp_path / "gh-calls"
     script = tmp_path / "fake-gh"
-    script.write_text(f'#!/bin/sh\necho x >> "{counter}"\necho \'{{"state":"OPEN"}}\'\n')
+    script.write_text(
+        f'#!/bin/sh\necho x >> "{counter}"\necho \'{{"state":"OPEN"}}\'\n'
+    )
     script.chmod(0o755)
 
     await _watcher(tmp_path, engine, hub, (str(script),)).poll_once()
@@ -150,7 +167,9 @@ async def test_failed_poll_changes_nothing_and_survives(
     hub = EventHub()
     queue = hub.subscribe()
     # The observed unauthenticated-gh failure mode (findings 1.1): exit 4.
-    gh = _fake_gh(tmp_path, {"state": "MERGED", "mergedAt": "2026-08-14T09:30:00Z"}, exit_code=4)
+    gh = _fake_gh(
+        tmp_path, {"state": "MERGED", "mergedAt": "2026-08-14T09:30:00Z"}, exit_code=4
+    )
 
     watcher = _watcher(tmp_path, engine, hub, gh)
     await watcher.poll_once()  # must not raise
@@ -160,7 +179,38 @@ async def test_failed_poll_changes_nothing_and_survives(
     assert queue.empty()
 
 
-async def test_unparseable_output_changes_nothing(engine: Engine, task: Task, tmp_path: Path) -> None:
+async def test_failed_poll_logs_only_sanitized_github_output(
+    engine: Engine, task: Task, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hub = EventHub()
+    secret = "watcher-exact-secret"
+    script = tmp_path / "fake-gh-redaction"
+    script.write_text(
+        "#!/bin/sh\n"
+        "printf 'Authorization: Token %s github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\\n' \"$GH_TOKEN\" >&2\n"
+        "exit 1\n"
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("GH_TOKEN", secret)
+    warnings: list[tuple[object, ...]] = []
+
+    def capture_warning(*args: object, **_kwargs: object) -> None:
+        warnings.append(args)
+
+    monkeypatch.setattr("ompire_daemon.prwatch.logger.warning", capture_warning)
+    watcher = _watcher(tmp_path, engine, hub, (str(script),))
+    await watcher._poll_task(task)
+
+    assert warnings
+    published = "\n".join(str(args) for args in warnings)
+    assert secret not in published
+    assert "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" not in published
+    assert "Authorization: [redacted]" in published
+
+
+async def test_unparseable_output_changes_nothing(
+    engine: Engine, task: Task, tmp_path: Path
+) -> None:
     hub = EventHub()
     gh = _fake_gh(tmp_path, None)
 
@@ -201,7 +251,9 @@ async def test_spawn_completed_unshipped_tasks_are_not_polled(
     hub = EventHub()
     counter = tmp_path / "gh-calls"
     script = tmp_path / "fake-gh"
-    script.write_text(f'#!/bin/sh\necho x >> "{counter}"\necho \'{{"state":"OPEN"}}\'\n')
+    script.write_text(
+        f'#!/bin/sh\necho x >> "{counter}"\necho \'{{"state":"OPEN"}}\'\n'
+    )
     script.chmod(0o755)
 
     await _watcher(tmp_path, engine, hub, (str(script),)).poll_once()

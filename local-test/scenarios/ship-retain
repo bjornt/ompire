@@ -20,6 +20,9 @@ _retain_cleanup() { rm -f "$DRAFT_FILE"; }
 register_cleanup _retain_cleanup
 
 ws_start ship_finished
+_agent_idle_after() { # _agent_idle_after TASK PREVIOUS_IDLE_EVENTS
+	[ "$(ws_count '.type == "status_changed" and .payload.task_id == '"$1"' and .payload.session == "main" and .payload.to == "idle"')" -gt "$2" ]
+}
 
 tid=$(spawn_task "$(unique_slug retain)" "Retain-mode E2E: do the initial work.")
 wait_for "work step completes" 180 workflow_complete "$tid"
@@ -28,11 +31,13 @@ wait_for "work step completes" 180 workflow_complete "$tid"
 
 clone=$(task_field "$tid" clone_path)
 for i in $(seq 1 "$AGENT_COMMITS"); do
+	idle_events=$(ws_count '.type == "status_changed" and .payload.task_id == '"$tid"' and .payload.session == "main" and .payload.to == "idle"')
 	follow_up "$tid" "[[scenario:commit]]
 Agent change $i: stage and commit."
-	# The commit lands in the clone when the fake agent's turn finishes;
-	# observe it as the branch's commit count growing.
+	# The commit can land just before session state returns idle. The draft route
+	# requires that latter observable state, so wait for both boundaries.
 	wait_for "agent commit $i lands in the clone" 60 _clone_commits "$clone" "$i"
+	wait_for "agent commit $i returns the primary session idle" 60 _agent_idle_after "$tid" "$idle_events"
 done
 ok "$AGENT_COMMITS agent commits authored"
 

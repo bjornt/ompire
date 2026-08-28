@@ -84,6 +84,34 @@ interval until it is dealt with.
 | `locked` | Key present, passphrase not cached | Refused |
 | `unknown` | Key, agent, or probe unresolved | Refused |
 
+## GitHub states
+
+GitHub state is a current daemon observation held only in memory. Restarting
+the daemon begins at `unknown` and probes again; a failed recheck replaces a
+previous ready result rather than leaving stale authorization visible.
+
+### Identity
+
+| State | Meaning |
+|---|---|
+| `unknown` | No GitHub CLI check has completed. |
+| `missing` | The configured GitHub CLI executable cannot run. |
+| `unauthenticated` | The CLI runs but its effective credential is missing or rejected. |
+| `ready` | `gh api --hostname github.com user` safely returned the selected login. |
+| `error` | A timeout, network error, malformed response, or other indeterminate check result occurred. |
+
+### Repository eligibility
+
+Each canonical `host/owner/repository` result is bound to the host, login, and
+credential-source tuple that produced it.
+
+| State | Meaning | Shipping |
+|---|---|---|
+| `unchecked` | The target has not been checked under a ready identity. | Refused |
+| `allowed` | Read-only repository, pull-request policy, and effective-access checks passed. | Allowed with a ready GPG gate |
+| `denied` | The known account cannot use the registered upstream target. | Refused |
+| `error` | Target response or eligibility evidence was incomplete or indeterminate. | Refused |
+
 ## Pull-request states
 
 A shipped task records its pull-request URL, state, and merge time. Ompire

@@ -45,7 +45,10 @@ scripts/setup-qa-env.sh
 
 Installs the toolchain, prepares workshop and LXD, sets up the browser,
 builds, writes the daemon configuration, registers the sandbox project, starts
-the daemon, and runs smoke checks.
+the daemon, and runs smoke checks. The smoke output compares only safe daemon
+GitHub fields — login, host, and source label — with `.qa-agent/state.json`,
+then verifies the registered sandbox target with the same explicit-host reads
+the preflight consumes. It never prints a credential value.
 
 It is idempotent — re-run it freely.
 
@@ -63,13 +66,38 @@ Any shell that needs the bot's identity:
 . .qa-agent/env.sh
 ```
 
+## Verify GitHub identity preflight
+
+Only on the disposable bot-owned sandbox, verify the failure and recovery path
+before a normal ship:
+
+1. Spawn or select a sandbox task and record its clone `HEAD`, worktree state,
+   and absence of `refs/ompire/ship-orig`.
+2. Start the daemon once with a deliberately invalid `GH_TOKEN` in its launch
+   environment. In the browser, confirm the chrome and Settings show `gh auth`
+   without token material and Ship flow disables **Sign & commit**.
+3. Send the ordinary ship-commit request. It must return safe `409` GitHub
+   status before a ship job, commit event, `HEAD` change, worktree change, or
+   `refs/ompire/ship-orig` change.
+4. Stop that daemon and restart the normal QA wrapper, which sources
+   `.qa-agent/env.sh`. Re-check GitHub in Settings and the task Ship flow;
+   both must report `gh @ompire-test` and the canonical sandbox target ready.
+5. Complete the normal signed ship and confirm the pull request exists on the
+   sandbox repository. Keep the GitHub API eligibility result distinct from
+   SSH or HTTPS push authentication.
+
+Capture only safe UI/API/event evidence. Never copy the invalid token, bot
+token, authorization header, or credential-bearing URL into a recording.
+
 ## The loop
 
 1. Spawn a task through the UI, or `POST /api/tasks`.
 2. Let the agent work.
 3. Drive Review to approval.
-4. Ship: draft, then sign and commit, then push and open the pull request.
-5. Verify on the sandbox repository.
+4. Check the task-specific GitHub banner; correct the daemon identity or
+   repository access and recheck when it is blocked.
+5. Ship: draft, then sign and commit, then push and open the pull request.
+6. Verify the signed commit and pull request on the sandbox repository.
 
 The verification that matters most: **commits must show as Verified on
 GitHub.** An unsigned or badly signed commit means the publishing path is

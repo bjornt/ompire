@@ -24,6 +24,7 @@ from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
+from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.projectfiles import (
@@ -84,7 +85,7 @@ from ompire_daemon.registry.templates import (
 from ompire_daemon.review import ReviewAlreadyOpenError, ReviewError, ReviewManager
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.sessions import SessionTracker
-from ompire_daemon.ship import ShipError, ShipManager
+from ompire_daemon.ship import GitHubPreflightError, ShipError, ShipManager
 from ompire_daemon.spawn import run_spawn_pipeline
 from ompire_daemon.workflows import (
     JUDGE_SESSION,
@@ -180,6 +181,10 @@ def _gpg(request: Request) -> GpgProbe:
     return request.app.state.gpg
 
 
+def _gh(request: Request) -> GitHubProbe:
+    return request.app.state.gh
+
+
 def _apply_settings_live(
     settings: dict[str, Any],
     events: EventHub,
@@ -212,7 +217,9 @@ def list_projects_route(engine: Engine = Depends(_engine)) -> list[Project]:
     return list_projects(engine)
 
 
-@router.post("/projects", response_model=ProjectOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/projects", response_model=ProjectOut, status_code=status.HTTP_201_CREATED
+)
 def create_project_route(
     body: ProjectCreate,
     engine: Engine = Depends(_engine),
@@ -310,7 +317,9 @@ def update_project_route(
     if renamed:
         # Keyed-by-name consumers can't match a renamed payload via
         # `project_updated`; the rename event carries the old key.
-        events.publish("project_renamed", {"old_name": name, "project": asdict(project)})
+        events.publish(
+            "project_renamed", {"old_name": name, "project": asdict(project)}
+        )
     else:
         events.publish("project_updated", asdict(project))
     return project
@@ -395,7 +404,9 @@ def list_templates_route(engine: Engine = Depends(_engine)) -> list[Template]:
     return list_templates(engine)
 
 
-@router.post("/templates", response_model=TemplateOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/templates", response_model=TemplateOut, status_code=status.HTTP_201_CREATED
+)
 def create_template_route(
     body: TemplateCreate,
     engine: Engine = Depends(_engine),
@@ -537,12 +548,16 @@ class TaskDetailOut(TaskOut):
 
 
 @router.get("/tasks/{task_id}", response_model=TaskDetailOut)
-async def get_task_route(task_id: int, engine: Engine = Depends(_engine)) -> TaskDetailOut:
+async def get_task_route(
+    task_id: int, engine: Engine = Depends(_engine)
+) -> TaskDetailOut:
     try:
         task = get_task(engine, task_id)
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    derived_status = await workshop_status(task.clone_path) if task.workshop_id else None
+    derived_status = (
+        await workshop_status(task.clone_path) if task.workshop_id else None
+    )
     return TaskDetailOut(**asdict(task), workshop_status=derived_status)
 
 
@@ -874,7 +889,12 @@ async def answer_agent_route(
     # frame, so the card disappears on send and the fan-out corrects any
     # surprise (e.g. a re-posted question arrives as a fresh question_posted).
     sessions.answer_pending(task_id, session)
-    return {"task_id": task_id, "session": session, "question_id": body.question_id, "answered": True}
+    return {
+        "task_id": task_id,
+        "session": session,
+        "question_id": body.question_id,
+        "answered": True,
+    }
 
 
 @router.get("/tasks/{task_id}/sessions/{session}/agent/state")
@@ -1078,6 +1098,13 @@ async def commit_ship_route(
             status.HTTP_409_CONFLICT,
             f"task {task_id} already has a ship in flight",
         )
+    try:
+        await ships.preflight(task)
+    except GitHubPreflightError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"message": str(exc), "gh": asdict(exc.status)},
+        ) from exc
 
     gpg_status = await gpg.probe()
     if gpg_status.state != "cached":
@@ -1099,7 +1126,11 @@ async def commit_ship_route(
 
     job = asyncio.create_task(
         ships.commit_and_ship(
-            task, body.message, body.pr_title, body.pr_body, mode=body.mode
+            task,
+            body.message,
+            body.pr_title,
+            body.pr_body,
+            mode=body.mode,
         )
     )
     jobs: set[asyncio.Task] = request.app.state.spawn_jobs
@@ -1119,6 +1150,33 @@ async def get_gpg_route(gpg: GpgProbe = Depends(_gpg)) -> dict[str, Any]:
 @router.post("/gpg/recheck")
 async def recheck_gpg_route(gpg: GpgProbe = Depends(_gpg)) -> dict[str, Any]:
     return asdict(await gpg.probe())
+
+
+class GitHubRecheckBody(BaseModel):
+    task_id: int | None = None
+
+
+@router.get("/gh")
+async def get_gh_route(gh: GitHubProbe = Depends(_gh)) -> dict[str, Any]:
+    """Return the last safe GitHub observation without starting a probe."""
+
+    return asdict(gh.current())
+
+
+@router.post("/gh/recheck")
+async def recheck_gh_route(
+    body: GitHubRecheckBody | None = None,
+    engine: Engine = Depends(_engine),
+    gh: GitHubProbe = Depends(_gh),
+) -> dict[str, Any]:
+    """Refresh global identity, optionally together with one task's trusted target."""
+
+    if body is None or body.task_id is None:
+        return asdict(await gh.probe())
+    task = _require_task(engine, body.task_id)
+    project = get_project(engine, task.project_name)
+    status, _target = await gh.probe_target(project.upstream_url)
+    return asdict(status)
 
 
 @router.delete("/tasks/{task_id}")
@@ -1156,7 +1214,9 @@ class SettingsOut(BaseModel):
 
 
 @router.get("/settings", response_model=SettingsOut)
-def get_settings_route(settings_store: SettingsStore = Depends(_settings)) -> SettingsOut:
+def get_settings_route(
+    settings_store: SettingsStore = Depends(_settings),
+) -> SettingsOut:
     result = settings_store.get()
     return SettingsOut(settings=result.settings, provenance=result.provenance)
 

@@ -41,6 +41,7 @@ class MockWebSocket {
     reviews?: unknown;
     ships?: unknown;
     gpg?: unknown;
+    gh?: unknown;
   }) {
     this.onopen?.();
     this.emit("snapshot", payload);
@@ -53,6 +54,33 @@ const project = {
   upstream_url: "https://example.com/maas.git",
   fork_url: null,
   checkout_path: "/home/op/proj/maas",
+};
+
+const githubProject = { ...project, upstream_url: "https://github.com/ompire/maas.git" };
+const readyGitHub = {
+  identity: {
+    state: "ready",
+    host: "github.com",
+    login: "octo",
+    credential_source: "GitHub CLI configuration",
+    executable_path: "/usr/bin/gh",
+    version: "gh version 2.97.0",
+    detail: null,
+    checked_at: "t0",
+  },
+  targets: {
+    "github.com/ompire/maas": {
+      state: "allowed",
+      target: { host: "github.com", owner: "ompire", repository: "maas" },
+      identity: {
+        host: "github.com",
+        login: "octo",
+        credential_source: "GitHub CLI configuration",
+      },
+      detail: null,
+      checked_at: "t0",
+    },
+  },
 };
 
 function makeTemplate(overrides: Partial<Template> = {}): Template {
@@ -113,6 +141,7 @@ async function renderAt(
     reviews?: unknown;
     ships?: unknown;
     gpg?: unknown;
+    gh?: unknown;
   },
 ) {
   window.history.pushState({}, "", path);
@@ -2062,7 +2091,11 @@ describe("ShipFlowView", () => {
       });
     });
 
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft"),
+      ).toHaveLength(1),
+    );
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/tasks/1/ship/draft",
       expect.objectContaining({ method: "POST", body: undefined }),
@@ -2101,7 +2134,7 @@ describe("ShipFlowView", () => {
       expect(screen.getByTestId("pr-title")).toHaveValue("Agent title");
       expect(screen.getByTestId("pr-body")).toHaveValue("Agent body");
     });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(1);
 
     await act(async () => {
       deferred.resolve({
@@ -2137,7 +2170,7 @@ describe("ShipFlowView", () => {
 
     expect(screen.getByTestId("draft-status")).toHaveTextContent("waiting");
     expect(screen.getByTestId("draft-status")).toHaveTextContent("working");
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(0);
 
     act(() => {
       socket().emit("status_changed", {
@@ -2148,7 +2181,9 @@ describe("ShipFlowView", () => {
         reason: "turn ended",
       });
     });
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(1),
+    );
 
     await act(async () => {
       deferred.resolve({
@@ -2192,31 +2227,37 @@ describe("ShipFlowView", () => {
     });
 
     expect(screen.getByTestId("draft-status")).toHaveTextContent("approved review");
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(0);
 
     act(() => {
       socket().emit("review_finished", { task_id: 1, status: "approved" });
     });
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(1),
+    );
   });
 
   it("leaves manual fields usable when no primary agent is live", async () => {
     const user = userEvent.setup();
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => readyGitHub,
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     await renderAt("/ship/1", {
-      projects: [project],
+      projects: [githubProject],
       tasks: [makeTask()],
       gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gh: readyGitHub,
     });
 
     expect(screen.getByTestId("draft-status")).toHaveTextContent("No live primary agent");
     expect(screen.getByTestId("redraft-button")).toBeDisabled();
     expect(screen.getByTestId("commit-message")).not.toBeDisabled();
     await user.type(screen.getByTestId("commit-message"), "Manual message");
-    expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled();
-    expect(fetchMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(0);
   });
 
   it("confirms edited regeneration and protects newer in-flight edits", async () => {
@@ -2225,7 +2266,11 @@ describe("ShipFlowView", () => {
       ok: boolean;
       json: () => Promise<unknown>;
     }>();
-    const fetchMock = vi.fn().mockReturnValue(deferred.promise);
+    const fetchMock = vi.fn((url: string, _init?: RequestInit) =>
+      url === "/api/gh/recheck"
+        ? Promise.resolve({ ok: true, json: async () => readyGitHub })
+        : deferred.promise,
+    );
     vi.stubGlobal("fetch", fetchMock);
     const confirmSpy = vi
       .spyOn(window, "confirm")
@@ -2233,7 +2278,8 @@ describe("ShipFlowView", () => {
       .mockReturnValueOnce(true);
 
     await renderAt("/ship/1", {
-      projects: [project],
+      projects: [githubProject],
+      gh: readyGitHub,
       tasks: [makeTask()],
       sessions: {
         "1": { main: { status: "idle", reason: "turn ended", since: "t0" } },
@@ -2264,11 +2310,15 @@ describe("ShipFlowView", () => {
     await user.type(screen.getByTestId("pr-title"), "Operator title");
     await user.click(screen.getByTestId("redraft-button"));
     expect(confirmSpy).toHaveBeenCalledTimes(1);
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(0);
 
     await user.click(screen.getByTestId("redraft-button"));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string)).toEqual({
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(1),
+    );
+    const redraft = fetchMock.mock.calls.find(([url]) => url === "/api/tasks/1/ship/draft");
+    expect(redraft).toBeDefined();
+    expect(JSON.parse(redraft![1]?.body as string)).toEqual({
       replace: true,
     });
     expect(screen.getByTestId("redraft-button")).toHaveTextContent("Re-drafting");
@@ -2316,10 +2366,14 @@ describe("ShipFlowView", () => {
       ok: boolean;
       json: () => Promise<unknown>;
     }>();
-    const fetchMock = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("daemon connection lost"))
-      .mockReturnValueOnce(retry.promise);
+    let draftAttempts = 0;
+    const fetchMock = vi.fn((url: string, _init?: RequestInit) => {
+      if (url === "/api/gh/recheck") {
+        return Promise.resolve({ ok: true, json: async () => readyGitHub });
+      }
+      draftAttempts += 1;
+      return draftAttempts === 1 ? Promise.reject(new Error("daemon connection lost")) : retry.promise;
+    });
     vi.stubGlobal("fetch", fetchMock);
 
     await renderAt("/ship/1", {
@@ -2340,11 +2394,15 @@ describe("ShipFlowView", () => {
     act(() => {
       socket().emit("review_finished", { task_id: 1, status: "approved" });
     });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(1);
 
     await user.click(screen.getByTestId("redraft-button"));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string)).toEqual({
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(2),
+    );
+    const retriedDraft = fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")[1];
+    expect(retriedDraft).toBeDefined();
+    expect(JSON.parse(retriedDraft![1]?.body as string)).toEqual({
       replace: true,
     });
 
@@ -2366,6 +2424,7 @@ describe("ShipFlowView", () => {
 
   it("resets draft fields when navigating between task ship routes", async () => {
     const user = userEvent.setup();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => readyGitHub }));
     const second = makeTask({
       id: 2,
       slug: "second-task",
@@ -2418,13 +2477,15 @@ describe("ShipFlowView", () => {
     expect(screen.getByTestId("commit-message")).not.toHaveValue("Edited first task");
   });
   it("renders the live review step and live commit/push steps", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => readyGitHub }));
     await renderAt("/ship/1", {
-      projects: [project],
+      projects: [githubProject],
       tasks: [makeTask()],
       sessions: {
         "1": { main: { status: "reviewing", reason: "llmvet review", since: "t0" } },
       },
       gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gh: readyGitHub,
       reviews: {
         "1": {
           status: "approved",
@@ -2458,7 +2519,7 @@ describe("ShipFlowView", () => {
     expect((screen.getByTestId("commit-message") as HTMLTextAreaElement).value).toBe(" agent commit");
     expect((screen.getByTestId("pr-title") as HTMLInputElement).value).toBe(" agent pr title");
     expect((screen.getByTestId("pr-body") as HTMLTextAreaElement).value).toBe(" agent pr body");
-    expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled();
+    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
     expect(screen.getByTestId("push-pr-progress")).toHaveTextContent("Waiting for a signed commit.");
     expect(screen.getByTestId("ship-step-cleanup")).toBeInTheDocument();
   });
@@ -2494,9 +2555,10 @@ describe("ShipFlowView", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await renderAt("/ship/1", {
-      projects: [project],
+      projects: [githubProject],
       tasks: [makeTask()],
       gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gh: readyGitHub,
       ships: {
         "1": {
           status: "drafted",
@@ -2514,6 +2576,7 @@ describe("ShipFlowView", () => {
         },
       },
     });
+    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
 
     await user.clear(screen.getByTestId("commit-message"));
     await user.type(screen.getByTestId("commit-message"), "Final commit");
@@ -2528,7 +2591,9 @@ describe("ShipFlowView", () => {
         body: expect.stringContaining("Final commit"),
       }),
     );
-    const body = JSON.parse(fetchMock.mock.calls[fetchMock.mock.calls.length - 1][1].body as string);
+    const body = JSON.parse(
+      fetchMock.mock.calls.find(([url]) => url === "/api/tasks/1/ship/commit")?.[1].body as string,
+    );
     expect(body).toEqual({
       message: "Final commit",
       pr_title: "Final PR title",
@@ -2566,10 +2631,12 @@ describe("ShipFlowView", () => {
 
   it("selects retain mode and disables the commit message field", async () => {
     const user = userEvent.setup();
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => readyGitHub }));
     await renderAt("/ship/1", {
-      projects: [project],
+      projects: [githubProject],
       tasks: [makeTask()],
       gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gh: readyGitHub,
       ships: {
         "1": {
           status: "drafted",
@@ -2596,7 +2663,7 @@ describe("ShipFlowView", () => {
     expect(screen.getByTestId("retain-message-hint")).toHaveTextContent(
       "Per-commit messages are retained",
     );
-    expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled();
+    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
   });
 
   it("posts ship commit with retain mode", async () => {
@@ -2616,9 +2683,10 @@ describe("ShipFlowView", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await renderAt("/ship/1", {
-      projects: [project],
+      projects: [githubProject],
       tasks: [makeTask()],
       gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gh: readyGitHub,
       ships: {
         "1": {
           status: "drafted",
@@ -2636,6 +2704,7 @@ describe("ShipFlowView", () => {
         },
       },
     });
+    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
 
     await user.click(screen.getByRole("radio", { name: /Retain/i }));
     await user.click(screen.getByTestId("sign-commit-button"));
@@ -2647,7 +2716,9 @@ describe("ShipFlowView", () => {
         body: expect.stringContaining("retain"),
       }),
     );
-    const body = JSON.parse(fetchMock.mock.calls[fetchMock.mock.calls.length - 1][1].body as string);
+    const body = JSON.parse(
+      fetchMock.mock.calls.find(([url]) => url === "/api/tasks/1/ship/commit")?.[1].body as string,
+    );
     expect(body).toEqual({
       message: "draft commit",
       pr_title: "draft title",
@@ -2655,6 +2726,190 @@ describe("ShipFlowView", () => {
       mode: "retain",
     });
   });
+  it("requests one task-scoped GitHub recheck under StrictMode", async () => {
+    const deferred = nativePromiseWithResolvers.withResolvers<{
+      ok: boolean;
+      json: () => Promise<unknown>;
+    }>();
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/gh/recheck") return deferred.promise;
+      throw new Error(`unexpected request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    window.history.pushState({}, "", "/ship/1");
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+    const strictSocket = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+    act(() => {
+      strictSocket.emitSnapshot({ projects: [githubProject], tasks: [makeTask()], gh: readyGitHub });
+    });
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/gh/recheck")).toHaveLength(1),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/gh/recheck",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ task_id: 1 }) }),
+    );
+    await act(async () => {
+      deferred.resolve({ ok: true, json: async () => readyGitHub });
+      await deferred.promise;
+    });
+  });
+
+  it.each([
+    [
+      {
+        ...readyGitHub,
+        identity: { ...readyGitHub.identity, state: "missing", login: null },
+        targets: {},
+      },
+      "GitHub CLI is unavailable",
+      "Install or correct the configured GitHub CLI",
+    ],
+    [
+      {
+        ...readyGitHub,
+        identity: { ...readyGitHub.identity, state: "unauthenticated", login: null, credential_source: "GH_TOKEN" },
+        targets: {},
+      },
+      "GitHub authentication is required",
+      "GH_TOKEN takes precedence",
+    ],
+    [
+      {
+        ...readyGitHub,
+        targets: {
+          "github.com/ompire/maas": {
+            ...readyGitHub.targets["github.com/ompire/maas"],
+            state: "denied",
+            detail: "account lacks pull permission",
+          },
+        },
+      },
+      "Repository access is denied",
+      "@octo cannot create a pull request for github.com/ompire/maas",
+    ],
+  ])("renders actionable blocked GitHub state", async (gh, heading, detail) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => gh }));
+    await renderAt("/ship/1", {
+      projects: [githubProject],
+      tasks: [makeTask()],
+      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gh,
+    });
+
+    const banner = await screen.findByTestId("github-preflight-banner");
+    expect(banner).toHaveTextContent(heading);
+    expect(banner).toHaveTextContent(detail);
+    expect(banner).toHaveTextContent("does not verify SSH or HTTPS authentication");
+    expect(screen.getByTestId("sign-commit-button")).toBeDisabled();
+  });
+
+  it("recovers from a transient target check and enables the matching account", async () => {
+    const user = userEvent.setup();
+    let attempts = 0;
+    const fetchMock = vi.fn((url: string) => {
+      if (url !== "/api/gh/recheck") throw new Error(`unexpected request ${url}`);
+      attempts += 1;
+      if (attempts === 1) return Promise.reject(new Error("temporary network failure"));
+      return Promise.resolve({ ok: true, json: async () => readyGitHub });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await renderAt("/ship/1", {
+      projects: [githubProject],
+      tasks: [makeTask()],
+      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gh: { ...readyGitHub, identity: { ...readyGitHub.identity, state: "unknown", login: null }, targets: {} },
+    });
+
+    expect(await screen.findByTestId("github-preflight-banner")).toHaveTextContent(
+      "GitHub check could not complete",
+    );
+    await user.click(screen.getByTestId("recheck-github-target-button"));
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/gh/recheck")).toHaveLength(2),
+    );
+    act(() => {
+      socket().emit("gh_status", { gh: readyGitHub });
+    });
+    await user.type(screen.getByTestId("commit-message"), "manual commit");
+    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
+    expect(screen.getByTestId("github-preflight-banner")).toHaveTextContent("GitHub preflight ready");
+  });
+
+  it("does not reuse a target result for another upstream or identity", async () => {
+    const otherTarget = {
+      ...readyGitHub,
+      targets: {
+        "github.com/other/repository": {
+          ...readyGitHub.targets["github.com/ompire/maas"],
+          target: { host: "github.com", owner: "other", repository: "repository" },
+        },
+      },
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => otherTarget }));
+    await renderAt("/ship/1", {
+      projects: [githubProject],
+      tasks: [makeTask()],
+      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gh: otherTarget,
+    });
+
+    await screen.findByTestId("github-preflight-banner");
+    expect(screen.getByTestId("github-preflight-banner")).toHaveTextContent("needs a current check");
+    expect(screen.getByTestId("sign-commit-button")).toBeDisabled();
+
+    act(() => {
+      socket().emit("gh_status", {
+        gh: {
+          ...readyGitHub,
+          identity: { ...readyGitHub.identity, login: "changed-account" },
+          targets: readyGitHub.targets,
+        },
+      });
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("github-preflight-banner")).toHaveTextContent("needs a current check"),
+    );
+    expect(screen.getByTestId("sign-commit-button")).toBeDisabled();
+  });
+
+  it("renders a safe structured commit refusal", async () => {
+    const user = userEvent.setup();
+    const leaked = "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const fetchMock = vi.fn((url: string) => {
+      if (url === "/api/gh/recheck") return Promise.resolve({ ok: true, json: async () => readyGitHub });
+      if (url === "/api/tasks/1/ship/commit") {
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          json: async () => ({ detail: { message: `GitHub preflight blocked: Authorization: Bearer ${leaked}` } }),
+        });
+      }
+      throw new Error(`unexpected request ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await renderAt("/ship/1", {
+      projects: [githubProject],
+      tasks: [makeTask()],
+      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+      gh: readyGitHub,
+    });
+
+    await user.type(screen.getByTestId("commit-message"), "manual commit");
+    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
+    await user.click(screen.getByTestId("sign-commit-button"));
+    expect(await screen.findByTestId("commit-command-error")).toHaveTextContent(
+      "GitHub preflight blocked: Authorization: [redacted]",
+    );
+    expect(document.body.textContent).not.toContain(leaked);
+  });
+
 });
 
 describe("Chrome GPG chip", () => {
@@ -2692,6 +2947,51 @@ describe("Chrome GPG chip", () => {
 
     const chip = screen.getByTestId("gpg-chip");
     expect(chip).toHaveTextContent("gpg —");
+  });
+});
+
+describe("Chrome GitHub chip", () => {
+  const readyGitHub = {
+    identity: {
+      state: "ready",
+      host: "github.com",
+      login: "octo",
+      credential_source: "GitHub CLI configuration",
+      executable_path: "/usr/bin/gh",
+      version: "gh version 2.97.0",
+      detail: null,
+      checked_at: "t0",
+    },
+    targets: {},
+  };
+
+  it("renders the safe ready identity and follows live status deltas", async () => {
+    await renderAt("/tasks", {
+      projects: [project],
+      tasks: [makeTask()],
+      gh: readyGitHub,
+    });
+
+    const chip = screen.getByTestId("gh-chip");
+    expect(chip).toHaveTextContent("gh @octo");
+    expect(chip).toHaveAccessibleName("GitHub CLI ready as @octo for github.com");
+
+    act(() => {
+      socket().emit("gh_status", {
+        gh: {
+          ...readyGitHub,
+          identity: {
+            ...readyGitHub.identity,
+            state: "unauthenticated",
+            login: null,
+            detail: "HTTP 401: Bad credentials",
+          },
+        },
+      });
+    });
+
+    await waitFor(() => expect(chip).toHaveTextContent("gh auth"));
+    expect(chip).toHaveAccessibleName("GitHub CLI authentication is unavailable for github.com");
   });
 });
 

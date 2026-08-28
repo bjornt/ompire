@@ -24,11 +24,19 @@ not from a menu.
 | "N need you" | Attention count, derived from the daemon's tier model |
 | Daemon | WebSocket connection state |
 | GPG | Real signing-key lock state |
+| GitHub | Current daemon GitHub CLI identity state |
 
 The GPG chip renders a cached state (optionally with a remaining-TTL label), a
 locked state with the terminal-helper unlock instruction accessible, or an
 unknown state — sourced from the snapshot's `gpg` entry and `gpg_status`
 events, never a static placeholder.
+
+The GitHub chip renders `gh @login`, `gh missing`, `gh auth`, `gh error`, or
+`gh —` from snapshot `gh` state and `gh_status` events. Its accessible
+description is safe status text only. **Templates & settings** shows the same
+state with the login, host, credential-source label, executable path, version,
+last-check time, and sanitized failure detail. Its **Re-check GitHub** action
+is disabled while a request is in flight.
 
 ### The WebSocket client
 
@@ -39,6 +47,18 @@ A reconnect loses nothing, because the client never held anything the daemon
 did not also hold. The daemon chip reflects connection state so the operator
 can tell "nothing is happening" from "I am not being told what is happening".
 
+### Shipping preflight
+
+An actionable task's Ship flow requests a task-scoped GitHub recheck when its
+registered upstream changes. The banner compares the daemon result to that
+specific upstream and current identity; it never reuses an allowed result for
+another target or account. It shows checking, ready, missing/authentication,
+denied, and error recovery states, and **Sign & commit** requires both this
+ready target result and a cached GPG key.
+
+The banner says explicitly that GitHub API eligibility does not prove SSH or
+HTTPS `git push` authentication. The daemon repeats every preflight; browser
+state only controls presentation.
 ### Snapshot-gated routes
 
 A route that needs to decide whether a task exists waits for the current

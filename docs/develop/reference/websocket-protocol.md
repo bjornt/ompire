@@ -65,6 +65,7 @@ full current registry state:
 | workflow state | Per-task run status, current step, and gate message |
 | `settings` | The effective settings map |
 | `gpg` | Current signing-key state |
+| `gh` | Current in-memory GitHub CLI identity plus canonical target eligibility map; no credential value or token fragment |
 | `reviews` | Per task, durable review status and iterations, plus the live reviewer's URL and port when one is running (`null` otherwise) |
 | `ships` | Per task, in-memory ship status, mode, draft, commit sha, PR URL, error, and latest `last_step` projection |
 | attention | Current attention entries |
@@ -95,6 +96,7 @@ Published on the dashboard channel:
 | `ship_draft` | A parsed agent draft is ready |
 | `ship_step`, `ship_finished` | A `draft`, `commit`, `push`, or `pr` step starts, completes, fails, or the publication reaches a terminal state |
 | `gpg_status` | The signing-key probe result changes |
+| `gh_status` | A completed GitHub identity or target probe replaced the full safe `gh` projection |
 | `settings_changed` | Effective settings change |
 
 `spawn_step` and `ship_step` payloads carry `status` — `started`, `ok`, or
@@ -110,6 +112,13 @@ latest `last_step` in its in-memory `ships` snapshot, so a client that missed a
 delta can render the same Draft-stage retry state after reconnect. Ship state is
 not durable except for a task's pull-request URL; a restart replaces it with an
 empty ship projection rather than replaying an agent request.
+
+`gh` is environmental observation rather than durable publishing policy. Its
+identity states are `unknown`, `missing`, `unauthenticated`, `ready`, and
+`error`; target states are `unchecked`, `allowed`, `denied`, and `error`.
+Target entries carry the canonical target and the safe host/login/source tuple
+that produced them. A changed or failed identity probe clears earlier targets;
+clients replace this full projection rather than replaying events.
 
 `workflow_step` carries the task id, step name, kind, and status of `started`,
 `ok`, `failed`, or `waiting` — with error text on failure and the

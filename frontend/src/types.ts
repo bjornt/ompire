@@ -371,6 +371,53 @@ export interface GpgStatusPayload {
   status: GpgStatus;
 }
 
+export type GitHubIdentityState = "unknown" | "missing" | "unauthenticated" | "ready" | "error";
+export type GitHubTargetState = "unchecked" | "allowed" | "denied" | "error";
+
+/** Canonical GitHub pull-request target, derived by the trusted daemon. */
+export interface GitHubTarget {
+  host: string;
+  owner: string;
+  repository: string;
+}
+
+/** Safe ambient identity tuple which makes a target result current. */
+export interface GitHubIdentityBinding {
+  host: string;
+  login: string;
+  credential_source: string;
+}
+
+/** The daemon's current GitHub CLI observation. No credential value is exposed. */
+export interface GitHubIdentityStatus {
+  state: GitHubIdentityState;
+  host: string;
+  login: string | null;
+  credential_source: string | null;
+  executable_path: string | null;
+  version: string | null;
+  detail: string | null;
+  checked_at: string | null;
+}
+
+/** A read-only repository eligibility result bound to its producing identity. */
+export interface GitHubTargetStatus {
+  state: GitHubTargetState;
+  target: GitHubTarget | null;
+  identity: GitHubIdentityBinding | null;
+  detail: string | null;
+  checked_at: string | null;
+}
+
+export interface GitHubStatus {
+  identity: GitHubIdentityStatus;
+  targets: Record<string, GitHubTargetStatus>;
+}
+
+export interface GitHubStatusPayload {
+  gh: GitHubStatus;
+}
+
 /** Effective daemon settings map (daemon-settings capability). Values are
  * booleans for tier prefs or numbers for intervals/thresholds. */
 export type DaemonSettings = Record<string, boolean | number>;
@@ -411,6 +458,9 @@ export interface SnapshotPayload {
   /** Current GPG signing-key cache state; absent from snapshots emitted before
    * the ship chunk. */
   gpg?: GpgStatus;
+  /** Current daemon-owned GitHub CLI and target eligibility observation; absent
+   * from snapshots emitted before the GitHub preflight capability. */
+  gh?: GitHubStatus;
   /** Effective daemon settings (daemon-settings capability). */
   settings?: DaemonSettings;
 }

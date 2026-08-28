@@ -25,8 +25,8 @@ from sqlalchemy import Engine
 
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
+from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.registry.tasks import Task, list_pr_pollable_tasks, mark_pr_state
-from ompire_daemon.ship import _run_command
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +41,13 @@ _STATE_MAP = {"OPEN": "open", "MERGED": "merged", "CLOSED": "closed"}
 class PrWatcher:
     """One instance per daemon; started/stopped from the app lifespan."""
 
-    def __init__(self, config: Config, engine: Engine, hub: EventHub) -> None:
+    def __init__(
+        self, config: Config, engine: Engine, hub: EventHub, gh: GitHubProbe
+    ) -> None:
         self._config = config
         self._engine = engine
         self._hub = hub
+        self._gh = gh
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -81,11 +84,12 @@ class PrWatcher:
         assert task.pr_url is not None  # guaranteed by the poll-set query
         # `gh pr view` takes a full URL and needs no repo cwd; run from the
         # data dir so a manually-deleted clone can never break the poll.
-        stdout, stderr, code = await _run_command(
-            [*self._config.gh_command, "pr", "view", task.pr_url, "--json", "state,mergedAt"],
+        result = await self._gh.run(
+            ["pr", "view", task.pr_url, "--json", "state,mergedAt"],
             str(self._config.data_dir),
             _GH_TIMEOUT,
         )
+        stdout, stderr, code = result.stdout, result.stderr, result.returncode
         if code != 0:
             logger.warning(
                 "gh pr view failed for task %d (%s): %s",

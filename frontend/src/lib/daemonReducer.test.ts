@@ -869,6 +869,84 @@ describe("applyEnvelope ship/gpg events", () => {
   });
 });
 
+describe("applyEnvelope GitHub status", () => {
+  const target = {
+    state: "allowed",
+    target: { host: "github.com", owner: "owner", repository: "repo" },
+    identity: {
+      host: "github.com",
+      login: "octo",
+      credential_source: "GitHub CLI configuration",
+    },
+    detail: null,
+    checked_at: "t0",
+  };
+  const readyGh = {
+    identity: {
+      state: "ready",
+      host: "github.com",
+      login: "octo",
+      credential_source: "GitHub CLI configuration",
+      executable_path: "/usr/bin/gh",
+      version: "gh version 2.97.0",
+      detail: null,
+      checked_at: "t0",
+    },
+    targets: { "github.com/owner/repo": target },
+  };
+
+  it("tolerates a rolling snapshot without GitHub status", () => {
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [] },
+    });
+    expect(state.gh).toBeNull();
+  });
+
+  it("replaces GitHub status from snapshots and deltas", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [], gh: readyGh },
+    });
+    expect(state.gh?.targets["github.com/owner/repo"]?.state).toBe("allowed");
+
+    state = applyEnvelope(state, {
+      seq: 1,
+      ts: "t1",
+      type: "gh_status",
+      payload: {
+        gh: {
+          ...readyGh,
+          identity: { ...readyGh.identity, state: "error", login: null, detail: "network unavailable" },
+          targets: {},
+        },
+      },
+    });
+    expect(state.gh?.identity.state).toBe("error");
+    expect(state.gh?.targets).toEqual({});
+  });
+
+  it("drops target results whose identity binding no longer matches", () => {
+    const state = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "gh_status",
+      payload: {
+        gh: {
+          ...readyGh,
+          identity: { ...readyGh.identity, login: "another-account" },
+          targets: { "github.com/owner/repo": target },
+        },
+      },
+    });
+    expect(state.gh?.targets).toEqual({});
+  });
+});
+
 describe("applyEnvelope workflow events", () => {
   const stepRecord = {
     task_id: 1,

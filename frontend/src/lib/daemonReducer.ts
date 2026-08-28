@@ -10,6 +10,8 @@ import type {
   Envelope,
   GpgStatus,
   GpgStatusPayload,
+  GitHubStatus,
+  GitHubStatusPayload,
   Project,
   QuestionPostedPayload,
   QuestionResolvedPayload,
@@ -80,6 +82,8 @@ export interface DaemonState {
   /** Current GPG signing-key cache state (ship capability): loaded from the
    * snapshot, upserted by gpg_status events. */
   gpg: GpgStatus | null;
+  /** Current GitHub CLI/target observation, replaced by snapshot and gh_status. */
+  gh: GitHubStatus | null;
   /** Effective daemon settings (daemon-settings capability): loaded from the
    * snapshot, replaced by `settings_changed` events. */
   settings: DaemonSettings;
@@ -100,8 +104,38 @@ export const initialDaemonState: DaemonState = {
   reviews: {},
   ships: {},
   gpg: null,
+  gh: null,
   settings: {},
 };
+
+/** Do not retain a target result across a changed or unavailable ambient identity.
+ * The daemon already clears these, but the client treats snapshot/delta input as
+ * replaceable and fails closed when an older daemon sends contradictory data. */
+function normalizeGitHubStatus(status: GitHubStatus | undefined): GitHubStatus | null {
+  if (status === undefined) return null;
+  const identity = status.identity;
+  const binding =
+    identity.state === "ready" && identity.login !== null && identity.credential_source !== null
+      ? {
+          host: identity.host,
+          login: identity.login,
+          credential_source: identity.credential_source,
+        }
+      : null;
+  const targets = Object.fromEntries(
+    Object.entries(status.targets ?? {}).filter(([, target]) => {
+      if (target.state === "unchecked") return target.identity === null;
+      return (
+        binding !== null &&
+        target.identity !== null &&
+        target.identity.host === binding.host &&
+        target.identity.login === binding.login &&
+        target.identity.credential_source === binding.credential_source
+      );
+    }),
+  );
+  return { ...status, targets };
+}
 
 
 // Architecture: ADR-0004 (docs/adr/0004-use-rest-and-websocket-snapshot-deltas.md)
@@ -148,6 +182,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         reviews,
         ships,
         gpg: payload.gpg ?? null,
+        gh: normalizeGitHubStatus(payload.gh),
         settings: payload.settings ?? {},
       };
     }
@@ -533,6 +568,10 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
     case "gpg_status": {
       const { status } = envelope.payload as GpgStatusPayload;
       return { ...state, gpg: status };
+    }
+    case "gh_status": {
+      const { gh } = envelope.payload as GitHubStatusPayload;
+      return { ...state, gh: normalizeGitHubStatus(gh) };
     }
     default:
       return state;

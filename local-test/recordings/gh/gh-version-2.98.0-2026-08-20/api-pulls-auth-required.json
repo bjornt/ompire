@@ -1,0 +1,35 @@
+{
+  "invocation": {
+    "argv": [
+      "api",
+      "--hostname",
+      "github.com",
+      "repos/local-test/sandbox/pulls?per_page=1"
+    ],
+    "cwd": "<CWD>",
+    "env": {
+      "HOME": "<HOME>",
+      "PATH": "<HOME>/.local/bin:/var/lib/workshop/sdk/uv/bin:/var/lib/workshop/sdk/puppeteer-chrome/bin:/var/lib/workshop/sdk/omp/bin:/var/lib/workshop/sdk/node/bin:/var/lib/workshop/sdk/llmvet/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+    },
+    "files_before": {},
+    "input_files": {},
+    "stdin": ""
+  },
+  "kind": "invocation",
+  "metadata": {
+    "captured_at": "2026-08-28T13:29:46Z",
+    "case": "api-pulls-auth-required",
+    "tool": "gh",
+    "tool_version": "gh version 2.98.0 (2026-08-20)"
+  },
+  "replay": {
+    "enabled": false
+  },
+  "result": {
+    "exit_code": 4,
+    "files_after": {},
+    "stderr": "gh: To use GitHub CLI in automation, set the GH_TOKEN environment variable.\n",
+    "stdout": ""
+  },
+  "schema_version": 1
+}

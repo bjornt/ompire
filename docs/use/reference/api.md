@@ -82,9 +82,12 @@ All paths are under `/api/tasks/{id}/sessions/{session}/agent`.
 `ship/draft` returns `404` for an unknown task and `409` for an unavailable or
 non-idle primary agent, an archived or already-published task, or an explicit
 replacement while a ship attempt is active. See [Ship flow](ship-flow.md) for
-draft lifecycle and field behavior. `ship/commit` returns `409` when the GPG
-key is not `cached`, a ship is already in flight, the mode is not `squash` or
-`retain`, or `retain` preconditions are unmet.
+draft lifecycle and field behavior. `ship/commit` returns `409` when GitHub
+CLI identity or target eligibility cannot be established, the GPG key is not
+`cached`, a ship is already in flight, the mode is not `squash` or `retain`, or
+`retain` preconditions are unmet. GitHub refusal uses
+`{"detail":{"message":...,"gh":...}}`; it is safe to show but creates no
+ship job or local Git mutation.
 
 ## Daemon
 
@@ -93,6 +96,8 @@ key is not `cached`, a ship is already in flight, the mode is not `squash` or
 | `GET` | `/api/daemon/info` | Version, bind, port, config path, data dir, audit log path |
 | `GET` | `/api/gpg` | Last probed signing-key state |
 | `POST` | `/api/gpg/recheck` | Re-probe and broadcast |
+| `GET` | `/api/gh` | Latest safe in-memory GitHub CLI identity and target eligibility status |
+| `POST` | `/api/gh/recheck` | Re-probe global identity with no body; `{"task_id": id}` additionally checks that task's registered upstream. A completed observation remains `200`; only an unknown task is `404`. |
 | `GET` | `/api/settings` | Effective settings |
 | `PUT` | `/api/settings` | Set runtime overrides |
 | `DELETE` | `/api/settings/{key}` | Clear one override |
@@ -112,6 +117,11 @@ A reconnect produces a fresh snapshot, so a dropped connection loses nothing.
 Raw agent transcript events are not on this socket — they use separate,
 buffered per-session channels, so a dashboard client is not made to receive
 every frame of every agent.
+
+The snapshot's optional `gh` key contains `{identity, targets}`. Every
+completed GitHub probe emits `gh_status` with the same full safe status object,
+so reconnecting clients need no event replay. See [States](states.md) for the
+identity and target vocabularies.
 
 The protocol is documented in full in [WebSocket
 protocol](../../develop/reference/websocket-protocol.md).

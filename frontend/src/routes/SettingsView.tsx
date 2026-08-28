@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   createTemplate,
   deleteTemplate,
   getDaemonInfo,
   getSettings,
   getToken,
+  recheckGitHub,
   rotateToken,
   updateSettings,
   updateTemplate,
@@ -12,6 +13,7 @@ import {
 } from "../lib/api";
 import { setDaemonToken } from "../lib/token";
 import { useDaemonState } from "../lib/useDaemonState";
+import { githubIdentityPresentation, safeGitHubDetail } from "../lib/githubPresentation";
 import { REGISTERED_WORKFLOWS, THINKING_LEVELS, templateCheckout } from "../lib/templates";
 import type {
   AttentionTier,
@@ -210,8 +212,15 @@ function maskToken(token: string): string {
 }
 
 function DaemonPanel() {
+  const { gh } = useDaemonState();
   const [info, setInfo] = useState<DaemonInfo | null>(null);
   const [token, setToken] = useState<string | null>(null);
+  const [recheckingGitHub, setRecheckingGitHub] = useState(false);
+  const [gitHubRecheckError, setGitHubRecheckError] = useState<string | null>(null);
+  const gitHubRecheckLock = useRef(false);
+  const githubChip = githubIdentityPresentation(gh);
+  const identity = gh?.identity;
+  const githubDetail = safeGitHubDetail(identity?.detail) ?? gitHubRecheckError;
 
   useEffect(() => {
     getDaemonInfo().then((i) => setInfo(i)).catch(() => {});
@@ -238,6 +247,21 @@ function DaemonPanel() {
     const res = await rotateToken();
     setDaemonToken(res.token);
     setToken(res.token);
+  }
+
+  async function recheckGithub() {
+    if (gitHubRecheckLock.current) return;
+    gitHubRecheckLock.current = true;
+    setRecheckingGitHub(true);
+    setGitHubRecheckError(null);
+    try {
+      await recheckGitHub();
+    } catch (error: unknown) {
+      setGitHubRecheckError(safeGitHubDetail(errorText(error)));
+    } finally {
+      gitHubRecheckLock.current = false;
+      setRecheckingGitHub(false);
+    }
   }
 
   return (
@@ -272,6 +296,68 @@ function DaemonPanel() {
           )}
         </div>
       )}
+
+      <div className="daemonGithub" data-testid="daemon-github-panel">
+        <h3 className="daemonGithubTitle">GitHub CLI</h3>
+        <div
+          className="daemonGithubStatus"
+          role="status"
+          aria-live="polite"
+          aria-label={githubChip.description}
+          data-testid="daemon-gh-state"
+        >
+          <span className="dot" style={{ background: githubChip.dot }} />
+          {githubChip.label}
+        </div>
+        <div className="daemonInfoGrid">
+          {identity?.login && (
+            <div className="daemonInfoRow" data-testid="daemon-gh-login">
+              <span>Account</span>
+              <code>@{identity.login}</code>
+            </div>
+          )}
+          <div className="daemonInfoRow" data-testid="daemon-gh-host">
+            <span>Host</span>
+            <code>{identity?.host ?? "Not checked yet"}</code>
+          </div>
+          {identity?.credential_source && (
+            <div className="daemonInfoRow" data-testid="daemon-gh-source">
+              <span>Credential source</span>
+              <code>{identity.credential_source}</code>
+            </div>
+          )}
+          {identity?.executable_path && (
+            <div className="daemonInfoRow" data-testid="daemon-gh-executable">
+              <span>Executable</span>
+              <code>{identity.executable_path}</code>
+            </div>
+          )}
+          {identity?.version && (
+            <div className="daemonInfoRow" data-testid="daemon-gh-version">
+              <span>Version</span>
+              <code>{identity.version}</code>
+            </div>
+          )}
+          <div className="daemonInfoRow" data-testid="daemon-gh-checked-at">
+            <span>Last checked</span>
+            <code>{identity?.checked_at ?? "Not checked yet"}</code>
+          </div>
+        </div>
+        {githubDetail && (
+          <p className="daemonGithubDetail" role="alert" data-testid="daemon-gh-detail">
+            {githubDetail}
+          </p>
+        )}
+        <button
+          type="button"
+          className="ghostButton"
+          disabled={recheckingGitHub}
+          onClick={() => void recheckGithub()}
+          data-testid="recheck-github-button"
+        >
+          {recheckingGitHub ? "Checking GitHub…" : "Re-check GitHub"}
+        </button>
+      </div>
 
       <div className="tokenRow">
         <code className="tokenValue" data-testid="daemon-token">

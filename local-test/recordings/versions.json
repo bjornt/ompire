@@ -2,45 +2,60 @@
   "schema_version": 1,
   "tools": {
     "gh": {
-      "version": "gh version 2.97.0 (2026-07-31)",
-      "captured_at": "2026-08-22",
-      "environment": "QA sandbox host",
-      "cases": [
-        "gh/gh-version-2.97.0-2026-07-31/view-unknown-repository.json"
+      "versions": [
+        {
+          "captured_at": "2026-08-22",
+          "cases": [
+            "gh/gh-version-2.97.0-2026-07-31/view-unknown-repository.json"
+          ],
+          "environment": "QA sandbox host",
+          "version": "gh version 2.97.0 (2026-07-31)"
+        },
+        {
+          "captured_at": "2026-08-28",
+          "cases": [
+            "gh/gh-version-2.98.0-2026-08-20/api-pulls-auth-required.json",
+            "gh/gh-version-2.98.0-2026-08-20/api-repository-auth-required.json",
+            "gh/gh-version-2.98.0-2026-08-20/api-user-auth-required.json",
+            "gh/gh-version-2.98.0-2026-08-20/version-2.98.0.json"
+          ],
+          "environment": "local workstation, no GitHub credential, GH_PROMPT_DISABLED",
+          "version": "gh version 2.98.0 (2026-08-20)"
+        }
       ]
     },
     "llmvet": {
-      "version": "0.3.0-37-g421d7fd",
       "captured_at": "2026-08-22",
-      "environment": "workstation SDK binary",
       "cases": [
         "llmvet/0.3.0-37-g421d7fd/version.json"
-      ]
+      ],
+      "environment": "workstation SDK binary",
+      "version": "0.3.0-37-g421d7fd"
     },
     "my-workshop": {
-      "version": "unversioned-sha256:2d579731d0132c8c",
       "captured_at": "2026-08-22",
-      "environment": "QA sandbox host",
       "cases": [
         "my-workshop/unversioned-sha256-2d579731d0132c8c/version.json"
-      ]
+      ],
+      "environment": "QA sandbox host",
+      "version": "unversioned-sha256:2d579731d0132c8c"
     },
     "omp": {
-      "version": "omp/17.4.0",
       "captured_at": "2026-08-22",
-      "environment": "workstation SDK binary",
       "cases": [
         "omp/omp-17.4.0/config-ask-timeout.json"
-      ]
+      ],
+      "environment": "workstation SDK binary",
+      "version": "omp/17.4.0"
     },
     "workshop": {
-      "version": "0.9.5",
       "captured_at": "2026-08-22",
-      "environment": "QA sandbox host",
       "cases": [
         "workshop/0.9.5/daemon-launch.json",
         "workshop/0.9.5/info-not-project.json"
-      ]
+      ],
+      "environment": "QA sandbox host",
+      "version": "0.9.5"
     }
   }
 }
