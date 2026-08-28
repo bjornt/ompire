@@ -278,7 +278,9 @@ export interface StatusChangedPayload {
 }
 
 export interface ReviewIteration {
-  outcome: "approved" | "comments" | "aborted" | "error";
+  /** `interrupted` is iteration-only: a daemon restart killed the reviewer.
+   * The review itself lands `aborted`. */
+  outcome: "approved" | "comments" | "aborted" | "error" | "interrupted";
   comment_count: number | null;
   stderr: string | null;
   recorded_at: string;
@@ -286,8 +288,10 @@ export interface ReviewIteration {
 
 export interface ReviewState {
   status: "open" | "approved" | "aborted" | "error";
-  url: string;
-  port: number;
+  /** Null whenever no reviewer process is live — including every review
+   * restored across a daemon restart, whose llmvet process is gone. */
+  url: string | null;
+  port: number | null;
   iterations: ReviewIteration[];
 }
 

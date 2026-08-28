@@ -37,13 +37,16 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0009"
+    assert version == "0010"
     assert "projects" in tables
     assert "tasks" in tables
     assert "templates" in tables
     assert "task_sessions" in tables
     assert "workflow_step_records" in tables
     assert "settings" in tables
+    # Durable review history (review capability; ADR-0016's review slice).
+    assert "reviews" in tables
+    assert "review_iterations" in tables
     assert "pr_url" in task_columns
     assert "template_name" in task_columns
     # Workflow run state lives on the task row (workflow-engine capability).
@@ -76,7 +79,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0009"
+    assert version == "0010"
     assert row == "demo"
 
 
@@ -132,7 +135,7 @@ def test_0007_seeds_templates_and_drops_project_columns(tmp_path: Path) -> None:
     engine = make_engine(db_path)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "0009"
+        assert version == "0010"
 
         templates = conn.execute(
             text(
@@ -208,7 +211,7 @@ def test_0008_backfills_sessions_and_legacy_workflow_runs(tmp_path: Path) -> Non
     engine = make_engine(db_path)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "0009"
+        assert version == "0010"
 
         sessions = conn.execute(
             text("SELECT task_id, name, omp_session_id FROM task_sessions ORDER BY task_id")
@@ -506,3 +509,54 @@ def test_upgrade_from_older_revision_preserves_rows(
         row = conn.execute(text("SELECT id, name, note FROM widgets WHERE id = 1")).one()
     assert version == "0002"
     assert row == (1, "gear", None)
+
+
+def test_0010_review_tables_roundtrip(tmp_path: Path) -> None:
+    """0010 adds review history and backfills nothing: tasks that predate it
+    legitimately have none, and inventing one would fabricate provenance."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0007_with_tasks(db_path)
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    engine = make_engine(db_path)
+    with engine.connect() as conn:
+        review_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(reviews)"))}
+        iteration_columns = {
+            row[1] for row in conn.execute(text("PRAGMA table_info(review_iterations)"))
+        }
+        assert review_columns == {
+            "task_id",
+            "status",
+            "process_started_at",
+            "created_at",
+            "updated_at",
+        }
+        assert iteration_columns == {
+            "task_id",
+            "seq",
+            "outcome",
+            "comment_count",
+            "stderr",
+            "recorded_at",
+        }
+        # No backfill for pre-existing tasks.
+        assert conn.execute(text("SELECT COUNT(*) FROM reviews")).scalar_one() == 0
+
+    from alembic import command
+
+    command.downgrade(_alembic_cfg(db_path), "0009")
+    with engine.connect() as conn:
+        version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+        tables = {
+            row[0]
+            for row in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
+        }
+    assert version == "0009"
+    assert "reviews" not in tables
+    assert "review_iterations" not in tables
+
+    # And forward again: task rows survive the round trip.
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM tasks")).scalar_one() == 4
+        assert conn.execute(text("SELECT COUNT(*) FROM reviews")).scalar_one() == 0

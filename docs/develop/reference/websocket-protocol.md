@@ -65,7 +65,7 @@ full current registry state:
 | workflow state | Per-task run status, current step, and gate message |
 | `settings` | The effective settings map |
 | `gpg` | Current signing-key state |
-| `reviews` | Per task, review status, URL, and iterations |
+| `reviews` | Per task, durable review status and iterations, plus the live reviewer's URL and port when one is running (`null` otherwise) |
 | `ships` | Per task, ship status, mode, draft, commit sha, PR URL |
 | attention | Current attention entries |
 

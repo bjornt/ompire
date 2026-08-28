@@ -116,9 +116,12 @@ re-established for each recovered session: a session being resumed presents as
 `starting` and lands `idle` once its agent is ready; one that cannot be
 resumed presents as `failed`.
 
-`reviewing` never survives a restart. Review state is transient, so a
-recovered task's primary session presents as `starting`, `idle`, or `failed`,
-and the operator re-triggers the review. The clone's Git state is restored
+`reviewing` never survives a restart — not because review state is transient,
+but because the reviewer process is. Review status and iteration history are
+durable, and an open review is recorded as interrupted on the next startup, so
+a recovered task's primary session presents as `starting`, `idle`, or
+`failed`, free to start a fresh review. See
+[Review](review.md#retention-and-restart); the clone's Git state is restored
 separately from the review's durable ref.
 
 ## Configuration

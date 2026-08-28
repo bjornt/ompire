@@ -223,3 +223,35 @@ def test_snapshot_carries_session_statuses(
         ).status_code
         == 200
     )
+
+
+def test_snapshot_serves_durable_review_history_with_no_live_process(
+    client: TestClient, auth_token: str, auth_headers: dict[str, str], demo_template: dict
+) -> None:
+    """The `reviews` map is composed from durable rows, so a reconnect after
+    a restart serves the restored history — with `url`/`port` null, because
+    the reviewer process did not survive (review capability; ADR-0016)."""
+    from ompire_daemon.registry.reviews import append_iteration, open_review
+
+    response = client.post(
+        "/api/tasks",
+        headers=auth_headers,
+        json={"template_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
+    )
+    assert response.status_code == 202
+    task_id = response.json()["id"]
+
+    engine = client.app.state.engine
+    open_review(engine, task_id)
+    append_iteration(engine, task_id, outcome="comments", comment_count=2)
+    append_iteration(engine, task_id, outcome="approved", status="approved")
+
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        snapshot = ws.receive_json()
+        review = snapshot["payload"]["reviews"][str(task_id)]
+
+    assert review["status"] == "approved"
+    assert review["url"] is None
+    assert review["port"] is None
+    assert [it["outcome"] for it in review["iterations"]] == ["comments", "approved"]
+    assert review["iterations"][0]["comment_count"] == 2

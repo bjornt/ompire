@@ -31,6 +31,7 @@ All paths are under `daemon/src/ompire_daemon/`.
 | `registry/tasks.py` | Tasks and their publishing state |
 | `registry/sessions.py` | Session identity, `(task_id, name)` |
 | `registry/workflows.py` | Workflow runs and step records |
+| `registry/reviews.py` | Review status and ordered iteration history |
 | `registry/settings.py` | Layered settings: override, then TOML, then default |
 
 ## Task lifecycle
@@ -50,7 +51,7 @@ All paths are under `daemon/src/ompire_daemon/`.
 
 | Module | Responsibility |
 |---|---|
-| `review.py` | Host-side review. Owns the `refs/ompire/review-orig` reset dance. |
+| `review.py` | Host-side review: the reset dance, the llmvet subprocess, and startup interruption handling. The record lives in `registry/reviews.py`. |
 | `ship.py` | Draft, signed commit, push, PR. Owns `refs/ompire/ship-orig`. |
 | `gpg.py` | Signing-key state probe: `cached`, `locked`, `unknown`. |
 | `prwatch.py` | Polls pull requests to a terminal state. |

@@ -3,11 +3,17 @@
 Architecture: ADR-0011
 (docs/adr/0011-keep-review-and-publishing-authority-outside-agent-sandbox.md)
 
-`ReviewManager` owns the per-task review state, the reset dance, the
-supervised llmvet subprocess, exit interpretation, and the comment loopback
-to the live agent. Review state is in-memory only (D-1); the only durable
-artifact is the git ref `refs/ompire/review-orig` the reset dance writes in
-the clone, which makes crash recovery a git operation.
+`ReviewManager` owns the reset dance, the supervised llmvet subprocess, exit
+interpretation, and the comment loopback to the live agent. It is the process
+supervisor, not the record: review status and the ordered iteration history
+are durable rows behind `registry/reviews.py` (ADR-0016's review slice), and
+every transition is written there before it is broadcast.
+
+Two things stay deliberately in memory, because they describe a process that
+cannot outlive the daemon: the reviewer's URL and port. A restored review
+therefore reports neither, and the UI offers no external link for it. The git
+ref `refs/ompire/review-orig` the reset dance writes remains the clone's own
+recovery artifact.
 """
 
 from __future__ import annotations
@@ -25,6 +31,15 @@ from sqlalchemy import Engine
 
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
+from ompire_daemon.registry.reviews import (
+    ReviewIterationRecord,
+    append_iteration,
+    clear_process_marker,
+    get_review,
+    list_interrupted_candidates,
+    list_reviews,
+    open_review,
+)
 from ompire_daemon.registry.tasks import Task
 from ompire_daemon.registry.templates import get_template
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
@@ -80,7 +95,8 @@ class ReviewAlreadyOpenError(ReviewError):
 
 @dataclass
 class ReviewIteration:
-    outcome: str  # approved | comments | aborted | error
+    # approved | comments | aborted | error | interrupted
+    outcome: str
     comment_count: int | None = None
     stderr: str | None = None
     recorded_at: str = field(default_factory=_now_iso)
@@ -88,9 +104,13 @@ class ReviewIteration:
 
 @dataclass
 class ReviewState:
+    """Composed read model: durable status and history from the registry,
+    plus the live process's URL and port when one is running. Both are None
+    for a review restored across a restart."""
+
     status: str  # open | approved | aborted | error
-    url: str
-    port: int
+    url: str | None
+    port: int | None
     iterations: list[ReviewIteration] = field(default_factory=list)
 
 
@@ -108,7 +128,9 @@ class ReviewManager:
         self._hub = hub
         self._sessions = sessions
         self._agents = agents
-        self._reviews: dict[int, ReviewState] = {}
+        # Runtime only: {task_id: (url, port)} for a live reviewer process.
+        # Status and iterations live in the registry.
+        self._runtime: dict[int, tuple[str, int]] = {}
         self._processes: dict[int, asyncio.subprocess.Process] = {}
         self._watchers: dict[int, asyncio.Task] = {}
         self._port_lock = asyncio.Lock()
@@ -129,12 +151,17 @@ class ReviewManager:
             self._event_task = asyncio.create_task(self._consume_events())
 
     def snapshot(self) -> dict[int, dict[str, Any]]:
-        """Current reviews for the WebSocket snapshot (design D-6)."""
-        return {
-            task_id: {
-                "status": state.status,
-                "url": state.url,
-                "port": state.port,
+        """Current reviews for the WebSocket snapshot (design D-6), composed
+        from durable history plus any live process's URL/port. A reconnect
+        after a restart therefore serves the restored history, and tasks with
+        no review are absent from the map."""
+        payload: dict[int, dict[str, Any]] = {}
+        for record in list_reviews(self._engine):
+            url, port = self._runtime.get(record.task_id, (None, None))
+            payload[record.task_id] = {
+                "status": record.status,
+                "url": url,
+                "port": port,
                 "iterations": [
                     {
                         "outcome": it.outcome,
@@ -142,14 +169,30 @@ class ReviewManager:
                         "stderr": it.stderr,
                         "recorded_at": it.recorded_at,
                     }
-                    for it in state.iterations
+                    for it in record.iterations
                 ],
             }
-            for task_id, state in self._reviews.items()
-        }
+        return payload
 
     def get(self, task_id: int) -> ReviewState | None:
-        return self._reviews.get(task_id)
+        record = get_review(self._engine, task_id)
+        if record is None:
+            return None
+        url, port = self._runtime.get(task_id, (None, None))
+        return ReviewState(
+            status=record.status,
+            url=url,
+            port=port,
+            iterations=[
+                ReviewIteration(
+                    outcome=it.outcome,
+                    comment_count=it.comment_count,
+                    stderr=it.stderr,
+                    recorded_at=it.recorded_at,
+                )
+                for it in record.iterations
+            ],
+        )
 
     async def shutdown(self) -> None:
         """Cancel every open review on daemon shutdown: SIGINT each llmvet,
@@ -294,15 +337,14 @@ class ReviewManager:
         await self._reset_to_merge_base(clone_path, base_branch)
 
         url = f"http://127.0.0.1:{port}"
-        state = self._reviews.get(task_id)
-        if state is None:
-            state = ReviewState(status="open", url=url, port=port)
-            self._reviews[task_id] = state
-        else:
-            # Re-review after comments: new subprocess, same history.
-            state.status = "open"
-            state.url = url
-            state.port = port
+        # Durable first: `open_review` upserts the row (re-review after
+        # comments appends to the same history) and stamps the write-ahead
+        # process marker, so a crash between here and the first frame is
+        # recoverable as an interrupted review rather than a lost one.
+        open_review(self._engine, task_id)
+        self._runtime[task_id] = (url, port)
+        state = self.get(task_id)
+        assert state is not None
 
         primary = self._primary_session(task)
         self._sessions.review_opened(task_id, primary, f"llmvet review on {url}")
@@ -327,28 +369,59 @@ class ReviewManager:
                     process.kill()
                 await process.wait()
         # The watcher will record the aborted iteration and restore the clone.
-        state = self._reviews.get(task_id)
+        state = self.get(task_id)
         if state is None:
             raise ReviewError(f"task {task_id} has no review state")
         return state
 
     async def cancel_and_drop(self, task_id: int) -> None:
-        """Cancel an open review if one exists, then drop in-memory state.
-        Used by the cleanup path, which deletes the clone afterwards.
+        """Cancel an open review if one exists, then drop its runtime state.
+
+        The cleanup path. The durable history is deliberately retained: a
+        shipped, cleaned-up task keeps the review evidence explaining why it
+        was allowed to publish (`VISION.md` principle 4, ADR-0016). Only
+        purge deletes it.
         """
         if task_id in self._processes:
             with contextlib.suppress(ReviewError):
                 await self.cancel_review(task_id)
         self.drop_review(task_id)
+        # `drop_review` cancelled the watcher, so nothing else will record
+        # the cancelled reviewer's outcome. Land it here instead: a retained
+        # row left `open` with no process would show an archived task as
+        # still under review. An uncleared marker is exactly the "a process
+        # was running and its exit was never recorded" case, so this cannot
+        # double-record an outcome the watcher already wrote.
+        record = get_review(self._engine, task_id)
+        if (
+            record is not None
+            and record.status == "open"
+            and record.process_started_at is not None
+        ):
+            iteration = append_iteration(
+                self._engine, task_id, outcome="aborted", status="aborted"
+            )
+            self._hub.publish(
+                "review_iteration",
+                {"task_id": task_id, "iteration": self._iteration_payload(iteration)},
+            )
+            self._hub.publish(
+                "review_finished", {"task_id": task_id, "status": "aborted"}
+            )
+        # The clone is about to be deleted, so no process can be running and
+        # no restart may later read this review as interrupted.
+        clear_process_marker(self._engine, task_id)
 
     def drop_review(self, task_id: int) -> None:
-        """Drop in-memory review state (cleanup/purge path). Does not restore
-        the clone — cleanup already deletes the directory."""
+        """Drop the review's runtime state — watcher, process handle, and the
+        URL/port. Rows are untouched here: cleanup retains them and
+        `purge_task` deletes them. Does not restore the clone — cleanup
+        already deletes the directory."""
         watcher = self._watchers.pop(task_id, None)
         if watcher is not None:
             watcher.cancel()
         self._processes.pop(task_id, None)
-        self._reviews.pop(task_id, None)
+        self._runtime.pop(task_id, None)
 
     # --- internals ----------------------------------------------------------
 
@@ -387,6 +460,11 @@ class ReviewManager:
             return
         finally:
             self._processes.pop(task_id, None)
+            # The process was observed exiting: drop its URL/port and clear
+            # the write-ahead marker, so a later startup does not read this
+            # review as interrupted.
+            self._runtime.pop(task_id, None)
+            clear_process_marker(self._engine, task_id)
             await self._restore(clone_path)
 
         assert process is not None
@@ -399,8 +477,7 @@ class ReviewManager:
     async def _interpret_exit(
         self, task_id: int, task: Task, code: int, stdout: str, stderr: str
     ) -> None:
-        state = self._reviews.get(task_id)
-        if state is None:
+        if get_review(self._engine, task_id) is None:
             return
 
         if code == 0:
@@ -416,14 +493,18 @@ class ReviewManager:
             # Comments: count `> `-blockquoted segments as a best-effort
             # display number; fall back to a generic label.
             comment_count = stdout.count("> ")
-            iteration = ReviewIteration(
+            # Durable before broadcast. The review stays `open` — its comments
+            # are with the agent — but its process marker is already cleared,
+            # so a restart restores this as comments rather than interrupted.
+            record = append_iteration(
+                self._engine,
+                task_id,
                 outcome="comments",
                 comment_count=comment_count if comment_count > 0 else None,
             )
-            state.iterations.append(iteration)
             self._hub.publish(
                 "review_iteration",
-                {"task_id": task_id, "iteration": self._iteration_payload(iteration)},
+                {"task_id": task_id, "iteration": self._iteration_payload(record)},
             )
             # Comments loop back to the primary session (workflow-engine D-8).
             handle = self._agents.get(task_id, self._primary_session(task))
@@ -475,17 +556,21 @@ class ReviewManager:
         stderr: str | None = None,
         close_session: bool,
     ) -> None:
-        state = self._reviews.get(task_id)
-        if state is None:
+        if get_review(self._engine, task_id) is None:
             return
-        iteration = ReviewIteration(
-            outcome=outcome, comment_count=comment_count, stderr=stderr
+        # One transaction for the terminal iteration and the status it
+        # produced, written before either is broadcast.
+        record = append_iteration(
+            self._engine,
+            task_id,
+            outcome=outcome,
+            comment_count=comment_count,
+            stderr=stderr,
+            status=outcome,
         )
-        state.iterations.append(iteration)
-        state.status = outcome
         self._hub.publish(
             "review_iteration",
-            {"task_id": task_id, "iteration": self._iteration_payload(iteration)},
+            {"task_id": task_id, "iteration": self._iteration_payload(record)},
         )
         self._hub.publish("review_finished", {"task_id": task_id, "status": outcome})
         if close_session:
@@ -494,7 +579,7 @@ class ReviewManager:
             )
 
     @staticmethod
-    def _iteration_payload(iteration: ReviewIteration) -> dict[str, Any]:
+    def _iteration_payload(iteration: ReviewIteration | ReviewIterationRecord) -> dict[str, Any]:
         return {
             "outcome": iteration.outcome,
             "comment_count": iteration.comment_count,
@@ -550,7 +635,7 @@ class ReviewManager:
                 "review watcher for task %d failed", task_id, exc_info=task.exception()
             )
 
-    # --- startup crash-recovery helper --------------------------------------
+    # --- startup crash-recovery helpers -------------------------------------
 
     @staticmethod
     async def restore_parked_clone(clone_path: str, timeout: int) -> bool:
@@ -581,3 +666,38 @@ class ReviewManager:
             )
         )
         return True
+
+
+
+def restore_reviews(engine: Engine) -> list[int]:
+    """Close out reviews whose llmvet process died with the daemon.
+
+    A review persisted `open` with an uncleared write-ahead process marker
+    had a reviewer running when the daemon stopped. That process cannot be
+    adopted and is never relaunched on the operator's behalf, so the review
+    is closed honestly: an `interrupted` iteration is appended and the review
+    lands `aborted`, leaving the recovered primary session free to start a
+    fresh review that appends to the same history.
+
+    A review left `open` because its comments went back to the agent has a
+    cleared marker and is restored exactly as persisted. Returns the task ids
+    that were interrupted.
+
+    Must run before the first WebSocket snapshot is served, so a client never
+    sees an open review the daemon is about to correct.
+    """
+    interrupted: list[int] = []
+    for record in list_interrupted_candidates(engine):
+        append_iteration(
+            engine,
+            record.task_id,
+            outcome="interrupted",
+            status="aborted",
+        )
+        clear_process_marker(engine, record.task_id)
+        interrupted.append(record.task_id)
+        logger.info(
+            "review for task %d was interrupted by a daemon restart; recorded aborted",
+            record.task_id,
+        )
+    return interrupted

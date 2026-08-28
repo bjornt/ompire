@@ -573,3 +573,337 @@ class TestReviewManagerLifecycle:
         assert final.iterations[0].comment_count == 2
         # The second iteration recorded the error (no live agent).
         assert final.iterations[1].outcome == "error"
+
+
+def _seed_project_and_task(engine, git_checkout: Path, slug: str = "task1") -> int:
+    """Seed project/template/task rows directly — the same shape the
+    lifecycle tests build inline. Returns the task id."""
+    from ompire_daemon.db import projects, tasks, templates
+
+    with engine.begin() as conn:
+        if conn.execute(projects.select().where(projects.c.name == "demo")).first() is None:
+            conn.execute(
+                projects.insert().values(
+                    name="demo",
+                    title="Demo",
+                    upstream_url="https://example.com/demo.git",
+                    fork_url=None,
+                    checkout_path=str(git_checkout),
+                )
+            )
+            now0 = _now_iso()
+            conn.execute(
+                templates.insert().values(
+                    name="demo",
+                    project_name="demo",
+                    base_branch="main",
+                    branch_pattern="ompire/<slug>",
+                    workflow="single-step",
+                    workshop_additions="project",
+                    model=None,
+                    thinking=None,
+                    preamble="",
+                    created_at=now0,
+                    updated_at=now0,
+                )
+            )
+        now = _now_iso()
+        result = conn.execute(
+            tasks.insert().values(
+                project_name="demo",
+                template_name="demo",
+                slug=slug,
+                branch=f"ompire/{slug}",
+                clone_path=str(git_checkout),
+                state="created",
+                prompt="hello",
+                error=None,
+                workshop_id=None,
+                workflow_name="single-step",
+                workflow_status=None,
+                workflow_step=None,
+                spawn_completed_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return result.inserted_primary_key[0]
+
+
+class TestReviewDurability:
+    """Review status and iterations are durable rows, not manager memory
+    (ADR-0016's review slice)."""
+
+    @pytest.mark.asyncio
+    async def test_completed_review_is_written_to_the_registry(
+        self, review_app, tmp_path: Path, git_checkout: Path
+    ) -> None:
+        from ompire_daemon.registry.reviews import get_review
+        from ompire_daemon.registry.tasks import get_task
+
+        app = review_app
+        fake_llmvet = _write_fake_llmvet(tmp_path, "", 0)
+        app.state.config = Config(
+            **{**app.state.config.__dict__, "llmvet_command": (str(fake_llmvet),)}
+        )
+        reviews = app.state.reviews
+        reviews._config = app.state.config
+        reviews.start()
+
+        engine = app.state.engine
+        task_id = _seed_project_and_task(engine, git_checkout)
+        app.state.sessions.recovering(task_id, "main")
+        app.state.sessions.session_recovered(task_id, "main")
+
+        # The row exists as soon as the review opens, with the write-ahead
+        # process marker stamped before llmvet was launched.
+        await reviews.start_review(get_task(engine, task_id))
+        opened = get_review(engine, task_id)
+        assert opened is not None
+        assert opened.status == "open"
+        assert opened.process_started_at is not None
+
+        deadline = asyncio.get_event_loop().time() + 5
+        while reviews.get(task_id) and reviews.get(task_id).status == "open":
+            if asyncio.get_event_loop().time() > deadline:
+                raise RuntimeError("review did not finish")
+            await asyncio.sleep(0.01)
+
+        record = get_review(engine, task_id)
+        assert record is not None
+        assert record.status == "approved"
+        assert [it.outcome for it in record.iterations] == ["approved"]
+        # The process is gone: marker cleared, no URL or port to offer.
+        assert record.process_started_at is None
+        state = reviews.get(task_id)
+        assert state is not None
+        assert state.url is None
+        assert state.port is None
+
+    @pytest.mark.asyncio
+    async def test_re_review_appends_to_one_history(
+        self, review_app, tmp_path: Path, git_checkout: Path
+    ) -> None:
+        from ompire_daemon.registry.reviews import get_review
+        from ompire_daemon.registry.tasks import get_task
+
+        app = review_app
+        reviews = app.state.reviews
+        reviews.start()
+        engine = app.state.engine
+        task_id = _seed_project_and_task(engine, git_checkout)
+        app.state.sessions.recovering(task_id, "main")
+        app.state.sessions.session_recovered(task_id, "main")
+        task = get_task(engine, task_id)
+
+        async def run_once(script: Path) -> None:
+            app.state.config = Config(
+                **{**app.state.config.__dict__, "llmvet_command": (str(script),)}
+            )
+            reviews._config = app.state.config
+            await reviews.start_review(task)
+            deadline = asyncio.get_event_loop().time() + 5
+            while task_id in reviews._processes:
+                if asyncio.get_event_loop().time() > deadline:
+                    raise RuntimeError("review did not finish")
+                await asyncio.sleep(0.01)
+            # Let the watcher's finalization land.
+            await asyncio.sleep(0.2)
+
+        await run_once(_write_fake_llmvet(tmp_path, "", 130))
+        await run_once(_write_fake_llmvet(tmp_path, "", 0))
+
+        record = get_review(engine, task_id)
+        assert record is not None
+        assert record.status == "approved"
+        assert [(it.seq, it.outcome) for it in record.iterations] == [
+            (1, "aborted"),
+            (2, "approved"),
+        ]
+
+    def test_cleanup_retains_history_and_purge_deletes_it(
+        self, review_client: TestClient, auth_headers: dict[str, str], git_checkout: Path
+    ) -> None:
+        """Cleanup keeps the evidence that approved the ship; only purge
+        deletes it (`VISION.md` principle 4, ADR-0016)."""
+        from ompire_daemon.registry.reviews import (
+            append_iteration,
+            get_review,
+            open_review,
+        )
+
+        client = review_client
+        engine = client.app.state.engine
+        task_id = _seed_project_and_task(engine, git_checkout)
+        open_review(engine, task_id)
+        append_iteration(engine, task_id, outcome="approved", status="approved")
+        # The clone path must sit under the task root for cleanup to proceed.
+        from ompire_daemon.db import tasks as tasks_table
+
+        clone = client.app.state.config.task_dir_root / "demo" / "task1"
+        clone.mkdir(parents=True, exist_ok=True)
+        with engine.begin() as conn:
+            conn.execute(
+                tasks_table.update()
+                .where(tasks_table.c.id == task_id)
+                .values(clone_path=str(clone))
+            )
+
+        r = client.post(f"/api/tasks/{task_id}/cleanup", headers=auth_headers)
+        assert r.status_code == 200, r.text
+        record = get_review(engine, task_id)
+        assert record is not None
+        assert record.status == "approved"
+        assert [it.outcome for it in record.iterations] == ["approved"]
+        # An archived task carries no live process, so nothing may later read
+        # this review as interrupted.
+        assert record.process_started_at is None
+
+        r = client.delete(f"/api/tasks/{task_id}", headers=auth_headers)
+        assert r.status_code == 200, r.text
+        assert get_review(engine, task_id) is None
+
+
+class TestRestoreReviews:
+    """`restore_reviews` runs before the first snapshot and closes out only
+    the reviews whose llmvet process died with the daemon."""
+
+    def test_open_review_with_live_marker_becomes_interrupted(
+        self, app, git_checkout: Path
+    ) -> None:
+        from ompire_daemon.registry.reviews import get_review, open_review
+        from ompire_daemon.review import restore_reviews
+
+        engine = app.state.engine
+        task_id = _seed_project_and_task(engine, git_checkout)
+        open_review(engine, task_id)
+
+        assert restore_reviews(engine) == [task_id]
+
+        record = get_review(engine, task_id)
+        assert record is not None
+        assert record.status == "aborted"
+        assert [it.outcome for it in record.iterations] == ["interrupted"]
+        assert record.process_started_at is None
+
+    def test_comments_review_is_restored_untouched(
+        self, app, git_checkout: Path
+    ) -> None:
+        """Its reviewer already exited and its comments are with the agent:
+        the review is `open` on purpose, not a restart casualty."""
+        from ompire_daemon.registry.reviews import (
+            append_iteration,
+            clear_process_marker,
+            get_review,
+            open_review,
+        )
+        from ompire_daemon.review import restore_reviews
+
+        engine = app.state.engine
+        task_id = _seed_project_and_task(engine, git_checkout)
+        open_review(engine, task_id)
+        append_iteration(engine, task_id, outcome="comments", comment_count=3)
+        clear_process_marker(engine, task_id)
+
+        assert restore_reviews(engine) == []
+
+        record = get_review(engine, task_id)
+        assert record is not None
+        assert record.status == "open"
+        assert [it.outcome for it in record.iterations] == ["comments"]
+
+    def test_terminal_review_is_restored_untouched(
+        self, app, git_checkout: Path
+    ) -> None:
+        from ompire_daemon.registry.reviews import (
+            append_iteration,
+            clear_process_marker,
+            get_review,
+            open_review,
+        )
+        from ompire_daemon.review import restore_reviews
+
+        engine = app.state.engine
+        task_id = _seed_project_and_task(engine, git_checkout)
+        open_review(engine, task_id)
+        append_iteration(engine, task_id, outcome="approved", status="approved")
+        clear_process_marker(engine, task_id)
+
+        assert restore_reviews(engine) == []
+
+        record = get_review(engine, task_id)
+        assert record is not None
+        assert record.status == "approved"
+        assert [it.outcome for it in record.iterations] == ["approved"]
+
+    def test_interrupted_review_can_be_re_reviewed_into_the_same_history(
+        self, app, git_checkout: Path
+    ) -> None:
+        from ompire_daemon.registry.reviews import (
+            append_iteration,
+            get_review,
+            open_review,
+        )
+        from ompire_daemon.review import restore_reviews
+
+        engine = app.state.engine
+        task_id = _seed_project_and_task(engine, git_checkout)
+        open_review(engine, task_id)
+        restore_reviews(engine)
+
+        # A fresh review after the restart appends rather than starting over.
+        open_review(engine, task_id)
+        append_iteration(engine, task_id, outcome="approved", status="approved")
+
+        record = get_review(engine, task_id)
+        assert record is not None
+        assert record.status == "approved"
+        assert [(it.seq, it.outcome) for it in record.iterations] == [
+            (1, "interrupted"),
+            (2, "approved"),
+        ]
+
+
+class TestCleanupWithLiveReviewer:
+    @pytest.mark.asyncio
+    async def test_cleanup_lands_a_live_review_terminal(
+        self, review_app, tmp_path: Path, git_checkout: Path
+    ) -> None:
+        """Cleanup cancels the reviewer without waiting for its watcher, so
+        the review must be landed terminal here. A retained row left `open`
+        with no process would show an archived task as still under review."""
+        from ompire_daemon.registry.reviews import get_review
+        from ompire_daemon.registry.tasks import get_task
+
+        app = review_app
+        slow = tmp_path / "slow-llmvet"
+        slow.write_text("#!/bin/sh\nsleep 5\n")
+        slow.chmod(0o755)
+        app.state.config = Config(
+            **{**app.state.config.__dict__, "llmvet_command": (str(slow),)}
+        )
+        reviews = app.state.reviews
+        reviews._config = app.state.config
+        reviews.start()
+
+        engine = app.state.engine
+        task_id = _seed_project_and_task(engine, git_checkout)
+        app.state.sessions.recovering(task_id, "main")
+        app.state.sessions.session_recovered(task_id, "main")
+        await reviews.start_review(get_task(engine, task_id))
+        deadline = asyncio.get_event_loop().time() + 5
+        while task_id not in reviews._processes:
+            if asyncio.get_event_loop().time() > deadline:
+                raise RuntimeError("llmvet never launched")
+            await asyncio.sleep(0.01)
+
+        await reviews.cancel_and_drop(task_id)
+
+        record = get_review(engine, task_id)
+        assert record is not None
+        assert record.status == "aborted"
+        assert [it.outcome for it in record.iterations] == ["aborted"]
+        assert record.process_started_at is None
+        state = reviews.get(task_id)
+        assert state is not None
+        assert state.url is None

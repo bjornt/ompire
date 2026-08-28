@@ -12,6 +12,7 @@ so "no session id" says nothing about recoverability."""
 
 from __future__ import annotations
 
+import subprocess
 import time
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from ompire_daemon.registry.workflows import (
     list_step_records,
     set_run_status,
 )
+from ompire_daemon.review import REVIEW_GIT_REF
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.workflows import WorkflowRunner
 from tests.test_rpc import fake_omp_argv
@@ -385,3 +387,190 @@ def test_shutdown_then_restart_resumes_without_reprompt(
         task_final = get_task(restarted.state.engine, task_id)
         assert task_final.state == "created"
         assert task_final.workflow_status == "complete"
+
+
+# --- review history across a restart (review capability; ADR-0016) ----------
+
+
+def _restart_config(tmp_path: Path) -> Config:
+    fake_my_workshop = tmp_path / "fake-my-workshop"
+    fake_my_workshop.write_text('#!/bin/sh\necho "ws-test" > .workshop.lock\n')
+    fake_my_workshop.chmod(0o755)
+    return Config(
+        data_dir=tmp_path / "data",
+        task_dir_root=tmp_path / "tasks",
+        checkout_root=tmp_path / "proj",
+        my_workshop_command=(str(fake_my_workshop),),
+    )
+
+
+def _spawn_live_task(app, client: TestClient, git_checkout: Path) -> int:
+    headers = {"Authorization": f"Bearer {app.state.auth_token}"}
+    client.post(
+        "/api/projects",
+        headers=headers,
+        json={
+            "name": "demo",
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+            "checkout_path": str(git_checkout),
+        },
+    )
+    assert (
+        client.post(
+            "/api/templates", headers=headers, json={"name": "demo", "project_name": "demo"}
+        ).status_code
+        == 201
+    )
+    response = client.post(
+        "/api/tasks",
+        headers=headers,
+        json={"template_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
+    )
+    assert response.status_code == 202
+    task_id = response.json()["id"]
+    _wait_settled(client, headers, task_id)
+    return task_id
+
+
+def _snapshot_review(client: TestClient, token: str, task_id: int) -> dict | None:
+    with client.websocket_connect(f"/api/ws?token={token}") as ws:
+        snapshot = ws.receive_json()
+        return snapshot["payload"]["reviews"].get(str(task_id))
+
+
+def test_restart_preserves_approved_review_history(
+    tmp_path: Path, git_checkout: Path
+) -> None:
+    """An approval earned before a restart still stands afterwards: the
+    operator is not asked to re-review, and no dead llmvet link is offered."""
+    from ompire_daemon.registry.reviews import append_iteration, open_review
+
+    config = _restart_config(tmp_path)
+    app = create_app(config, frontend_dist=tmp_path / "no-dist")
+    with TestClient(app) as client:
+        task_id = _spawn_live_task(app, client, git_checkout)
+        engine = app.state.engine
+        open_review(engine, task_id)
+        append_iteration(engine, task_id, outcome="comments", comment_count=2)
+        # The reviewer exited, so its marker is cleared before the restart.
+        app.state.reviews.drop_review(task_id)
+        from ompire_daemon.registry.reviews import clear_process_marker
+
+        clear_process_marker(engine, task_id)
+        open_review(engine, task_id)
+        append_iteration(engine, task_id, outcome="approved", status="approved")
+        clear_process_marker(engine, task_id)
+    app.state.engine.dispose()
+
+    restarted = create_app(config, frontend_dist=tmp_path / "no-dist")
+    with TestClient(restarted) as client:
+        review = _snapshot_review(client, restarted.state.auth_token, task_id)
+
+    assert review is not None
+    assert review["status"] == "approved"
+    # Multi-pass history survives in order.
+    assert [it["outcome"] for it in review["iterations"]] == ["comments", "approved"]
+    assert review["iterations"][0]["comment_count"] == 2
+    # The reviewer process did not survive the restart.
+    assert review["url"] is None
+    assert review["port"] is None
+
+
+def test_restart_marks_an_open_review_interrupted(
+    tmp_path: Path, git_checkout: Path
+) -> None:
+    """A review that was open when the daemon died becomes visibly
+    interrupted rather than disappearing, and its primary session comes back
+    recovering — never `reviewing`."""
+    from ompire_daemon.registry.reviews import get_review, open_review
+
+    config = _restart_config(tmp_path)
+    app = create_app(config, frontend_dist=tmp_path / "no-dist")
+    with TestClient(app) as client:
+        task_id = _spawn_live_task(app, client, git_checkout)
+        # A live reviewer: the row is open with an uncleared process marker
+        # and the clone is parked behind `refs/ompire/review-orig` — exactly
+        # the state an ungraceful crash mid-review leaves behind.
+        open_review(app.state.engine, task_id)
+        record = get_review(app.state.engine, task_id)
+        assert record is not None and record.process_started_at is not None
+        clone = Path(get_task(app.state.engine, task_id).clone_path)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=clone, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        subprocess.run(["git", "update-ref", REVIEW_GIT_REF, head], cwd=clone, check=True)
+    app.state.engine.dispose()
+
+    restarted = create_app(config, frontend_dist=tmp_path / "no-dist")
+    with TestClient(restarted) as client:
+        review = _snapshot_review(client, restarted.state.auth_token, task_id)
+        with client.websocket_connect(
+            f"/api/ws?token={restarted.state.auth_token}"
+        ) as ws:
+            snapshot = ws.receive_json()
+            session = snapshot["payload"]["sessions"][str(task_id)]["main"]
+
+    assert review is not None
+    assert review["status"] == "aborted"
+    assert [it["outcome"] for it in review["iterations"]] == ["interrupted"]
+    assert review["url"] is None
+    assert session["status"] != "reviewing"
+    # The clone was restored from its durable ref before the first snapshot.
+    assert (
+        subprocess.run(
+            ["git", "rev-parse", "--verify", REVIEW_GIT_REF],
+            cwd=clone,
+            capture_output=True,
+            check=False,
+        ).returncode
+        != 0
+    )
+
+
+def test_restart_leaves_a_comments_review_open_for_the_agent(
+    tmp_path: Path, git_checkout: Path
+) -> None:
+    """Comments went back to the agent, so the review is `open` on purpose.
+    Its reviewer had already exited, so it is not a restart casualty."""
+    from ompire_daemon.registry.reviews import (
+        append_iteration,
+        clear_process_marker,
+        open_review,
+    )
+
+    config = _restart_config(tmp_path)
+    app = create_app(config, frontend_dist=tmp_path / "no-dist")
+    with TestClient(app) as client:
+        task_id = _spawn_live_task(app, client, git_checkout)
+        engine = app.state.engine
+        open_review(engine, task_id)
+        append_iteration(engine, task_id, outcome="comments", comment_count=1)
+        clear_process_marker(engine, task_id)
+    app.state.engine.dispose()
+
+    restarted = create_app(config, frontend_dist=tmp_path / "no-dist")
+    with TestClient(restarted) as client:
+        review = _snapshot_review(client, restarted.state.auth_token, task_id)
+
+    assert review is not None
+    assert review["status"] == "open"
+    assert [it["outcome"] for it in review["iterations"]] == ["comments"]
+
+
+def test_restart_of_a_task_with_no_review_has_no_review_entry(
+    tmp_path: Path, git_checkout: Path
+) -> None:
+    """Absence is never filled in: a task that predates review history, or
+    never ran one, has no entry to restore."""
+    config = _restart_config(tmp_path)
+    app = create_app(config, frontend_dist=tmp_path / "no-dist")
+    with TestClient(app) as client:
+        task_id = _spawn_live_task(app, client, git_checkout)
+    app.state.engine.dispose()
+
+    restarted = create_app(config, frontend_dist=tmp_path / "no-dist")
+    with TestClient(restarted) as client:
+        review = _snapshot_review(client, restarted.state.auth_token, task_id)
+
+    assert review is None

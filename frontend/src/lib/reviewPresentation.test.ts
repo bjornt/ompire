@@ -21,6 +21,63 @@ function review(overrides: Partial<ReviewState> = {}): ReviewState {
 }
 
 describe("review presentation", () => {
+  it("offers no llmvet link for a review restored across a daemon restart", () => {
+    // The reviewer process does not survive a restart, so the durable
+    // history comes back with no URL or port to open.
+    const restored = review({
+      status: "approved",
+      url: null,
+      port: null,
+      iterations: [
+        { outcome: "comments", comment_count: 2, stderr: null, recorded_at: "2026-08-26T10:00:00Z" },
+        { outcome: "approved", comment_count: 0, stderr: null, recorded_at: "2026-08-26T11:00:00Z" },
+      ],
+    });
+
+    const presentation = projectReview(restored, idle);
+
+    expect(presentation.state).toBe("approved");
+    expect(presentation.url).toBeNull();
+    expect(presentation.canCancel).toBe(false);
+    expect(presentation.iterations.map((i) => i.outcome)).toEqual(["comments", "approved"]);
+  });
+
+  it("names a restart as the reason an interrupted review aborted", () => {
+    const interrupted = review({
+      status: "aborted",
+      url: null,
+      port: null,
+      iterations: [
+        { outcome: "interrupted", comment_count: null, stderr: null, recorded_at: "2026-08-26T10:00:00Z" },
+      ],
+    });
+
+    const presentation = projectReview(interrupted, idle);
+
+    expect(presentation.state).toBe("aborted");
+    expect(presentation.hint).toContain("daemon restart");
+    expect(presentation.canStart).toBe(true);
+    expect(formatReviewOutcome("interrupted")).toBe("Interrupted by daemon restart");
+  });
+
+  it("keeps a restored comments review open for the agent", () => {
+    const restored = review({
+      status: "open",
+      url: null,
+      port: null,
+      iterations: [
+        { outcome: "comments", comment_count: 1, stderr: null, recorded_at: "2026-08-26T10:00:00Z" },
+      ],
+    });
+
+    expect(projectReview(restored, working)).toMatchObject({
+      state: "comments",
+      url: null,
+      canStart: false,
+    });
+    expect(projectReview(restored, idle)).toMatchObject({ state: "comments", canStart: true });
+  });
+
   it("explains no-review availability from the primary session", () => {
     expect(projectReview(undefined, undefined)).toMatchObject({
       state: "no-review",

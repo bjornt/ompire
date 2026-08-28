@@ -124,6 +124,36 @@ workflow_step_records = Table(
     Column("finished_at", String, nullable=True),
 )
 
+# Durable review history (ADR-0016's review slice). One row per task; the
+# reviewer process itself is not durable, so its URL and port stay in
+# `ReviewManager` memory. `process_started_at` is the write-ahead marker: it
+# is stamped before llmvet is launched and cleared when the process is
+# observed exiting, so startup can tell an interrupted reviewer from a review
+# left `open` because its comments went back to the agent.
+reviews = Table(
+    "reviews",
+    metadata,
+    Column("task_id", Integer, ForeignKey("tasks.id"), primary_key=True),
+    Column("status", String, nullable=False),
+    Column("process_started_at", String, nullable=True),
+    Column("created_at", String, nullable=False),
+    Column("updated_at", String, nullable=False),
+)
+
+# Ordered review iterations; identity is (task_id, seq) because re-review
+# after comments appends to the same review's history, mirroring
+# `workflow_step_records`.
+review_iterations = Table(
+    "review_iterations",
+    metadata,
+    Column("task_id", Integer, ForeignKey("tasks.id"), primary_key=True),
+    Column("seq", Integer, primary_key=True),
+    Column("outcome", String, nullable=False),
+    Column("comment_count", Integer, nullable=True),
+    Column("stderr", Text, nullable=True),
+    Column("recorded_at", String, nullable=False),
+)
+
 # ADR-0013: UI-editable overrides are persisted as JSON-encoded scalar
 # values and layered over operator-owned config.toml.
 settings = Table(

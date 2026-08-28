@@ -63,7 +63,10 @@ export function projectReview(
     return {
       state: "aborted",
       label: "Aborted",
-      hint: "The last review was aborted. Start another review when the primary session is idle.",
+      hint:
+        latest?.outcome === "interrupted"
+          ? "A daemon restart interrupted the reviewer. Start another review when the primary session is idle."
+          : "The last review was aborted. Start another review when the primary session is idle.",
       canStart,
       canCancel: false,
       url: review.url,
@@ -110,7 +113,9 @@ export function projectReview(
 }
 
 export function formatReviewOutcome(outcome: ReviewIteration["outcome"]): string {
-  return outcome === "comments" ? "Comments submitted" : outcome[0].toUpperCase() + outcome.slice(1);
+  if (outcome === "comments") return "Comments submitted";
+  if (outcome === "interrupted") return "Interrupted by daemon restart";
+  return outcome[0].toUpperCase() + outcome.slice(1);
 }
 
 export function formatReviewCommentCount(iteration: ReviewIteration): string | null {

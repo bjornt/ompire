@@ -35,7 +35,7 @@ from ompire_daemon.prwatch import PrWatcher
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
 from ompire_daemon.registry.settings import SettingsStore
 from ompire_daemon.registry.tasks import list_tasks
-from ompire_daemon.review import ReviewManager
+from ompire_daemon.review import ReviewManager, restore_reviews
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import ShipManager
 from ompire_daemon.static import DEFAULT_FRONTEND_DIST, mount_frontend
@@ -113,7 +113,12 @@ async def _prepare_startup(
     events: EventHub,
     sessions: SessionTracker,
 ) -> list[Any]:
-    """Restore any clone parked mid-review, then classify startup tasks."""
+    """Close out interrupted reviews, restore any clone parked mid-review,
+    then classify startup tasks."""
+    # Durable review history is corrected before anything else reads it, so
+    # the first snapshot never carries an open review whose llmvet process
+    # died with the daemon (review capability; ADR-0016).
+    restore_reviews(engine)
     for task in list_tasks(engine):
         if task.state == "archived":
             continue
@@ -202,11 +207,11 @@ def create_app(
     app.state.prwatch = PrWatcher(config, app.state.engine, app.state.events)
     app.state.advisories.register(app.state.sessions)
 
-    # Before any snapshot is served: restore any clone left parked by a
-    # mid-review crash (review capability, design D-3), then classify every
-    # live task per the startup reconciliation matrix (crash-recovery
-    # capability, design D-4). No event loop is running yet at this point in
-    # `create_app`, hence `run`.
+    # Before any snapshot is served: close out reviews interrupted by the
+    # restart and restore any clone left parked by a mid-review crash (review
+    # capability, design D-3), then classify every live task per the startup
+    # reconciliation matrix (crash-recovery capability, design D-4). No event
+    # loop is running yet at this point in `create_app`, hence `run`.
     app.state.recoverable_tasks = asyncio.run(
         _prepare_startup(
             app.state.engine,

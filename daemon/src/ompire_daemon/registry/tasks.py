@@ -14,7 +14,13 @@ from pathlib import Path
 from sqlalchemy import Engine
 from sqlalchemy.exc import IntegrityError
 
-from ompire_daemon.db import task_sessions, tasks, workflow_step_records
+from ompire_daemon.db import (
+    review_iterations,
+    reviews,
+    task_sessions,
+    tasks,
+    workflow_step_records,
+)
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 MAX_SLUG_LENGTH = 64
@@ -238,11 +244,14 @@ def purge_task(engine: Engine, task_id: int) -> None:
     task = get_task(engine, task_id)
     if task.state != "archived":
         raise TaskNotArchivedError(task_id, task.state)
-    # Child rows go first: session rows and step records are history keyed by
-    # task id (workflow-engine capability).
+    # Child rows go first: session rows, step records, and review history are
+    # all keyed by task id. Purge is the only operation that deletes durable
+    # history — cleanup deliberately retains the review (ADR-0016).
     with engine.begin() as conn:
         conn.execute(workflow_step_records.delete().where(workflow_step_records.c.task_id == task_id))
         conn.execute(task_sessions.delete().where(task_sessions.c.task_id == task_id))
+        conn.execute(review_iterations.delete().where(review_iterations.c.task_id == task_id))
+        conn.execute(reviews.delete().where(reviews.c.task_id == task_id))
         conn.execute(tasks.delete().where(tasks.c.id == task_id))
 
 

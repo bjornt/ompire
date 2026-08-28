@@ -39,9 +39,13 @@ external link and **Cancel review** is available. Cancellation similarly stays
 locked until the daemon reports its outcome; a failed cancellation leaves the
 observed review visible and restores the valid action.
 
+A review restored after a daemon restart keeps its status and iterations but
+has no live reviewer, so the panel offers no llmvet link for it. See
+[Review](review.md#retention-and-restart).
+
 The panel updates from the main daemon stream without a reload. It distinguishes
-an open review, comments returned to the agent, approval, abort, and review
-error. When comments are returned, it says the primary agent is addressing
+an open review, comments returned to the agent, approval, abort, review error,
+and a reviewer interrupted by a daemon restart. When comments are returned, it says the primary agent is addressing
 them; after that session returns to idle, **Start another review** becomes
 available. It exposes the task's Ship flow link when review is approved, the
 daemon has recorded ship progress, or the task has a pull request. When the

@@ -59,6 +59,11 @@ describe("ship presentation", () => {
 
     expect(hasShipFlowHandoff(current, undefined, undefined)).toBe(false);
     expect(hasShipFlowHandoff(current, approvedReview(), undefined)).toBe(true);
+    // An approval restored across a daemon restart has no live reviewer URL,
+    // but still opens the ship flow.
+    expect(
+      hasShipFlowHandoff(current, { ...approvedReview(), url: null, port: null }, undefined),
+    ).toBe(true);
     expect(hasShipFlowHandoff(current, undefined, ship())).toBe(true);
     expect(hasShipFlowHandoff({ ...current, pr_url: "https://github.com/ompire/maas/pull/1" }, undefined, undefined)).toBe(
       true,

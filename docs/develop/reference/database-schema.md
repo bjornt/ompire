@@ -88,6 +88,43 @@ Steps are recorded repeatedly rather than mutated, so a retried step leaves
 both attempts in the history. In-memory runners re-drive workflow state from
 these records after a restart.
 
+## `reviews`
+
+| Column | Type | Notes |
+|---|---|---|
+| `task_id` | integer | FK to `tasks.id`, primary key |
+| `status` | string | `open`, `approved`, `aborted`, `error` |
+| `process_started_at` | string, nullable | Write-ahead marker; ISO-8601 |
+| `created_at`, `updated_at` | string | ISO-8601 |
+
+One row per task, upserted on every start: re-review after comments reopens
+the same review so the loop stays one ordered history.
+
+`process_started_at` is stamped before llmvet is launched and cleared when the
+process is observed exiting. It is not a display field — it is what lets
+startup tell an interrupted reviewer from a review that is `open` only because
+its comments went back to the agent. See
+[Crash recovery](crash-recovery.md#review-and-ship-recovery).
+
+The reviewer's URL and port are deliberately **not** columns. They describe a
+process that cannot outlive the daemon, and a restored review must not offer a
+dead link.
+
+## `review_iterations`
+
+| Column | Type | Notes |
+|---|---|---|
+| `task_id` | integer | FK, part of the primary key |
+| `seq` | integer | Part of the primary key |
+| `outcome` | string | `approved`, `comments`, `aborted`, `error`, `interrupted` |
+| `comment_count` | integer, nullable | Cosmetic; the comment text is authoritative |
+| `stderr` | text, nullable | Captured reviewer stderr |
+| `recorded_at` | string | ISO-8601 |
+
+Ordered `(task_id, seq)` like `workflow_steps`, because re-review revisits the
+same review. `interrupted` is iteration-only and always accompanies an
+`aborted` review.
+
 ## `settings`
 
 | Column | Type | Notes |
@@ -108,10 +145,14 @@ An unknown key or a wrong value type is rejected with `422` naming the key.
 
 ## What is not durable
 
-Session status, review history, attention state, and most ship progress are
-in-memory. The durable boundary is narrower than
-[`VISION.md`](../../VISION.md) calls for, and widening it is an open
-decision in the ADR migration rather than a settled design.
+Session status, attention state, the live reviewer process (its URL and port),
+and most ship progress are in-memory. Review status and iteration history are
+durable, realizing the review slice of
+[ADR-0016](../../adr/0016-persist-authority-bearing-task-history-and-provenance.md).
+
+The durable boundary is still narrower than [`VISION.md`](../../VISION.md)
+calls for: human decisions, publishing-operation intent records, and commit
+lineage remain transient, so ADR-0016 stays proposed.
 
 ## Migrations
 

@@ -85,22 +85,45 @@ On startup, any non-archived task whose clone still carries a review ref is
 restored before serving: reset to the ref, ref deleted. A crash mid-review
 never leaves a detached or parked `HEAD`.
 
-Review state itself is transient and does not survive a restart. A recovered
-task's primary session presents as `idle`, not `reviewing`, and the operator
-re-triggers.
+Review status and iteration history are durable rows (`reviews` and
+`review_iterations`, behind `registry/reviews.py`) and are restored before the
+first snapshot. The reviewer process is not: llmvet is never adopted or
+relaunched, so a restored review carries no URL or port.
+
+Telling an interrupted reviewer from a review that is legitimately still open
+needs more than status, because a review whose comments went back to the agent
+stays `open` while its process has already exited. The `reviews` row therefore
+carries a `process_started_at` write-ahead marker, stamped before llmvet is
+launched and cleared when the process is observed exiting:
+
+| Persisted state | Startup behavior |
+|---|---|
+| `open`, marker set | Reviewer died with the daemon: append an `interrupted` iteration, land the review `aborted`, clear the marker |
+| `open`, marker clear | Comments are with the agent: restored untouched |
+| Terminal (`approved`/`aborted`/`error`) | Restored untouched |
+| No row | No review ran; nothing is inferred |
+
+A recovered task's primary session presents as `starting`, `idle`, or
+`failed`, never `reviewing`, and can start a fresh review that appends to the
+same history. Operator-facing detail is in
+[Review](../../use/reference/review.md#retention-and-restart).
+
+Ship progress other than `pr_url` remains transient.
 
 ## What is not recovered
 
 | State | Behavior after restart |
 |---|---|
 | Session status | Rebuilt by recovery, not replayed |
-| Review status and iterations | Discarded; the clone's Git state is still restored |
+| Reviewer process, its URL and port | Discarded; the review's history is restored, the clone's Git state too |
 | Ship progress other than `pr_url` | Discarded |
 | Attention entries | Rebuilt from recovered session status |
 
-The durable boundary is narrower than [`VISION.md`](../../VISION.md) calls
-for. Widening it is an open architectural decision rather than a settled
-design.
+The durable boundary is still narrower than [`VISION.md`](../../VISION.md)
+calls for. Review history now sits inside it; human decisions,
+publishing-operation intent records, and commit lineage do not, so
+[ADR-0016](../../adr/0016-persist-authority-bearing-task-history-and-provenance.md)
+remains proposed.
 
 ## Configuration
 

@@ -70,12 +70,13 @@ When the reviewer exits, the daemon restores the clone with
 
 ### Crash safety
 
-The ref is the recovery artifact. On startup, any non-archived task whose
-clone still carries `refs/ompire/review-orig` is restored — reset to the ref,
-ref deleted — before the daemon serves its first snapshot.
+The ref is the recovery artifact for the clone. On startup, any non-archived
+task whose clone still carries `refs/ompire/review-orig` is restored — reset
+to the ref, ref deleted — before the daemon serves its first snapshot.
 
 A crash mid-review therefore never leaves a clone with a detached or parked
-`HEAD`.
+`HEAD`. The review's own status and history are restored separately, from the
+database — see [Retention and restart](#retention-and-restart).
 
 ### Outcomes
 
@@ -116,12 +117,40 @@ so the loop is visible rather than being a sequence of unrelated reviews.
 | Cancel with no open review | `409` |
 | Comments arrive but the primary session has no live agent | Review recorded `error` naming the missing agent; the session is left unchanged |
 
-Review state is held **in memory**. It does not survive a daemon restart — a
-recovered task's primary session presents as `idle` rather than `reviewing`,
-and the operator re-triggers. The clone's Git state is restored from the
-durable ref regardless.
+### Retention and restart
 
-Cleanup discards the review entry and terminates any open reviewer process.
+Review status and the ordered iteration history are **durable**. They survive
+a graceful shutdown, a crash, and a browser reconnect, and are restored before
+the daemon serves its first snapshot. An approval earned before a restart
+still stands afterwards and still opens the Ship flow; a multi-pass comment
+history comes back in order, and starting another review appends to it rather
+than beginning a new one.
+
+The reviewer process is not durable, and Ompire never relaunches llmvet on
+your behalf. A restored review therefore reports no URL or port, and no
+external review link is offered for it.
+
+A graceful shutdown cancels an open review normally, so it lands **Aborted**
+before the daemon exits. A review that is **still open at the next startup** —
+the daemon crashed or was killed — is closed honestly instead: an
+`Interrupted by daemon restart` iteration is appended and the
+review lands `Aborted`, which is why the panel says a restart interrupted the
+reviewer rather than that you cancelled it. The recovered primary session
+presents as `starting`, `idle`, or `failed` per normal session recovery —
+never `reviewing` — and once it is idle you can start a fresh review.
+
+A review left open because its comments went back to the agent is *not* a
+restart casualty: its reviewer had already exited, so it comes back exactly as
+it was, still labelled **Comments submitted**.
+
+A task that never ran a review has no review entry. Ompire does not infer one
+from Git state or from an existing pull request.
+
+Cleanup terminates any open reviewer process, records that review **Aborted**,
+and **keeps** the review history: a shipped, cleaned-up task retains the
+evidence explaining why it was allowed to publish, and never shows as still
+under review. Purging the task deletes that history along with its other
+records.
 
 ## Configuration
 
@@ -143,6 +172,12 @@ Cleanup discards the review entry and terminates any open reviewer process.
 | `review_iteration` | `{task_id, iteration}` |
 | `review_finished` | `{task_id, status}` |
 
-The snapshot carries a `reviews` map from task id to `{status, url,
-iterations}` for every task with a live or completed review that has not been
-cleaned up.
+The snapshot carries a `reviews` map from task id to `{status, url, port,
+iterations}` for every task with a review, including cleaned-up tasks. `url`
+and `port` are `null` whenever no reviewer process is live — always the case
+after a restart.
+
+An iteration's `outcome` is one of `approved`, `comments`, `aborted`, `error`,
+or `interrupted`. The last is restart-only and always accompanies an `aborted`
+review; the review's own `status` remains one of `open`, `approved`,
+`aborted`, or `error`.
