@@ -16,9 +16,11 @@ import type {
 } from "../types";
 import { getDaemonToken } from "./token";
 
-/** Minimal authenticated REST client. Commands go over REST, events come
- * back over the WebSocket (ADR-0004) — callers should render results from
- * daemon state, not from these return values.
+/** Minimal authenticated REST client. Commands go over REST, events come back
+ * over the WebSocket (ADR-0004). Components render from daemon state, never
+ * from these return values directly — but a response *is* an authoritative
+ * command outcome, so a caller may feed it into daemon state through
+ * `useDaemonReconcile` rather than waiting for the matching event.
  *
  * Architecture: docs/adr/0004-use-rest-and-websocket-snapshot-deltas.md */
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
@@ -216,7 +218,8 @@ export function deleteProject(name: string): Promise<{ deleted: string }> {
 
 /** Template CRUD (templates capability). The list itself arrives via the
  * WebSocket snapshot — these are commands only; render results from daemon
- * state, not from these return values. */
+ * state, not from these return values. Templates have no view that reconciles
+ * responses, so they rely on the event alone. */
 export interface TemplateInput {
   project_name: string;
   base_branch: string;

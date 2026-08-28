@@ -263,3 +263,10 @@
 .removeButton:hover {
   border-color: var(--line);
 }
+
+/* Mirrors .submitError (SpawnView.css) for the create form's confirmed state. */
+.submitConfirmed {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--green);
+}

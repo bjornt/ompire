@@ -23,6 +23,12 @@ from it but never modifies it.
 Open the Projects view and add a project. The name must be a valid slug; the
 UI rejects anything else before submitting.
 
+The form locks while the daemon works and the button reads `Creating…`. On
+success it confirms with `Created <name>` and closes, and the card is already
+in the list — there is nothing to reload or wait for. If the daemon rejects the
+project, the form stays open with what you typed and shows the reason, so you
+can correct the name or URL and submit again.
+
 ## Register through the API
 
 ```sh

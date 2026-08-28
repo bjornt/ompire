@@ -3427,7 +3427,14 @@ describe("ProjectsView (projects-view capability)", () => {
     expect(screen.getByTestId("projects-empty-state")).toBeInTheDocument();
   });
 
-  it("creates a project via the form and closes it", async () => {
+  async function fillCreateForm(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByTestId("new-project-toggle"));
+    await user.type(screen.getByTestId("new-project-name"), "llmvet");
+    await user.type(screen.getByTestId("new-project-title"), "LLM-assisted patch review CLI");
+    await user.type(screen.getByTestId("new-project-upstream"), "git@github.com:bjornt/llmvet.git");
+  }
+
+  it("shows the card as soon as the daemon answers, without waiting for the event", async () => {
     await renderAt("/projects", { projects: [project], tasks: [] });
     const user = userEvent.setup();
     const fetchMock = vi.fn().mockResolvedValue({
@@ -3436,11 +3443,8 @@ describe("ProjectsView (projects-view capability)", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    await user.click(screen.getByTestId("new-project-toggle"));
-    await user.type(screen.getByTestId("new-project-name"), "llmvet");
-    await user.type(screen.getByTestId("new-project-title"), "LLM-assisted patch review CLI");
-    await user.type(screen.getByTestId("new-project-upstream"), "git@github.com:bjornt/llmvet.git");
-    await user.click(screen.getByRole("button", { name: "Create project" }));
+    await fillCreateForm(user);
+    await user.click(screen.getByTestId("new-project-submit"));
 
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/projects",
@@ -3455,12 +3459,145 @@ describe("ProjectsView (projects-view capability)", () => {
       }),
     );
 
-    // The form closed; the new card arrives over the wire, not from the response.
+    // The response is reconciled into daemon state, so the card is present and
+    // the form has closed — no `project_created` frame has arrived yet.
+    expect(screen.getByTestId("project-card-llmvet")).toBeInTheDocument();
     expect(screen.queryByTestId("new-project-form")).not.toBeInTheDocument();
+
+    // The delayed event for the same project must not duplicate the card.
     act(() => {
       socket().emit("project_created", llmvet);
     });
+    expect(screen.getAllByTestId("project-card-llmvet")).toHaveLength(1);
+  });
+
+  it("locks the form while creating and reports the daemon's own answer", async () => {
+    await renderAt("/projects", { projects: [project], tasks: [] });
+    const user = userEvent.setup();
+    let release: (value: unknown) => void = () => {};
+    const pending = new Promise((resolve) => {
+      release = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockReturnValue(
+          pending.then(() => ({ ok: true, json: () => Promise.resolve({ ...llmvet }) })),
+        ),
+    );
+
+    await fillCreateForm(user);
+    await user.click(screen.getByTestId("new-project-submit"));
+
+    // In flight: the form is still mounted, every field is locked, and the
+    // button says so.
+    expect(screen.getByTestId("new-project-form")).toBeInTheDocument();
+    expect(screen.getByTestId("new-project-submit")).toHaveTextContent("Creating…");
+    expect(screen.getByTestId("new-project-name")).toBeDisabled();
+    expect(screen.getByTestId("new-project-title")).toBeDisabled();
+    expect(screen.getByTestId("new-project-upstream")).toBeDisabled();
+    expect(screen.getByTestId("new-project-fork")).toBeDisabled();
+
+    await act(async () => {
+      release(null);
+      await pending;
+    });
     expect(screen.getByTestId("project-card-llmvet")).toBeInTheDocument();
+  });
+
+  it("issues one request when the submit button is clicked twice", async () => {
+    await renderAt("/projects", { projects: [project], tasks: [] });
+    const user = userEvent.setup();
+    let release: (value: unknown) => void = () => {};
+    const pending = new Promise((resolve) => {
+      release = resolve;
+    });
+    const fetchMock = vi
+      .fn()
+      .mockReturnValue(
+        pending.then(() => ({ ok: true, json: () => Promise.resolve({ ...llmvet }) })),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await fillCreateForm(user);
+    const submit = screen.getByTestId("new-project-submit");
+    await user.click(submit);
+    await user.click(submit);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      release(null);
+      await pending;
+    });
+  });
+
+  it("reports a malformed create response and adds no card", async () => {
+    await renderAt("/projects", { projects: [project], tasks: [] });
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ title: "no name" }) }),
+    );
+
+    await fillCreateForm(user);
+    await user.click(screen.getByTestId("new-project-submit"));
+
+    expect(await screen.findByTestId("new-project-error")).toHaveTextContent(
+      "unusable project record",
+    );
+    expect(screen.getByTestId("new-project-form")).toBeInTheDocument();
+    // Input survives, and nothing was added to the list.
+    expect(screen.getByTestId("new-project-name")).toHaveValue("llmvet");
+    expect(screen.queryByTestId("project-card-llmvet")).not.toBeInTheDocument();
+    expect(screen.getByTestId("new-project-submit")).toBeEnabled();
+  });
+
+  it("renames a project in place without leaving a second card", async () => {
+    await renderAt("/projects", { projects: [project], tasks: [] });
+    const user = userEvent.setup();
+    const renamed = { ...project, name: "maas-ng" };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(renamed) }),
+    );
+
+    await user.click(
+      within(screen.getByTestId("project-card-maas")).getByRole("button", { name: "Edit" }),
+    );
+    await user.clear(screen.getByTestId("edit-name-maas"));
+    await user.type(screen.getByTestId("edit-name-maas"), "maas-ng");
+    await user.click(screen.getByTestId("edit-save-maas"));
+
+    expect(screen.getByTestId("project-card-maas-ng")).toBeInTheDocument();
+    expect(screen.queryByTestId("project-card-maas")).not.toBeInTheDocument();
+
+    act(() => {
+      socket().emit("project_renamed", { old_name: "maas", project: renamed });
+    });
+    expect(screen.getAllByTestId("project-card-maas-ng")).toHaveLength(1);
+  });
+
+  it("removes a project immediately and stays removed when the event lands", async () => {
+    await renderAt("/projects", { projects: [project], tasks: [] });
+    const user = userEvent.setup();
+    vi.stubGlobal("confirm", vi.fn().mockReturnValue(true));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ deleted: "maas" }) }),
+    );
+
+    await user.click(
+      within(screen.getByTestId("project-card-maas")).getByRole("button", { name: "Edit" }),
+    );
+    await user.click(screen.getByTestId("remove-project-maas"));
+
+    expect(screen.queryByTestId("project-card-maas")).not.toBeInTheDocument();
+    act(() => {
+      socket().emit("project_deleted", { name: "maas" });
+    });
+    expect(screen.queryByTestId("project-card-maas")).not.toBeInTheDocument();
+    expect(screen.getByTestId("projects-empty-state")).toBeInTheDocument();
   });
 
   it("keeps the form open with the daemon's detail on duplicate name", async () => {

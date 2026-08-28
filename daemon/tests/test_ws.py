@@ -76,6 +76,72 @@ def test_mutation_broadcast(
         assert event["seq"] > snapshot["seq"]
 
 
+def test_every_project_mutation_reaches_a_connected_client(
+    client: TestClient, auth_token: str, auth_headers: dict[str, str]
+) -> None:
+    """Create, plain update, rename, and delete each deliver their event to an
+    already-connected client, in order, with no reconnect in between.
+
+    All four are synchronous routes publishing from FastAPI's threadpool, so
+    they exercise the hub's cross-thread hand-off (`EventHub.publish`).
+    """
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        ws.receive_json()  # snapshot
+
+        created = client.post(
+            "/api/projects",
+            headers=auth_headers,
+            json={
+                "name": "ompire",
+                "title": "Ompire",
+                "upstream_url": "https://example.com/ompire.git",
+            },
+        )
+        assert created.status_code == 201
+        event = ws.receive_json()
+        assert event["type"] == "project_created"
+        assert event["payload"]["name"] == "ompire"
+
+        stored = created.json()
+        updated = client.put(
+            "/api/projects/ompire",
+            headers=auth_headers,
+            json={
+                "title": "Ompire, retitled",
+                "upstream_url": stored["upstream_url"],
+                "fork_url": stored["fork_url"],
+                "checkout_path": stored["checkout_path"],
+            },
+        )
+        assert updated.status_code == 200
+        event = ws.receive_json()
+        assert event["type"] == "project_updated"
+        assert event["payload"]["title"] == "Ompire, retitled"
+
+        renamed = client.put(
+            "/api/projects/ompire",
+            headers=auth_headers,
+            json={
+                "title": "Ompire, retitled",
+                "upstream_url": stored["upstream_url"],
+                "fork_url": stored["fork_url"],
+                "checkout_path": stored["checkout_path"],
+                "new_name": "ompire-ng",
+            },
+        )
+        assert renamed.status_code == 200
+        event = ws.receive_json()
+        assert event["type"] == "project_renamed"
+        assert event["payload"]["old_name"] == "ompire"
+        assert event["payload"]["project"]["name"] == "ompire-ng"
+
+        deleted = client.delete("/api/projects/ompire-ng", headers=auth_headers)
+        assert deleted.status_code == 200
+        event = ws.receive_json()
+        assert event["type"] == "project_deleted"
+        assert event["payload"] == {"name": "ompire-ng"}
+
+
 def test_template_events_and_snapshot(
     client: TestClient, auth_token: str, auth_headers: dict[str, str]
 ) -> None:
@@ -105,6 +171,26 @@ def test_template_events_and_snapshot(
         assert event["payload"]["name"] == "demo"
         assert event["payload"]["base_branch"] == "main"
         assert event["seq"] > snapshot["seq"]
+
+        stored = event["payload"]
+        renamed = client.put(
+            "/api/templates/demo",
+            headers=auth_headers,
+            json={
+                "project_name": stored["project_name"],
+                "base_branch": "develop",
+                "branch_pattern": stored["branch_pattern"],
+                "workflow": stored["workflow"],
+                "workshop_additions": stored["workshop_additions"],
+                "model": stored["model"],
+                "thinking": stored["thinking"],
+                "preamble": stored["preamble"],
+            },
+        )
+        assert renamed.status_code == 200, renamed.text
+        event = ws.receive_json()
+        assert event["type"] == "template_updated"
+        assert event["payload"]["base_branch"] == "develop"
 
         deleted = client.delete("/api/templates/demo", headers=auth_headers)
         assert deleted.status_code == 200

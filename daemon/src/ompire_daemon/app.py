@@ -65,6 +65,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     prwatch: PrWatcher = app.state.prwatch
     gpg: GpgProbe = app.state.gpg
     gh: GitHubProbe = app.state.gh
+    # Synchronous REST routes publish from FastAPI's threadpool; the hub needs
+    # this loop to hand fan-out back to it (see events.py).
+    events: EventHub = app.state.events
+    events.bind_loop(asyncio.get_running_loop())
     await notifier.probe()
     notifier.start()
     advisories.start()

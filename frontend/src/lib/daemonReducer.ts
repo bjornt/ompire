@@ -108,6 +108,19 @@ export const initialDaemonState: DaemonState = {
   settings: {},
 };
 
+/** Projects are keyed by name, and the same project can arrive twice: once as
+ * a mutation's own REST response and once as its WebSocket event. Replacing in
+ * place keeps that idempotent in either arrival order, so a card can never be
+ * duplicated (ADR-0004: the daemon is authoritative for command outcomes and
+ * observed state alike). */
+function upsertProject(projects: Project[], project: Project): Project[] {
+  const index = projects.findIndex((p) => p.name === project.name);
+  if (index === -1) return [...projects, project];
+  const next = [...projects];
+  next[index] = project;
+  return next;
+}
+
 /** Do not retain a target result across a changed or unavailable ambient identity.
  * The daemon already clears these, but the client treats snapshot/delta input as
  * replaceable and fails closed when an older daemon sends contradictory data. */
@@ -136,7 +149,6 @@ function normalizeGitHubStatus(status: GitHubStatus | undefined): GitHubStatus |
   );
   return { ...status, targets };
 }
-
 
 // Architecture: ADR-0004 (docs/adr/0004-use-rest-and-websocket-snapshot-deltas.md)
 /** Applies one envelope from the daemon's WebSocket. `snapshot` is a full
@@ -186,16 +198,10 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         settings: payload.settings ?? {},
       };
     }
-    case "project_created": {
-      const project = envelope.payload as Project;
-      return { ...state, projects: [...state.projects, project] };
-    }
+    case "project_created":
     case "project_updated": {
       const project = envelope.payload as Project;
-      return {
-        ...state,
-        projects: state.projects.map((p) => (p.name === project.name ? project : p)),
-      };
+      return { ...state, projects: upsertProject(state.projects, project) };
     }
     case "project_renamed": {
       // Renames change the key `project_updated` matches on, so they carry
@@ -203,7 +209,10 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       const { old_name, project } = envelope.payload as { old_name: string; project: Project };
       return {
         ...state,
-        projects: state.projects.map((p) => (p.name === old_name ? project : p)),
+        projects: upsertProject(
+          state.projects.filter((p) => p.name !== old_name),
+          project,
+        ),
       };
     }
     case "project_deleted": {

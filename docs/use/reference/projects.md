@@ -47,6 +47,23 @@ The view updates over the WebSocket. Creates, updates, deletes, renames, and
 task changes are reflected without a reload. An empty list renders an empty
 state rather than example cards.
 
+### Creating and editing
+
+While a create or edit request is in flight the form stays on screen with every
+field and button disabled, and the submit button reads `Creating…` or `Saving…`.
+A second click cannot submit the same form twice.
+
+The daemon's answer is what the view acts on. On success the create form shows a
+short `Created <name>` confirmation and closes once the new card is in the list —
+it never closes into a list without it. The card is there as soon as the daemon
+responds; it does not wait for the matching WebSocket event, and the event
+arriving afterwards does not add a second card. Other connected clients see the
+new card from the event, also without a reload.
+
+A rejection leaves the form open and re-enabled, with every field's text intact
+and the daemon's own detail shown inline. A success whose body is not a usable
+project record is reported the same way and adds nothing to the list.
+
 ## States and behavior
 
 Projects have no lifecycle state. They exist or they do not.
@@ -121,4 +138,4 @@ project's `checkout_path`. It defaults to `~/proj`.
 | `GET` | `/api/projects/{name}/files` |
 
 Projects appear in the WebSocket snapshot. Mutations broadcast
-`project_created` and `project_renamed`.
+`project_created`, `project_updated`, `project_renamed`, and `project_deleted`.

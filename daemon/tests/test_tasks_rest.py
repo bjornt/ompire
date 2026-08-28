@@ -235,6 +235,28 @@ def test_purge_requires_archived(
     assert client.get(f"/api/tasks/{task['id']}", headers=auth_headers).status_code == 404
 
 
+def test_purge_reaches_a_connected_client(
+    client: TestClient, auth_token: str, auth_headers: dict, demo_template: dict
+) -> None:
+    """`purge_task_route` is a synchronous route, so its `task_deleted` goes
+    through the hub's cross-thread hand-off like the project mutations do."""
+    task = _spawn(client, auth_headers)
+    _wait_settled(client, auth_headers, task["id"])
+
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        ws.receive_json()  # snapshot
+
+        client.post(f"/api/tasks/{task['id']}/cleanup", headers=auth_headers)
+        purge = client.delete(f"/api/tasks/{task['id']}", headers=auth_headers)
+        assert purge.status_code == 200
+
+        while True:
+            event = ws.receive_json()
+            if event["type"] == "task_deleted":
+                assert event["payload"] == {"id": task["id"]}
+                break
+
+
 def test_project_delete_blocked_until_tasks_purged(
     client: TestClient, auth_headers: dict, demo_template: dict
 ) -> None:

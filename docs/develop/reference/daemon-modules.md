@@ -18,7 +18,7 @@ All paths are under `daemon/src/ompire_daemon/`.
 |---|---|
 | `api/rest.py` | Every state-changing operation. The largest module, and deliberately so — commands are REST. |
 | `api/ws.py` | `/api/ws`: snapshot then deltas. Accepts no commands. |
-| `events.py` | The in-process event hub everything publishes to. |
+| `events.py` | The in-process event hub everything publishes to. Publishing is safe from any thread; fan-out always runs on the daemon's event loop. |
 
 ## Persistence
 

@@ -1,9 +1,9 @@
 // Architecture: ADR-0002 (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
 // Transport: ADR-0004 (docs/adr/0004-use-rest-and-websocket-snapshot-deltas.md)
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import type { Envelope } from "../types";
 import { applyEnvelope, initialDaemonState, type DaemonState } from "./daemonReducer";
-import { DaemonContext } from "./daemonContext";
+import { DaemonContext, DaemonReconcileContext } from "./daemonContext";
 import { getDaemonToken } from "./token";
 
 const INITIAL_BACKOFF_MS = 1000;
@@ -75,5 +75,18 @@ export function DaemonProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  return <DaemonContext.Provider value={state}>{children}</DaemonContext.Provider>;
+  // Stable identity: views depend on this in effects and submit handlers.
+  const reconcile = useCallback((type: string, payload: unknown) => {
+    // `seq`/`ts` order and stamp wire frames; the reducer reads neither, so a
+    // locally-applied response carries no sequence of its own.
+    setState((prev) => applyEnvelope(prev, { seq: -1, ts: "", type, payload }));
+  }, []);
+
+  return (
+    <DaemonContext.Provider value={state}>
+      <DaemonReconcileContext.Provider value={reconcile}>
+        {children}
+      </DaemonReconcileContext.Provider>
+    </DaemonContext.Provider>
+  );
 }

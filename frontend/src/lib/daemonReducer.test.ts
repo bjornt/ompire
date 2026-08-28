@@ -100,6 +100,114 @@ describe("applyEnvelope", () => {
     expect(next.projects).toEqual([renamed]);
   });
 
+  it("keeps one card when a create is applied twice (response then event)", () => {
+    const start = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [] },
+    });
+    // The mutation's own response, reconciled locally...
+    const reconciled = applyEnvelope(start, {
+      seq: -1,
+      ts: "",
+      type: "project_created",
+      payload: project,
+    });
+    // ...then the delayed WebSocket event for the same project.
+    const next = applyEnvelope(reconciled, {
+      seq: 1,
+      ts: "",
+      type: "project_created",
+      payload: project,
+    });
+    expect(next.projects).toEqual([project]);
+  });
+
+  it("keeps one card when the event precedes the reconciled response", () => {
+    const start = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [] },
+    });
+    const evented = applyEnvelope(start, {
+      seq: 1,
+      ts: "",
+      type: "project_created",
+      payload: project,
+    });
+    const next = applyEnvelope(evented, {
+      seq: -1,
+      ts: "",
+      type: "project_created",
+      payload: project,
+    });
+    expect(next.projects).toEqual([project]);
+  });
+
+  it("upserts an unknown project arriving as project_updated", () => {
+    const start = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [] },
+    });
+    const next = applyEnvelope(start, {
+      seq: 1,
+      ts: "",
+      type: "project_updated",
+      payload: project,
+    });
+    expect(next.projects).toEqual([project]);
+  });
+
+  it("keeps one card when a rename is applied twice", () => {
+    const start = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [project], tasks: [] },
+    });
+    const renamed = { ...project, name: "maas-ng" };
+    const envelope = {
+      seq: 1,
+      ts: "",
+      type: "project_renamed",
+      payload: { old_name: project.name, project: renamed },
+    };
+    const next = applyEnvelope(applyEnvelope(start, envelope), envelope);
+    expect(next.projects).toEqual([renamed]);
+  });
+
+  it("stays deleted when a late project_deleted repeats", () => {
+    const start = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [project], tasks: [] },
+    });
+    const envelope = { seq: 1, ts: "", type: "project_deleted", payload: { name: project.name } };
+    const next = applyEnvelope(applyEnvelope(start, envelope), envelope);
+    expect(next.projects).toEqual([]);
+  });
+
+  it("lets a fresh snapshot replace reconciled projects", () => {
+    const reconciled = applyEnvelope(initialDaemonState, {
+      seq: -1,
+      ts: "",
+      type: "project_created",
+      payload: project,
+    });
+    const next = applyEnvelope(reconciled, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [] },
+    });
+    expect(next.projects).toEqual([]);
+  });
+
   it("applies project_deleted by name", () => {
     const start = applyEnvelope(initialDaemonState, {
       seq: 0,

@@ -77,13 +77,45 @@ client that missed frames does not reconcile or replay, it re-reads. That is
 why the frontend can be stateless with respect to the daemon, and why
 restarting the browser cannot corrupt anything.
 
+## Delivery
+
+Fan-out always runs on the daemon's event loop, whichever context published the
+event. Synchronous REST routes run in FastAPI's threadpool, so `EventHub`
+hands their events back to the loop rather than touching a subscriber queue
+from another thread — a queue written from off the loop wakes its reader
+through a non-thread-safe path, leaving the event to wait for unrelated
+activity. An event is therefore never delivered late because the daemon
+happened to be idle.
+
+Each producer's events are delivered in the order it published them. Ordering
+*between* concurrent producers is not defined, and no client depends on it.
+
+## Applying a mutation's own response
+
+A command's REST response is an authoritative daemon outcome, not just an
+acknowledgement, so a client may apply it to its own state through the very
+reducer path the matching event uses. The Projects view does this, which is why
+a new card appears the moment the daemon answers.
+
+This is not the reconciliation the reconnect rule above rules out. It carries
+two obligations:
+
+- **Deltas are idempotent per key.** Applying a create or update for a key
+  already present replaces it rather than appending, so the response and its
+  event together can never produce two entries — in either arrival order.
+- **A snapshot still replaces everything.** Nothing applied from a response
+  outlives the next snapshot that omits it.
+
+A client that applies no responses is still correct; it just learns the outcome
+one event later.
+
 ## Event types
 
 Published on the dashboard channel:
 
 | Type | Fires when |
 |---|---|
-| `project_created`, `project_renamed` | Project mutations |
+| `project_created`, `project_updated`, `project_renamed`, `project_deleted` | Project mutations |
 | `template_created`, `template_updated`, `template_deleted` | Template mutations |
 | `task_created`, `task_updated`, `task_deleted` | Task mutations |
 | `spawn_step` | A spawn step starts, succeeds, or fails |
