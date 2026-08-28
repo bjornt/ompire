@@ -76,6 +76,12 @@ class ShipDraft:
     pr_body: str
     source: str = "agent"
 
+@dataclass
+class ShipStepState:
+    step: str
+    status: str
+    detail: Any = None
+
 
 @dataclass
 class ShipState:
@@ -85,6 +91,7 @@ class ShipState:
     commit_sha: str | None = None
     pr_url: str | None = None
     error: str | None = None
+    last_step: ShipStepState | None = None
     updated_at: str = field(default_factory=_now_iso)
 
 
@@ -101,6 +108,22 @@ class GpgLockedError(ShipError):
 class NoLiveAgentError(ShipError):
     def __init__(self, task_id: int) -> None:
         super().__init__(f"task {task_id} has no live agent")
+        self.task_id = task_id
+
+class SessionNotIdleError(ShipError):
+    def __init__(self, task_id: int, session: str, current_status: str | None) -> None:
+        current = current_status or "untracked"
+        super().__init__(
+            f"task {task_id} session {session!r} is not idle (current status: {current})"
+        )
+        self.task_id = task_id
+        self.session = session
+        self.current_status = current_status
+
+
+class ShipAlreadyPublishedError(ShipError):
+    def __init__(self, task_id: int) -> None:
+        super().__init__(f"task {task_id} is already published or archived")
         self.task_id = task_id
 
 
@@ -179,19 +202,44 @@ class ShipManager:
 
     # --- public operations -------------------------------------------------
 
-    async def draft(self, task: Task) -> ShipState:
-        """Ask the primary session's live agent for commit/PR text
-        (workflow-engine design D-8); on failure degrade to manual entry via
-        a `ship_draft` event with `source="manual"`.
+    async def draft(self, task: Task, *, replace: bool = False) -> ShipState:
+        """Ask the primary session's live, idle agent for commit/PR text.
+
+        A normal request ensures an initial draft and returns any existing
+        attempt unchanged. ``replace`` is the explicit regeneration/retry path.
+        The state claim happens before the first await so concurrent callers
+        cannot both prompt the agent.
         """
         from ompire_daemon.workflows import get_workflow
+
+        existing = self._ships.get(task.id)
+        if existing is not None and not replace:
+            return existing
+        if existing is not None and existing.status in {
+            "drafting",
+            "committing",
+            "pushing",
+        }:
+            raise ShipInProgressError(task.id)
+        if (
+            task.state == "archived"
+            or task.pr_url is not None
+            or (existing is not None and existing.status == "shipped")
+        ):
+            raise ShipAlreadyPublishedError(task.id)
 
         primary = get_workflow(task.workflow_name).primary
         handle = self._agents.get(task.id, primary)
         if handle is None or handle.returncode is not None:
             raise NoLiveAgentError(task.id)
+        session = self._sessions.get(task.id, primary)
+        if session is None or session.status != "idle":
+            raise SessionNotIdleError(
+                task.id, primary, session.status if session is not None else None
+            )
 
-        self._set_state(task.id, status="drafting", draft=None, error=None)
+        self._set_state(task.id, status="drafting", error=None)
+        self._publish_step(task.id, "draft", "started")
 
         try:
             await handle.prompt(_DRAFT_PROMPT)
@@ -222,27 +270,21 @@ class ShipManager:
             self._hub.publish(
                 "ship_draft", {"task_id": task.id, "draft": asdict(parsed)}
             )
+            self._publish_step(task.id, "draft", "ok")
             return state
         except TimeoutError:
-            state = self._set_state(
-                task.id, status="error", draft=None, error="timed out waiting for agent draft"
+            return self._finish_draft_error(
+                task.id, "timed out waiting for agent draft"
             )
-            return state
         except Exception as exc:  # noqa: BLE001
-            state = self._set_state(
-                task.id, status="error", draft=None, error=f"draft failed: {exc}"
-            )
-            return state
+            return self._finish_draft_error(task.id, f"draft failed: {exc}")
 
     def seed_commit(self, task_id: int, mode: str = "squash") -> ShipState:
         """Synchronously seed the committing state for the REST route, which
         then backgrounds `commit_and_ship`.
         """
         state = self._set_state(task_id, status="committing", error=None, mode=mode)
-        self._hub.publish(
-            "ship_step",
-            {"task_id": task_id, "step": "commit", "status": "started"},
-        )
+        self._publish_step(task_id, "commit", "started")
         return state
 
     async def commit_and_ship(
@@ -264,10 +306,7 @@ class ShipManager:
         existing = self._ships.get(task.id)
         self._set_state(task.id, status="committing", error=None, mode=mode)
         if existing is None or existing.status != "committing":
-            self._hub.publish(
-                "ship_step",
-                {"task_id": task.id, "step": "commit", "status": "started"},
-            )
+            self._publish_step(task.id, "commit", "started")
 
         project = self._project(task)
         base_branch = self._base_branch(task)
@@ -288,27 +327,16 @@ class ShipManager:
                 )
 
             self._set_state(task.id, commit_sha=sha)
-            self._hub.publish(
-                "ship_step",
-                {
-                    "task_id": task.id,
-                    "step": "commit",
-                    "status": "ok",
-                    "detail": {"sha": sha, "count": commit_count},
-                },
+            self._publish_step(
+                task.id,
+                "commit",
+                "ok",
+                {"sha": sha, "count": commit_count},
             )
         except Exception as exc:  # noqa: BLE001
             message = f"commit failed: {exc}"
             self._set_state(task.id, status="error", error=message)
-            self._hub.publish(
-                "ship_step",
-                {
-                    "task_id": task.id,
-                    "step": "commit",
-                    "status": "failed",
-                    "detail": message,
-                },
-            )
+            self._publish_step(task.id, "commit", "failed", message)
             self._hub.publish("ship_finished", {"task_id": task.id, "status": "error"})
             return self._ships[task.id]
         finally:
@@ -320,15 +348,7 @@ class ShipManager:
         except Exception as exc:  # noqa: BLE001
             message = f"push/PR failed: {exc}"
             self._set_state(task.id, status="error", error=message)
-            self._hub.publish(
-                "ship_step",
-                {
-                    "task_id": task.id,
-                    "step": "pr",
-                    "status": "failed",
-                    "detail": message,
-                },
-            )
+            self._publish_step(task.id, "pr", "failed", message)
             self._hub.publish("ship_finished", {"task_id": task.id, "status": "error"})
             return self._ships[task.id]
 
@@ -659,27 +679,16 @@ class ShipManager:
             remote_url = project.upstream_url
             head = branch
 
-        self._hub.publish(
-            "ship_step",
-            {"task_id": task.id, "step": "push", "status": "started"},
-        )
+        self._publish_step(task.id, "push", "started")
         await self._push(clone_path, remote_url, branch)
-        self._hub.publish(
-            "ship_step", {"task_id": task.id, "step": "push", "status": "ok"}
-        )
+        self._publish_step(task.id, "push", "ok")
 
-        self._hub.publish(
-            "ship_step",
-            {"task_id": task.id, "step": "pr", "status": "started"},
-        )
+        self._publish_step(task.id, "pr", "started")
         upstream_slug = parse_github_slug(project.upstream_url)
         pr_url = await self._create_pr(
             clone_path, upstream_slug, base_branch, head, pr_title, pr_body
         )
-        self._hub.publish(
-            "ship_step",
-            {"task_id": task.id, "step": "pr", "status": "ok", "detail": pr_url},
-        )
+        self._publish_step(task.id, "pr", "ok", pr_url)
         return pr_url
 
     async def _push(
@@ -798,6 +807,28 @@ class ShipManager:
         raise ShipError("gh pr create succeeded but printed no PR URL")
 
     # --- helpers ------------------------------------------------------------
+
+    def _publish_step(
+        self, task_id: int, step: str, status: str, detail: Any = None
+    ) -> ShipState:
+        state = self._set_state(
+            task_id,
+            last_step=ShipStepState(step=step, status=status, detail=detail),
+        )
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "step": step,
+            "status": status,
+        }
+        if detail is not None:
+            payload["detail"] = detail
+        self._hub.publish("ship_step", payload)
+        return state
+
+    def _finish_draft_error(self, task_id: int, message: str) -> ShipState:
+        state = self._set_state(task_id, status="error", error=message)
+        self._publish_step(task_id, "draft", "failed", message)
+        return state
 
     def _set_state(self, task_id: int, **kwargs: Any) -> ShipState:
         state = self._ships.get(task_id)

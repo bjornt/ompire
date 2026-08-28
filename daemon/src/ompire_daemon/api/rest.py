@@ -1017,6 +1017,10 @@ async def cancel_review_route(
     }
 
 
+class ShipDraftBody(BaseModel):
+    replace: bool = False
+
+
 class ShipCommitBody(BaseModel):
     message: str
     pr_title: str
@@ -1030,8 +1034,8 @@ _IN_FLIGHT_SHIP_STATUSES = {"drafting", "committing", "pushing"}
 @router.post("/tasks/{task_id}/ship/draft")
 async def draft_ship_route(
     task_id: int,
+    body: ShipDraftBody | None = None,
     engine: Engine = Depends(_engine),
-    supervisor: AgentSupervisor = Depends(_supervisor),
     ships: ShipManager = Depends(_ships),
 ) -> dict[str, Any]:
     try:
@@ -1039,11 +1043,10 @@ async def draft_ship_route(
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
-    # Ship-draft prompts the workflow's primary session (workflow-engine D-8).
-    _require_live_agent(supervisor, task_id, _primary_session(task))
-
     try:
-        state = await ships.draft(task)
+        state = await ships.draft(
+            task, replace=body.replace if body is not None else False
+        )
     except ShipError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     return asdict(state)

@@ -66,7 +66,7 @@ full current registry state:
 | `settings` | The effective settings map |
 | `gpg` | Current signing-key state |
 | `reviews` | Per task, durable review status and iterations, plus the live reviewer's URL and port when one is running (`null` otherwise) |
-| `ships` | Per task, ship status, mode, draft, commit sha, PR URL |
+| `ships` | Per task, in-memory ship status, mode, draft, commit sha, PR URL, error, and latest `last_step` projection |
 | attention | Current attention entries |
 
 Every frame after the snapshot is a delta.
@@ -92,13 +92,24 @@ Published on the dashboard channel:
 | `attention`, `attention_cleared` | A task's attention tier changes |
 | `stats`, `advisory` | Session telemetry and decorations |
 | `review_started`, `review_iteration`, `review_finished` | Review lifecycle |
-| `ship_draft` | A ship draft is ready |
-| `ship_step`, `ship_finished` | `commit`, `push`, or `pr` starts or completes |
+| `ship_draft` | A parsed agent draft is ready |
+| `ship_step`, `ship_finished` | A `draft`, `commit`, `push`, or `pr` step starts, completes, fails, or the publication reaches a terminal state |
 | `gpg_status` | The signing-key probe result changes |
 | `settings_changed` | Effective settings change |
 
 `spawn_step` and `ship_step` payloads carry `status` — `started`, `ok`, or
-`failed` — and a failure carries the tool's stderr.
+`failed` — and a failure carries the relevant detail. Ship-step `detail` is a
+string for a draft, push, or pull-request failure, a pull-request URL on a
+successful `pr`, and commit metadata on a successful `commit`.
+
+Draft lifecycle is explicit: `ship_step` with `step: "draft"` and
+`status: "started"` precedes the agent request; a parsed success publishes
+`ship_draft` followed by `draft`/`ok`; a timeout, transport failure, missing
+text, or marker parse failure publishes `draft`/`failed`. The daemon keeps the
+latest `last_step` in its in-memory `ships` snapshot, so a client that missed a
+delta can render the same Draft-stage retry state after reconnect. Ship state is
+not durable except for a task's pull-request URL; a restart replaces it with an
+empty ship projection rather than replaying an agent request.
 
 `workflow_step` carries the task id, step name, kind, and status of `started`,
 `ok`, `failed`, or `waiting` — with error text on failure and the

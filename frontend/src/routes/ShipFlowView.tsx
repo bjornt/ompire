@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useDaemonState } from "../lib/useDaemonState";
 import { primarySessionName } from "../lib/daemonReducer";
@@ -59,21 +59,33 @@ function ReviewStep({
 }
 
 function CommitStep({
-  taskId,
+  task,
+  session,
+  review,
   ship,
   gpg,
 }: {
-  taskId: number;
+  task: Task;
+  session: SessionInfo | undefined;
+  review: ReviewState | undefined;
   ship: ShipState | undefined;
   gpg: GpgStatus | null;
 }) {
+  const taskId = task.id;
   const [mode, setMode] = useState<"squash" | "retain">("squash");
   const [message, setMessage] = useState("");
   const [prTitle, setPrTitle] = useState("");
   const [prBody, setPrBody] = useState("");
-  const [touched, setTouched] = useState({ message: false, prTitle: false, prBody: false });
-  const [redrafting, setRedrafting] = useState(false);
+  const [touched, setTouched] = useState({
+    message: false,
+    prTitle: false,
+    prBody: false,
+  });
+  const [draftRequest, setDraftRequest] = useState<"automatic" | "replacement" | null>(null);
+  const [draftCommandError, setDraftCommandError] = useState<string | null>(null);
   const [rechecking, setRechecking] = useState(false);
+  const draftCommandLocked = useRef(false);
+  const automaticAttempted = useRef(false);
 
   useEffect(() => {
     const draft = ship?.draft;
@@ -82,25 +94,86 @@ function CommitStep({
     setPrTitle((prev) => (touched.prTitle ? prev : draft.pr_title));
     setPrBody((prev) => (touched.prBody ? prev : draft.pr_body));
   }, [ship?.draft]); // eslint-disable-line react-hooks/exhaustive-deps
-  // touched resets intentionally omitted: the effect seeds untouched fields
-  // when a draft arrives without clobbering fields the user has edited.
+  // `touched` is intentionally sampled when a new draft object arrives. Each
+  // field changed after the request baseline keeps the operator's value.
+
+  useEffect(() => {
+    if (ship?.updated_at) setDraftCommandError(null);
+  }, [ship?.updated_at]);
+
+  const published =
+    task.state === "archived" ||
+    task.pr_url !== null ||
+    ship?.pr_url != null ||
+    ship?.status === "shipped";
+  const reviewAllowsAutomatic = review === undefined || review.status === "approved";
+  const sessionIdle = session?.status === "idle";
+  const automaticEligible =
+    ship === undefined && !published && reviewAllowsAutomatic && sessionIdle;
+  const automaticPending = automaticEligible && !automaticAttempted.current;
+  const drafting =
+    draftRequest !== null || ship?.status === "drafting" || automaticPending;
+  const publishing =
+    ship?.status === "committing" || ship?.status === "pushing";
+  const draftFailed =
+    ship?.status === "error" && ship.last_step?.step === "draft";
+  const canRequestDraft =
+    !published &&
+    sessionIdle &&
+    !drafting &&
+    !publishing &&
+    ship?.status !== "shipped";
+
+  const requestDraft = useCallback(
+    async (replace: boolean, kind: "automatic" | "replacement") => {
+      if (draftCommandLocked.current) return;
+      draftCommandLocked.current = true;
+      if (kind === "automatic") automaticAttempted.current = true;
+      setDraftRequest(kind);
+      setDraftCommandError(null);
+      try {
+        await draftShip(taskId, replace ? { replace: true } : undefined);
+      } catch (caught: unknown) {
+        setDraftCommandError(
+          caught instanceof Error ? caught.message : String(caught),
+        );
+      } finally {
+        draftCommandLocked.current = false;
+        setDraftRequest(null);
+      }
+    },
+    [taskId],
+  );
+
+  useEffect(() => {
+    if (automaticEligible && !automaticAttempted.current) {
+      void requestDraft(false, "automatic");
+    }
+  }, [automaticEligible, requestDraft]);
 
   const gpgCached = gpg?.state === "cached";
   const gpgLocked = gpg?.state === "locked";
-  const busy = ship?.status === "drafting" || ship?.status === "committing";
   const canCommit =
-    gpgCached && !busy && (mode === "retain" || message.trim().length > 0);
+    gpgCached &&
+    !drafting &&
+    !publishing &&
+    (mode === "retain" || message.trim().length > 0);
   const unlockCommand = gpg?.key ? `echo | gpg --clearsign -u ${gpg.key} >/dev/null` : "";
   const retainSelected = mode === "retain";
 
   async function onRedraft() {
-    setRedrafting(true);
-    setTouched({ message: false, prTitle: false, prBody: false });
-    try {
-      await draftShip(taskId);
-    } finally {
-      setRedrafting(false);
+    if (!canRequestDraft) return;
+    const hasOperatorEdits = touched.message || touched.prTitle || touched.prBody;
+    if (
+      hasOperatorEdits &&
+      !window.confirm(
+        "Re-draft publication metadata via the agent?\n\nThis replaces the commit message, PR title, and PR body you edited. Changes made after drafting starts will still be preserved.",
+      )
+    ) {
+      return;
     }
+    setTouched({ message: false, prTitle: false, prBody: false });
+    await requestDraft(true, "replacement");
   }
 
   async function onCommit() {
@@ -122,12 +195,39 @@ function CommitStep({
     }
   }
 
+  let draftStatus: string;
+  if (drafting) {
+    draftStatus = "Drafting… Keep editing; fields you change will not be overwritten.";
+  } else if (published) {
+    draftStatus = "This task is already published; agent drafting is unavailable.";
+  } else if (session === undefined || session.status === "failed") {
+    draftStatus = "No live primary agent is available. Enter publication metadata manually.";
+  } else if (session.status !== "idle") {
+    draftStatus = `Drafting is waiting for the primary agent to become idle (currently ${session.status}).`;
+  } else if (review !== undefined && review.status !== "approved" && ship === undefined) {
+    draftStatus = "Automatic drafting is waiting for an approved review. Manual entry and Re-draft remain available.";
+  } else if (draftFailed || draftCommandError !== null) {
+    draftStatus = "Drafting failed. Correct the metadata manually or retry via the agent.";
+  } else if (ship?.draft) {
+    draftStatus = "Agent draft ready. Review and edit every field before signing.";
+  } else {
+    draftStatus = "Agent drafting is available; manual entry remains available.";
+  }
+
+  const draftButtonLabel = drafting
+    ? draftRequest === "replacement"
+      ? "Re-drafting…"
+      : "Drafting…"
+    : draftFailed || draftCommandError !== null
+      ? "Retry drafting"
+      : "Re-draft via agent";
+
   return (
     <div className="shipStep" data-testid="ship-step-commit">
       <div className="stepHeader">
         <StepIcon
           index={2}
-          active={ship?.status === "drafting" || ship?.status === "committing" || ship?.status === "drafted"}
+          active={drafting || ship?.status === "committing" || ship?.status === "drafted"}
           done={ship?.status === "shipped"}
           error={ship?.status === "error"}
         />
@@ -137,6 +237,10 @@ function CommitStep({
         )}
       </div>
 
+      <p className="draftStatus" data-testid="draft-status">
+        {draftStatus}
+      </p>
+
       <div className="commitMode" data-testid="commit-mode">
         <label className="modeOption">
           <input
@@ -145,7 +249,7 @@ function CommitStep({
             value="squash"
             checked={mode === "squash"}
             onChange={() => setMode("squash")}
-            disabled={busy}
+            disabled={publishing}
           />
           Squash
         </label>
@@ -156,7 +260,7 @@ function CommitStep({
             value="retain"
             checked={mode === "retain"}
             onChange={() => setMode("retain")}
-            disabled={busy}
+            disabled={publishing}
           />
           Retain
         </label>
@@ -168,10 +272,10 @@ function CommitStep({
           <textarea
             rows={4}
             value={message}
-            disabled={busy || retainSelected}
+            disabled={publishing || retainSelected}
             onChange={(e) => {
               setMessage(e.target.value);
-              setTouched((t) => ({ ...t, message: true }));
+              setTouched((current) => ({ ...current, message: true }));
             }}
             data-testid="commit-message"
           />
@@ -186,10 +290,10 @@ function CommitStep({
           <input
             type="text"
             value={prTitle}
-            disabled={busy}
+            disabled={publishing}
             onChange={(e) => {
               setPrTitle(e.target.value);
-              setTouched((t) => ({ ...t, prTitle: true }));
+              setTouched((current) => ({ ...current, prTitle: true }));
             }}
             data-testid="pr-title"
           />
@@ -199,10 +303,10 @@ function CommitStep({
           <textarea
             rows={5}
             value={prBody}
-            disabled={busy}
+            disabled={publishing}
             onChange={(e) => {
               setPrBody(e.target.value);
-              setTouched((t) => ({ ...t, prBody: true }));
+              setTouched((current) => ({ ...current, prBody: true }));
             }}
             data-testid="pr-body"
           />
@@ -212,11 +316,11 @@ function CommitStep({
       <div className="commitActions">
         <button
           type="button"
-          disabled={redrafting || busy}
+          disabled={!canRequestDraft}
           onClick={() => void onRedraft()}
           data-testid="redraft-button"
         >
-          {redrafting ? "Re-drafting…" : "Re-draft via agent"}
+          {draftButtonLabel}
         </button>
         <button
           type="button"
@@ -228,6 +332,12 @@ function CommitStep({
           Sign & commit
         </button>
       </div>
+
+      {draftCommandError && (
+        <div className="shipError" data-testid="draft-command-error">
+          Draft request failed: {draftCommandError}
+        </div>
+      )}
 
       {gpgLocked && unlockCommand && (
         <div className="gpgBanner" data-testid="gpg-locked-banner">
@@ -268,17 +378,17 @@ function PushPrStep({
 
   let progress = "Waiting for a signed commit.";
   if (done) progress = "Pull request opened.";
-  else if (ship?.lastStep?.step === "commit" && ship.lastStep.status === "failed")
-    progress = `Commit failed: ${ship.lastStep.detail ?? ""}`.trim();
-  else if (ship?.lastStep?.step === "push" && ship.lastStep.status === "failed")
-    progress = `Push failed: ${ship.lastStep.detail ?? ""}`.trim();
-  else if (ship?.lastStep?.step === "pr" && ship.lastStep.status === "failed")
-    progress = `PR failed: ${ship.lastStep.detail ?? ""}`.trim();
-  else if (ship?.status === "committing" || ship?.lastStep?.step === "commit")
+  else if (ship?.last_step?.step === "commit" && ship.last_step.status === "failed")
+    progress = `Commit failed: ${typeof ship.last_step.detail === "string" ? ship.last_step.detail : ""}`.trim();
+  else if (ship?.last_step?.step === "push" && ship.last_step.status === "failed")
+    progress = `Push failed: ${typeof ship.last_step.detail === "string" ? ship.last_step.detail : ""}`.trim();
+  else if (ship?.last_step?.step === "pr" && ship.last_step.status === "failed")
+    progress = `PR failed: ${typeof ship.last_step.detail === "string" ? ship.last_step.detail : ""}`.trim();
+  else if (ship?.status === "committing" || ship?.last_step?.step === "commit")
     progress = "Creating signed squash commit…";
-  else if (ship?.status === "pushing" || ship?.lastStep?.step === "push")
+  else if (ship?.status === "pushing" || ship?.last_step?.step === "push")
     progress = "Pushing branch…";
-  else if (ship?.lastStep?.step === "pr") progress = "Opening pull request…";
+  else if (ship?.last_step?.step === "pr") progress = "Opening pull request…";
 
   return (
     <div className="shipStep" data-testid="ship-step-push-pr">
@@ -416,7 +526,7 @@ export function ShipFlowView() {
 
       <div className="shipFlow" data-testid="ship-flow">
         <ReviewStep session={session} review={review} />
-        <CommitStep taskId={taskId} ship={ship} gpg={gpg} />
+        <CommitStep key={taskId} task={task} session={session} review={review} ship={ship} gpg={gpg} />
         <PushPrStep ship={ship} prUrl={task.pr_url} />
         <CleanupStep task={task} />
       </div>

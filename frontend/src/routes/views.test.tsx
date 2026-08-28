@@ -1,4 +1,5 @@
-import { act, render, screen, within } from "@testing-library/react";
+import { StrictMode } from "react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
@@ -1974,7 +1975,7 @@ describe("ShipFlowView", () => {
           pr_url: null,
           error: "push/PR failed: forbidden",
           updated_at: "2026-08-20T00:02:00Z",
-          lastStep: { step: "pr", status: "failed", detail: "forbidden" },
+          last_step: { step: "pr", status: "failed", detail: "forbidden" },
         },
       },
     });
@@ -2030,6 +2031,391 @@ describe("ShipFlowView", () => {
     });
 
     expect(await screen.findByTestId("ship-flow-not-found")).toBeInTheDocument();
+  });
+
+  it("auto-drafts once under StrictMode and preserves fields edited in flight", async () => {
+    const user = userEvent.setup();
+    const deferred = nativePromiseWithResolvers.withResolvers<{
+      ok: boolean;
+      json: () => Promise<unknown>;
+    }>();
+    const fetchMock = vi.fn().mockReturnValue(deferred.promise);
+    vi.stubGlobal("fetch", fetchMock);
+
+    window.history.pushState({}, "", "/ship/1");
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+    const strictSocket = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+    act(() => {
+      strictSocket.emitSnapshot({
+        projects: [project],
+        tasks: [makeTask()],
+        sessions: {
+          "1": { main: { status: "idle", reason: "turn ended", since: "t0" } },
+        },
+        reviews: {
+          "1": { status: "approved", url: null, port: null, iterations: [] },
+        },
+      });
+    });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/1/ship/draft",
+      expect.objectContaining({ method: "POST", body: undefined }),
+    );
+    expect(screen.getByTestId("draft-status")).toHaveTextContent("Drafting");
+    expect(screen.getByTestId("commit-message")).not.toBeDisabled();
+    expect(screen.getByTestId("pr-title")).not.toBeDisabled();
+
+    await user.type(screen.getByTestId("commit-message"), "Operator message");
+    act(() => {
+      strictSocket.emit("ship_step", {
+        task_id: 1,
+        step: "draft",
+        status: "started",
+      });
+      strictSocket.emit("ship_draft", {
+        task_id: 1,
+        draft: {
+          commit_message: "Agent message",
+          pr_title: "Agent title",
+          pr_body: "Agent body",
+          source: "agent",
+        },
+      });
+      strictSocket.emit("status_changed", {
+        task_id: 1,
+        session: "main",
+        from: "idle",
+        to: "idle",
+        reason: "duplicate update",
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("commit-message")).toHaveValue("Operator message");
+      expect(screen.getByTestId("pr-title")).toHaveValue("Agent title");
+      expect(screen.getByTestId("pr-body")).toHaveValue("Agent body");
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      deferred.resolve({
+        ok: true,
+        json: async () => ({
+          status: "drafted",
+          draft: null,
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t1",
+        }),
+      });
+      await deferred.promise;
+    });
+  });
+
+  it("waits for a no-review primary session to become idle", async () => {
+    const deferred = nativePromiseWithResolvers.withResolvers<{
+      ok: boolean;
+      json: () => Promise<unknown>;
+    }>();
+    const fetchMock = vi.fn().mockReturnValue(deferred.promise);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": { main: { status: "working", reason: "agent turn", since: "t0" } },
+      },
+    });
+
+    expect(screen.getByTestId("draft-status")).toHaveTextContent("waiting");
+    expect(screen.getByTestId("draft-status")).toHaveTextContent("working");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    act(() => {
+      socket().emit("status_changed", {
+        task_id: 1,
+        session: "main",
+        from: "working",
+        to: "idle",
+        reason: "turn ended",
+      });
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      deferred.resolve({
+        ok: true,
+        json: async () => ({
+          status: "drafting",
+          draft: null,
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t1",
+        }),
+      });
+      await deferred.promise;
+    });
+  });
+
+  it("waits for an existing review to be approved before auto-drafting", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        status: "drafting",
+        draft: null,
+        commit_sha: null,
+        pr_url: null,
+        error: null,
+        updated_at: "t1",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": { main: { status: "idle", reason: "turn ended", since: "t0" } },
+      },
+      reviews: {
+        "1": { status: "open", url: null, port: null, iterations: [] },
+      },
+    });
+
+    expect(screen.getByTestId("draft-status")).toHaveTextContent("approved review");
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    act(() => {
+      socket().emit("review_finished", { task_id: 1, status: "approved" });
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+  });
+
+  it("leaves manual fields usable when no primary agent is live", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      gpg: { state: "cached", key: "ABC123", keygrip: "abc", detail: null, checked_at: "t0" },
+    });
+
+    expect(screen.getByTestId("draft-status")).toHaveTextContent("No live primary agent");
+    expect(screen.getByTestId("redraft-button")).toBeDisabled();
+    expect(screen.getByTestId("commit-message")).not.toBeDisabled();
+    await user.type(screen.getByTestId("commit-message"), "Manual message");
+    expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("confirms edited regeneration and protects newer in-flight edits", async () => {
+    const user = userEvent.setup();
+    const deferred = nativePromiseWithResolvers.withResolvers<{
+      ok: boolean;
+      json: () => Promise<unknown>;
+    }>();
+    const fetchMock = vi.fn().mockReturnValue(deferred.promise);
+    vi.stubGlobal("fetch", fetchMock);
+    const confirmSpy = vi
+      .spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": { main: { status: "idle", reason: "turn ended", since: "t0" } },
+      },
+      reviews: {
+        "1": { status: "approved", url: null, port: null, iterations: [] },
+      },
+      ships: {
+        "1": {
+          status: "drafted",
+          draft: {
+            commit_message: "First message",
+            pr_title: "First title",
+            pr_body: "First body",
+            source: "agent",
+          },
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t0",
+          last_step: { step: "draft", status: "ok" },
+        },
+      },
+    });
+
+    await screen.findByDisplayValue("First title");
+    await user.clear(screen.getByTestId("pr-title"));
+    await user.type(screen.getByTestId("pr-title"), "Operator title");
+    await user.click(screen.getByTestId("redraft-button"));
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await user.click(screen.getByTestId("redraft-button"));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body as string)).toEqual({
+      replace: true,
+    });
+    expect(screen.getByTestId("redraft-button")).toHaveTextContent("Re-drafting");
+    expect(screen.getByTestId("pr-body")).not.toBeDisabled();
+
+    await user.clear(screen.getByTestId("pr-body"));
+    await user.type(screen.getByTestId("pr-body"), "Newer operator body");
+    act(() => {
+      socket().emit("ship_draft", {
+        task_id: 1,
+        draft: {
+          commit_message: "Second message",
+          pr_title: "Second title",
+          pr_body: "Second agent body",
+          source: "agent",
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("commit-message")).toHaveValue("Second message");
+      expect(screen.getByTestId("pr-title")).toHaveValue("Second title");
+      expect(screen.getByTestId("pr-body")).toHaveValue("Newer operator body");
+    });
+
+    await act(async () => {
+      deferred.resolve({
+        ok: true,
+        json: async () => ({
+          status: "drafted",
+          draft: null,
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t1",
+        }),
+      });
+      await deferred.promise;
+    });
+  });
+
+  it("shows a transport error without auto-looping and retries explicitly", async () => {
+    const user = userEvent.setup();
+    const retry = nativePromiseWithResolvers.withResolvers<{
+      ok: boolean;
+      json: () => Promise<unknown>;
+    }>();
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("daemon connection lost"))
+      .mockReturnValueOnce(retry.promise);
+    vi.stubGlobal("fetch", fetchMock);
+
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      sessions: {
+        "1": { main: { status: "idle", reason: "turn ended", since: "t0" } },
+      },
+      reviews: {
+        "1": { status: "approved", url: null, port: null, iterations: [] },
+      },
+    });
+
+    expect(await screen.findByTestId("draft-command-error")).toHaveTextContent(
+      "daemon connection lost",
+    );
+    expect(screen.getByTestId("redraft-button")).toHaveTextContent("Retry drafting");
+    act(() => {
+      socket().emit("review_finished", { task_id: 1, status: "approved" });
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByTestId("redraft-button"));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body as string)).toEqual({
+      replace: true,
+    });
+
+    await act(async () => {
+      retry.resolve({
+        ok: true,
+        json: async () => ({
+          status: "drafting",
+          draft: null,
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t1",
+        }),
+      });
+      await retry.promise;
+    });
+  });
+
+  it("resets draft fields when navigating between task ship routes", async () => {
+    const user = userEvent.setup();
+    const second = makeTask({
+      id: 2,
+      slug: "second-task",
+      branch: "bjornt/second-task",
+      clone_path: "/home/op/tasks/maas/second-task",
+    });
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask(), second],
+      ships: {
+        "1": {
+          status: "drafted",
+          draft: {
+            commit_message: "First task",
+            pr_title: "First title",
+            pr_body: "First body",
+            source: "agent",
+          },
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t0",
+        },
+        "2": {
+          status: "drafted",
+          draft: {
+            commit_message: "Second task",
+            pr_title: "Second title",
+            pr_body: "Second body",
+            source: "agent",
+          },
+          commit_sha: null,
+          pr_url: null,
+          error: null,
+          updated_at: "t0",
+        },
+      },
+    });
+
+    await screen.findByDisplayValue("First task");
+    await user.clear(screen.getByTestId("commit-message"));
+    await user.type(screen.getByTestId("commit-message"), "Edited first task");
+
+    act(() => {
+      window.history.pushState({}, "", "/ship/2");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+
+    expect(await screen.findByDisplayValue("Second task")).toBeInTheDocument();
+    expect(screen.getByTestId("commit-message")).not.toHaveValue("Edited first task");
   });
   it("renders the live review step and live commit/push steps", async () => {
     await renderAt("/ship/1", {

@@ -24,7 +24,8 @@ verdict.
    again, select **Start another review**. The ordered history retains every
    iteration, including reviewer error detail.
 5. After **Approved**, select **Continue to Ship flow**. It opens
-   `/ship/<task-id>` directly at the task's publishing flow.
+   `/ship/<task-id>` directly at the task's publishing flow and automatically
+   starts the first eligible publication draft.
 
 To resume publishing later without returning through a task card, select
 **Ship flow** in the global navigation. The chooser lists tasks that can enter
@@ -69,14 +70,39 @@ published before anything is.
 
 ### 1. Draft
 
+On the task-specific Ship flow, an approved review normally starts the agent
+draft automatically once the primary session is idle. The Commit step says
+**Drafting…** immediately. You can write in the commit-message, pull-request
+title, and pull-request body fields while it works; values you change are kept
+when the agent's result arrives, while untouched fields are filled in for you.
+
+If the agent is still working or reviewing, Ship flow waits for it to become
+idle. If no live agent is available, enter the metadata by hand. A draft error
+leaves those fields usable and provides an explicit retry; it never retries on
+its own.
+
+The authenticated REST command remains useful for automation or recovery. With
+no body it safely ensures an initial draft — a repeated request returns the
+current draft or current attempt rather than prompting the agent twice:
+
 ```sh
 curl -sS -X POST http://127.0.0.1:4173/api/tasks/42/ship/draft \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-The daemon prompts the task's primary session to draft a commit message and
-pull-request title and body. This requires a live agent — drafting is the one
-part of shipping the agent does. The result is returned for you to edit.
+Use a deliberate replacement request to regenerate a ready draft or retry a
+draft error:
+
+```sh
+curl -sS -X POST http://127.0.0.1:4173/api/tasks/42/ship/draft \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"replace": true}'
+```
+
+In the UI, **Re-draft via agent** asks for confirmation only when it would
+replace metadata you edited. After confirmation, newer edits made while the
+replacement is running remain yours.
 
 ### 2. Commit, push, and open the pull request
 
@@ -93,8 +119,9 @@ curl -sS -X POST http://127.0.0.1:4173/api/tasks/42/ship/commit \
 ```
 
 The daemon performs the rest itself: signed commit, push, then pull-request
-creation through `gh`. Progress is published per step — `commit`, `push`,
-`pr` — and the pull-request URL is attached to the task when it succeeds.
+creation through `gh`. Progress is published per step — `draft`, `commit`,
+`push`, `pr` — and the pull-request URL is attached to the task when it
+succeeds.
 
 ## Ship modes
 
@@ -116,10 +143,16 @@ sequence is interrupted.
 | Condition | Response |
 |---|---|
 | GPG key not `cached` | `409` with the current GPG state attached |
-| A ship already in flight for this task | `409` |
+| A commit or push is already in flight | `409` |
 | Mode other than `squash` or `retain` | `409` |
 | `retain` preconditions unmet | `409` with the reason |
-| No live agent (draft only) | `409` |
+| No live or idle primary agent (new/replacement draft only) | `409` |
+| Archived task, existing pull request, or completed ship (new/replacement draft only) | `409` |
+| A draft is already in flight (replacement only) | `409` |
+
+A bodyless draft request that finds an existing draft, terminal draft error, or
+current attempt returns that observed state unchanged. Use `{"replace": true}`
+or the UI's explicit retry only after the primary session is idle.
 
 Every one of these is refused before any Git operation runs, so a rejected
 ship leaves nothing to clean up.

@@ -103,6 +103,7 @@ export const initialDaemonState: DaemonState = {
   settings: {},
 };
 
+
 // Architecture: ADR-0004 (docs/adr/0004-use-rest-and-websocket-snapshot-deltas.md)
 /** Applies one envelope from the daemon's WebSocket. `snapshot` is a full
  * state replacement; every other `type` is an incremental delta. Unknown
@@ -366,42 +367,75 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
     }
     case "ship_draft": {
       const { task_id, draft } = envelope.payload as ShipDraftPayload;
-      const existing = state.ships[task_id];
-      return {
-        ...state,
-        ships: {
-          ...state.ships,
-          [task_id]: {
-            ...(existing ?? {
-              status: "drafted",
-              draft: null,
-              commit_sha: null,
-              pr_url: null,
-              error: null,
-              updated_at: envelope.ts,
-            }),
-            status: "drafted",
-            draft,
-            updated_at: envelope.ts,
-          } as ShipState,
-        },
+      const existing: ShipState = state.ships[task_id] ?? {
+        status: "drafted",
+        mode: "squash",
+        draft: null,
+        commit_sha: null,
+        pr_url: null,
+        error: null,
+        updated_at: envelope.ts,
+        last_step: null,
       };
-    }
-    case "ship_step": {
-      const { task_id, step, status, detail } = envelope.payload as ShipStepPayload;
-      const existing = state.ships[task_id];
-      if (!existing) return state;
-      const nextStatus: ShipState["status"] =
-        step === "commit" ? "committing" : step === "push" || step === "pr" ? "pushing" : existing.status;
       return {
         ...state,
         ships: {
           ...state.ships,
           [task_id]: {
             ...existing,
-            status: status === "failed" && existing.status !== "shipped" ? "error" : nextStatus,
-            error: status === "failed" ? detail ?? null : existing.error,
-            lastStep: { step, status, detail },
+            status: "drafted",
+            draft,
+            error: null,
+            last_step: { step: "draft", status: "ok" },
+            updated_at: envelope.ts,
+          },
+        },
+      };
+    }
+    case "ship_step": {
+      const { task_id, step, status, detail } = envelope.payload as ShipStepPayload;
+      const existing: ShipState = state.ships[task_id] ?? {
+        status: "drafting",
+        mode: "squash",
+        draft: null,
+        commit_sha: null,
+        pr_url: null,
+        error: null,
+        updated_at: envelope.ts,
+        last_step: null,
+      };
+      let nextStatus = existing.status;
+      if (status === "failed" && existing.status !== "shipped") {
+        nextStatus = "error";
+      } else if (step === "draft") {
+        if (status === "started") nextStatus = "drafting";
+        else if (existing.draft !== null) nextStatus = "drafted";
+      } else if (step === "commit") {
+        nextStatus = "committing";
+      } else if (step === "push" || step === "pr") {
+        nextStatus = "pushing";
+      }
+      const lastStep = {
+        step,
+        status,
+        ...(detail === undefined ? {} : { detail }),
+      };
+      return {
+        ...state,
+        ships: {
+          ...state.ships,
+          [task_id]: {
+            ...existing,
+            status: nextStatus,
+            error:
+              status === "failed"
+                ? typeof detail === "string"
+                  ? detail
+                  : "Ship step failed"
+                : status === "started"
+                  ? null
+                  : existing.error,
+            last_step: lastStep,
             updated_at: envelope.ts,
           },
         },

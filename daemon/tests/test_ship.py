@@ -22,13 +22,18 @@ from ompire_daemon.registry.tasks import (
     create_task,
     get_task,
     mark_archived,
+    mark_pr_url,
 )
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import (
     NoLiveAgentError,
+    SessionNotIdleError,
+    ShipAlreadyPublishedError,
     ShipDraft,
     ShipError,
+    ShipInProgressError,
     ShipManager,
+    ShipState,
     _find_pr_url,
     _parse_draft,
     parse_github_owner,
@@ -918,13 +923,31 @@ def test_find_pr_url():
 class FakeAgentHandle:
     returncode = None
 
-    def __init__(self, draft_text: str):
+    def __init__(
+        self,
+        draft_text: str | None,
+        *,
+        prompt_started: asyncio.Event | None = None,
+        prompt_release: asyncio.Event | None = None,
+        request_error: Exception | None = None,
+    ):
         self._draft = draft_text
+        self._prompt_started = prompt_started
+        self._prompt_release = prompt_release
+        self._request_error = request_error
+        self.prompt_count = 0
 
     async def prompt(self, message: str) -> dict:
+        self.prompt_count += 1
+        if self._prompt_started is not None:
+            self._prompt_started.set()
+        if self._prompt_release is not None:
+            await self._prompt_release.wait()
         return {"ok": True}
 
     async def request(self, request_type: str, **fields) -> dict:
+        if self._request_error is not None:
+            raise self._request_error
         if request_type == "get_last_assistant_text":
             # Live omp wraps the text: {"success": true, "data": {"text": ...}}
             # (same shape advisories.py reads). A bare string here once masked
@@ -933,8 +956,27 @@ class FakeAgentHandle:
         return {}
 
 
-async def test_draft_via_agent_publishes_draft(
-    tmp_root, engine, ships, agents, hub, monkeypatch
+def _mark_session_idle(sessions: SessionTracker, task_id: int) -> None:
+    sessions.recovering(task_id, "main")
+    sessions.session_recovered(task_id, "main")
+
+
+async def _fire_idle(hub: EventHub, task_id: int) -> None:
+    await asyncio.sleep(0.01)
+    hub.publish(
+        "status_changed",
+        {
+            "task_id": task_id,
+            "session": "main",
+            "from": "working",
+            "to": "idle",
+            "reason": "test",
+        },
+    )
+
+
+async def test_draft_via_agent_publishes_lifecycle(
+    tmp_root, engine, ships, agents, sessions, hub
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
     draft_text = textwrap.dedent(
@@ -949,38 +991,36 @@ async def test_draft_via_agent_publishes_draft(
         PR body
         """
     )
-    agents._handles[(task.id, "main")] = FakeAgentHandle(draft_text)
-
+    handle = FakeAgentHandle(draft_text)
+    agents._handles[(task.id, "main")] = handle
+    _mark_session_idle(sessions, task.id)
     queue = hub.subscribe()
 
-    async def _next_event_of(type_name: str):
-        while True:
-            event = await asyncio.wait_for(queue.get(), timeout=1.0)
-            if event.type == type_name:
-                return event
-
-    async def fire_idle():
-        await asyncio.sleep(0.05)
-        hub.publish(
-            "status_changed",
-            {
-                "task_id": task.id,
-                "session": "main",
-                "from": "working",
-                "to": "idle",
-                "reason": "test",
-            },
-        )
-
-    asyncio.create_task(fire_idle())
+    asyncio.create_task(_fire_idle(hub, task.id))
     state = await ships.draft(task)
 
+    events = []
+    while len(events) < 3:
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        if event.type in {"ship_step", "ship_draft"}:
+            events.append(event)
     hub.unsubscribe(queue)
-    assert state.status == "drafted"
-    assert state.draft.commit_message == "Commit msg"
 
-    event = await _next_event_of("ship_draft")
-    assert event.payload["draft"]["pr_title"] == "PR title"
+    assert state.status == "drafted"
+    assert state.draft is not None
+    assert state.draft.commit_message == "Commit msg"
+    assert state.last_step is not None
+    assert (state.last_step.step, state.last_step.status) == ("draft", "ok")
+    assert handle.prompt_count == 1
+    assert [
+        (event.type, event.payload.get("status"))
+        for event in events
+    ] == [
+        ("ship_step", "started"),
+        ("ship_draft", None),
+        ("ship_step", "ok"),
+    ]
+    assert events[1].payload["draft"]["pr_title"] == "PR title"
 
 
 async def test_draft_without_live_agent_raises(
@@ -989,6 +1029,202 @@ async def test_draft_without_live_agent_raises(
     _project, task = _make_project_and_task(engine, tmp_root)
     with pytest.raises(NoLiveAgentError):
         await ships.draft(task)
+
+async def test_draft_requires_idle_primary_session(
+    tmp_root, engine, ships, agents, sessions
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    handle = FakeAgentHandle("unused")
+    agents._handles[(task.id, "main")] = handle
+    sessions.recovering(task.id, "main")
+
+    with pytest.raises(SessionNotIdleError, match="not idle"):
+        await ships.draft(task)
+    assert handle.prompt_count == 0
+
+
+async def test_concurrent_ensure_coalesces_and_replace_conflicts(
+    tmp_root, engine, ships, agents, sessions, hub
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    handle = FakeAgentHandle(
+        textwrap.dedent(
+            """\
+            <<<COMMIT_MESSAGE>>>
+            Commit msg
+            <<<PR_TITLE>>>
+            PR title
+            <<<PR_BODY>>>
+            PR body
+            """
+        ),
+        prompt_started=started,
+        prompt_release=release,
+    )
+    agents._handles[(task.id, "main")] = handle
+    _mark_session_idle(sessions, task.id)
+
+    first = asyncio.create_task(ships.draft(task))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    duplicate = await ships.draft(task)
+    assert duplicate.status == "drafting"
+    with pytest.raises(ShipInProgressError):
+        await ships.draft(task, replace=True)
+    assert handle.prompt_count == 1
+
+    release.set()
+    asyncio.create_task(_fire_idle(hub, task.id))
+    completed = await asyncio.wait_for(first, timeout=1.0)
+    assert completed.status == "drafted"
+    assert handle.prompt_count == 1
+
+
+async def test_existing_draft_is_idempotent_and_explicitly_replaceable(
+    tmp_root, engine, ships, agents, sessions, hub
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    first_text = textwrap.dedent(
+        """\
+        <<<COMMIT_MESSAGE>>>
+        First
+        <<<PR_TITLE>>>
+        First title
+        <<<PR_BODY>>>
+        First body
+        """
+    )
+    handle = FakeAgentHandle(first_text)
+    agents._handles[(task.id, "main")] = handle
+    _mark_session_idle(sessions, task.id)
+
+    asyncio.create_task(_fire_idle(hub, task.id))
+    first = await ships.draft(task)
+    assert (await ships.draft(task)) is first
+    assert handle.prompt_count == 1
+
+    handle._draft = first_text.replace("First", "Second")
+    asyncio.create_task(_fire_idle(hub, task.id))
+    replaced = await ships.draft(task, replace=True)
+    assert replaced.draft is not None
+    assert replaced.draft.commit_message == "Second"
+    assert handle.prompt_count == 2
+
+
+async def test_failed_replacement_preserves_previous_draft_and_is_retryable(
+    tmp_root, engine, ships, agents, sessions, hub
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    handle = FakeAgentHandle(
+        "<<<COMMIT_MESSAGE>>>\nFirst\n<<<PR_TITLE>>>\nTitle\n<<<PR_BODY>>>\nBody"
+    )
+    agents._handles[(task.id, "main")] = handle
+    _mark_session_idle(sessions, task.id)
+
+    asyncio.create_task(_fire_idle(hub, task.id))
+    original = await ships.draft(task)
+    assert original.draft is not None
+
+    handle._draft = "missing markers"
+    asyncio.create_task(_fire_idle(hub, task.id))
+    failed = await ships.draft(task, replace=True)
+    assert failed.status == "error"
+    assert failed.draft is original.draft
+    assert failed.last_step is not None
+    assert failed.last_step.step == "draft"
+    assert failed.last_step.status == "failed"
+    assert "parse draft markers" in (failed.error or "")
+
+    handle._draft = (
+        "<<<COMMIT_MESSAGE>>>\nRetry\n<<<PR_TITLE>>>\nRetry title\n"
+        "<<<PR_BODY>>>\nRetry body"
+    )
+    asyncio.create_task(_fire_idle(hub, task.id))
+    retried = await ships.draft(task, replace=True)
+    assert retried.status == "drafted"
+    assert retried.error is None
+    assert retried.draft is not None
+    assert retried.draft.commit_message == "Retry"
+
+
+@pytest.mark.parametrize(
+    ("draft_text", "request_error", "expected"),
+    [
+        (None, None, "did not return text"),
+        ("missing markers", None, "could not parse draft markers"),
+        (None, RuntimeError("rpc broke"), "agent request failed: rpc broke"),
+    ],
+)
+async def test_draft_failures_publish_retryable_error(
+    tmp_root,
+    engine,
+    ships,
+    agents,
+    sessions,
+    hub,
+    draft_text,
+    request_error,
+    expected,
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    handle = FakeAgentHandle(draft_text, request_error=request_error)
+    agents._handles[(task.id, "main")] = handle
+    _mark_session_idle(sessions, task.id)
+    queue = hub.subscribe()
+
+    asyncio.create_task(_fire_idle(hub, task.id))
+    state = await ships.draft(task)
+
+    failed = None
+    while failed is None:
+        event = await asyncio.wait_for(queue.get(), timeout=1.0)
+        if event.type == "ship_step" and event.payload.get("status") == "failed":
+            failed = event
+    hub.unsubscribe(queue)
+    assert state.status == "error"
+    assert expected in (state.error or "")
+    assert expected in failed.payload["detail"]
+    assert ships.snapshot()[task.id]["last_step"]["step"] == "draft"
+
+
+async def test_draft_timeout_publishes_retryable_error(
+    tmp_root, engine, ships, agents, sessions, hub, monkeypatch
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    agents._handles[(task.id, "main")] = FakeAgentHandle("unused")
+    _mark_session_idle(sessions, task.id)
+
+    async def timeout(*args, **kwargs):
+        raise TimeoutError
+
+    monkeypatch.setattr("ompire_daemon.ship.wait_for_idle", timeout)
+    state = await ships.draft(task)
+    assert state.status == "error"
+    assert state.error == "timed out waiting for agent draft"
+    assert state.last_step is not None
+    assert state.last_step.status == "failed"
+
+
+@pytest.mark.parametrize("published", ["archived", "pr", "shipped"])
+async def test_explicit_draft_refuses_published_tasks(
+    tmp_root, engine, ships, agents, sessions, published
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    handle = FakeAgentHandle("unused")
+    agents._handles[(task.id, "main")] = handle
+    _mark_session_idle(sessions, task.id)
+    if published == "archived":
+        task = mark_archived(engine, task.id)
+    elif published == "pr":
+        task = mark_pr_url(engine, task.id, "https://github.com/owner/repo/pull/1")
+    else:
+        ships._ships[task.id] = ShipState(status="shipped")
+
+    with pytest.raises(ShipAlreadyPublishedError):
+        await ships.draft(task, replace=True)
+    assert handle.prompt_count == 0
 
 
 # --- REST guards ----------------------------------------------------------
@@ -1000,6 +1236,35 @@ def test_draft_route_409_without_live_agent(client, auth_header, engine, tmp_roo
         f"/api/tasks/{task.id}/ship/draft", headers=auth_header
     )
     assert response.status_code == 409
+
+def test_draft_route_keeps_bodyless_ensure_and_explicit_replace(
+    client, auth_header, engine, tmp_root, app, monkeypatch
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    replacements: list[bool] = []
+    state = ShipState(
+        status="drafted",
+        draft=ShipDraft("Commit", "Title", "Body"),
+    )
+
+    async def draft(_task, *, replace: bool = False):
+        replacements.append(replace)
+        return state
+
+    monkeypatch.setattr(app.state.ships, "draft", draft)
+
+    ensured = client.post(
+        f"/api/tasks/{task.id}/ship/draft", headers=auth_header
+    )
+    replaced = client.post(
+        f"/api/tasks/{task.id}/ship/draft",
+        headers=auth_header,
+        json={"replace": True},
+    )
+
+    assert ensured.status_code == 200
+    assert replaced.status_code == 200
+    assert replacements == [False, True]
 
 
 def test_commit_route_409_gpg_locked(client, auth_header, engine, tmp_root, app, monkeypatch):

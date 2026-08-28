@@ -3,11 +3,13 @@
 ## Overview
 
 Shipping turns a task's work into a signed commit, a pushed branch, and a pull
-request. The agent drafts the text; the daemon does everything else with
-host-side credentials the agent never sees.
+request. The primary agent can draft the publication text; the daemon does
+everything else with host-side credentials the agent never sees.
 
 The flow has four steps — Review, Commit, Push + PR, Cleanup — surfaced as a
-stepper in the Ship Flow view.
+stepper in the Ship Flow view. Opening a task-specific Ship flow prepares an
+eligible agent draft automatically; it never signs, pushes, or creates a pull
+request without the operator's explicit action.
 
 ## Ship flow index
 
@@ -43,18 +45,44 @@ it has no qualifying task after a snapshot, it links back to Tasks.
 
 ### 1. Draft
 
-`POST /api/tasks/{id}/ship/draft` asks the task's **primary session** to draft
-a commit message and a pull-request title and body. The agent has full task
-context, which is exactly what makes it good at this and nothing else in the
-flow.
+After its initial daemon snapshot, `/ship/<task-id>` automatically starts one
+draft when the task has no ship state, is neither archived nor already attached
+to a pull request, its primary session is both live and `idle`, and review is
+either approved or absent. Review approval is the normal handoff. The
+no-review case preserves the explicit Ship flow path for legacy tasks.
 
-The draft is recorded and broadcast as `ship_draft`, prefilling editable
-fields.
+The Commit step shows **Drafting…** immediately. Its commit-message,
+pull-request-title, and pull-request-body fields remain editable while the
+agent works. A value the operator changes while that request is running is not
+replaced by the arriving draft; untouched fields are seeded independently.
+Signing and another draft request remain unavailable until the request is
+terminal.
 
-Drafting is best-effort. If the reply cannot be obtained or parsed, the ship
-state is recorded `error` with a reason and the operator supplies the fields
-by hand. The draft turn drives the primary session `idle → working → idle`
-through normal frame handling, with no bespoke transition.
+When the primary session is working, reviewing, starting, retrying, or waiting,
+the step says that drafting is waiting for it to become idle. When no live
+primary agent is available, the step says so and keeps all three fields usable
+for manual text. A review record that is present but not approved prevents only
+the automatic trigger; it does not erase the manual fields or change the
+ordinary command guards.
+
+`POST /api/tasks/{id}/ship/draft` is an idempotent **ensure draft** command.
+It asks the task's primary session for a commit message and pull-request title
+and body only when no ship attempt exists; repeated bodyless requests return
+the existing draft or current attempt without another agent turn. Send
+`{"replace": true}` to explicitly regenerate an existing draft or retry a
+terminal draft error. Replacement is refused while any draft, commit, or push
+is in flight.
+
+The daemon broadcasts a parsed successful draft as `ship_draft`, prefilling
+editable fields. It also publishes draft lifecycle through `ship_step`; see
+[Interfaces](#interfaces). The draft turn drives the primary session
+`idle → working → idle` through normal frame handling, with no bespoke
+transition.
+
+Drafting is best-effort. A transport error, timeout, missing agent text, or
+invalid markers leaves the fields intact, records a retryable Draft-stage
+error, and does not retry automatically. Correct the fields manually or use
+the explicit retry action once the session is again eligible.
 
 ### 2. Commit
 
@@ -110,8 +138,12 @@ Ship commit is refused, before any Git operation runs, when:
 | Retain with a dirty working tree | `409` naming the dirty tree |
 | Retain over a range containing a merge commit | `409`; merges are unsupported |
 
-Draft is refused with `409` when the primary session has no live agent, and
-`404` for an unknown task.
+Draft is refused with `404` for an unknown task. A new or explicit replacement
+draft receives `409` when the task is archived, has a pull request, has already
+shipped, has a draft/ship operation in flight, has no live primary agent, or
+that session is not `idle`. A bodyless request that observes an existing draft,
+draft error, or in-flight attempt returns it unchanged; `{"replace": true}` is
+the explicit retry or regeneration path.
 
 ### Failure restores exactly
 
@@ -134,11 +166,17 @@ The stepper renders live:
 **Review** shows the review status, a `reopen 127.0.0.1:<port>` link while a
 review is open, and the per-iteration history.
 
-**Commit** shows commit-mode radios with Squash as default, editable message
-and pull-request fields prefilled from the draft, a "Re-draft via agent"
-control, and "Sign & commit". When the shared GPG state is `locked` it renders
-an amber blocked banner with the terminal-helper unlock instruction and a
-"Re-check key" control, and disables Sign & commit.
+**Commit** starts an eligible initial draft automatically after the snapshot.
+It shows **Drafting…** while that request is active, then shows commit-mode
+radios with Squash as default, editable message and pull-request fields, a
+**Re-draft via agent** control, and **Sign & commit**. Fields remain editable
+while drafting; an arriving draft only fills fields the operator has not edited
+since the request began. Re-drafting asks for confirmation only if it would
+replace edited values, and preserves changes made after confirmation while the
+replacement is running. A failed draft shows its captured reason and an
+explicit retry alongside usable manual fields. When the shared GPG state is
+`locked` it renders an amber blocked banner with the terminal-helper unlock
+instruction and a **Re-check key** control, and disables **Sign & commit**.
 
 **Push + PR** reflects progress from `ship_step` events and shows the
 resulting pull-request link.
@@ -163,17 +201,25 @@ links to both Ship flow and Tasks, rather than a transient false 404.
 
 | Method | Path |
 |---|---|
-| `POST` | `/api/tasks/{id}/ship/draft` |
+| `POST` | `/api/tasks/{id}/ship/draft` — body omitted or `{"replace": false}` ensures one initial draft; `{"replace": true}` explicitly regenerates or retries |
 | `POST` | `/api/tasks/{id}/ship/commit` |
 
 | Event | Payload |
 |---|---|
-| `ship_draft` | `{task_id, draft}` |
-| `ship_step` | `{task_id, step, status, detail}` for commit, push, and pr |
+| `ship_step` | `{task_id, step, status, detail?}`; `step` is `draft`, `commit`, `push`, or `pr`, and `status` is `started`, `ok`, or `failed` |
+| `ship_draft` | `{task_id, draft}` after a parsed successful draft |
 | `ship_finished` | `{task_id, status, pr_url}` — `shipped` or `error` |
 
-The snapshot carries a `ships` map from task id to the current status, mode,
-draft, commit sha, pull-request URL, and error.
+A draft begins with `ship_step` `draft`/`started`. Success publishes
+`ship_draft`, then `draft`/`ok`; failure publishes `draft`/`failed` with its
+reason. The snapshot carries a `ships` map from task id to the current status,
+mode, draft, commit sha, pull-request URL, error, and latest transient
+`last_step`, so a reconnect can render the same retry stage even if it missed a
+delta. REST responses and deltas can arrive in either order; clients render the
+daemon state rather than treating a response as the source of form values.
 
-Ship state other than the persisted `pr_url` is held in memory and discarded
-when the task is cleaned up or purged.
+Ship state other than the persisted `pr_url` is held in memory and is lost on a
+daemon restart as well as when the task is cleaned up or purged. A durable
+approved review can make a newly opened Ship flow request a fresh draft after a
+restart; no commit, push, or pull request is repeated automatically.
+

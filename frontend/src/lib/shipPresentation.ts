@@ -66,8 +66,9 @@ function stageFor(task: Task, review: ReviewState | undefined, ship: ShipState |
   if (ship?.status === "drafting") return "draft";
 
   if (ship?.status === "error") {
-    if (ship.lastStep?.step === "push" || ship.lastStep?.step === "pr") return "push-pr";
-    if (ship.lastStep?.step === "commit") return "sign";
+    if (ship.last_step?.step === "push" || ship.last_step?.step === "pr") return "push-pr";
+    if (ship.last_step?.step === "commit") return "sign";
+    if (ship.last_step?.step === "draft") return "draft";
     return review?.status === "approved" ? "draft" : "review";
   }
 

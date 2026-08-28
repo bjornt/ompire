@@ -124,9 +124,9 @@ export function cancelReview(id: number): Promise<ReviewState> {
   return request<ReviewState>("POST", `/api/tasks/${id}/review/cancel`);
 }
 
-/** Draft a commit message + PR title/body via the live agent (ship capability). */
-export function draftShip(id: number): Promise<ShipState> {
-  return request<ShipState>("POST", `/api/tasks/${id}/ship/draft`);
+/** Ensure or explicitly replace commit/PR metadata through the live agent. */
+export function draftShip(id: number, options?: { replace: boolean }): Promise<ShipState> {
+  return request<ShipState>("POST", `/api/tasks/${id}/ship/draft`, options);
 }
 
 /** Run the signed squash commit → push → PR flow (ship capability). */

@@ -320,6 +320,16 @@ export interface ShipDraft {
 
 export type ShipStatus = "drafting" | "drafted" | "committing" | "pushing" | "shipped" | "error";
 
+export type ShipStepName = "draft" | "fetch" | "commit" | "push" | "pr";
+export type ShipStepStatus = "started" | "ok" | "failed";
+export type ShipStepDetail = string | { sha: string; count: number };
+
+export interface ShipStepState {
+  step: ShipStepName;
+  status: ShipStepStatus;
+  detail?: ShipStepDetail | null;
+}
+
 export interface ShipState {
   status: ShipStatus;
   mode?: "squash" | "retain";
@@ -328,22 +338,17 @@ export interface ShipState {
   pr_url: string | null;
   error: string | null;
   updated_at: string;
-  /** Augmented by the reducer from ship_step events for UI progress. */
-  lastStep?: { step: ShipStepName; status: "ok" | "failed"; detail?: string } | null;
+  /** Latest daemon-owned transient step, included in snapshots and deltas. */
+  last_step?: ShipStepState | null;
 }
-
-export type ShipStepName = "fetch" | "commit" | "push" | "pr";
 
 export interface ShipDraftPayload {
   task_id: number;
   draft: ShipDraft;
 }
 
-export interface ShipStepPayload {
+export interface ShipStepPayload extends ShipStepState {
   task_id: number;
-  step: ShipStepName;
-  status: "ok" | "failed";
-  detail?: string;
 }
 
 export interface ShipFinishedPayload {

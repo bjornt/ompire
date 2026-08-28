@@ -132,7 +132,7 @@ describe("ship presentation", () => {
         status: "error",
         commit_sha: "abc123",
         error: "push/PR failed: forbidden",
-        lastStep: { step: "pr", status: "failed", detail: "forbidden" },
+        last_step: { step: "pr", status: "failed", detail: "forbidden" },
       }),
     );
 
@@ -142,6 +142,29 @@ describe("ship presentation", () => {
       error: "push/PR failed: forbidden",
     });
     expect(presentation.detail).toContain("Retry Push / PR");
+  });
+
+  it("keeps a no-review draft failure at the Draft retry stage", () => {
+    const presentation = presentShipFlow(
+      task(),
+      undefined,
+      ship({
+        status: "error",
+        draft: null,
+        error: "could not parse draft markers",
+        last_step: {
+          step: "draft",
+          status: "failed",
+          detail: "could not parse draft markers",
+        },
+      }),
+    );
+
+    expect(presentation).toMatchObject({
+      stage: "draft",
+      activity: "error",
+      error: "could not parse draft markers",
+    });
   });
 
   it("uses a pull request over lower ship milestones", () => {

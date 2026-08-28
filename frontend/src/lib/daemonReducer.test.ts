@@ -725,6 +725,46 @@ describe("applyEnvelope ship/gpg events", () => {
     expect(state.ships[1]).toMatchObject({ status: "drafted", draft, updated_at: "t1" });
   });
 
+  it("upserts draft lifecycle from ship_step and clears errors on success", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 1,
+      ts: "t1",
+      type: "ship_step",
+      payload: { task_id: 1, step: "draft", status: "started" },
+    });
+    expect(state.ships[1]).toMatchObject({
+      status: "drafting",
+      draft: null,
+      error: null,
+      last_step: { step: "draft", status: "started" },
+    });
+
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "t2",
+      type: "ship_step",
+      payload: { task_id: 1, step: "draft", status: "failed", detail: "bad markers" },
+    });
+    expect(state.ships[1]).toMatchObject({
+      status: "error",
+      error: "bad markers",
+      last_step: { step: "draft", status: "failed", detail: "bad markers" },
+    });
+
+    state = applyEnvelope(state, {
+      seq: 3,
+      ts: "t3",
+      type: "ship_draft",
+      payload: { task_id: 1, draft },
+    });
+    expect(state.ships[1]).toMatchObject({
+      status: "drafted",
+      draft,
+      error: null,
+      last_step: { step: "draft", status: "ok" },
+    });
+  });
+
   it("tracks step progress and failure on ship_step", () => {
     let state = applyEnvelope(initialDaemonState, {
       seq: 0,
@@ -752,7 +792,7 @@ describe("applyEnvelope ship/gpg events", () => {
       payload: { task_id: 1, step: "push", status: "ok" },
     });
     expect(state.ships[1].status).toBe("pushing");
-    expect(state.ships[1].lastStep).toEqual({ step: "push", status: "ok" });
+    expect(state.ships[1].last_step).toEqual({ step: "push", status: "ok" });
 
     state = applyEnvelope(state, {
       seq: 2,

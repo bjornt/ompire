@@ -76,12 +76,15 @@ All paths are under `/api/tasks/{id}/sessions/{session}/agent`.
 | `POST` | `/api/tasks/{id}/workflow/resume` | Resume a workflow stopped at a gate |
 | `POST` | `/api/tasks/{id}/review` | Open a review |
 | `POST` | `/api/tasks/{id}/review/cancel` | Cancel and restore the clone |
-| `POST` | `/api/tasks/{id}/ship/draft` | Have the agent draft commit and PR text. Requires a live agent |
+| `POST` | `/api/tasks/{id}/ship/draft` | Ensure one initial agent draft, or explicitly replace it with `{"replace": true}`. A new/replacement request requires a live, `idle` primary agent; an ordinary repeated request returns observed ship state without a second agent turn. |
 | `POST` | `/api/tasks/{id}/ship/commit` | Sign, commit, push, open the PR |
 
-`ship/commit` returns `409` when the GPG key is not `cached`, a ship is
-already in flight, the mode is not `squash` or `retain`, or `retain`
-preconditions are unmet.
+`ship/draft` returns `404` for an unknown task and `409` for an unavailable or
+non-idle primary agent, an archived or already-published task, or an explicit
+replacement while a ship attempt is active. See [Ship flow](ship-flow.md) for
+draft lifecycle and field behavior. `ship/commit` returns `409` when the GPG
+key is not `cached`, a ship is already in flight, the mode is not `squash` or
+`retain`, or `retain` preconditions are unmet.
 
 ## Daemon
 
