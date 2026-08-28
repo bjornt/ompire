@@ -1,11 +1,16 @@
+/* The authoring form is the panel being worked; the pipeline panel is blank
+ * until a task is submitted and has a bounded amount to say afterwards. So the
+ * form takes the flexible track and the pipeline panel a capped one — a plain
+ * fr ratio would hand the extra width on a wide monitor back to the panel that
+ * does not need it. Collapse before the form is squeezed, not after. */
 .spawnGrid {
   display: grid;
-  grid-template-columns: minmax(380px, 1fr) minmax(340px, 460px);
+  grid-template-columns: minmax(420px, 1fr) minmax(280px, 360px);
   gap: 20px;
   align-items: start;
 }
 
-@media (max-width: 860px) {
+@media (max-width: 900px) {
   .spawnGrid {
     grid-template-columns: 1fr;
   }
@@ -58,13 +63,17 @@
   padding: 3px 0;
 }
 
+/* Wrap on the form's own width rather than the viewport's: the form is wider
+ * in one column at 900px than in two columns at 901px, so a viewport media
+ * query would stack this pair exactly where there is most room for it. */
 .overrideGrid {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
 }
 
 .overrideGrid .field {
-  flex: 1;
+  flex: 1 1 240px;
   min-width: 0;
 }
 

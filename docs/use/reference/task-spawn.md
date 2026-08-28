@@ -44,9 +44,18 @@ task; the button reads `Creating…` until the daemon accepts the request, then
 `Launching…` while the pipeline runs. The locked fields keep the submitted
 values, so the request stays readable while the workspace is built.
 
-The panel beside the form reads `Creating the task…` until the daemon accepts
-the request, then renders per-step pipeline progress. A failed step expands its
+The pipeline panel reads `Creating the task…` until the daemon accepts the
+request, then renders per-step pipeline progress. A failed step expands its
 stderr or error text in place — there is no separate failure screen.
+
+The authoring form is the wider of the two panels wherever they sit side by
+side, and the pipeline panel is capped: it has four steps and an optional
+stderr block to show, so extra width on a large monitor goes to the prompt
+rather than to the panel that is blank until something is submitted. Long
+paths in a captured error wrap inside the panel instead of widening it. Below
+roughly 900px the view becomes one column — the form spans the full width with
+the pipeline panel beneath it — and the paired model and thinking overrides
+stack whenever the form is too narrow to give both a usable width.
 
 When the daemon records spawn completion, Ompire opens the task's detail view
 at `/tasks/<task-id>`, replacing the Spawn view in browser history. It does not
