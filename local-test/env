@@ -339,8 +339,11 @@ EOF
 
 	# ---- 8. register project + template --------------------------------------
 	local payload
+	# Explicit adopt mode: registration validates the checkout it is given
+	# (ADR-0022), and the harness just created a real one.
 	payload=$(jq -n --arg n "$NAME" --arg t "$SLUG" --arg u "$SSH_URL" --arg c "$CHECKOUT" \
-		'{name: $n, title: $t, upstream_url: $u, checkout_path: $c}')
+		'{name: $n, title: $t, upstream_url: $u, checkout_path: $c,
+		  checkout_mode: "adopt", fetch_remote: "origin"}')
 	if ! api_daemon POST /api/projects "$payload" >/dev/null 2>&1; then
 		local existing got
 		existing=$(api_daemon GET "/api/projects/$NAME" 2>/dev/null || true)

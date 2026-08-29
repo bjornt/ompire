@@ -42,6 +42,7 @@ class MockWebSocket {
     ships?: unknown;
     gpg?: unknown;
     gh?: unknown;
+    settings?: unknown;
   }) {
     this.onopen?.();
     this.emit("snapshot", payload);
@@ -54,6 +55,10 @@ const project = {
   upstream_url: "https://example.com/maas.git",
   fork_url: null,
   checkout_path: "/home/op/proj/maas",
+  checkout_mode: "adopted",
+  fetch_remote: "origin",
+  setup_state: "ready",
+  setup_error: null,
 };
 
 const githubProject = { ...project, upstream_url: "https://github.com/ompire/maas.git" };
@@ -142,6 +147,7 @@ async function renderAt(
     ships?: unknown;
     gpg?: unknown;
     gh?: unknown;
+    settings?: unknown;
   },
 ) {
   window.history.pushState({}, "", path);
@@ -3397,6 +3403,10 @@ describe("ProjectsView (projects-view capability)", () => {
     upstream_url: "git@github.com:bjornt/llmvet.git",
     fork_url: null,
     checkout_path: "/home/op/proj/llmvet",
+    checkout_mode: "adopted" as const,
+    fetch_remote: "origin",
+    setup_state: "ready",
+    setup_error: null,
   };
 
   it("renders one card per project with fork-less annotation and active-task pills", async () => {
@@ -3455,14 +3465,23 @@ describe("ProjectsView (projects-view capability)", () => {
           title: "LLM-assisted patch review CLI",
           upstream_url: "git@github.com:bjornt/llmvet.git",
           fork_url: null,
+          // Adoption is the default mode; the empty path derives from the
+          // effective checkout root (ADR-0022).
+          checkout_mode: "adopt",
+          checkout_path: null,
+          fetch_remote: "origin",
         }),
       }),
     );
 
-    // The response is reconciled into daemon state, so the card is present and
-    // the form has closed — no `project_created` frame has arrived yet.
+    // The response is reconciled into daemon state, so the card is present
+    // without waiting for anything — no `project_created` frame has arrived yet.
     expect(screen.getByTestId("project-card-llmvet")).toBeInTheDocument();
-    expect(screen.queryByTestId("new-project-form")).not.toBeInTheDocument();
+    // The form closes as an effect of that card reaching daemon state, which
+    // is one render later; the contract is that it never closes *before*.
+    await waitFor(() =>
+      expect(screen.queryByTestId("new-project-form")).not.toBeInTheDocument(),
+    );
 
     // The delayed event for the same project must not duplicate the card.
     act(() => {
@@ -3663,6 +3682,7 @@ describe("ProjectsView (projects-view capability)", () => {
           upstream_url: project.upstream_url,
           fork_url: null,
           checkout_path: project.checkout_path,
+          fetch_remote: project.fetch_remote,
           new_name: "maas-ng",
         }),
       }),
@@ -4241,5 +4261,302 @@ describe("SpawnView file mentions", () => {
 
     expect(prompt).toBeDisabled();
     expect(screen.queryByTestId("mention-popup")).not.toBeInTheDocument();
+  });
+});
+
+describe("project checkout onboarding (ADR-0022)", () => {
+  const adopted = {
+    name: "maas",
+    title: "MAAS",
+    upstream_url: "https://example.com/maas.git",
+    fork_url: null,
+    checkout_path: "/home/op/proj/maas",
+    checkout_mode: "adopted" as const,
+    fetch_remote: "origin",
+    setup_state: "ready" as const,
+    setup_error: null,
+  };
+  const cloning = {
+    ...adopted,
+    name: "fresh",
+    checkout_path: "/home/op/proj/fresh",
+    checkout_mode: "cloned" as const,
+    setup_state: "cloning" as const,
+  };
+  const failed = {
+    ...cloning,
+    setup_state: "failed" as const,
+    setup_error: "step 'clone' failed:\nfatal: repository not found",
+  };
+
+  it("shows an adopted project's checkout, mode, and fetch remote", async () => {
+    await renderAt("/projects", { projects: [adopted], tasks: [] });
+
+    const meta = screen.getByTestId("checkout-path-maas");
+    expect(meta).toHaveTextContent("/home/op/proj/maas");
+    expect(meta).toHaveTextContent("your checkout");
+    expect(meta).toHaveTextContent("fetches origin");
+    expect(screen.getByTestId("setup-state-maas")).toHaveTextContent("ready");
+  });
+
+  it("renders live clone progress and then the ready card, from state alone", async () => {
+    await renderAt("/projects", { projects: [cloning], tasks: [] });
+
+    expect(screen.getByTestId("setup-state-fresh")).toHaveTextContent("cloning");
+    act(() => {
+      socket().emit("project_setup_step", {
+        project: "fresh",
+        step: "clone",
+        status: "started",
+      });
+    });
+    expect(screen.getByTestId("setup-fresh")).toHaveTextContent("Cloning — clone…");
+
+    act(() => {
+      socket().emit("project_updated", { ...cloning, setup_state: "ready" });
+    });
+    expect(screen.getByTestId("setup-state-fresh")).toHaveTextContent("ready");
+    expect(screen.queryByTestId("setup-fresh")).not.toBeInTheDocument();
+  });
+
+  it("renders a cloning project correctly on reconnect with no step events", async () => {
+    await renderAt("/projects", { projects: [cloning], tasks: [] });
+
+    // No `project_setup_step` has ever arrived; the durable row is enough.
+    expect(screen.getByTestId("setup-fresh")).toHaveTextContent("Cloning…");
+  });
+
+  it("shows a failed clone's stderr and offers a retry", async () => {
+    await renderAt("/projects", { projects: [failed], tasks: [] });
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ ...failed, setup_state: "cloning", setup_error: null }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    expect(screen.getByTestId("setup-error-fresh")).toHaveTextContent(
+      "fatal: repository not found",
+    );
+
+    await user.click(screen.getByTestId("retry-setup-fresh"));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/projects/fresh/setup/retry",
+      expect.objectContaining({ method: "POST" }),
+    );
+    // The daemon's own answer is reconciled, so the card moves without an event.
+    expect(screen.getByTestId("setup-state-fresh")).toHaveTextContent("cloning");
+  });
+
+  it("offers removal from the failed card, and says the checkout survives", async () => {
+    await renderAt("/projects", { projects: [failed], tasks: [] });
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ deleted: "fresh" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    await user.click(screen.getByTestId("remove-failed-fresh"));
+
+    expect(confirm.mock.calls[0][0]).toContain("/home/op/proj/fresh");
+    expect(confirm.mock.calls[0][0]).toContain("stays on disk");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/projects/fresh",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByTestId("project-card-fresh")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("backing out of the removal confirmation changes nothing", async () => {
+    await renderAt("/projects", { projects: [failed], tasks: [] });
+    const user = userEvent.setup();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+
+    await user.click(screen.getByTestId("remove-failed-fresh"));
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId("project-card-fresh")).toBeInTheDocument();
+  });
+
+  it("sends clone mode with no checkout path and previews the destination", async () => {
+    await renderAt("/projects", {
+      projects: [],
+      tasks: [],
+      settings: { checkout_root: "/home/op/src" },
+    });
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve(cloning),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await user.click(screen.getByTestId("new-project-toggle"));
+    await user.type(screen.getByTestId("new-project-name"), "fresh");
+    await user.type(screen.getByTestId("new-project-title"), "Fresh");
+    await user.type(screen.getByTestId("new-project-upstream"), "https://example.com/fresh.git");
+    await user.click(screen.getByTestId("new-project-mode-clone"));
+
+    expect(screen.getByTestId("new-project-clone-preview")).toHaveTextContent(
+      "/home/op/src/fresh",
+    );
+
+    await user.click(screen.getByTestId("new-project-submit"));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/projects",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          name: "fresh",
+          title: "Fresh",
+          upstream_url: "https://example.com/fresh.git",
+          fork_url: null,
+          checkout_mode: "clone",
+        }),
+      }),
+    );
+  });
+
+  it("offers the detected remotes for confirmation without applying them silently", async () => {
+    await renderAt("/projects", { projects: [], tasks: [] });
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            ok: true,
+            reason: "",
+            detail: "",
+            remotes: [
+              { name: "origin", url: "git@github.com:me/repo.git" },
+              { name: "upstream", url: "https://github.com/org/repo.git" },
+            ],
+            suggested_upstream: "https://github.com/org/repo.git",
+            suggested_fork: "git@github.com:me/repo.git",
+          }),
+      }),
+    );
+
+    await user.click(screen.getByTestId("new-project-toggle"));
+    await user.type(screen.getByTestId("new-project-checkout-path"), "/home/op/proj/repo");
+    await user.tab();
+
+    expect(await screen.findByTestId("new-project-inspection")).toHaveTextContent(
+      "remotes: origin, upstream",
+    );
+    expect(screen.getByTestId("new-project-upstream")).toHaveValue(
+      "https://github.com/org/repo.git",
+    );
+    expect(screen.getByTestId("new-project-fork")).toHaveValue("git@github.com:me/repo.git");
+  });
+
+  it("explains a rejected checkout inline while the operator is typing", async () => {
+    await renderAt("/projects", { projects: [], tasks: [] });
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            ok: false,
+            reason: "missing",
+            detail: "checkout path does not exist: /nope",
+            remotes: [],
+            suggested_upstream: null,
+            suggested_fork: null,
+          }),
+      }),
+    );
+
+    await user.click(screen.getByTestId("new-project-toggle"));
+    await user.type(screen.getByTestId("new-project-checkout-path"), "/nope");
+    await user.tab();
+
+    expect(await screen.findByTestId("new-project-inspection")).toHaveTextContent(
+      "does not exist",
+    );
+    expect(screen.getByTestId("new-project-upstream")).toHaveValue("");
+  });
+
+  it("locks a cloned project's checkout path in the edit panel", async () => {
+    await renderAt("/projects", {
+      projects: [{ ...cloning, setup_state: "ready" }],
+      tasks: [],
+    });
+    const user = userEvent.setup();
+
+    await user.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+
+    expect(screen.getByTestId("edit-checkout-fresh")).toBeDisabled();
+    expect(screen.getByTestId("checkout-note-fresh")).toBeInTheDocument();
+  });
+
+  it("refuses to spawn against a project whose checkout is not ready", async () => {
+    await renderAt("/spawn", {
+      projects: [cloning],
+      templates: [
+        {
+          name: "fresh",
+          project_name: "fresh",
+          base_branch: "main",
+          branch_pattern: "ompire/<slug>",
+          workflow: "single-step",
+          workshop_additions: "project",
+          model: null,
+          thinking: null,
+          preamble: "",
+        },
+      ],
+      tasks: [],
+    });
+    const user = userEvent.setup();
+
+    await user.type(screen.getByLabelText("Task slug"), "fix-it");
+
+    expect(screen.getByTestId("project-not-ready")).toHaveTextContent("cloning");
+    expect(screen.getByRole("button", { name: "Spawn task" })).toBeDisabled();
+  });
+});
+
+describe("project create form mode switching (ADR-0022)", () => {
+  it("drops a stale checkout inspection when the mode changes", async () => {
+    await renderAt("/projects", { projects: [], tasks: [] });
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            ok: false,
+            reason: "missing",
+            detail: "checkout path does not exist: /nope",
+            remotes: [],
+            suggested_upstream: null,
+            suggested_fork: null,
+          }),
+      }),
+    );
+
+    await user.click(screen.getByTestId("new-project-toggle"));
+    await user.type(screen.getByTestId("new-project-checkout-path"), "/nope");
+    await user.tab();
+    expect(await screen.findByTestId("new-project-inspection")).toBeInTheDocument();
+
+    // Clone mode does not use that path, so the message must not survive.
+    await user.click(screen.getByTestId("new-project-mode-clone"));
+
+    expect(screen.queryByTestId("new-project-inspection")).not.toBeInTheDocument();
   });
 });

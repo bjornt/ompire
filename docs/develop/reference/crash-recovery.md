@@ -62,6 +62,20 @@ never sees a task in a state the daemon is about to correct.
 | Resume attempted, agent cannot be started | That session becomes `failed` with a resume-failure reason |
 | Already `failed` or `archived` | Left untouched |
 
+Project setup is reconciled in the same pass, and for the same reason
+([ADR-0022](../../adr/0022-create-or-adopt-base-checkouts-without-mutating-them.md)).
+Every project left `cloning` is resolved against the filesystem:
+
+| Condition | Result |
+|---|---|
+| A valid checkout with the expected fetch remote is at the destination | `ready` — the clone finished before the daemon stopped |
+| Anything else | `failed`, "interrupted by daemon restart"; the staging tree is removed |
+
+The clone is never restarted automatically; retry is the operator's decision.
+This is possible because the setup job builds the clone at a staging sibling
+and moves it onto the destination with one rename, so the destination is
+either absent or complete — there is no partial tree to classify.
+
 ### Graceful shutdown
 
 On shutdown the daemon terminates each live agent child with a signal that

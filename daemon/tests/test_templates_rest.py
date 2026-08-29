@@ -9,8 +9,12 @@ from fastapi.testclient import TestClient
 
 from ompire_daemon.registry.tasks import create_task, mark_archived
 
+from .conftest import make_adoptable_checkout
+
 
 def _create_project(client: TestClient, auth_headers: dict[str, str], name: str = "demo") -> dict:
+    # Registration adopts and validates the checkout (ADR-0022).
+    make_adoptable_checkout(client.app.state.config.checkout_root, name)
     response = client.post(
         "/api/projects",
         headers=auth_headers,

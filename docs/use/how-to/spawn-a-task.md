@@ -11,7 +11,7 @@ the task in `failed` with the step name and its stderr attached.
 
 | Step | Action |
 |---|---|
-| `fetch` | `git fetch origin` in the project's checkout, so the clone starts from current refs |
+| `fetch` | `git fetch` the project's [fetch remote](../reference/projects.md#fetch-remote) in its checkout, so the clone starts from current refs |
 | `clone` | Local clone of the checkout into `task_dir_root/<project>/<slug>` |
 | `branch` | Branch off `origin/<base>` using the template's branch pattern |
 | `workshop` | Launch the task's container and confirm it registered |

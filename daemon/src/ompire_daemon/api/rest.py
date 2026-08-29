@@ -32,6 +32,14 @@ from ompire_daemon.gpg import (
     gpg_signing_refusal,
 )
 from ompire_daemon.notifications import AttentionNotifier
+from ompire_daemon.projectcheckout import (
+    InvalidRemoteNameError,
+    InvalidRepoUrlError,
+    inspect_checkout,
+    inspection_message,
+    validate_remote_name,
+    validate_repo_url,
+)
 from ompire_daemon.projectfiles import (
     DEFAULT_LIMIT as FILE_SEARCH_DEFAULT_LIMIT,
 )
@@ -43,11 +51,20 @@ from ompire_daemon.projectfiles import (
     search_project_files,
     validate_mentions,
 )
+from ompire_daemon.projectsetup import (
+    CLONE_FETCH_REMOTE,
+    DestinationExistsError,
+    ProjectSetupManager,
+    clone_target,
+)
 from ompire_daemon.registry.projects import (
+    DEFAULT_FETCH_REMOTE,
     DuplicateProjectError,
     Project,
     ProjectHasReferencingTasksError,
     ProjectNotFoundError,
+    ProjectNotReadyError,
+    ProjectSetupBusyError,
     create_project,
     delete_project,
     get_project,
@@ -55,7 +72,11 @@ from ompire_daemon.registry.projects import (
     update_project,
     validate_slug,
 )
-from ompire_daemon.registry.settings import SettingsStore, SettingsValidationError
+from ompire_daemon.registry.settings import (
+    SettingsStore,
+    SettingsValidationError,
+    effective_checkout_root,
+)
 from ompire_daemon.registry.tasks import (
     ClonePathOutsideRootError,
     DuplicateTaskError,
@@ -108,16 +129,30 @@ router = APIRouter(prefix="/api", dependencies=[Depends(require_bearer_token)])
 
 
 class ProjectCreate(BaseModel):
+    """`checkout_mode` defaults to `adopt`, which is what every registration
+    before ADR-0022 meant: the operator supplies (or derives) a checkout that
+    already exists. `clone` derives the destination from the effective
+    checkout root and refuses a `checkout_path` of its own."""
+
     name: str
     title: str
     upstream_url: str
     fork_url: str | None = None
     checkout_path: str | None = None
+    checkout_mode: str = "adopt"
+    fetch_remote: str = DEFAULT_FETCH_REMOTE
 
     @field_validator("name")
     @classmethod
     def _validate_name(cls, value: str) -> str:
         validate_slug(value)
+        return value
+
+    @field_validator("checkout_mode")
+    @classmethod
+    def _validate_mode(cls, value: str) -> str:
+        if value not in ("adopt", "clone"):
+            raise ValueError("checkout_mode must be 'adopt' or 'clone'")
         return value
 
 
@@ -126,6 +161,7 @@ class ProjectUpdate(BaseModel):
     upstream_url: str
     fork_url: str | None = None
     checkout_path: str
+    fetch_remote: str = DEFAULT_FETCH_REMOTE
     new_name: str | None = None
 
     @field_validator("new_name")
@@ -136,12 +172,38 @@ class ProjectUpdate(BaseModel):
         return value
 
 
+class CheckoutInspectIn(BaseModel):
+    checkout_path: str
+    fetch_remote: str = DEFAULT_FETCH_REMOTE
+
+
+class RemoteOut(BaseModel):
+    name: str
+    url: str
+
+
+class CheckoutInspectOut(BaseModel):
+    """What a read-only look at a candidate checkout found. Remote names and
+    URLs only — never file contents, and nothing is written to the path."""
+
+    ok: bool
+    reason: str
+    detail: str
+    remotes: list[RemoteOut]
+    suggested_upstream: str | None = None
+    suggested_fork: str | None = None
+
+
 class ProjectOut(BaseModel):
     name: str
     title: str
     upstream_url: str
     fork_url: str | None
     checkout_path: str
+    checkout_mode: str
+    fetch_remote: str
+    setup_state: str
+    setup_error: str | None
 
     model_config = {"from_attributes": True}
 
@@ -212,6 +274,47 @@ def _gh(request: Request) -> GitHubProbe:
     return request.app.state.gh
 
 
+def _project_setup(request: Request) -> ProjectSetupManager:
+    return request.app.state.project_setup
+
+
+def _require_ready_project(engine: Engine, name: str) -> Project:
+    """Resolve a project that a task may actually use.
+
+    A project whose checkout is still being created, or whose creation failed,
+    has no usable clone source; letting a task start against it only defers
+    the failure to the spawn pipeline's first git command (ADR-0022).
+    """
+    try:
+        project = get_project(engine, name)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    _refuse_unready(project)
+    return project
+
+
+def _refuse_unready(project: Project) -> None:
+    if project.setup_state != "ready":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            str(ProjectNotReadyError(project.name, project.setup_state)),
+        )
+
+
+def _refuse_unready_named(engine: Engine, name: str) -> None:
+    """Readiness guard for template routes.
+
+    An *unknown* project is deliberately left to the template registry, whose
+    `UnknownTemplateProjectError` is already a 422; only an existing but
+    unusable project is refused here.
+    """
+    try:
+        project = get_project(engine, name)
+    except ProjectNotFoundError:
+        return
+    _refuse_unready(project)
+
+
 def _apply_settings_live(
     settings: dict[str, Any],
     events: EventHub,
@@ -244,29 +347,160 @@ def list_projects_route(engine: Engine = Depends(_engine)) -> list[Project]:
     return list_projects(engine)
 
 
+def _validated_urls(body: ProjectCreate | ProjectUpdate) -> tuple[str, str | None]:
+    """Upstream and fork, refused before they can become `git` argv."""
+    try:
+        upstream = validate_repo_url("upstream_url", body.upstream_url)
+        fork = (
+            validate_repo_url("fork_url", body.fork_url)
+            if body.fork_url and body.fork_url.strip()
+            else None
+        )
+    except InvalidRepoUrlError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)
+        ) from exc
+    return upstream, fork
+
+
+def _validated_remote(name: str) -> str:
+    try:
+        return validate_remote_name(name)
+    except InvalidRemoteNameError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)
+        ) from exc
+
+
+async def _require_usable_checkout(
+    checkout_path: str, fetch_remote: str, timeout: int
+) -> None:
+    """Refuse an adopted checkout Ompire cannot clone a task workspace from.
+
+    Read-only: this only looks (ADR-0022).
+    """
+    inspection = await inspect_checkout(
+        checkout_path, fetch_remote=fetch_remote, timeout=timeout
+    )
+    if not inspection.ok:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            inspection_message(inspection, fetch_remote),
+        )
+
+
+@router.post("/projects/checkout-inspect", response_model=CheckoutInspectOut)
+async def inspect_checkout_route(
+    body: CheckoutInspectIn,
+    config: Config = Depends(_config),
+) -> CheckoutInspectOut:
+    """Look at a candidate checkout so the create form can prefill and explain.
+
+    Answers for an unregistered path, reads only remote names and URLs, and
+    writes nothing. A refusal is a successful response describing why, not an
+    error — the operator is still typing.
+    """
+    fetch_remote = _validated_remote(body.fetch_remote)
+    inspection = await inspect_checkout(
+        body.checkout_path,
+        fetch_remote=fetch_remote,
+        timeout=config.spawn_step_timeout,
+    )
+    return CheckoutInspectOut(
+        ok=inspection.ok,
+        reason=inspection.reason,
+        detail=inspection_message(inspection, fetch_remote),
+        remotes=[RemoteOut(name=r.name, url=r.url) for r in inspection.remotes],
+        suggested_upstream=inspection.suggested_upstream,
+        suggested_fork=inspection.suggested_fork,
+    )
+
+
 @router.post(
     "/projects", response_model=ProjectOut, status_code=status.HTTP_201_CREATED
 )
-def create_project_route(
+async def create_project_route(
     body: ProjectCreate,
     engine: Engine = Depends(_engine),
     config: Config = Depends(_config),
     events: EventHub = Depends(_events),
+    settings: SettingsStore = Depends(_settings),
+    setup: ProjectSetupManager = Depends(_project_setup),
 ) -> Project:
+    """Register a project, adopting an existing checkout or creating one.
+
+    Adoption is answered here: validation is a handful of local git reads, so
+    the operator gets ready-or-why in the response. Clone mode returns a
+    `cloning` project immediately and continues in the background.
+    """
+    upstream_url, fork_url = _validated_urls(body)
+    if body.checkout_mode == "clone":
+        if body.checkout_path:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "checkout_path cannot be supplied in clone mode; the "
+                "destination is derived from the effective checkout root",
+            )
+        # Derived, never supplied — that is what bounds the one place Ompire
+        # creates a repository outside its task root (ADR-0022/0023).
+        target = clone_target(
+            effective_checkout_root(settings.effective()), body.name
+        )
+        if target.destination.exists():
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, str(DestinationExistsError(target.destination))
+            )
+        checkout_path: str | None = str(target.destination)
+        fetch_remote = CLONE_FETCH_REMOTE
+        checkout_mode, setup_state = "cloned", "cloning"
+    else:
+        fetch_remote = _validated_remote(body.fetch_remote)
+        checkout_path = body.checkout_path or str(
+            effective_checkout_root(settings.effective()) / body.name
+        )
+        await _require_usable_checkout(
+            checkout_path, fetch_remote, config.spawn_step_timeout
+        )
+        checkout_mode, setup_state = "adopted", "ready"
+
     try:
         project = create_project(
             engine,
             name=body.name,
             title=body.title,
-            upstream_url=body.upstream_url,
-            fork_url=body.fork_url,
-            checkout_path=body.checkout_path,
+            upstream_url=upstream_url,
+            fork_url=fork_url,
+            checkout_path=checkout_path,
             default_checkout_root=config.checkout_root,
+            checkout_mode=checkout_mode,
+            fetch_remote=fetch_remote,
+            setup_state=setup_state,
         )
     except DuplicateProjectError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     events.publish("project_created", asdict(project))
+    if project.setup_state == "cloning":
+        setup.start(project)
     return project
+
+
+@router.post(
+    "/projects/{name}/setup/retry",
+    response_model=ProjectOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_project_setup_route(
+    name: str,
+    setup: ProjectSetupManager = Depends(_project_setup),
+) -> Project:
+    # Must be async: `retry` schedules the clone job on the running loop, and
+    # a sync route would run in FastAPI's threadpool where there is none.
+    try:
+        return setup.retry(name)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
 
 @router.get("/projects/{name}", response_model=ProjectOut)
@@ -318,20 +552,49 @@ async def search_project_files_route(
 
 
 @router.put("/projects/{name}", response_model=ProjectOut)
-def update_project_route(
+async def update_project_route(
     name: str,
     body: ProjectUpdate,
     engine: Engine = Depends(_engine),
+    config: Config = Depends(_config),
     events: EventHub = Depends(_events),
 ) -> Project:
+    upstream_url, fork_url = _validated_urls(body)
+    fetch_remote = _validated_remote(body.fetch_remote)
+    try:
+        current = get_project(engine, name)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    if current.setup_state == "cloning":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, str(ProjectSetupBusyError(name))
+        )
+    # The checkout mode is fixed at registration: a cloned project's checkout
+    # is Ompire's own derived path, and repointing it would silently orphan
+    # what was created (ADR-0022).
+    if current.checkout_mode == "cloned" and body.checkout_path != current.checkout_path:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"project {name!r} uses a checkout Ompire created; its path cannot "
+            "be changed",
+        )
+    checkout_changed = (
+        body.checkout_path != current.checkout_path
+        or fetch_remote != current.fetch_remote
+    )
+    if current.setup_state == "ready" and checkout_changed:
+        await _require_usable_checkout(
+            body.checkout_path, fetch_remote, config.spawn_step_timeout
+        )
     try:
         project = update_project(
             engine,
             name,
             title=body.title,
-            upstream_url=body.upstream_url,
-            fork_url=body.fork_url,
+            upstream_url=upstream_url,
+            fork_url=fork_url,
             checkout_path=body.checkout_path,
+            fetch_remote=fetch_remote,
             new_name=body.new_name,
         )
     except ProjectNotFoundError as exc:
@@ -360,6 +623,8 @@ def delete_project_route(
         delete_project(engine, name)
     except ProjectNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except ProjectSetupBusyError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except ProjectHasReferencingTasksError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     events.publish("project_deleted", {"name": name})
@@ -440,6 +705,7 @@ def create_template_route(
     config: Config = Depends(_config),
     events: EventHub = Depends(_events),
 ) -> Template:
+    _refuse_unready_named(engine, body.project_name)
     try:
         template = create_template(
             engine,
@@ -481,6 +747,7 @@ def update_template_route(
     engine: Engine = Depends(_engine),
     events: EventHub = Depends(_events),
 ) -> Template:
+    _refuse_unready_named(engine, body.project_name)
     try:
         template = update_template(
             engine,
@@ -600,7 +867,7 @@ async def spawn_task_route(
         template = get_template(engine, body.template_name)
     except TemplateNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    project = get_project(engine, template.project_name)
+    project = _require_ready_project(engine, template.project_name)
 
     # Mentions are validated before anything is created: Omp drops one it
     # cannot resolve without a word (findings-omp-file-mentions.md), so a
@@ -1263,10 +1530,15 @@ async def update_settings_route(
     try:
         result = settings_store.update(body)
     except SettingsValidationError as exc:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            f"{exc.key}: {exc.message}",
-        ) from exc
+        # Every validator already names its key; prefixing unconditionally
+        # produced "checkout_root: checkout_root must be…", which the
+        # Settings panel now shows to the operator verbatim.
+        detail = (
+            exc.message
+            if exc.message.startswith(f"{exc.key}:") or exc.message.startswith(exc.key)
+            else f"{exc.key}: {exc.message}"
+        )
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail) from exc
     _apply_settings_live(result.settings, events, notifications, advisories, sessions)
     if "gpg_signing_key" in body:
         await gpg.probe()

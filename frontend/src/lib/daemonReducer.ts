@@ -17,6 +17,7 @@ import type {
   QuestionResolvedPayload,
   ReviewFinishedPayload,
   ReviewIterationPayload,
+  ProjectSetupStep,
   ReviewStartedPayload,
   ReviewState,
   SessionInfo,
@@ -52,6 +53,10 @@ export interface DaemonState {
    * `spawn_step` events, never part of the snapshot — a reconnect drops it,
    * and the persisted task state is authoritative from then on. */
   spawnProgress: Record<number, SpawnStepPayload[]>;
+  /** Transient clone-mode project setup progress, keyed by project name. Fed
+   * by `project_setup_step`, never part of the snapshot: the project's own
+   * `setup_state`/`setup_error` is what a reconnecting client renders. */
+  projectSetupProgress: Record<string, ProjectSetupStep[]>;
   /** Live session statuses per task id, then per session name
    * (workflow-engine design D-7): loaded from the snapshot, upserted by the
    * session-carrying `status_changed`, dropped with the task. */
@@ -96,6 +101,7 @@ export const initialDaemonState: DaemonState = {
   templates: [],
   tasks: [],
   spawnProgress: {},
+  projectSetupProgress: {},
   sessions: {},
   workflows: {},
   attention: {},
@@ -186,6 +192,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         templates: payload.templates ?? [],
         tasks: payload.tasks,
         spawnProgress: {},
+        projectSetupProgress: {},
         sessions,
         workflows,
         attention,
@@ -217,7 +224,12 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
     }
     case "project_deleted": {
       const { name } = envelope.payload as { name: string };
-      return { ...state, projects: state.projects.filter((p) => p.name !== name) };
+      const { [name]: _dropped, ...projectSetupProgress } = state.projectSetupProgress;
+      return {
+        ...state,
+        projects: state.projects.filter((p) => p.name !== name),
+        projectSetupProgress,
+      };
     }
     case "template_created": {
       const template = envelope.payload as Template;
@@ -267,6 +279,17 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         advisories,
         reviews,
         ships,
+      };
+    }
+    case "project_setup_step": {
+      const step = envelope.payload as ProjectSetupStep;
+      const existing = state.projectSetupProgress[step.project] ?? [];
+      return {
+        ...state,
+        projectSetupProgress: {
+          ...state.projectSetupProgress,
+          [step.project]: [...existing, step],
+        },
       };
     }
     case "spawn_step": {

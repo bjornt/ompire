@@ -790,6 +790,9 @@ def test_workflow_resume_endpoint_404_and_409(
     )
     assert response.status_code == 404
 
+    from .conftest import make_adoptable_checkout
+
+    checkout = make_adoptable_checkout(client.app.state.config.checkout_root, "demo")
     r = client.post(
         "/api/projects",
         headers=auth_headers,
@@ -797,7 +800,7 @@ def test_workflow_resume_endpoint_404_and_409(
             "name": "demo",
             "title": "Demo",
             "upstream_url": "https://example.com/demo.git",
-            "checkout_path": "/tmp/nonexistent",
+            "checkout_path": str(checkout),
         },
     )
     assert r.status_code == 201, r.text

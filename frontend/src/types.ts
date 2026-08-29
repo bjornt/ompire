@@ -1,9 +1,37 @@
+/** `checkout_mode` says who owns the base checkout: `adopted` is the
+ * operator's own, `cloned` was created by Ompire (ADR-0022). `fetch_remote` is
+ * the remote spawn fetches in *that* checkout — unrelated to the per-task
+ * clone's `origin`. */
 export interface Project {
   name: string;
   title: string;
   upstream_url: string;
   fork_url: string | null;
   checkout_path: string;
+  checkout_mode: "adopted" | "cloned";
+  fetch_remote: string;
+  setup_state: "ready" | "cloning" | "failed";
+  setup_error: string | null;
+}
+
+/** Read-only look at a candidate checkout, used by the create form to
+ * prefill and to explain a refusal before submission. */
+export interface CheckoutInspection {
+  ok: boolean;
+  reason: string;
+  detail: string;
+  remotes: { name: string; url: string }[];
+  suggested_upstream: string | null;
+  suggested_fork: string | null;
+}
+
+/** Live progress of a clone-mode project's setup. Ephemeral: the durable
+ * outcome is the project's own `setup_state`/`setup_error`. */
+export interface ProjectSetupStep {
+  project: string;
+  step: string;
+  status: "started" | "ok" | "failed";
+  stderr?: string;
 }
 
 /** Repository-relative paths for the Spawn prompt's `@` mentions. Names

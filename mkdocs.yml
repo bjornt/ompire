@@ -134,3 +134,6 @@ nav:
           - 0018 Python workflows for now: adr/0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md
           - 0019 Documentation by audience: adr/0019-split-documentation-by-audience-using-diataxis.md
           - 0020 Portable Markdown: adr/0020-author-documentation-as-portable-markdown.md
+          - 0021 Signing-key selection as a setting: adr/0021-admit-signing-key-selection-as-bounded-daemon-writable-setting.md
+          - 0022 Adopt or clone base checkouts: adr/0022-create-or-adopt-base-checkouts-without-mutating-them.md
+          - 0023 Checkout root as a setting: adr/0023-admit-checkout-root-as-bounded-daemon-writable-setting.md

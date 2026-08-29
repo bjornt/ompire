@@ -20,7 +20,7 @@ that are also editable at runtime (marked below).
 |---|---|---|---|
 | `data_dir` | string | `$SNAP_USER_DATA`, else `$XDG_DATA_HOME/ompire` | Holds the database, the bearer token, and the audit log. |
 | `task_dir_root` | string | `~/tasks` | Task clones live under `<root>/<project>/<slug>`. Cleanup refuses paths outside this root. |
-| `checkout_root` | string | `~/proj` | Default parent for a project's `checkout_path`. |
+| `checkout_root` | string | `~/proj` | Parent directory a project's `checkout_path` is derived from. A registry override takes precedence — see [Daemon settings](daemon-settings.md#the-recognized-settings). |
 
 Paths are expanded, so `~` works.
 
@@ -30,6 +30,7 @@ Paths are expanded, so `~` works.
 |---|---|---|---|
 | `default_branch_pattern` | string | `"ompire/<slug>"` | Used when a template does not override it. |
 | `spawn_step_timeout` | integer (s) | `120` | Applies to the Git steps. |
+| `project_clone_timeout` | integer (s) | `900` | Bounds "clone it for me" [project setup](projects.md#checkout-modes), which pulls a whole repository over the network. |
 | `workshop_step_timeout` | integer (s) | `600` | Much larger than the Git timeout because container launch includes SDK installation. |
 | `my_workshop_command` | list of strings | `["my-workshop"]` | Must be non-empty. |
 

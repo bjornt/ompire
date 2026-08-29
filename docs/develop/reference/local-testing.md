@@ -97,7 +97,12 @@ sandboxed inside a state root, with a state `bin` directory placing every fake
 on its `PATH` — which is the whole substitution mechanism.
 
 The forge-backed project is registered through the REST API, not by writing
-rows, so registration itself is exercised.
+rows, so registration itself is exercised — including the adoption validation
+that now runs there
+([ADR-0022](../../adr/0022-create-or-adopt-base-checkouts-without-mutating-them.md)).
+The harness registers in explicit adopt mode against the checkout it just
+created; the `project-onboarding` scenario covers clone mode, its failure and
+retry paths, and restart reconciliation.
 
 Smoke checks gate the bring-up: a failed check stops the environment rather
 than handing over one that is subtly broken.

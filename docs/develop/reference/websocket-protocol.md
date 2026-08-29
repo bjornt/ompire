@@ -118,6 +118,7 @@ Published on the dashboard channel:
 | `project_created`, `project_updated`, `project_renamed`, `project_deleted` | Project mutations |
 | `template_created`, `template_updated`, `template_deleted` | Template mutations |
 | `task_created`, `task_updated`, `task_deleted` | Task mutations |
+| `project_setup_step` | A clone-mode project setup step starts, succeeds, or fails |
 | `spawn_step` | A spawn step starts, succeeds, or fails |
 | `workflow_step` | A workflow step transitions |
 | `status_changed` | A session's status transitions |
@@ -130,6 +131,12 @@ Published on the dashboard channel:
 | `gpg_status` | The signing-key probe result changes |
 | `gh_status` | A completed GitHub identity or target probe replaced the full safe `gh` projection |
 | `settings_changed` | Effective settings change |
+
+`project_setup_step` carries the project name, the step (`prepare`, `clone`,
+`fork-remote`, `finalize`), and a `status` of `started`, `ok`, or `failed`,
+with git's stderr on failure. It is transient and never part of the snapshot:
+the durable outcome is the project's own `setup_state`/`setup_error`, which
+are broadcast as `project_updated` and are what a reconnecting client renders.
 
 `spawn_step` and `ship_step` payloads carry `status` — `started`, `ok`, or
 `failed` — and a failure carries the relevant detail. Ship-step `detail` is a

@@ -31,12 +31,12 @@ tool-enforced structure. It also explains the shape of this documentation.
 | Process and topology | 0002, 0003 |
 | Client protocol | 0004 |
 | State and durability | 0005, 0016 |
-| Isolation and credentials | 0006, 0015 |
+| Isolation and credentials | 0006, 0015, 0022 |
 | Agent integration | 0007 |
 | Work model | 0008, 0009, 0010, 0018 |
 | Review and publishing | 0011, 0017 |
 | Attention | 0012 |
-| Settings | 0013, 0021 |
+| Settings | 0013, 0021, 0023 |
 | Testing | 0014 |
 | Process and documentation | 0001, 0019, 0020 |
 

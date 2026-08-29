@@ -11,14 +11,16 @@ registry `settings` table as JSON-encoded scalar values.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 from sqlalchemy import CursorResult, Engine, text
 from sqlalchemy.orm import Session
 
-from ompire_daemon.config import Config
+from ompire_daemon.config import DEFAULT_CHECKOUT_ROOT, Config
 from ompire_daemon.db import settings as settings_table
 from ompire_daemon.gpg import FINGERPRINT_RE
 
@@ -60,6 +62,12 @@ _DEFAULTS: dict[str, Any] = {
     # bounded to a full fingerprint here and to a key the host keyring already
     # holds at the REST boundary, so it can never name a key off this host.
     "gpg_signing_key": None,
+    # ADR-0023: the parent directory clone-mode project setup creates
+    # checkouts under. Unlike the signing key this always has a value, so the
+    # effective map never makes a client guess what "unset" resolves to. The
+    # default layer is `Config.checkout_root`, which already *is* "config.toml
+    # value or built-in default" — see `_default_value`.
+    "checkout_root": str(DEFAULT_CHECKOUT_ROOT),
 }
 
 # Keys that may be seeded from config.toml and the Config attribute that
@@ -69,11 +77,12 @@ _CONFIG_KEYS: dict[str, str] = {
     "stall_threshold": "stall_threshold",
     "context_advisory_threshold": "context_advisory_threshold",
     "gpg_signing_key": "gpg_signing_key",
+    "checkout_root": "checkout_root",
 }
 
 
 
-def _validate(key: str, value: Any) -> Any:
+def _validate(key: str, value: Any, config: Config) -> Any:
     """Return a normalized valid value or raise `SettingsValidationError`."""
     if key not in _DEFAULTS:
         raise SettingsValidationError(key, f"unknown setting: {key}")
@@ -120,6 +129,9 @@ def _validate(key: str, value: Any) -> Any:
             )
         return value
 
+    if key == "checkout_root":
+        return _validate_checkout_root(value, config.task_dir_root)
+
     if key == "gpg_signing_key":
         # Only a full fingerprint identifies exactly one key. Key IDs and
         # user-ID substrings stay a config.toml convenience; a stored
@@ -135,7 +147,52 @@ def _validate(key: str, value: Any) -> Any:
     raise SettingsValidationError(key, f"{key} has no validator")
 
 
+def _validate_checkout_root(value: Any, task_dir_root: Path) -> str:
+    """Bound the one filesystem path the UI may set (ADR-0023).
+
+    Absolute after `~` expansion, no traversal, and disjoint from the daemon's
+    task root — a base checkout that lived inside the task root would sit
+    where task cleanup deletes.
+    """
+    key = "checkout_root"
+    if not isinstance(value, str) or not value.strip():
+        raise SettingsValidationError(key, f"{key} must be a non-empty path, got {value!r}")
+    raw = value.strip()
+    if ".." in Path(raw).parts:
+        raise SettingsValidationError(key, f"{key} must not contain '..', got {raw!r}")
+    expanded = Path(raw).expanduser()
+    if not expanded.is_absolute():
+        raise SettingsValidationError(
+            key, f"{key} must be an absolute path, got {raw!r}"
+        )
+    resolved = Path(os.path.normpath(str(expanded)))
+    task_root = Path(os.path.normpath(str(Path(task_dir_root).expanduser())))
+    if resolved == task_root or task_root in resolved.parents:
+        raise SettingsValidationError(
+            key,
+            f"{key} must not be inside the task root {task_root} — task "
+            "cleanup deletes there",
+        )
+    if resolved == Path(resolved.anchor):
+        raise SettingsValidationError(
+            key, f"{key} must not be the filesystem root, got {raw!r}"
+        )
+    return str(resolved)
+
+
 def _default_for(key: str) -> Any:
+    return _DEFAULTS[key]
+
+
+def _default_value(config: Config, key: str) -> Any:
+    """The bottom layer for `key`.
+
+    `checkout_root` is the one key whose built-in default is already resolved
+    on `Config`: startup turns the operator's value or the product default
+    into one path, and both the daemon and this store must agree on it.
+    """
+    if key == "checkout_root":
+        return str(config.checkout_root)
     return _DEFAULTS[key]
 
 
@@ -155,7 +212,7 @@ def _resolve_key(config: Config, key: str, override: Any | None) -> tuple[Any, s
     config_value = _config_value(config, key)
     if config_value is not None:
         return config_value, "config"
-    return _default_for(key), "default"
+    return _default_value(config, key), "default"
 
 
 def _json_load(value: str) -> Any:
@@ -208,7 +265,7 @@ class SettingsStore:
         """
         validated: dict[str, Any] = {}
         for key, value in changes.items():
-            validated[key] = _validate(key, value)
+            validated[key] = _validate(key, value, self._config)
         return validated
 
     def update(self, changes: Mapping[str, Any]) -> Settings:
@@ -240,6 +297,18 @@ class SettingsStore:
             )
             session.commit()
             return result.rowcount > 0
+
+
+def effective_checkout_root(settings: Mapping[str, Any]) -> Path:
+    """The parent directory a clone-mode project's checkout is created under.
+
+    Expanded here rather than at write time so a `~`-relative value from
+    `config.toml` keeps meaning "this operator's home".
+    """
+    value = settings.get("checkout_root")
+    if not isinstance(value, str) or not value.strip():
+        return DEFAULT_CHECKOUT_ROOT
+    return Path(value.strip()).expanduser()
 
 
 def get_settings(engine: Engine, config: Config) -> Settings:

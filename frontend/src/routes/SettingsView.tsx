@@ -204,6 +204,68 @@ function WatchdogInputs({
   );
 }
 
+function CheckoutRootPanel({
+  settings,
+  provenance,
+  onCommit,
+  onReset,
+}: {
+  settings: DaemonSettings;
+  provenance: Provenance;
+  onCommit: (value: string) => Promise<string | null>;
+  onReset: () => Promise<string | null>;
+}) {
+  const stored = typeof settings.checkout_root === "string" ? settings.checkout_root : "";
+  const [value, setValue] = useState(stored);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setValue(stored);
+    setError(null);
+  }, [stored]);
+
+  const overridden = provenance.checkout_root === "override";
+
+  return (
+    <label className="formField">
+      <span className="fieldLabel">
+        Checkout root{" "}
+        <span className="fieldHint">where "clone it for me" puts a new checkout</span>
+        <OverrideTag provenance={provenance} settingKey="checkout_root" testId="checkout-root" />
+      </span>
+      <input
+        className="mono"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={async () => {
+          const next = value.trim();
+          if (next === stored || next === "") return;
+          setError(await onCommit(next));
+        }}
+        data-testid="checkout-root"
+      />
+      <span className="fieldHint">
+        Applies to the next project you clone. Existing checkouts are never moved.
+      </span>
+      {overridden && (
+        <button
+          type="button"
+          className="ghostButton"
+          onClick={async () => setError(await onReset())}
+          data-testid="checkout-root-reset"
+        >
+          Reset to default
+        </button>
+      )}
+      {error && (
+        <span className="submitError" role="alert" data-testid="checkout-root-error">
+          {error}
+        </span>
+      )}
+    </label>
+  );
+}
+
 function maskToken(token: string): string {
   if (token.length <= 8) return token;
   const prefix = token.startsWith("ompire_tok_") ? "ompire_tok_" : "";
@@ -671,9 +733,13 @@ function TemplateEditor({
             {projects.length === 0 ? (
               <option value="">no projects registered</option>
             ) : (
+              // A project whose checkout is still being created, or whose
+              // creation failed, has no clone source; offering it would only
+              // defer the failure to the first spawn (ADR-0022).
               projects.map((p) => (
-                <option key={p.name} value={p.name}>
+                <option key={p.name} value={p.name} disabled={p.setup_state !== "ready"}>
                   {p.name}
+                  {p.setup_state === "ready" ? "" : ` — ${p.setup_state}`}
                 </option>
               ))
             )}
@@ -681,6 +747,12 @@ function TemplateEditor({
           {pickedProject && (
             <span className="derivedNote" data-testid="template-project-derived">
               checkout {pickedProject.checkout_path} · remote {pickedProject.upstream_url}
+            </span>
+          )}
+          {pickedProject && pickedProject.setup_state !== "ready" && (
+            <span className="submitError" data-testid="template-project-not-ready">
+              {pickedProject.name}&apos;s checkout is {pickedProject.setup_state}. Finish or
+              retry its setup on the Projects view first.
             </span>
           )}
         </label>
@@ -848,6 +920,28 @@ export function SettingsView() {
     }
   }
 
+  /** A free-text setting needs its refusal shown: unlike a toggle, the
+   * operator cannot see from the control that the value was rejected. */
+  async function putTextSetting(key: string, value: string): Promise<string | null> {
+    try {
+      const res = await updateSettings({ [key]: value });
+      setProvenance(res.provenance ?? {});
+      return null;
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  async function clearSetting(key: string): Promise<string | null> {
+    try {
+      await deleteSetting(key);
+      setProvenance((await getSettings()).provenance ?? {});
+      return null;
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+  }
+
   const renotify =
     typeof settings.renotify_interval === "number" ? settings.renotify_interval : 300;
 
@@ -948,6 +1042,16 @@ export function SettingsView() {
           <section className="panel" data-testid="watchdogs-panel">
             <h2 className="panelTitle">Watchdogs &amp; thresholds</h2>
             <WatchdogInputs settings={settings} provenance={provenance} onChange={putSetting} />
+          </section>
+
+          <section className="panel" data-testid="checkout-root-panel">
+            <h2 className="panelTitle">Checkout root</h2>
+            <CheckoutRootPanel
+              settings={settings}
+              provenance={provenance}
+              onCommit={(value) => putTextSetting("checkout_root", value)}
+              onReset={() => clearSetting("checkout_root")}
+            />
           </section>
 
           <section className="panel" data-testid="daemon-panel">

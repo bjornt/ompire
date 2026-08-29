@@ -17,6 +17,16 @@ The rationale is in
 | `upstream_url` | string | Pull requests target this |
 | `fork_url` | string, nullable | Push target when set |
 | `checkout_path` | string | Local checkout Ompire clones from |
+| `checkout_mode` | string | `adopted` (the operator's) or `cloned` (created by Ompire) |
+| `fetch_remote` | string | Remote to fetch **in that checkout**; default `origin` |
+| `setup_state` | string | `ready`, `cloning`, or `failed` |
+| `setup_error` | text, nullable | Failing step and git stderr |
+
+The four onboarding columns arrived with migration `0011`
+([ADR-0022](../../adr/0022-create-or-adopt-base-checkouts-without-mutating-them.md)).
+Rows written before it backfill to `adopted` / `origin` / `ready` / `NULL`;
+the migration reaches no filesystem to decide that, because a pre-`0011` row
+records only what the operator supplied.
 
 ## `templates`
 

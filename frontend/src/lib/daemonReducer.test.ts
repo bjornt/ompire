@@ -8,6 +8,10 @@ const project: Project = {
   upstream_url: "https://example.com/maas.git",
   fork_url: null,
   checkout_path: "/home/op/proj/maas",
+  checkout_mode: "adopted",
+  fetch_remote: "origin",
+  setup_state: "ready",
+  setup_error: null,
 };
 
 const template: Template = {
@@ -1321,5 +1325,76 @@ describe("applyEnvelope daemon settings events", () => {
       payload: { settings: { renotify_interval: 600 } },
     });
     expect(state.settings).toEqual({ renotify_interval: 600 });
+  });
+});
+
+describe("project setup progress (ADR-0022)", () => {
+  const cloning: Project = {
+    ...project,
+    name: "fresh",
+    checkout_mode: "cloned",
+    setup_state: "cloning",
+  };
+
+  it("accumulates project_setup_step per project", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 1,
+      ts: "",
+      type: "project_created",
+      payload: cloning,
+    } as Envelope);
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "",
+      type: "project_setup_step",
+      payload: { project: "fresh", step: "prepare", status: "ok" },
+    } as Envelope);
+    state = applyEnvelope(state, {
+      seq: 3,
+      ts: "",
+      type: "project_setup_step",
+      payload: { project: "fresh", step: "clone", status: "started" },
+    } as Envelope);
+
+    expect(state.projectSetupProgress.fresh.map((s) => s.step)).toEqual([
+      "prepare",
+      "clone",
+    ]);
+  });
+
+  it("drops a project's progress when the project is deleted", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 1,
+      ts: "",
+      type: "project_setup_step",
+      payload: { project: "fresh", step: "clone", status: "failed", stderr: "boom" },
+    } as Envelope);
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "",
+      type: "project_deleted",
+      payload: { name: "fresh" },
+    } as Envelope);
+
+    expect(state.projectSetupProgress).toEqual({});
+  });
+
+  it("clears transient progress on a fresh snapshot", () => {
+    let state = applyEnvelope(initialDaemonState, {
+      seq: 1,
+      ts: "",
+      type: "project_setup_step",
+      payload: { project: "fresh", step: "clone", status: "started" },
+    } as Envelope);
+    state = applyEnvelope(state, {
+      seq: 2,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [cloning], templates: [], tasks: [], sessions: {} },
+    } as Envelope);
+
+    // The durable setup_state is what a reconnecting client renders.
+    expect(state.projectSetupProgress).toEqual({});
+    expect(state.projects[0].setup_state).toBe("cloning");
   });
 });

@@ -104,7 +104,14 @@ def _git_steps(config: Config, project: Project, template: Template, task: Task)
     clone_path = task.clone_path
     git_timeout = config.spawn_step_timeout
     return [
-        Step("fetch", ["git", "-C", project.checkout_path, "fetch", "origin"], git_timeout),
+        # The base checkout's own fetch remote, which is not necessarily
+        # `origin` (ADR-0022). The clone below is what gives the *task* clone
+        # an `origin` pointing at this checkout; that one is fixed.
+        Step(
+            "fetch",
+            ["git", "-C", project.checkout_path, "fetch", project.fetch_remote],
+            git_timeout,
+        ),
         # Local source path => hardlink clone, near-instant.
         Step("clone", ["git", "clone", project.checkout_path, clone_path], git_timeout),
         Step(

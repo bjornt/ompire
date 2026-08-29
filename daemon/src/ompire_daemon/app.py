@@ -32,6 +32,7 @@ from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.notifications import AttentionNotifier
+from ompire_daemon.projectsetup import ProjectSetupManager
 from ompire_daemon.prwatch import PrWatcher
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
 from ompire_daemon.registry.settings import SettingsStore
@@ -65,6 +66,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     prwatch: PrWatcher = app.state.prwatch
     gpg: GpgProbe = app.state.gpg
     gh: GitHubProbe = app.state.gh
+    project_setup: ProjectSetupManager = app.state.project_setup
     # Synchronous REST routes publish from FastAPI's threadpool; the hub needs
     # this loop to hand fan-out back to it (see events.py).
     events: EventHub = app.state.events
@@ -112,6 +114,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # cancelled mid-step leaves its record `running` for the next
         # startup's recovery (workflow-engine design D-6).
         await app.state.workflow_runner.shutdown()
+        await project_setup.shutdown()
         await agents.shutdown()
         await reviews.shutdown()
 
@@ -121,9 +124,14 @@ async def _prepare_startup(
     config: Config,
     events: EventHub,
     sessions: SessionTracker,
+    project_setup: ProjectSetupManager,
 ) -> list[Any]:
-    """Close out interrupted reviews, restore any clone parked mid-review,
-    then classify startup tasks."""
+    """Resolve interrupted project clones, close out interrupted reviews,
+    restore any clone parked mid-review, then classify startup tasks."""
+    # A project left `cloning` by a stopped daemon is resolved from the
+    # filesystem before any client can see the project list, so a card can
+    # never sit pending forever (ADR-0022).
+    await project_setup.reconcile_pending()
     # Durable review history is corrected before anything else reads it, so
     # the first snapshot never carries an open review whose llmvet process
     # died with the daemon (review capability; ADR-0016).
@@ -195,6 +203,9 @@ def create_app(
     )
     app.state.gpg = GpgProbe(config, app.state.events, app.state.settings_store)
     app.state.gh = GitHubProbe(config, app.state.events)
+    app.state.project_setup = ProjectSetupManager(
+        config, app.state.engine, app.state.events
+    )
     app.state.ships = ShipManager(
         config,
         app.state.engine,
@@ -233,6 +244,7 @@ def create_app(
             app.state.config,
             app.state.events,
             app.state.sessions,
+            app.state.project_setup,
         )
     )
 

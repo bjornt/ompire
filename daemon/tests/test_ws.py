@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
+
+from .conftest import make_adoptable_checkout
+
+
+@pytest.fixture(autouse=True)
+def _adoptable_checkouts(app) -> None:
+    """Real checkouts for the project names this module registers (ADR-0022)."""
+    # Not "demo": the `git_checkout` fixture owns that path.
+    for name in ("ompire", "ompire-ng"):
+        make_adoptable_checkout(app.state.config.checkout_root, name)
+
 
 
 def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) -> None:
@@ -143,7 +156,10 @@ def test_every_project_mutation_reaches_a_connected_client(
 
 
 def test_template_events_and_snapshot(
-    client: TestClient, auth_token: str, auth_headers: dict[str, str]
+    client: TestClient,
+    auth_token: str,
+    auth_headers: dict[str, str],
+    git_checkout: Path,
 ) -> None:
     client.post(
         "/api/projects",
@@ -152,6 +168,7 @@ def test_template_events_and_snapshot(
             "name": "demo",
             "title": "Demo",
             "upstream_url": "https://example.com/demo.git",
+            "checkout_path": str(git_checkout),
         },
     )
 

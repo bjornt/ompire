@@ -4,9 +4,24 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from ompire_daemon.registry.tasks import create_task, mark_archived
+
+from .conftest import make_adoptable_checkout
+
+
+@pytest.fixture(autouse=True)
+def _adoptable_checkouts(app) -> None:
+    """Give every project name this module registers a real checkout.
+
+    Registration adopts and therefore validates (ADR-0022); these tests are
+    about registry and event semantics, not about a missing work tree.
+    """
+    # Not "demo": the `git_checkout` fixture owns that path.
+    for name in ("ompire", "ompire-ng", "taken", "other"):
+        make_adoptable_checkout(app.state.config.checkout_root, name)
 
 
 def test_create_and_list(client: TestClient, auth_headers: dict[str, str]) -> None:
@@ -355,6 +370,25 @@ def _register(client: TestClient, auth_headers: dict[str, str], checkout: str) -
     assert response.status_code == 201
 
 
+def _register_unchecked(client: TestClient, checkout: str) -> None:
+    """Register straight through the registry, skipping adoption validation.
+
+    File search has to answer honestly for a checkout that disappeared *after*
+    registration; REST would (correctly) refuse to register one that was
+    already broken.
+    """
+    from ompire_daemon.registry.projects import create_project
+
+    create_project(
+        client.app.state.engine,
+        name="demo",
+        title="Demo",
+        upstream_url="https://example.com/demo.git",
+        checkout_path=checkout,
+        default_checkout_root=Path(checkout).parent,
+    )
+
+
 def test_file_search_requires_the_bearer_token(
     client: TestClient, auth_headers: dict[str, str], git_checkout: Path
 ) -> None:
@@ -413,7 +447,7 @@ def test_file_search_unknown_project_404(
 def test_file_search_missing_checkout_is_409_not_an_empty_list(
     client: TestClient, auth_headers: dict[str, str], tmp_path: Path
 ) -> None:
-    _register(client, auth_headers, str(tmp_path / "gone"))
+    _register_unchecked(client, str(tmp_path / "gone"))
 
     response = client.get("/api/projects/demo/files", headers=auth_headers)
 
@@ -426,9 +460,274 @@ def test_file_search_non_git_checkout_is_409(
 ) -> None:
     plain = tmp_path / "plain"
     plain.mkdir()
-    _register(client, auth_headers, str(plain))
+    _register_unchecked(client, str(plain))
 
     response = client.get("/api/projects/demo/files", headers=auth_headers)
 
     assert response.status_code == 409
     assert "not a git repository" in response.json()["detail"]
+
+
+# --- adoption (ADR-0022) -----------------------------------------------------
+
+
+def test_adopted_project_reports_its_onboarding_facts(
+    client: TestClient, auth_headers: dict[str, str], git_checkout: Path
+) -> None:
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "demo",
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+            "checkout_path": str(git_checkout),
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["checkout_mode"] == "adopted"
+    assert body["fetch_remote"] == "origin"
+    assert body["setup_state"] == "ready"
+    assert body["setup_error"] is None
+
+
+def test_adopting_a_missing_checkout_is_refused(
+    client: TestClient, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "demo",
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+            "checkout_path": str(tmp_path / "gone"),
+        },
+    )
+
+    assert response.status_code == 422
+    assert "does not exist" in response.json()["detail"]
+    assert client.get("/api/projects", headers=auth_headers).json() == []
+
+
+def test_adopting_a_checkout_without_the_named_remote_is_refused(
+    client: TestClient, auth_headers: dict[str, str], git_checkout: Path
+) -> None:
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "demo",
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+            "checkout_path": str(git_checkout),
+            "fetch_remote": "upstream",
+        },
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "upstream" in detail and "origin" in detail
+
+
+def test_adopting_a_checkout_with_a_non_origin_remote_succeeds(
+    client: TestClient, auth_headers: dict[str, str], app
+) -> None:
+    checkout = make_adoptable_checkout(
+        app.state.config.checkout_root, "forked", remote="upstream"
+    )
+
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "forked",
+            "title": "Forked",
+            "upstream_url": "https://example.com/forked.git",
+            "checkout_path": str(checkout),
+            "fetch_remote": "upstream",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["fetch_remote"] == "upstream"
+
+
+def test_registration_never_writes_to_the_adopted_checkout(
+    client: TestClient, auth_headers: dict[str, str], git_checkout: Path
+) -> None:
+    import hashlib
+    import os
+
+    def fingerprint(root: Path) -> dict:
+        out = {}
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                full = Path(dirpath) / name
+                try:
+                    out[str(full)] = hashlib.sha256(full.read_bytes()).hexdigest()
+                except OSError:
+                    pass
+        return out
+
+    before = fingerprint(git_checkout)
+    client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "demo",
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+            "checkout_path": str(git_checkout),
+        },
+    )
+    assert fingerprint(git_checkout) == before
+
+
+@pytest.mark.parametrize(
+    "url", ["ext::sh -c touch", "--upload-pack=x", "/etc/passwd", "git://h/r.git"]
+)
+def test_hostile_upstream_urls_are_refused(
+    client: TestClient, auth_headers: dict[str, str], git_checkout: Path, url: str
+) -> None:
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "demo",
+            "title": "Demo",
+            "upstream_url": url,
+            "checkout_path": str(git_checkout),
+        },
+    )
+    assert response.status_code == 422
+    assert client.get("/api/projects", headers=auth_headers).json() == []
+
+
+def test_invalid_fetch_remote_name_is_refused(
+    client: TestClient, auth_headers: dict[str, str], git_checkout: Path
+) -> None:
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "demo",
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+            "checkout_path": str(git_checkout),
+            "fetch_remote": "a b",
+        },
+    )
+    assert response.status_code == 422
+
+
+# --- checkout inspection ------------------------------------------------------
+
+
+def test_checkout_inspect_reports_remotes_and_suggestions(
+    client: TestClient, auth_headers: dict[str, str], git_checkout: Path
+) -> None:
+    response = client.post(
+        "/api/projects/checkout-inspect",
+        headers=auth_headers,
+        json={"checkout_path": str(git_checkout)},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert [r["name"] for r in body["remotes"]] == ["origin"]
+    assert body["suggested_upstream"] == body["remotes"][0]["url"]
+
+
+def test_checkout_inspect_explains_a_bad_path_without_erroring(
+    client: TestClient, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    response = client.post(
+        "/api/projects/checkout-inspect",
+        headers=auth_headers,
+        json={"checkout_path": str(tmp_path / "gone")},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is False
+    assert body["reason"] == "missing"
+    assert "does not exist" in body["detail"]
+    assert body["remotes"] == []
+
+
+# --- guards -------------------------------------------------------------------
+
+
+def test_delete_is_refused_while_a_clone_is_running(
+    client: TestClient, auth_headers: dict[str, str], app
+) -> None:
+    from ompire_daemon.registry.projects import create_project
+
+    create_project(
+        app.state.engine,
+        name="cloning-now",
+        title="Cloning",
+        upstream_url="https://example.com/x.git",
+        default_checkout_root=app.state.config.checkout_root,
+        checkout_mode="cloned",
+        setup_state="cloning",
+    )
+
+    response = client.delete("/api/projects/cloning-now", headers=auth_headers)
+
+    assert response.status_code == 409
+    assert "still being set up" in response.json()["detail"]
+
+
+def test_template_cannot_point_at_an_unready_project(
+    client: TestClient, auth_headers: dict[str, str], app
+) -> None:
+    from ompire_daemon.registry.projects import create_project
+
+    create_project(
+        app.state.engine,
+        name="cloning-now",
+        title="Cloning",
+        upstream_url="https://example.com/x.git",
+        default_checkout_root=app.state.config.checkout_root,
+        checkout_mode="cloned",
+        setup_state="cloning",
+    )
+
+    response = client.post(
+        "/api/templates",
+        headers=auth_headers,
+        json={"name": "t", "project_name": "cloning-now"},
+    )
+
+    assert response.status_code == 409
+    assert "not ready" in response.json()["detail"]
+
+
+def test_update_revalidates_a_changed_adopted_checkout(
+    client: TestClient, auth_headers: dict[str, str], git_checkout: Path, tmp_path: Path
+) -> None:
+    project = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "demo",
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+            "checkout_path": str(git_checkout),
+        },
+    ).json()
+
+    response = client.put(
+        "/api/projects/demo",
+        headers=auth_headers,
+        json={**_put_payload(project), "checkout_path": str(tmp_path / "gone")},
+    )
+
+    assert response.status_code == 422
+    stored = client.get("/api/projects/demo", headers=auth_headers).json()
+    assert stored["checkout_path"] == str(git_checkout)

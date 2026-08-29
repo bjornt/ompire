@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/project-onboarding — project checkout onboarding
+# (ADR-0022) against the local forge.
+#
+# Covers what only real git plus a real daemon can show:
+#   1. adoption validates read-only, and refuses with the reason
+#   2. checkout-inspect reports the remotes of an unregistered path
+#   3. clone mode creates a usable checkout, visibly, in the background
+#   4. a failed clone leaves nothing behind and can be retried to success
+#   5. a project that is not ready cannot be pointed at by a template
+#   6. unregistering never deletes the checkout
+#
+# Both clone targets are forge repos, so everything stays offline. The
+# failing one has its bare repo removed after the URL rewrite is generated,
+# which makes `git clone` fail locally and immediately instead of depending
+# on a network timeout.
+#
+# Restart reconciliation of an interrupted clone is a daemon-side race
+# covered deterministically by `test_recovery.py`; this runbook does not try
+# to kill the daemon mid-clone.
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+FORGE=$CTL/forge
+FORGE_ROOT=$STATE_ROOT/forge/github.com
+STAMP=$(date +%H%M%S)-$$
+CLONED=cloned-$STAMP
+BROKEN=broken-$STAMP
+
+regen_gitconfig() { # keep the signing key the ship gate depends on
+	"$FORGE" gitconfig --signingkey "$($GPGCTL fingerprint)" >/dev/null
+}
+
+project_field() { # project_field NAME FIELD
+	api_json GET "/api/projects/$1" | jq -r --arg f "$2" '.[$f] // empty'
+}
+
+project_state() { # project_state NAME EXPECTED — predicate for wait_for
+	[ "$(project_field "$1" setup_state)" = "$2" ]
+}
+
+cleanup() {
+	for name in "$CLONED" "$BROKEN"; do
+		_api_run DELETE "/api/projects/$name" >/dev/null 2>&1 || true
+		rm -rf "${HOME_DIR:?}/proj/$name" "$FORGE_ROOT/sandbox/$name.git"
+	done
+	regen_gitconfig || true
+}
+trap cleanup EXIT
+
+# --- 1. adoption validates, and only reads --------------------------------------
+
+checkout=$(project_field sandbox checkout_path)
+[ -d "$checkout" ] || die "sandbox checkout missing at $checkout"
+
+before=$(git -C "$checkout" remote -v | sort)
+
+code=$(api_code POST /api/projects "$(jq -nc --arg n "reject-$STAMP" \
+	'{name: $n, title: "Rejected", upstream_url: "git@github.com:x/y.git",
+	  checkout_path: "/nonexistent/nope"}')")
+[ "$code" = 422 ] && ok "missing checkout refused at registration (422)" ||
+	fail "missing checkout refused" "code $code"
+
+code=$(api_code POST /api/projects "$(jq -nc --arg n "reject2-$STAMP" --arg c "$checkout" \
+	'{name: $n, title: "Rejected", upstream_url: "git@github.com:x/y.git",
+	  checkout_path: $c, fetch_remote: "nosuchremote"}')")
+[ "$code" = 422 ] && ok "unknown fetch remote refused (422)" ||
+	fail "unknown fetch remote refused" "code $code"
+
+code=$(api_code POST /api/projects "$(jq -nc --arg n "reject3-$STAMP" --arg c "$checkout" \
+	'{name: $n, title: "Rejected", upstream_url: "ext::sh -c touch /tmp/ompire-pwned",
+	  checkout_path: $c}')")
+[ "$code" = 422 ] && ok "helper-command URL refused before any git ran (422)" ||
+	fail "helper-command URL refused" "code $code"
+[ ! -e /tmp/ompire-pwned ] && ok "the rejected URL executed nothing" ||
+	fail "rejected URL executed a command" "/tmp/ompire-pwned exists"
+
+[ "$before" = "$(git -C "$checkout" remote -v | sort)" ] &&
+	ok "adoption left the checkout's remotes untouched" ||
+	fail "adoption mutated the checkout" "remotes changed"
+
+# --- 2. checkout-inspect ---------------------------------------------------------
+
+_api_run POST /api/projects/checkout-inspect \
+	"$(jq -nc --arg c "$checkout" '{checkout_path: $c}')"
+jq -e '.ok == true and (.remotes | map(.name) | index("origin"))' >/dev/null <<<"$API_BODY" &&
+	ok "checkout-inspect reports the sandbox checkout as usable" ||
+	fail "checkout-inspect on sandbox" "$API_BODY"
+
+_api_run POST /api/projects/checkout-inspect '{"checkout_path": "/nonexistent/nope"}'
+jq -e '.ok == false and .reason == "missing"' >/dev/null <<<"$API_BODY" &&
+	ok "checkout-inspect explains a missing path without erroring" ||
+	fail "checkout-inspect on missing path" "$API_BODY"
+
+# --- 3. clone mode ---------------------------------------------------------------
+
+"$FORGE" init "sandbox/$CLONED" >/dev/null
+"$FORGE" init "sandbox/$BROKEN" >/dev/null
+regen_gitconfig
+# Remove the bare repo behind BROKEN's rewritten URL: the clone now fails
+# locally and instantly, with git's own message.
+rm -rf "$FORGE_ROOT/sandbox/$BROKEN.git"
+
+_api_run POST /api/projects "$(jq -nc --arg n "$CLONED" \
+	--arg u "git@github.com:sandbox/$CLONED.git" \
+	'{name: $n, title: "Cloned", upstream_url: $u, checkout_mode: "clone"}')"
+[ "$API_CODE" = 201 ] || die "clone-mode registration rejected ($API_CODE): $API_BODY"
+jq -e '.setup_state == "cloning" and .checkout_mode == "cloned"' >/dev/null <<<"$API_BODY" &&
+	ok "clone-mode project registered as cloning" ||
+	fail "clone-mode project registered as cloning" "$API_BODY"
+
+dest=$(jq -r .checkout_path <<<"$API_BODY")
+wait_for "clone reaches ready" 120 project_state "$CLONED" ready >/dev/null
+
+[ -d "$dest/.git" ] && ok "checkout created at $dest" ||
+	fail "checkout created" "$dest has no .git"
+[ -n "$(git -C "$dest" remote get-url origin)" ] &&
+	ok "cloned checkout has an origin remote" ||
+	fail "cloned checkout has origin" "none"
+[ -z "$(ls -d "$HOME_DIR"/proj/.ompire-clone-* 2>/dev/null)" ] &&
+	ok "no staging tree left behind" || fail "staging cleaned up" "still present"
+
+# --- 4. a failed clone leaves nothing, and retries to success --------------------
+
+_api_run POST /api/projects "$(jq -nc --arg n "$BROKEN" \
+	--arg u "git@github.com:sandbox/$BROKEN.git" \
+	'{name: $n, title: "Broken", upstream_url: $u, checkout_mode: "clone"}')"
+[ "$API_CODE" = 201 ] || die "broken clone-mode registration rejected ($API_CODE): $API_BODY"
+broken_dest=$(jq -r .checkout_path <<<"$API_BODY")
+
+wait_for "unreachable upstream fails setup" 120 project_state "$BROKEN" failed >/dev/null
+err=$(project_field "$BROKEN" setup_error)
+grep -q "clone" <<<"$err" && ok "failure names the step and carries git's stderr" ||
+	fail "setup_error names the step" "$err"
+[ ! -e "$broken_dest" ] && ok "nothing left at the destination" ||
+	fail "destination clean after failure" "$broken_dest exists"
+
+# A project that is not ready has no clone source, so nothing may point at it.
+code=$(api_code POST /api/templates \
+	"$(jq -nc --arg n "$BROKEN" --arg p "$BROKEN" '{name: $n, project_name: $p}')")
+[ "$code" = 409 ] && ok "template refuses a project that is not ready (409)" ||
+	fail "template refuses unready project" "code $code"
+
+# Fix the URL the way an operator would, then retry.
+_api_run PUT "/api/projects/$BROKEN" "$(jq -nc --arg c "$broken_dest" \
+	--arg u "git@github.com:sandbox/$CLONED.git" \
+	'{title: "Broken", upstream_url: $u, fork_url: null, checkout_path: $c}')"
+[ "$API_CODE" = 200 ] || die "update of a failed project rejected ($API_CODE): $API_BODY"
+
+_api_run POST "/api/projects/$BROKEN/setup/retry"
+[ "$API_CODE" = 202 ] && ok "retry accepted (202)" || fail "retry accepted" "code $API_CODE"
+
+wait_for "retry reaches ready" 120 project_state "$BROKEN" ready >/dev/null
+[ -d "$broken_dest/.git" ] && ok "retry produced a checkout at $broken_dest" ||
+	fail "retry produced a checkout" "$broken_dest has no .git"
+
+# --- 5. unregistering never deletes the checkout ---------------------------------
+
+_api_run DELETE "/api/projects/$CLONED"
+[ "$API_CODE" = 200 ] || fail "delete cloned project" "code $API_CODE"
+[ -d "$dest/.git" ] && ok "unregistering left the cloned checkout on disk" ||
+	fail "checkout survives unregistration" "$dest is gone"

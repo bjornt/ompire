@@ -39,6 +39,8 @@ All paths are under `daemon/src/ompire_daemon/`.
 | Module | Responsibility |
 |---|---|
 | `spawn.py` | The four-step spawn pipeline: fetch, clone, branch, workshop. |
+| `projectcheckout.py` | Read-only inspection of a base checkout, plus the URL and remote-name validators that guard `git clone` argv. Never writes to a checkout. |
+| `projectsetup.py` | `ProjectSetupManager`: the supervised clone-mode setup job, its step events, retry, and startup reconciliation of interrupted clones. |
 | `projectfiles.py` | Project file search, and the `@file` mention rule: validated at submit against the checkout, resolved again against the clone before delivery. |
 | `workshop.py` | Container existence checks and teardown. Status is derived on demand, never persisted. |
 | `agent.py` | Agent child process lifecycle and event fan-out. |

@@ -72,28 +72,30 @@ A key with no passphrase is ready as soon as it is selected — there is nothing
 to cache. Any other state names its own problem and its own fix; see
 [Configure GPG signing](../how-to/configure-gpg-signing.md).
 
-## 5. Prepare a checkout
+## 5. Register the project
 
-Ompire clones from a local checkout rather than from the network, so the task
-starts from refs you already have. Create one:
-
-```sh
-mkdir -p ~/proj
-git clone https://github.com/you/scratch-repo ~/proj/scratch-repo
-```
-
-## 6. Register the project
+Ompire clones each task workspace from a local checkout rather than from the
+network, so the task starts from refs already on disk. Ompire can create that
+checkout for you.
 
 In the Projects view, add a project:
 
 - **Name:** `scratch-repo` — lowercase, digits, and hyphens only
 - **Title:** anything readable
-- **Upstream URL:** the GitHub URL you just cloned
-- **Checkout path:** leave blank to derive `~/proj/scratch-repo`
+- **Upstream URL:** `https://github.com/you/scratch-repo`
+- **Base checkout:** choose **Clone it for me**
 
 Leave the fork URL empty if you can push to the repository directly.
 
-## 7. Spawn a task
+The card appears immediately, shows `cloning…`, and turns `ready` when the
+checkout is in place at `~/proj/scratch-repo`. If it fails, the card shows
+git's own error and a **Retry setup** button.
+
+If you already have the repository checked out somewhere, keep **Use an
+existing checkout** instead and give its absolute path. Ompire validates it
+while you submit, and only ever reads it.
+
+## 6. Spawn a task
 
 In the Spawn view, choose the project, give the task a slug such as
 `add-readme-badge`, and write a prompt describing a small, self-contained
@@ -115,7 +117,7 @@ When it completes, Ompire opens the task for you. It has its own clone under
 `~/tasks/scratch-repo/add-readme-badge` and an agent running inside its own
 container.
 
-## 8. Watch it work — or don't
+## 7. Watch it work — or don't
 
 You are now on the task's detail view, where the agent's output appears as it
 works.
@@ -127,7 +129,7 @@ notification with sound if it needs an approval or has failed.
 
 Go do something else. Ompire will tell you when it needs you.
 
-## 9. Review the work
+## 8. Review the work
 
 When the agent is idle, start a review from the task detail view.
 
@@ -139,7 +141,7 @@ If you want changes, send a review comment back to the agent. It becomes the
 agent's next prompt and the session returns to `working`. Repeat until you are
 satisfied.
 
-## 10. Ship it
+## 9. Ship it
 
 Shipping is two steps, so you see what will be published before it is.
 
@@ -156,7 +158,7 @@ Re-cache it and try again; nothing was written, so there is nothing to undo.
 When it succeeds, the pull-request URL is attached to the task. Check GitHub:
 the commit should show as **Verified**.
 
-## 11. Clean up
+## 10. Clean up
 
 Once the pull request has landed, clean up the task. The container is removed,
 the clone is deleted, and the task is archived — its record and publishing

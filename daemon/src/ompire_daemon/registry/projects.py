@@ -56,6 +56,32 @@ class ProjectHasReferencingTasksError(Exception):
         self.template_names = template_names
 
 
+CHECKOUT_MODES = ("adopted", "cloned")
+SETUP_STATES = ("ready", "cloning", "failed")
+
+DEFAULT_FETCH_REMOTE = "origin"
+
+
+class ProjectSetupBusyError(Exception):
+    """Refusal for an operation that cannot run while a clone is in flight."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(f"project {name!r} is still being set up")
+        self.name = name
+
+
+class ProjectNotReadyError(Exception):
+    """409 detail for spawn/template guards: the checkout is not usable yet."""
+
+    def __init__(self, name: str, setup_state: str) -> None:
+        super().__init__(
+            f"project {name!r} is not ready (setup {setup_state}); "
+            "finish or retry its checkout setup first"
+        )
+        self.name = name
+        self.setup_state = setup_state
+
+
 @dataclass(frozen=True)
 class Project:
     name: str
@@ -63,6 +89,12 @@ class Project:
     upstream_url: str
     fork_url: str | None
     checkout_path: str
+    # Onboarding facts (ADR-0022). `cloned` means Ompire created the checkout
+    # and may remove a *staging* tree it owns; it never deletes either kind.
+    checkout_mode: str = "adopted"
+    fetch_remote: str = DEFAULT_FETCH_REMOTE
+    setup_state: str = "ready"
+    setup_error: str | None = None
 
 
 def validate_slug(name: str) -> None:
@@ -77,6 +109,10 @@ def _row_to_project(row) -> Project:
         upstream_url=row.upstream_url,
         fork_url=row.fork_url,
         checkout_path=row.checkout_path,
+        checkout_mode=row.checkout_mode,
+        fetch_remote=row.fetch_remote,
+        setup_state=row.setup_state,
+        setup_error=row.setup_error,
     )
 
 
@@ -103,6 +139,9 @@ def create_project(
     fork_url: str | None = None,
     checkout_path: str | None = None,
     default_checkout_root: Path,
+    checkout_mode: str = "adopted",
+    fetch_remote: str = DEFAULT_FETCH_REMOTE,
+    setup_state: str = "ready",
 ) -> Project:
     validate_slug(name)
     resolved_checkout_path = checkout_path or str(default_checkout_root / name)
@@ -115,6 +154,10 @@ def create_project(
                     upstream_url=upstream_url,
                     fork_url=fork_url,
                     checkout_path=resolved_checkout_path,
+                    checkout_mode=checkout_mode,
+                    fetch_remote=fetch_remote,
+                    setup_state=setup_state,
+                    setup_error=None,
                 )
             )
     except IntegrityError as exc:
@@ -130,6 +173,7 @@ def update_project(
     upstream_url: str,
     fork_url: str | None,
     checkout_path: str,
+    fetch_remote: str = DEFAULT_FETCH_REMOTE,
     new_name: str | None = None,
 ) -> Project:
     rename = new_name is not None and new_name != name
@@ -148,6 +192,7 @@ def update_project(
         "upstream_url": upstream_url,
         "fork_url": fork_url,
         "checkout_path": checkout_path,
+        "fetch_remote": fetch_remote,
     }
     if rename:
         values["name"] = new_name
@@ -194,7 +239,50 @@ def _raise_if_referenced(engine: Engine, name: str) -> None:
         raise ProjectHasReferencingTasksError(name, labels, template_names)
 
 
+def list_setup_pending(engine: Engine) -> list[Project]:
+    """Projects whose clone was still running when the daemon stopped."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            projects.select()
+            .where(projects.c.setup_state == "cloning")
+            .order_by(projects.c.name)
+        ).all()
+    return [_row_to_project(row) for row in rows]
+
+
+def _set_setup(
+    engine: Engine, name: str, *, state: str, error: str | None
+) -> Project:
+    assert state in SETUP_STATES
+    with engine.begin() as conn:
+        result = conn.execute(
+            projects.update()
+            .where(projects.c.name == name)
+            .values(setup_state=state, setup_error=error)
+        )
+        if result.rowcount == 0:
+            raise ProjectNotFoundError(name)
+    return get_project(engine, name)
+
+
+def mark_setup_cloning(engine: Engine, name: str) -> Project:
+    """Arm a (re)try: clear the previous error so a retry cannot show a stale one."""
+    return _set_setup(engine, name, state="cloning", error=None)
+
+
+def mark_setup_ready(engine: Engine, name: str) -> Project:
+    return _set_setup(engine, name, state="ready", error=None)
+
+
+def mark_setup_failed(engine: Engine, name: str, error: str) -> Project:
+    return _set_setup(engine, name, state="failed", error=error)
+
+
 def delete_project(engine: Engine, name: str) -> None:
+    # A clone job holds a staging tree and will write this row when it ends;
+    # deleting the row underneath it would orphan both (ADR-0022).
+    if get_project(engine, name).setup_state == "cloning":
+        raise ProjectSetupBusyError(name)
     _raise_if_referenced(engine, name)
     with engine.begin() as conn:
         result = conn.execute(projects.delete().where(projects.c.name == name))

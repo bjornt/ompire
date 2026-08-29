@@ -31,6 +31,10 @@ DEFAULT_TASK_DIR_ROOT = Path("~/tasks").expanduser()
 DEFAULT_CHECKOUT_ROOT = Path("~/proj").expanduser()
 DEFAULT_BRANCH_PATTERN = "ompire/<slug>"
 DEFAULT_SPAWN_STEP_TIMEOUT = 120
+# Clone-mode project setup pulls a whole repository over the network, which is
+# a different order of magnitude from the local git steps spawn runs
+# (add-project-adopt-or-clone-onboarding).
+DEFAULT_PROJECT_CLONE_TIMEOUT = 900
 DEFAULT_MY_WORKSHOP_COMMAND = ("my-workshop",)
 DEFAULT_LLMVET_COMMAND = ("llmvet",)
 # Port range for the daemon-run llmvet review server (design D-4). The
@@ -83,6 +87,7 @@ _KNOWN_KEYS = {
     "checkout_root",
     "default_branch_pattern",
     "spawn_step_timeout",
+    "project_clone_timeout",
     "my_workshop_command",
     "llmvet_command",
     "review_port_range",
@@ -123,6 +128,7 @@ class Config:
     checkout_root: Path = DEFAULT_CHECKOUT_ROOT
     default_branch_pattern: str = DEFAULT_BRANCH_PATTERN
     spawn_step_timeout: int = DEFAULT_SPAWN_STEP_TIMEOUT
+    project_clone_timeout: int = DEFAULT_PROJECT_CLONE_TIMEOUT
     my_workshop_command: tuple[str, ...] = DEFAULT_MY_WORKSHOP_COMMAND
     llmvet_command: tuple[str, ...] = DEFAULT_LLMVET_COMMAND
     review_port_range: tuple[int, int] = DEFAULT_REVIEW_PORT_RANGE
@@ -195,6 +201,17 @@ def load_config(path: Path | None = None) -> Config:
     if not isinstance(spawn_step_timeout, int) or isinstance(spawn_step_timeout, bool):
         raise ConfigError(
             f"config key 'spawn_step_timeout' must be an integer, got {spawn_step_timeout!r}"
+        )
+
+    project_clone_timeout = data.get(
+        "project_clone_timeout", DEFAULT_PROJECT_CLONE_TIMEOUT
+    )
+    if not isinstance(project_clone_timeout, int) or isinstance(
+        project_clone_timeout, bool
+    ):
+        raise ConfigError(
+            f"config key 'project_clone_timeout' must be an integer, got "
+            f"{project_clone_timeout!r}"
         )
 
     my_workshop_command = data.get("my_workshop_command")
@@ -402,6 +419,11 @@ def load_config(path: Path | None = None) -> Config:
         )
 
     config_source: dict[str, Any] = {}
+    if "checkout_root" in data:
+        # Stored expanded, as a string: the settings store layers JSON scalars,
+        # and the effective value is turned back into a Path at the one place
+        # that derives a clone destination from it.
+        config_source["checkout_root"] = str(checkout_root)
     if "renotify_interval" in data:
         config_source["renotify_interval"] = float(renotify_interval)
     if "stall_threshold" in data:
@@ -418,6 +440,7 @@ def load_config(path: Path | None = None) -> Config:
         checkout_root=checkout_root,
         default_branch_pattern=default_branch_pattern,
         spawn_step_timeout=spawn_step_timeout,
+        project_clone_timeout=project_clone_timeout,
         my_workshop_command=my_workshop_command,
         llmvet_command=llmvet_command,
         review_port_range=review_port_range,

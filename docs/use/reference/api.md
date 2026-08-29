@@ -29,11 +29,17 @@ bodies; the tables below are a map, not a schema.
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/projects` | List |
-| `POST` | `/api/projects` | Create. `201`, or `409` on duplicate name |
+| `POST` | `/api/projects` | Create. `201`, or `409` on duplicate name. `422` when an adopted checkout is unusable or a URL is not an accepted form |
+| `POST` | `/api/projects/checkout-inspect` | Look at an unregistered path read-only; returns its remotes and, on refusal, why |
 | `GET` | `/api/projects/{name}` | Fetch |
-| `PUT` | `/api/projects/{name}` | Update |
-| `DELETE` | `/api/projects/{name}` | Delete. `409` if tasks or templates reference it |
+| `PUT` | `/api/projects/{name}` | Update. `409` while setup is running or when repointing a cloned checkout |
+| `DELETE` | `/api/projects/{name}` | Delete. `409` if tasks or templates reference it, or while setup is running |
+| `POST` | `/api/projects/{name}/setup/retry` | Re-arm a failed clone. `202`, or `409` for an adopted project |
 | `GET` | `/api/projects/{name}/files` | Repository paths for prompt `@` mentions. `409` if the checkout is missing or not a git repository |
+
+Create accepts `checkout_mode` (`adopt`, the default, or `clone`) and
+`fetch_remote`. Clone mode derives its destination and refuses a supplied
+`checkout_path`. See [Projects](projects.md#checkout-modes).
 
 ## Templates
 

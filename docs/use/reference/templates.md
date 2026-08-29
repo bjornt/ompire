@@ -42,6 +42,11 @@ Templates are managed from the Settings view. The "Project templates" list
 shows one row per template with its name and a summary line — checkout, base
 branch, branch pattern, model, and `wf:<workflow>`.
 
+Only a project whose checkout setup is `ready` can be picked; one that is
+still cloning or whose setup failed is shown disabled with its state, because
+a template pointing at it could not spawn. See
+[Projects](projects.md#setup-state).
+
 The editor offers a project picker (showing the picked project's checkout and
 remote read-only), base branch and branch pattern fields, a workflow select
 listing the daemon's registered workflows, a workshop-additions select, model

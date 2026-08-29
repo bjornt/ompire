@@ -3,8 +3,9 @@ import type {
   AgentStatsData,
   DaemonInfo,
   DaemonSettings,
-  GpgStatus,
   GitHubStatus,
+  CheckoutInspection,
+  GpgStatus,
   Project,
   ProjectFiles,
   ReviewState,
@@ -179,6 +180,11 @@ export function createProject(input: {
   title: string;
   upstream_url: string;
   fork_url: string | null;
+  /** `adopt` validates an existing checkout; `clone` derives the destination
+   * from the effective checkout root and creates it (ADR-0022). */
+  checkout_mode?: "adopt" | "clone";
+  checkout_path?: string | null;
+  fetch_remote?: string;
 }): Promise<Project> {
   return request<Project>("POST", "/api/projects", input);
 }
@@ -190,10 +196,29 @@ export function updateProject(
     upstream_url: string;
     fork_url: string | null;
     checkout_path: string;
+    fetch_remote?: string;
     new_name?: string;
   },
 ): Promise<Project> {
   return request<Project>("PUT", `/api/projects/${encodeURIComponent(name)}`, input);
+}
+
+/** Look at a candidate checkout without registering anything. A refusal comes
+ * back as `ok: false` with a reason, not as a thrown error — the operator is
+ * still typing. */
+export function inspectCheckout(input: {
+  checkout_path: string;
+  fetch_remote?: string;
+}): Promise<CheckoutInspection> {
+  return request<CheckoutInspection>("POST", "/api/projects/checkout-inspect", input);
+}
+
+/** Re-arm and restart a failed clone-mode setup. */
+export function retryProjectSetup(name: string): Promise<Project> {
+  return request<Project>(
+    "POST",
+    `/api/projects/${encodeURIComponent(name)}/setup/retry`,
+  );
 }
 
 /** Repository paths for the Spawn prompt's `@` mentions. Rooted at the

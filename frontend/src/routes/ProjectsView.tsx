@@ -1,8 +1,14 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { createProject, deleteProject, updateProject } from "../lib/api";
+import {
+  createProject,
+  deleteProject,
+  inspectCheckout,
+  retryProjectSetup,
+  updateProject,
+} from "../lib/api";
 import { useDaemonReconcile, useDaemonState } from "../lib/useDaemonState";
-import type { Project, Task } from "../types";
+import type { CheckoutInspection, Project, ProjectSetupStep, Task } from "../types";
 import "./ProjectsView.css";
 
 function errorText(error: unknown): string {
@@ -22,16 +28,55 @@ function asProject(value: unknown): Project | null {
 const MALFORMED_PROJECT_RESPONSE =
   "The daemon returned an unusable project record. Nothing was added — check the daemon log and try again.";
 
+const SETUP_LABEL: Record<Project["setup_state"], string> = {
+  ready: "ready",
+  cloning: "cloning…",
+  failed: "setup failed",
+};
+
+/** The last step event for a project, which is what "cloning…" should say. */
+function currentStep(steps: ProjectSetupStep[] | undefined): ProjectSetupStep | null {
+  return steps && steps.length > 0 ? steps[steps.length - 1] : null;
+}
+
+/** Confirm and unregister. Returns false when the operator backed out.
+ *
+ * One implementation for both places removal is offered, so the promise that
+ * the checkout survives is made in exactly one sentence (ADR-0022).
+ */
+async function confirmAndRemove(
+  project: Project,
+  reconcile: ReturnType<typeof useDaemonReconcile>,
+): Promise<boolean> {
+  if (
+    !window.confirm(
+      `Remove project ${project.name}?\n\nThis removes the registry entry only. ` +
+        `The checkout at ${project.checkout_path} stays on disk, whether you ` +
+        `registered it or Ompire cloned it.`,
+    )
+  ) {
+    return false;
+  }
+  await deleteProject(project.name);
+  reconcile("project_deleted", { name: project.name });
+  return true;
+}
+
 function NewProjectForm({ onClose }: { onClose: () => void }) {
-  const { projects } = useDaemonState();
+  const { projects, settings } = useDaemonState();
   const reconcile = useDaemonReconcile();
   const [name, setName] = useState("");
   const [title, setTitle] = useState("");
   const [upstream, setUpstream] = useState("");
   const [fork, setFork] = useState("");
+  const [mode, setMode] = useState<"adopt" | "clone">("adopt");
+  const [checkoutPath, setCheckoutPath] = useState("");
+  const [fetchRemote, setFetchRemote] = useState("origin");
+  const [inspection, setInspection] = useState<CheckoutInspection | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [createdName, setCreatedName] = useState<string | null>(null);
+  const inspectSeq = useRef(0);
 
   // The confirmed state ends when the project is really in daemon state, not
   // on a timer: the form never closes into a list that lacks the new card.
@@ -39,6 +84,42 @@ function NewProjectForm({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     if (confirmed) onClose();
   }, [confirmed, onClose]);
+
+  const checkoutRoot =
+    typeof settings.checkout_root === "string" ? settings.checkout_root : "";
+  const derivedPath = name.trim() ? `${checkoutRoot}/${name.trim()}` : `${checkoutRoot}/…`;
+
+  /** Discard the current inspection *and* any in-flight one.
+   *
+   * Clearing the state alone is not enough: clicking the mode radio blurs the
+   * path field first, which starts an inspection whose result would land
+   * afterwards and restore the message.
+   */
+  function cancelInspection() {
+    inspectSeq.current += 1;
+    setInspection(null);
+  }
+
+  /** Look at what the operator typed, and offer what it found. Never applies
+   * a detected value on its own — the operator confirms. */
+  async function onInspect() {
+    const seq = ++inspectSeq.current;
+    try {
+      const result = await inspectCheckout({
+        checkout_path: checkoutPath.trim(),
+        fetch_remote: fetchRemote.trim() || "origin",
+      });
+      if (seq !== inspectSeq.current) return;
+      setInspection(result);
+      if (result.ok) {
+        if (!upstream.trim() && result.suggested_upstream)
+          setUpstream(result.suggested_upstream);
+        if (!fork.trim() && result.suggested_fork) setFork(result.suggested_fork);
+      }
+    } catch (err) {
+      if (seq === inspectSeq.current) setError(errorText(err));
+    }
+  }
 
   async function onSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -52,6 +133,13 @@ function NewProjectForm({ onClose }: { onClose: () => void }) {
           title: title.trim(),
           upstream_url: upstream.trim(),
           fork_url: fork.trim() || null,
+          checkout_mode: mode,
+          ...(mode === "adopt"
+            ? {
+                checkout_path: checkoutPath.trim() || null,
+                fetch_remote: fetchRemote.trim() || "origin",
+              }
+            : {}),
         }),
       );
       if (created === null) {
@@ -132,6 +220,107 @@ function NewProjectForm({ onClose }: { onClose: () => void }) {
             />
           </label>
         </div>
+        <fieldset className="modeChoice" disabled={busy}>
+          <legend className="fieldLabel">Base checkout</legend>
+          <label className="modeOption">
+            <input
+              type="radio"
+              name="checkout-mode"
+              checked={mode === "adopt"}
+              onChange={() => {
+                setMode("adopt");
+                cancelInspection();
+              }}
+              data-testid="new-project-mode-adopt"
+            />
+            <span>
+              Use an existing checkout
+              <span className="fieldHint"> — Ompire only reads it</span>
+            </span>
+          </label>
+          <label className="modeOption">
+            <input
+              type="radio"
+              name="checkout-mode"
+              checked={mode === "clone"}
+              onChange={() => {
+                // The inspection describes a checkout path clone mode does
+                // not use; leaving it up would explain the wrong thing.
+                setMode("clone");
+                cancelInspection();
+              }}
+              data-testid="new-project-mode-clone"
+            />
+            <span>
+              Clone it for me
+              <span className="fieldHint"> — into the checkout root</span>
+            </span>
+          </label>
+        </fieldset>
+        {mode === "adopt" ? (
+          <div className="formGrid formGridUrls">
+            <label className="formField">
+              <span className="fieldLabel">
+                Checkout path <span className="fieldHint">— absolute; must already exist</span>
+              </span>
+              <input
+                className="mono urlInput"
+                value={checkoutPath}
+                onChange={(e) => {
+                  setCheckoutPath(e.target.value);
+                  cancelInspection();
+                }}
+                onBlur={() => {
+                  if (checkoutPath.trim()) void onInspect();
+                }}
+                placeholder={`${checkoutRoot}/repo`}
+                disabled={busy}
+                data-testid="new-project-checkout-path"
+              />
+            </label>
+            <label className="formField">
+              <span className="fieldLabel">
+                Fetch remote <span className="fieldHint">— in that checkout</span>
+              </span>
+              <input
+                className="mono"
+                value={fetchRemote}
+                onChange={(e) => {
+                  setFetchRemote(e.target.value);
+                  cancelInspection();
+                }}
+                onBlur={() => {
+                  if (checkoutPath.trim()) void onInspect();
+                }}
+                placeholder="origin"
+                disabled={busy}
+                data-testid="new-project-fetch-remote"
+              />
+            </label>
+          </div>
+        ) : (
+          <div className="clonePreview" data-testid="new-project-clone-preview">
+            <span className="metaLabel">will clone into</span>
+            <span className="metaValue">{derivedPath}</span>
+            <span className="cloneNote">
+              Nothing is written if that path already exists. Change the location in
+              Settings → Checkout root.
+            </span>
+          </div>
+        )}
+        {inspection && (
+          <div
+            className={inspection.ok ? "inspectOk" : "inspectProblem"}
+            role="status"
+            data-testid="new-project-inspection"
+          >
+            {inspection.ok
+              ? `Looks good — remotes: ${inspection.remotes
+                  .map((r) => r.name)
+                  .join(", ")}`
+              : inspection.detail}
+          </div>
+        )}
         <div className="formActions">
           <button
             type="submit"
@@ -139,7 +328,13 @@ function NewProjectForm({ onClose }: { onClose: () => void }) {
             disabled={busy}
             data-testid="new-project-submit"
           >
-            {createdName !== null ? "Created" : submitting ? "Creating…" : "Create project"}
+            {createdName !== null
+              ? "Created"
+              : submitting
+                ? mode === "clone"
+                  ? "Starting clone…"
+                  : "Creating…"
+                : "Create project"}
           </button>
           {/* Only the in-flight request locks Cancel: the confirmed state is
               gated on daemon state rather than a timer, so the operator keeps a
@@ -177,6 +372,8 @@ function ProjectEditPanel({
   const [title, setTitle] = useState(project.title);
   const [upstream, setUpstream] = useState(project.upstream_url);
   const [fork, setFork] = useState(project.fork_url ?? "");
+  const [checkoutPath, setCheckoutPath] = useState(project.checkout_path);
+  const [fetchRemote, setFetchRemote] = useState(project.fetch_remote);
   const reconcile = useDaemonReconcile();
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -185,6 +382,9 @@ function ProjectEditPanel({
   // row (any state) references the project; the daemon's 409 stays
   // authoritative against races.
   const renameBlocked = referencingCount > 0;
+  // A cloned checkout is Ompire's own derived path; repointing it would
+  // orphan what was created, and the daemon refuses it (ADR-0022).
+  const pathLocked = project.checkout_mode === "cloned";
 
   async function onSave(event: React.FormEvent) {
     event.preventDefault();
@@ -199,7 +399,8 @@ function ProjectEditPanel({
           title: title.trim(),
           upstream_url: upstream.trim(),
           fork_url: fork.trim() || null,
-          checkout_path: project.checkout_path,
+          checkout_path: checkoutPath.trim(),
+          fetch_remote: fetchRemote.trim() || "origin",
           ...(renaming ? { new_name: newName } : {}),
         }),
       );
@@ -220,20 +421,11 @@ function ProjectEditPanel({
   }
 
   async function onRemove() {
-    if (
-      !window.confirm(
-        `Remove project ${project.name}?\n\nThis removes the registry entry. Clones on disk are not touched.`,
-      )
-    ) {
-      return;
-    }
     if (submitting) return;
     setError(null);
     setSubmitting(true);
     try {
-      await deleteProject(project.name);
-      reconcile("project_deleted", { name: project.name });
-      onClose();
+      if (await confirmAndRemove(project, reconcile)) onClose();
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -294,6 +486,35 @@ function ProjectEditPanel({
           />
         </label>
       </div>
+      <div className="formGrid formGridUrls">
+        <label className="formField">
+          <span className="fieldLabel">Checkout path</span>
+          <input
+            className="mono urlInput"
+            value={checkoutPath}
+            onChange={(e) => setCheckoutPath(e.target.value)}
+            required
+            disabled={pathLocked || submitting}
+            data-testid={`edit-checkout-${project.name}`}
+          />
+          {pathLocked && (
+            <span className="renameNote" data-testid={`checkout-note-${project.name}`}>
+              Ompire created this checkout — its path is fixed
+            </span>
+          )}
+        </label>
+        <label className="formField">
+          <span className="fieldLabel">Fetch remote</span>
+          <input
+            className="mono"
+            value={fetchRemote}
+            onChange={(e) => setFetchRemote(e.target.value)}
+            required
+            disabled={submitting}
+            data-testid={`edit-fetch-remote-${project.name}`}
+          />
+        </label>
+      </div>
       <div className="formActions">
         <button
           type="submit"
@@ -326,6 +547,90 @@ function ProjectEditPanel({
   );
 }
 
+function ProjectSetupPanel({ project }: { project: Project }) {
+  const { projectSetupProgress } = useDaemonState();
+  const reconcile = useDaemonReconcile();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function guarded(work: () => Promise<void>) {
+    if (busy) return;
+    setError(null);
+    setBusy(true);
+    try {
+      await work();
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const onRetry = () =>
+    guarded(async () => {
+      reconcile("project_updated", await retryProjectSetup(project.name));
+    });
+
+  // Retry and give up are the two answers to a failed setup, so both belong
+  // here rather than one of them being a click deeper in the edit panel.
+  const onRemove = () =>
+    guarded(async () => {
+      await confirmAndRemove(project, reconcile);
+    });
+
+  if (project.setup_state === "cloning") {
+    const step = currentStep(projectSetupProgress[project.name]);
+    return (
+      <div className="setupPanel" role="status" data-testid={`setup-${project.name}`}>
+        <span className="setupBusy">
+          Cloning{step ? ` — ${step.step}` : ""}…
+        </span>
+        <span className="cloneNote">
+          Tasks cannot be spawned against this project until the checkout is ready.
+        </span>
+      </div>
+    );
+  }
+  if (project.setup_state === "failed") {
+    return (
+      <div className="setupPanel" role="alert" data-testid={`setup-${project.name}`}>
+        <span className="setupFailed">Setup failed</span>
+        {project.setup_error && (
+          <pre className="setupError" data-testid={`setup-error-${project.name}`}>
+            {project.setup_error}
+          </pre>
+        )}
+        <div className="formActions">
+          <button
+            type="button"
+            className="primaryButton"
+            onClick={() => void onRetry()}
+            disabled={busy}
+            data-testid={`retry-setup-${project.name}`}
+          >
+            {busy ? "Working…" : "Retry setup"}
+          </button>
+          <button
+            type="button"
+            className="removeButton"
+            onClick={() => void onRemove()}
+            disabled={busy}
+            data-testid={`remove-failed-${project.name}`}
+          >
+            Remove project…
+          </button>
+        </div>
+        {error && (
+          <div className="submitError" role="alert" data-testid={`retry-error-${project.name}`}>
+            {error}
+          </div>
+        )}
+      </div>
+    );
+  }
+  return null;
+}
+
 function ProjectCard({
   project,
   tasks,
@@ -347,6 +652,12 @@ function ProjectCard({
       <div className="projectCardHead">
         <span className="projectName">{project.name}</span>
         <span className="projectTitle">{project.title}</span>
+        <span
+          className={`setupPill setupPill-${project.setup_state}`}
+          data-testid={`setup-state-${project.name}`}
+        >
+          {SETUP_LABEL[project.setup_state]}
+        </span>
         <span className="spacer" />
         <Link
           to={`/tasks?project=${encodeURIComponent(project.name)}`}
@@ -373,7 +684,18 @@ function ProjectCard({
             <span className="metaValue">{project.fork_url}</span>
           </>
         )}
+        <span className="metaLabel">checkout</span>
+        <span className="metaValue" data-testid={`checkout-path-${project.name}`}>
+          {project.checkout_path}
+          <span className="noForkNote">
+            {" · "}
+            {project.checkout_mode === "cloned" ? "cloned by Ompire" : "your checkout"}
+            {" · fetches "}
+            {project.fetch_remote}
+          </span>
+        </span>
       </div>
+      <ProjectSetupPanel project={project} />
       {editing && (
         <ProjectEditPanel
           project={project}

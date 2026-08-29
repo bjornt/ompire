@@ -574,3 +574,65 @@ def test_restart_of_a_task_with_no_review_has_no_review_entry(
         review = _snapshot_review(client, restarted.state.auth_token, task_id)
 
     assert review is None
+
+
+# --- project setup reconciliation (ADR-0022) ----------------------------------
+
+
+def test_restart_marks_an_interrupted_clone_failed(tmp_path: Path) -> None:
+    """A row left `cloning` by a stopped daemon is resolved at the next
+    startup — before any client can see the project list — and never sits
+    pending forever."""
+    config = _restart_config(tmp_path)
+    app = create_app(config, frontend_dist=tmp_path / "no-dist")
+    destination = config.checkout_root / "cloned"
+    staging = config.checkout_root / ".ompire-clone-cloned"
+    staging.mkdir(parents=True)
+    (staging / "partial").write_text("half a clone\n")
+    create_project(
+        app.state.engine,
+        name="cloned",
+        title="Cloned",
+        upstream_url="https://example.com/cloned.git",
+        checkout_path=str(destination),
+        default_checkout_root=config.checkout_root,
+        checkout_mode="cloned",
+        setup_state="cloning",
+    )
+
+    restarted = create_app(config, frontend_dist=tmp_path / "no-dist")
+
+    with TestClient(restarted) as client:
+        headers = {"Authorization": f"Bearer {restarted.state.auth_token}"}
+        body = client.get("/api/projects/cloned", headers=headers).json()
+    assert body["setup_state"] == "failed"
+    assert "interrupted by daemon restart" in body["setup_error"]
+    assert not staging.exists()
+    assert not destination.exists()
+
+
+def test_restart_marks_a_completed_clone_ready(
+    tmp_path: Path, git_checkout: Path
+) -> None:
+    """The daemon died between the rename and the row write; the filesystem
+    is the authority."""
+    config = _restart_config(tmp_path)
+    app = create_app(config, frontend_dist=tmp_path / "no-dist")
+    create_project(
+        app.state.engine,
+        name="demo",
+        title="Demo",
+        upstream_url="https://example.com/demo.git",
+        checkout_path=str(git_checkout),
+        default_checkout_root=config.checkout_root,
+        checkout_mode="cloned",
+        setup_state="cloning",
+    )
+
+    restarted = create_app(config, frontend_dist=tmp_path / "no-dist")
+
+    with TestClient(restarted) as client:
+        headers = {"Authorization": f"Bearer {restarted.state.auth_token}"}
+        body = client.get("/api/projects/demo", headers=headers).json()
+    assert body["setup_state"] == "ready"
+    assert body["setup_error"] is None

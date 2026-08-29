@@ -97,6 +97,48 @@ def auth_headers(auth_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {auth_token}"}
 
 
+def make_adoptable_checkout(
+    root: Path, name: str, *, remote: str = "origin", commit: bool = True
+) -> Path:
+    """A real work tree at `root/name` that adoption accepts.
+
+    Registration validates the checkout now (ADR-0022), so a test that only
+    cares about registry or event semantics still needs a genuine repository
+    at the path it registers.
+    """
+    import subprocess
+
+    def git(*args: str, cwd: Path) -> None:
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+        )
+
+    checkout = root / name
+    if checkout.exists():
+        return checkout
+    checkout.mkdir(parents=True)
+    git("init", "--initial-branch=main", ".", cwd=checkout)
+    if commit:
+        (checkout / "README.md").write_text(f"{name}\n")
+        git("add", "README.md", cwd=checkout)
+        git("commit", "-m", "initial", cwd=checkout)
+    git("remote", "add", remote, f"https://example.com/{name}.git", cwd=checkout)
+    return checkout
+
+
+@pytest.fixture
+def make_checkout(daemon_config: Config):
+    """Factory for `make_adoptable_checkout` bound to the config's root."""
+
+    def _make(name: str = "demo", **kwargs) -> Path:
+        return make_adoptable_checkout(daemon_config.checkout_root, name, **kwargs)
+
+    return _make
+
+
 @pytest.fixture
 def git_checkout(tmp_path: Path) -> Path:
     """A real project checkout with an `origin` remote and a committed `main`."""

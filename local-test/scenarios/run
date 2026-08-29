@@ -24,6 +24,7 @@ ENV_TOOL=$REPO_ROOT/local-test/env
 # crash-recovery last-but-one (it kills the daemon); cleanup last.
 MATRIX=(
 	happy-path
+	project-onboarding
 	file-mentions
 	ask-approval
 	review-comments

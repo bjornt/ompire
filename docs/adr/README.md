@@ -39,6 +39,8 @@ relying on it.
 | [0019](0019-split-documentation-by-audience-using-diataxis.md) | Split documentation into operator and contributor sets organized by Diátaxis | Proposed |
 | [0020](0020-author-documentation-as-portable-markdown.md) | Author documentation as portable Markdown and treat the site generator as a presentation layer | Proposed |
 | [0021](0021-admit-signing-key-selection-as-bounded-daemon-writable-setting.md) | Admit signing-key selection as a bounded daemon-writable setting | Accepted |
+| [0022](0022-create-or-adopt-base-checkouts-without-mutating-them.md) | Create or adopt a project's base checkout without mutating operator repositories | Accepted |
+| [0023](0023-admit-checkout-root-as-bounded-daemon-writable-setting.md) | Admit `checkout_root` as a bounded daemon-writable setting | Accepted |
 
 ## Template
 

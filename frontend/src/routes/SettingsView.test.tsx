@@ -95,6 +95,9 @@ function buildFetchHandler({
     if (url === "/api/gpg/recheck" && method === "POST") {
       return jsonResponse(gpgStatus ?? { state: "unknown" });
     }
+    if (url.startsWith("/api/settings/checkout_root") && method === "DELETE") {
+      return jsonResponse({ deleted: "checkout_root" });
+    }
     if (url.startsWith("/api/settings/gpg_signing_key") && method === "DELETE") {
       const nextProvenance = { ...provenance, gpg_signing_key: "default" as const };
       return jsonResponse({
@@ -480,5 +483,127 @@ describe("SettingsView commit-signing panel", () => {
     expect(screen.getByTestId("daemon-gpg-recovery")).toHaveTextContent(
       "Start the agent",
     );
+  });
+});
+
+describe("SettingsView checkout-root panel (ADR-0023)", () => {
+  beforeEach(() => {
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    window.localStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    MockWebSocket.instances = [];
+  });
+
+  it("shows the effective value and persists a new one", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockImplementation(
+      buildFetchHandler({
+        settings: { checkout_root: "/home/op/proj" },
+        provenance: { checkout_root: "default" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderSettings({ checkout_root: "/home/op/proj" });
+
+    const input = screen.getByTestId("checkout-root");
+    expect(input).toHaveValue("/home/op/proj");
+
+    await user.clear(input);
+    await user.type(input, "/home/op/src");
+    await user.tab();
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings",
+        expect.objectContaining({
+          method: "PUT",
+          body: JSON.stringify({ checkout_root: "/home/op/src" }),
+        }),
+      ),
+    );
+    await waitFor(() => expect(screen.getByTestId("checkout-root-reset")).toBeInTheDocument());
+  });
+
+  it("surfaces the daemon's refusal instead of pretending the value stuck", async () => {
+    const user = userEvent.setup();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url === "/api/settings" && (init?.method ?? "GET") === "PUT") {
+          return jsonResponse({ detail: "checkout_root must be an absolute path" }, 422);
+        }
+        return buildFetchHandler({ settings: { checkout_root: "/home/op/proj" } })(url, init);
+      }),
+    );
+
+    renderSettings({ checkout_root: "/home/op/proj" });
+
+    const input = screen.getByTestId("checkout-root");
+    await user.clear(input);
+    await user.type(input, "relative/path");
+    await user.tab();
+
+    expect(await screen.findByTestId("checkout-root-error")).toHaveTextContent(
+      "must be an absolute path",
+    );
+  });
+
+  it("only offers the reset while an override is in force", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(
+        buildFetchHandler({
+          settings: { checkout_root: "/home/op/proj" },
+          provenance: { checkout_root: "default" },
+        }),
+      ),
+    );
+
+    renderSettings({ checkout_root: "/home/op/proj" });
+
+    await waitFor(() =>
+      expect(screen.queryByTestId("checkout-root-reset")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("disables a template's project until its checkout is ready", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(buildFetchHandler()));
+    render(
+      <DaemonProvider>
+        <SettingsView />
+      </DaemonProvider>,
+    );
+    act(() => {
+      socket().emitSnapshot({
+        projects: [
+          {
+            name: "fresh",
+            title: "Fresh",
+            upstream_url: "https://example.com/fresh.git",
+            fork_url: null,
+            checkout_path: "/home/op/proj/fresh",
+            checkout_mode: "cloned",
+            fetch_remote: "origin",
+            setup_state: "cloning",
+            setup_error: null,
+          },
+        ],
+        tasks: [],
+        templates: [],
+        settings: {},
+      });
+    });
+
+    const user = userEvent.setup();
+    await user.click(screen.getByTestId("new-template-toggle"));
+
+    expect(screen.getByRole("option", { name: /fresh/ })).toBeDisabled();
+    expect(screen.getByTestId("template-project-not-ready")).toHaveTextContent("cloning");
   });
 });

@@ -41,13 +41,41 @@ for characteristic reasons:
 
 | Step | Common cause |
 |---|---|
-| `fetch` | The project's `checkout_path` is missing, or `origin` is unreachable |
+| `fetch` | The project's checkout has gone missing, or its [fetch remote](../reference/projects.md#fetch-remote) is unreachable |
 | `clone` | No write access to `task_dir_root`, or the target path exists |
 | `branch` | `origin/<base_branch>` does not exist — check the template's base branch |
 | `workshop` | Container tooling unavailable, or the launch exceeded its timeout |
 
 A `workshop` failure after a successful launch usually means the container
 started but did not register; the lock file was missing or unreadable.
+
+## A project will not register
+
+Adopting a checkout validates it, so the refusal names the problem: the path
+does not exist, is not the top level of a git work tree, has no remote with
+the name you gave, or has no commits yet. Fix it in your own repository —
+Ompire never edits a checkout it did not create — and submit again.
+
+A URL refusal means the form is not one of `https://`, `ssh://`, or
+`git@host:owner/repo`. Local paths and `git://` are deliberately not accepted.
+
+## A project is stuck on "cloning"
+
+It is not: the card resolves either way. If the daemon was restarted mid-clone,
+the next startup marks the project `failed` with "interrupted by daemon
+restart" and you can retry from the card. A clone is never resumed
+automatically.
+
+A failed clone shows git's own stderr. The usual causes are an unreachable or
+private repository — the clone uses your git configuration with prompts
+disabled, so anything needing a password fails immediately rather than
+hanging — or no write access to the checkout root.
+
+## Spawn refuses with "project is not ready"
+
+The project's checkout setup has not finished, or it failed. Open the Projects
+view and either wait for the clone or retry it. See
+[Projects](../reference/projects.md#setup-state).
 
 ## Shipping is refused
 

@@ -27,6 +27,11 @@ from sqlalchemy import (
 
 metadata = MetaData()
 
+# `checkout_mode`/`setup_state` carry the onboarding facts a bare row could
+# not: whether Ompire created the base checkout or adopted the operator's, and
+# whether it is usable yet (ADR-0022). `fetch_remote` is the remote spawn
+# fetches in *that* checkout — the per-task clone's own `origin` is unrelated
+# and unchanged.
 projects = Table(
     "projects",
     metadata,
@@ -35,6 +40,10 @@ projects = Table(
     Column("upstream_url", String, nullable=False),
     Column("fork_url", String, nullable=True),
     Column("checkout_path", String, nullable=False),
+    Column("checkout_mode", String, nullable=False, server_default="adopted"),
+    Column("fetch_remote", String, nullable=False, server_default="origin"),
+    Column("setup_state", String, nullable=False, server_default="ready"),
+    Column("setup_error", Text, nullable=True),
 )
 
 # SPEC Decision 6/9: spawn configuration lives on templates; checkout path and

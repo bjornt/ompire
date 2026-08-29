@@ -730,3 +730,68 @@ async def test_template_defaults_omit_flags(
     assert "--model" not in argv
     assert "--thinking" not in argv
     await supervisor.stop(task.id, "main")
+
+
+async def test_fetch_uses_the_project_fetch_remote(
+    app, git_checkout: Path, fake_my_workshop, pipeline
+) -> None:
+    """A base checkout whose fetch remote is `upstream` still spawns.
+
+    Only the *base checkout's* fetch changes (ADR-0022); the task clone's own
+    `origin` still points at that checkout, which is what branch creation
+    resolves `origin/<base>` against.
+    """
+    engine = app.state.engine
+    run, hub, _tracker, supervisor = pipeline
+    config: Config = replace(
+        app.state.config,
+        my_workshop_command=(fake_my_workshop('echo "ws" > .workshop.lock'),),
+    )
+    queue = hub.subscribe()
+
+    # Rename the fixture's remote so `origin` does not exist in the checkout.
+    subprocess.run(
+        ["git", "-C", str(git_checkout), "remote", "rename", "origin", "upstream"],
+        check=True,
+        capture_output=True,
+    )
+    create_project(
+        engine,
+        name="demo",
+        title="Demo",
+        upstream_url="https://example.com/demo.git",
+        checkout_path=str(git_checkout),
+        default_checkout_root=git_checkout.parent,
+        fetch_remote="upstream",
+    )
+    create_template(
+        engine,
+        name="demo",
+        project_name="demo",
+        base_branch="main",
+        branch_pattern="ompire/<slug>",
+    )
+    task = _make_task(engine, config)
+
+    await run(engine, task.id, config)
+    await _wait_workflow_settled(engine, task.id)
+
+    settled = get_task(engine, task.id)
+    assert settled.error is None
+    assert settled.spawn_completed_at is not None
+    steps = [
+        (e.payload["step"], e.payload["status"])
+        for e in _drain(queue)
+        if e.type == "spawn_step"
+    ]
+    assert ("fetch", "ok") in steps
+    assert ("branch", "ok") in steps
+    # The clone-side `origin` is untouched and still names the base checkout.
+    clone_origin = subprocess.run(
+        ["git", "-C", task.clone_path, "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert clone_origin == str(git_checkout)
+    await supervisor.stop(task.id, "main")

@@ -61,6 +61,11 @@ export function SpawnView() {
   const seenRef = useRef(false);
 
   const template = templates.find((t) => t.name === templateName) ?? templates[0];
+  // Spawn clones from the project's base checkout, so a project whose setup
+  // has not finished has nothing to clone from (ADR-0022).
+  const templateProject = template
+    ? (projects.find((p) => p.name === template.project_name) ?? null)
+    : null;
   const branchPreview = useMemo(() => {
     if (!template || !slug) return null;
     return template.branch_pattern.replace("<slug>", slug);
@@ -261,13 +266,24 @@ export function SpawnView() {
             </div>
           )}
 
-          <button className="primary" type="submit" disabled={locked || !template || !slug}>
+          <button
+            className="primary"
+            type="submit"
+            disabled={locked || !template || !slug || templateProject?.setup_state !== "ready"}
+          >
             {phase.kind === "creating"
               ? "Creating…"
               : phase.kind === "launching"
                 ? "Launching…"
                 : "Spawn task"}
           </button>
+          {templateProject && templateProject.setup_state !== "ready" && (
+            <div className="submitError" role="alert" data-testid="project-not-ready">
+              {templateProject.name}&apos;s checkout is {templateProject.setup_state} — there
+              is nothing to clone a workspace from yet.{" "}
+              <Link to="/projects">Open Projects</Link>
+            </div>
+          )}
           {submitError && (
             <div className="submitError" role="alert">
               {submitError}

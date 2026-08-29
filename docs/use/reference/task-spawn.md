@@ -136,7 +136,7 @@ delivered as a reference omp would silently drop.
 
 | Step | Action |
 |---|---|
-| `fetch` | `git fetch origin` in the project's checkout |
+| `fetch` | `git fetch <project fetch remote>` in the project's checkout |
 | `clone` | Local hardlink clone of the checkout to `<task_root>/<project>/<slug>` |
 | `branch` | New branch from the template's pattern, off `origin/<base_branch>` |
 | `workshop` | Launch the task's container in the clone |
@@ -144,6 +144,12 @@ delivered as a reference omp would silently drop.
 Git runs as subprocesses with argument lists, never through a shell. Each git
 step is bounded by `spawn_step_timeout`; the workshop step has its own,
 larger, `workshop_step_timeout`.
+
+The two remotes in that table are different things. `fetch` refreshes the
+project's own [`fetch_remote`](projects.md#fetch-remote) in the base checkout,
+which is `origin` unless the project says otherwise. `branch` then resolves
+`origin/<base_branch>` inside the **task's** clone, whose `origin` always
+points back at that base checkout.
 
 The clone step also appends `.ompire/` to the clone's `.git/info/exclude`, so
 structured step outcomes never appear as untracked files in the agent's view
@@ -189,6 +195,7 @@ manage it later.
 | Prompt mention names a missing path or something that is not a regular file | `422`, nothing created |
 | Prompt mention is not on the template's base branch | `422`, nothing created — the clone would not contain it |
 | Prompt mention stops resolving in the clone before delivery | Step fails with the path named; no prompt is sent |
+| Project's checkout setup is not `ready` | `409`, nothing created — finish or retry it on the Projects view |
 | Template missing at pipeline start | Task `failed` before any git command |
 | Any step exits non-zero or times out | Pipeline stops, task `failed`, stderr stored on the task |
 | Resolved clone path falls outside the task root | Spawn rejected before any git command |

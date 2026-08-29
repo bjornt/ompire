@@ -30,11 +30,23 @@ EXPECTED_DEFAULTS = {
 }
 
 
+def expected_defaults(client: TestClient) -> dict:
+    """`EXPECTED_DEFAULTS` plus the one default that is a per-host path.
+
+    `checkout_root`'s bottom layer is `Config.checkout_root` (ADR-0023), which
+    the test config points at a temporary directory.
+    """
+    return {
+        **EXPECTED_DEFAULTS,
+        "checkout_root": str(client.app.state.config.checkout_root),
+    }
+
+
 def test_get_settings_defaults(client: TestClient, auth_headers: dict[str, str]) -> None:
     response = client.get("/api/settings", headers=auth_headers)
     assert response.status_code == 200
     body = response.json()
-    assert body["settings"] == EXPECTED_DEFAULTS
+    assert body["settings"] == expected_defaults(client)
     assert all(prov == "default" for prov in body["provenance"].values())
 
 
@@ -157,7 +169,7 @@ def test_settings_changed_broadcast(client: TestClient, auth_token: str) -> None
 def test_snapshot_carries_settings(client: TestClient, auth_token: str) -> None:
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         message = ws.receive_json()
-        assert message["payload"]["settings"] == EXPECTED_DEFAULTS
+        assert message["payload"]["settings"] == expected_defaults(client)
 
 
 def test_daemon_info(client: TestClient, auth_headers: dict[str, str], tmp_path: Path) -> None:
@@ -347,3 +359,106 @@ def test_clearing_the_selection_returns_to_auto_detection(
     assert body["settings"]["gpg_signing_key"] is None
     assert body["provenance"]["gpg_signing_key"] == "default"
     assert len(probes) == 2
+
+
+# --- checkout_root (ADR-0023) -------------------------------------------------
+
+
+def test_checkout_root_override_round_trips(
+    client: TestClient, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    wanted = tmp_path / "elsewhere"
+
+    response = client.put(
+        "/api/settings", headers=auth_headers, json={"checkout_root": str(wanted)}
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["settings"]["checkout_root"] == str(wanted)
+    assert body["provenance"]["checkout_root"] == "override"
+
+
+def test_deleting_the_checkout_root_override_falls_back(
+    client: TestClient, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    default = client.get("/api/settings", headers=auth_headers).json()["settings"][
+        "checkout_root"
+    ]
+    client.put(
+        "/api/settings",
+        headers=auth_headers,
+        json={"checkout_root": str(tmp_path / "elsewhere")},
+    )
+
+    assert (
+        client.delete("/api/settings/checkout_root", headers=auth_headers).status_code
+        == 200
+    )
+
+    body = client.get("/api/settings", headers=auth_headers).json()
+    assert body["settings"]["checkout_root"] == default
+    assert body["provenance"]["checkout_root"] == "default"
+
+
+def test_checkout_root_expands_a_tilde(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    response = client.put(
+        "/api/settings", headers=auth_headers, json={"checkout_root": "~/src"}
+    )
+
+    assert response.status_code == 200
+    stored = response.json()["settings"]["checkout_root"]
+    assert stored == str(Path("~/src").expanduser())
+
+
+def test_checkout_root_rejects_unsafe_values(
+    client: TestClient, auth_headers: dict[str, str], app
+) -> None:
+    task_root = app.state.config.task_dir_root
+    for value in [
+        "relative/path",
+        "/srv/../etc",
+        "",
+        "   ",
+        "/",
+        str(task_root),
+        str(task_root / "inside"),
+        42,
+    ]:
+        response = client.put(
+            "/api/settings", headers=auth_headers, json={"checkout_root": value}
+        )
+        assert response.status_code == 422, f"{value!r} was accepted"
+    # Nothing was stored by any of the refusals.
+    assert (
+        client.get("/api/settings", headers=auth_headers).json()["provenance"][
+            "checkout_root"
+        ]
+        == "default"
+    )
+
+
+def test_clone_destination_follows_the_checkout_root_override(
+    client: TestClient, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """A changed root applies to the next clone-mode registration only."""
+    elsewhere = tmp_path / "elsewhere"
+    client.put(
+        "/api/settings", headers=auth_headers, json={"checkout_root": str(elsewhere)}
+    )
+
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "cloned",
+            "title": "Cloned",
+            "upstream_url": "https://example.invalid/repo.git",
+            "checkout_mode": "clone",
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["checkout_path"] == str(elsewhere / "cloned")

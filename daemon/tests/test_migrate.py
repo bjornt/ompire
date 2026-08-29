@@ -37,7 +37,7 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0010"
+    assert version == "0011"
     assert "projects" in tables
     assert "tasks" in tables
     assert "templates" in tables
@@ -58,6 +58,48 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
     # The per-project spawn defaults moved to templates (SPEC Decision 6).
     assert "base_branch" not in project_columns
     assert "branch_pattern" not in project_columns
+    # Checkout onboarding facts (ADR-0022).
+    assert "checkout_mode" in project_columns
+    assert "fetch_remote" in project_columns
+    assert "setup_state" in project_columns
+    assert "setup_error" in project_columns
+
+
+def test_0011_backfills_existing_projects_as_adopted(tmp_path: Path) -> None:
+    """A row written before 0011 reads as an adopted, ready, `origin` checkout.
+
+    That is the only honest reading, and it must not depend on the checkout
+    still being on disk — the migration never touches the filesystem.
+    """
+    from alembic import command
+
+    db_path = tmp_path / "ompire.db"
+    command.upgrade(_alembic_cfg(db_path), "0010")
+    engine = make_engine(db_path)
+    with engine.connect() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO projects (name, title, upstream_url, fork_url, checkout_path) "
+                "VALUES ('legacy', 'Legacy', 'https://example.com/legacy', NULL, "
+                "'/nonexistent/legacy')"
+            )
+        )
+        conn.commit()
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT checkout_mode, fetch_remote, setup_state, setup_error "
+                "FROM projects WHERE name = 'legacy'"
+            )
+        ).one()
+    assert row.checkout_mode == "adopted"
+    assert row.fetch_remote == "origin"
+    assert row.setup_state == "ready"
+    assert row.setup_error is None
+    assert not Path("/nonexistent/legacy").exists()
 
 
 def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
@@ -79,7 +121,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0010"
+    assert version == "0011"
     assert row == "demo"
 
 
@@ -135,7 +177,7 @@ def test_0007_seeds_templates_and_drops_project_columns(tmp_path: Path) -> None:
     engine = make_engine(db_path)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "0010"
+        assert version == "0011"
 
         templates = conn.execute(
             text(
@@ -211,7 +253,7 @@ def test_0008_backfills_sessions_and_legacy_workflow_runs(tmp_path: Path) -> Non
     engine = make_engine(db_path)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "0010"
+        assert version == "0011"
 
         sessions = conn.execute(
             text("SELECT task_id, name, omp_session_id FROM task_sessions ORDER BY task_id")
