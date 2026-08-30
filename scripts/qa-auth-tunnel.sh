@@ -4,7 +4,7 @@
 # the VM needs it on ITS localhost:4000 (workshop.yaml's tunnel plug).
 #
 # Run on the gateway side (this container):
-#     ./qa-auth-tunnel.sh ubuntu@10.5.10.122
+#     ./qa-auth-tunnel.sh ubuntu@<qa-host>
 #
 # The loop re-establishes on disconnect; Ctrl-C to stop.
 set -euo pipefail

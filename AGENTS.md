@@ -42,7 +42,8 @@ See [Configuration](docs/use/reference/configuration.md).
   model. `local-test/scenarios/run --all`.
 - [Dogfooding QA loop](docs/develop/how-to/run-the-qa-loop.md) — the real
   stack against the `ompire-test` bot and its sandbox repo. **Never against
-  real repos.**
+  real repos, and never with a personal GitHub identity.** The guide covers
+  setup, the credential boundary, the loop, and teardown.
 
 UI behavior is verified in a real browser, never from a REST response. The
 workshop ships a headless Chrome; `scripts/setup-browser.sh --status` reports

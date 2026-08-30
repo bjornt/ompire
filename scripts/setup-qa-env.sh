@@ -47,10 +47,10 @@
 #   - The daemon keeps running afterwards (nohup; logs + pid in
 #     ~/.local/share/ompire/). Restart later with ~/.config/ompire/qa-daemon.sh.
 #   - Re-running is safe: every step is idempotent.
-#   - The ship flow's GPG gate may report the bot key as "locked": the key is
-#     passphrase-less (so signing always works), but the daemon's KEYINFO
-#     probe only recognizes passphrase-*cached* keys. The smoke step reports
-#     what the daemon will conclude.
+#   - The bot's GPG key is passphrase-protected and the daemon wrapper warms
+#     gpg-agent at startup, so the ship gate sees it as "ready". A cold key
+#     reports "locked" instead; the smoke step reports the daemon's own
+#     verdict either way.
 
 set -euo pipefail
 
@@ -170,7 +170,7 @@ if ! command -v uv >/dev/null; then
 	curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
 	export PATH="$HOME/.local/bin:$PATH"
 fi
-log "toolchain: node $(node --version), pnpm $(pnpm --version), uv $(uv --version | awk '{print $2}')"
+log "toolchain: node $(node --version), pnpm $(cd "$ROOT/frontend" && pnpm --version), uv $(uv --version | awk '{print $2}')"
 
 # ---- 3c. workshop stack (host-level: the daemon spawns agents through it) --
 
@@ -184,7 +184,8 @@ else
 		sudo snap install lxd --channel=6/stable
 		sudo lxd init --auto
 		sudo usermod -aG lxd "$USER"
-		warn "added $USER to group lxd — takes effect on next login; this run uses 'sg lxd'"
+		warn "added $USER to group lxd — takes effect on next login; start a new
+          login shell before spawning tasks, or workshop launches will fail"
 	fi
 	if ! command -v my-workshop >/dev/null; then
 		log "my-workshop: building from github.com/bjornt/my-workshop"
@@ -208,17 +209,21 @@ fi
 
 # ---- 5. dependencies + build ----------------------------------------------
 
+# Run pnpm with frontend/ as the working directory, never `pnpm -C frontend`
+# from the root: corepack resolves the pinned version from the CWD's
+# package.json, and the repository root deliberately has none, so -C silently
+# runs corepack's fallback version against the project's pin.
 log "deps: pnpm install (frontend), uv sync (daemon)"
-pnpm -C "$ROOT/frontend" install --frozen-lockfile
+(cd "$ROOT/frontend" && pnpm install --frozen-lockfile)
 uv sync --project "$ROOT/daemon" --quiet
 
 log "build: frontend production bundle (daemon serves frontend/dist)"
-pnpm -C "$ROOT/frontend" build
+(cd "$ROOT/frontend" && pnpm build)
 
 if [ "$OPT_CHECK" -eq 1 ]; then
 	log "check: daemon + frontend test suites"
 	(cd "$ROOT/daemon" && uv run pytest -q)
-	pnpm -C "$ROOT/frontend" test
+	(cd "$ROOT/frontend" && pnpm test)
 fi
 
 # ---- 6. daemon config -----------------------------------------------------
@@ -397,14 +402,24 @@ else
 fi
 
 # The daemon's own verdict, verbatim — this is what the ship gate consumes.
-gpg_state=$(api_daemon GET /api/gpg | jq -r '.state // empty' 2>/dev/null)
+gpg_json=$(api_daemon GET /api/gpg 2>/dev/null || true)
+gpg_state=$(jq -r '.state // empty' <<<"$gpg_json" 2>/dev/null)
+gpg_key=$(jq -r '.selected.fingerprint // empty' <<<"$gpg_json" 2>/dev/null)
 case "$gpg_state" in
-cached)
-	smoke_ok "daemon GPG probe: cached (ship gate allows Sign & commit)" ;;
+ready)
+	smoke_ok "daemon GPG probe: ready as ${gpg_key:-?} (ship gate allows Sign & commit)" ;;
 locked)
 	smoke_fail "daemon GPG probe: locked — warm gpg-agent (see env.sh comment) and restart the daemon" ;;
+agent_unavailable)
+	smoke_fail "daemon GPG probe: agent_unavailable — start it with 'gpg-connect-agent /bye' and re-check" ;;
+no_key)
+	smoke_fail "daemon GPG probe: no_key — gpg_signing_key in $OMPIRE_CONFIG should be $BOT_FPR" ;;
+ambiguous)
+	smoke_fail "daemon GPG probe: ambiguous — several usable keys; select $BOT_FPR in Settings" ;;
+missing)
+	smoke_fail "daemon GPG probe: missing — gpg is not on the daemon's PATH" ;;
 *)
-	smoke_fail "daemon GPG probe: ${gpg_state:-no response} — check the keygrip matches the bot key"
+	smoke_fail "daemon GPG probe: ${gpg_state:-no response} — expected ready"
 	;;
 esac
 
