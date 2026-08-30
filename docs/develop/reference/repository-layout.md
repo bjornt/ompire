@@ -16,7 +16,7 @@ docs/              documentation
   use/             operator documentation set
   develop/         contributor documentation set
   adr/             architecture decision records
-scripts/           QA and dogfooding scripts
+scripts/           QA, dogfooding, and local browser provisioning
 snap/              classic-confinement snap packaging
 design/handoff/    original design bundle and UI mockups
 changes/           temporary change artifacts, deleted when finished
@@ -29,7 +29,7 @@ changes/           temporary change artifacts, deleted when finished
 | `VISION.md` | Long-term product direction |
 | `AGENTS.md` | Short orientation for coding agents |
 | `Makefile` | Build, test, lint, typecheck, run |
-| `workshop.yaml` | Container definition |
+| `workshop.yaml` | Container definition, including the headless browser SDK |
 | `README.md` | Entry point |
 
 `ROADMAP.md` and `ADR.PLAN.md` are planning documents, not documentation.

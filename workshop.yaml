@@ -5,7 +5,10 @@ sdks:
     channel: 24
   - name: project-ompire-dev-setup
   - name: uv
-  - name: openspec
+  # Headless Chrome for driving the frontend during local end-to-end checks.
+  # Provides `pptr-node` and PUPPETEER_EXECUTABLE_PATH — see
+  # docs/develop/reference/local-testing.md#browser
+  - name: puppeteer-chrome
 actions:
   test-backend: |
     cd /project/daemon

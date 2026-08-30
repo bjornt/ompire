@@ -94,19 +94,41 @@ Replace `happy-path` with the selected runbook. A focused runbook and a
 browser check can share one environment when both prove distinct properties of
 the same change.
 
-Read the temporary token only from the isolated root, then open the actual
-frontend with the browser tool:
+Read the temporary token only from the isolated root to build the frontend URL:
 
 ```sh
 TOKEN=$(cat "$STATE_ROOT/home/.local/share/ompire/token")
 printf 'http://127.0.0.1:%s/?token=%s\n' "$PORT" "$TOKEN"
 ```
 
-Open that URL in a dedicated browser tab. The query token bootstraps the
-frontend's local storage. In the browser, call `open` before `run`, begin with
-an accessibility-tree observation, and re-observe after navigation or a
-re-render. Use the real controls and visible state; do not infer a passed UI
+The query token bootstraps the frontend's local storage, so it is needed once
+per browser profile.
+
+Then obtain a browser. Do not assume you have none, and do not ask the operator
+to open the UI: resolve it in this order, which
+`scripts/setup-browser.sh --status` also reports in one command.
+
+1. A browser capability your own tooling provides — Oh My Pi's `browser` tool,
+   a Chrome MCP server, an editor integration. Prefer it; it gives observation
+   and interaction without a script.
+2. `pptr-node` on `PATH`. Inside the workshop this is always present: it runs
+   the SDK's Node with Puppeteer vendored and Chrome wired up, so a short
+   script navigates, reads rendered state, clicks, and screenshots with no
+   install and no network.
+3. A Chrome named by `PUPPETEER_EXECUTABLE_PATH` or seeded in the Puppeteer
+   cache.
+4. `scripts/setup-browser.sh`, on a host with none that may be provisioned.
+
+`docs/develop/how-to/run-local-e2e.md`, section *Drive the UI in a browser*,
+carries the working recipe.
+
+Whichever you use, observe rendered state before acting, re-observe after every
+navigation or re-render, and drive the real controls. Do not infer a passed UI
 check from a successful REST response or source inspection.
+
+If no browser can be obtained at all, say which property you could not verify
+in the browser and report the non-browser evidence as exactly that. An
+unverified claim is worse than a named gap.
 
 ## Drive the real path
 
@@ -166,8 +188,8 @@ state that distinction when it matters.
 ## Teardown
 
 Always stop the isolated environment after capturing evidence, including on a
-failed check. Close the dedicated browser tab and wipe only the state root you
-created:
+failed check. Close the browser session you opened — a `pptr-node` script that
+ends closes its own — and wipe only the state root you created:
 
 ```sh
 LOCAL_TEST_STATE="$STATE_ROOT" LOCAL_TEST_PORT="$PORT" local-test/env down --wipe

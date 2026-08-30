@@ -108,4 +108,11 @@ Two options:
 - [Run the dogfooding QA loop](../how-to/run-the-qa-loop.md) — the real stack
   against a sandbox GitHub repository and bot account.
 
+Both verify frontend behavior by driving the real UI, which needs a headless
+browser. The workshop defined by `workshop.yaml` ships one, which an existing
+workshop picks up on its next `workshop refresh`; anywhere else,
+`scripts/setup-browser.sh --status` reports whether the host has one and the
+same script provisions it. See [Drive the UI in a
+browser](../how-to/run-local-e2e.md#drive-the-ui-in-a-browser).
+
 Never point the QA loop at a repository you care about.

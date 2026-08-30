@@ -30,6 +30,11 @@
 #   newest existing linux-*    the version this omp build already resolved
 #   DEFAULT_VERSION            the pinned fallback below
 #
+# --status resolves a browser without touching anything: it reports the binary
+# it would use, its version, and where it came from, exiting non-zero when
+# there is none. That is the one command an agent runs before deciding whether
+# it can produce browser evidence.
+#
 # With --write-env the resolved binary is also pinned via
 # PUPPETEER_EXECUTABLE_PATH in $PI_CONFIG_DIR/.env (loaded on every omp start),
 # which makes the browser tool use exactly this binary and skip Puppeteer's
@@ -66,6 +71,7 @@ cache_dir="${PI_CONFIG_DIR:-$HOME/.omp}/puppeteer"
 skip_deps=0
 skip_seed=0
 write_env=0
+status=0
 
 usage() {
   cat <<'EOF'
@@ -76,6 +82,9 @@ Usage: scripts/setup-browser.sh [options]
   --skip-deps         Do not apt-get install runtime dependencies
   --skip-seed         Install deps only; let Puppeteer download Chrome itself
   --write-env         Pin PUPPETEER_EXECUTABLE_PATH in $PI_CONFIG_DIR/.env
+  --status            Report the browser that would be used, then exit.
+                      Installs and downloads nothing. Exit 0 when one is
+                      usable, non-zero with a reason when none is.
   -h, --help          Show this help
 EOF
 }
@@ -87,6 +96,7 @@ for arg in "$@"; do
     --skip-deps)   skip_deps=1 ;;
     --skip-seed)   skip_seed=1 ;;
     --write-env)   write_env=1 ;;
+    --status)      status=1 ;;
     -h|--help)     usage; exit 0 ;;
     *) echo "setup-browser: unknown option: $arg" >&2; usage >&2; exit 2 ;;
   esac
@@ -209,7 +219,104 @@ write_env_override() {
   log "pinned $key=$bin in $env_file"
 }
 
+# ---- 6. read-only status -------------------------------------------------
+
+# Where a usable Chrome comes from, in the order a caller should prefer:
+# an explicit override, the workshop SDK, the seeded Puppeteer cache, then
+# whatever the host has on PATH. Prints "<path><tab><source>", empty when
+# nothing resolves. It runs in a subshell, so it reports rather than exports.
+resolve_browser() {
+  local bin="" source="" candidate sdk name
+
+  if [ -n "${PUPPETEER_EXECUTABLE_PATH:-}" ] && [ -x "${PUPPETEER_EXECUTABLE_PATH}" ]; then
+    bin="$PUPPETEER_EXECUTABLE_PATH"
+    source="PUPPETEER_EXECUTABLE_PATH"
+  elif command -v pptr-node >/dev/null 2>&1; then
+    sdk="$(cd "$(dirname "$(readlink -f "$(command -v pptr-node)")")/.." && pwd)"
+    if [ -x "$sdk/chrome/chrome" ]; then
+      bin="$sdk/chrome/chrome"
+      source="workshop SDK, via pptr-node"
+    fi
+  fi
+
+  if [ -z "$bin" ]; then
+    candidate="$(detect_cached_version)"
+    if [ -n "$candidate" ]; then
+      candidate="$cache_dir/chrome/linux-$candidate/chrome-linux64/chrome"
+      if [ -x "$candidate" ]; then
+        bin="$candidate"
+        source="seeded Puppeteer cache in $cache_dir"
+      fi
+    fi
+  fi
+
+  if [ -z "$bin" ]; then
+    for name in google-chrome-stable google-chrome chromium chromium-browser; do
+      if command -v "$name" >/dev/null 2>&1; then
+        bin="$(command -v "$name")"
+        source="$name on PATH"
+        break
+      fi
+    done
+  fi
+
+  [ -z "$bin" ] || printf '%s\t%s' "$bin" "$source"
+}
+
+report_status() {
+  local bin source missing version
+  IFS=$'\t' read -r bin source < <(resolve_browser) || true
+
+  if [ -z "${bin:-}" ]; then
+    {
+      echo "setup-browser: no usable browser found"
+      echo "  looked at: \$PUPPETEER_EXECUTABLE_PATH, pptr-node on PATH,"
+      echo "             $cache_dir, then chrome/chromium on PATH"
+      echo "  provision one with: scripts/setup-browser.sh"
+    } >&2
+    return 1
+  fi
+
+  missing="$(ldd "$bin" 2>/dev/null | awk '/not found/{print $1}')" || true
+  if [ -n "$missing" ]; then
+    {
+      echo "setup-browser: $bin has unresolved libraries:"
+      printf '  %s\n' "$missing"
+      echo "  install them with: scripts/setup-browser.sh --skip-seed"
+    } >&2
+    return 1
+  fi
+
+  if ! version="$("$bin" --version 2>&1)"; then
+    echo "setup-browser: $bin is not runnable: $version" >&2
+    return 1
+  fi
+  version="$(printf '%s' "$version" | head -1 | sed 's/[[:space:]]*$//')"
+
+  # A path can point at anything; only a binary that identifies itself as
+  # Chrome or Chromium is one Puppeteer can drive.
+  case "$version" in
+    *Chrom*) ;;
+    *)
+      {
+        echo "setup-browser: $bin does not identify as Chrome or Chromium"
+        echo "  it reported: $version"
+      } >&2
+      return 1
+      ;;
+  esac
+
+  printf 'browser: available\n'
+  printf 'binary:  %s\n' "$bin"
+  printf 'version: %s\n' "$version"
+  printf 'source:  %s\n' "$source"
+}
+
 # ---- main ----------------------------------------------------------------
+
+if [ "$status" -eq 1 ]; then
+  if report_status; then exit 0; else exit 1; fi
+fi
 
 [ "$skip_deps" -eq 1 ] || install_deps
 

@@ -138,6 +138,50 @@ so a later `up --fresh` need not re-resolve. `local-test/tools status`
 distinguishes the two: `pinned` is the verified fetch, `local` is a copy the
 environment supplied.
 
+### Browser
+
+Frontend behavior is verified by driving the real frontend, so a headless
+Chrome is part of the environment rather than an optional extra.
+
+`workshop.yaml` declares the `puppeteer-chrome` SDK. A workshop built from it
+carries Chrome for Testing, a vendored Puppeteer, and the `pptr-node` wrapper,
+which exports `PUPPETEER_EXECUTABLE_PATH`, extends `NODE_PATH` so `puppeteer`
+resolves, and then execs the SDK's own Node. The SDK also exports
+`PUPPETEER_SKIP_DOWNLOAD=1`, so Puppeteer never fetches a second Chrome over
+the network.
+
+Nothing here is pinned in `frontend/` or `daemon/`. Neither project depends on
+Puppeteer, and no browser runs in the unit suites or the scenario matrix — the
+browser serves interactive verification only.
+
+Read the live values rather than trusting a documented one:
+
+| Value | Command |
+|---|---|
+| The wrapper | `command -v pptr-node` |
+| The Chrome binary and build | `"$PUPPETEER_EXECUTABLE_PATH" --version` |
+| The vendored Puppeteer | `pptr-node -e "console.log(require('puppeteer/package.json').version)"` |
+| All of the above, resolved in order | `scripts/setup-browser.sh --status` |
+
+Outside a workshop, `scripts/setup-browser.sh` provisions one: it installs
+Chrome's runtime shared libraries and `unzip`, seeds a pinned Chrome for
+Testing build into the Puppeteer cache under `$PI_CONFIG_DIR/puppeteer`, and
+with `--write-env` pins `PUPPETEER_EXECUTABLE_PATH` in that config directory's
+`.env`.
+
+`--status` is its read-only mode and the one command worth running first. It
+resolves in a fixed order — `PUPPETEER_EXECUTABLE_PATH`, then `pptr-node`, then
+the seeded cache, then `chrome`/`chromium` on `PATH` — and reports the binary,
+its version, and its source. It installs nothing, downloads nothing, and needs
+neither root nor network. It exits 0 only for a binary that runs and identifies
+itself as Chrome or Chromium; a missing browser, unresolved shared libraries,
+an unrunnable path, and a path pointing at something that is not Chrome each
+exit non-zero with that reason on stderr.
+
+The procedure — finding a browser, opening the tokenized frontend URL, and what
+to report when there is none — is in [Run the local end-to-end
+harness](../how-to/run-local-e2e.md#drive-the-ui-in-a-browser).
+
 ### Control CLIs
 
 Steering happens through published surfaces only:

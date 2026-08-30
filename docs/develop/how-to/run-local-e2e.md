@@ -62,6 +62,90 @@ if you are changing the WebSocket layer — `--all` will not cover it.
 Each scenario is also directly executable — it sources `lib.sh` itself. The
 `run` driver adds preflight checks and the clean-machine matrix run.
 
+## Drive the UI in a browser
+
+The harness serves the real frontend, so frontend behavior is verified in a
+browser. A REST response or a source reading is not a UI check and must never
+be reported as one.
+
+### Find a browser
+
+Ask the script rather than guessing:
+
+```sh
+scripts/setup-browser.sh --status
+```
+
+```text
+browser: available
+binary:  /var/lib/workshop/sdk/puppeteer-chrome/chrome/chrome
+version: Google Chrome for Testing 150.0.7871.24
+source:  PUPPETEER_EXECUTABLE_PATH
+```
+
+It installs and downloads nothing, and exits non-zero with a reason when there
+is no usable browser. It resolves the same order you should follow yourself:
+
+| Order | Source | Use it when |
+|---|---|---|
+| 1 | A browser capability your own tooling provides | Your agent harness has one — Oh My Pi's `browser` tool, a Chrome MCP server, an editor integration. Prefer it; it gives you observation and interaction without writing a script |
+| 2 | `pptr-node` on `PATH` | Inside a workshop. It runs the SDK's Node with Puppeteer vendored and Chrome already wired up |
+| 3 | `PUPPETEER_EXECUTABLE_PATH`, or a Chrome seeded in the Puppeteer cache | A browser was provisioned here earlier |
+| 4 | `scripts/setup-browser.sh` | The host has none and may be provisioned |
+| 5 | Nothing | Say so — see [below](#when-there-is-no-browser) |
+
+### Open the frontend
+
+`local-test/env up` prints the tokenized URL. Reconstruct it later from the
+state root:
+
+```sh
+TOKEN=$(cat "${LOCAL_TEST_STATE:-local-test/.state}/home/.local/share/ompire/token")
+printf 'http://127.0.0.1:%s/?token=%s\n' "${LOCAL_TEST_PORT:-4173}" "$TOKEN"
+```
+
+The `?token=` stashes itself in the browser's local storage, so it is needed
+once per browser profile.
+
+### Drive it with `pptr-node`
+
+When you are writing the script yourself, `pptr-node` needs no flags, no
+install, and no network:
+
+```js
+// visit.mjs
+import puppeteer from 'puppeteer';
+
+const [url, shot] = process.argv.slice(2);
+const browser = await puppeteer.launch();
+const page = await browser.newPage();
+await page.setViewport({ width: 1440, height: 900 });
+
+await page.goto(url, { waitUntil: 'networkidle2' });
+console.log(await page.title());
+console.log(await page.evaluate(() => document.body.innerText));
+if (shot) await page.screenshot({ path: shot, fullPage: true });
+
+await browser.close();
+```
+
+```sh
+pptr-node visit.mjs "http://127.0.0.1:$PORT/?token=$TOKEN" tasks.png
+```
+
+Observe rendered state before and after every navigation or interaction, and
+use the real controls — `page.click`, `page.type`, `page.waitForSelector` —
+rather than asserting against the API behind them. Run Chrome with
+`--no-sandbox` only where the container forces it; it is not needed in a
+workshop.
+
+### When there is no browser
+
+Say which property you could not verify in the browser, report the non-browser
+evidence as exactly what it is, and stop. Do not describe an API result as a UI
+check, and do not ask the operator to open the UI by hand — the harness is
+drivable, and an unverified claim is worse than a named gap.
+
 ## Driving the fakes
 
 Control scripts let a scenario steer the substituted tools:

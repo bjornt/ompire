@@ -44,6 +44,11 @@ See [Configuration](docs/use/reference/configuration.md).
   stack against the `ompire-test` bot and its sandbox repo. **Never against
   real repos.**
 
+UI behavior is verified in a real browser, never from a REST response. The
+workshop ships a headless Chrome; `scripts/setup-browser.sh --status` reports
+what is available on any host. See [Drive the UI in a
+browser](docs/develop/how-to/run-local-e2e.md#drive-the-ui-in-a-browser).
+
 ## Delivering a change
 
 Changes go through the lightweight skills-based workflow: `change-propose` →
