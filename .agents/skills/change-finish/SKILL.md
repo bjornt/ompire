@@ -1,13 +1,19 @@
 ---
 name: change-finish
-description: Finish a completed lightweight change by auditing the implementation against SPEC.md, PLAN.md, the project's own documentation, ADRs, tests, and optional VISION.md, then removing the temporary change directory. Use when the user wants to reconcile and close a completed change.
+description: Finish a completed standalone or epic child change by auditing SPEC.md, PLAN.md, documentation, ADRs, tests, and optional vision alignment, then removing its temporary directory.
 ---
 
 Finish an implemented lightweight change. This replaces specification validation, syncing, and archiving with one reconciliation step followed by deletion of temporary planning files.
 
 ## Resolve and read the change
 
-Resolve `changes/<name>/` from the user's name or unambiguous repository context. Require both `SPEC.md` and `PLAN.md`. Read them completely before evaluating completion.
+Accept an explicit change-directory path, an epic-qualified `<epic>/<change>` name, or a bare change name. For a bare name, inspect exact candidates under both `changes/` and `epics/*/changes/`. Use a candidate only when exactly one exists or repository and conversation context identify it unambiguously. Otherwise ask for an explicit path or qualified name.
+
+Require both `SPEC.md` and `PLAN.md` and read them completely before evaluating completion.
+
+For an epic child, also read its parent `EPIC.md` completely. Require one exact matching entry and no second active child. The normal state is `[~]` with the corresponding child directory present and all named dependencies `[x]`.
+
+Reconcile mismatches conservatively before the audit. A `[ ]` entry with complete child artifacts may be restored to `[~]` when no other child is active. An `[x]` entry with surviving artifacts, `[~]` without artifacts, unknown child directory, duplicate name, or multiple active entries requires evidence from the artifacts, delivered behavior, durable documentation, and Git before any status repair. Never delete surviving work or infer completion from checked boxes merely to make the parent consistent.
 
 Also read:
 
@@ -74,24 +80,27 @@ Fix failures caused by the change. Do not suppress diagnostics, loosen assertion
 
 Only after every audit and verification item passes:
 
-1. Remove `changes/<name>/SPEC.md` and `changes/<name>/PLAN.md`.
-2. Remove the now-empty `changes/<name>/` directory.
-3. Do not move it to `archive/`, `completed/`, or another historical directory.
-4. Do not copy its contents into the documentation or ADRs verbatim. Durable knowledge must already be synthesized there.
-5. Leave other active change directories untouched.
+1. Remove the resolved change's `SPEC.md` and `PLAN.md`.
+2. Remove its now-empty directory. Preserve and reconcile any unexpected file before removal.
+3. For an epic child, immediately change the exact parent entry from `[~]` to `[x]`. Do this only after the child directory is gone; do not modify sibling entries.
+4. Remove an empty `epics/<epic>/changes/` directory when the filesystem permits, but retain `EPIC.md` and the epic directory for the aggregate `epic-finish` audit.
+5. Do not move the child to `archive/`, `completed/`, or another historical directory.
+6. Do not copy its contents into documentation or ADRs verbatim. Durable knowledge must already be synthesized there.
+7. Leave other active changes and epics untouched.
 
-The user's request to run this finishing workflow authorizes deletion of this temporary change directory once the completion gates pass. If the directory contains unexpected files, inspect them and preserve any durable information in its proper destination before removal; never discard unrelated user work.
+The user's request to run this finishing workflow authorizes deletion of the resolved temporary change directory once the completion gates pass. It does not authorize deletion of unexpected files or the parent epic. If the parent marker update is interrupted after child removal, retry it immediately; later epic workflows must detect and conservatively reconcile the mismatch.
 
-Git and the associated commit or pull request provide change history. The default branch should retain only the project's current documentation, accepted architectural history, implementation, and any still-active changes.
+Git and the associated commit or pull request provide change history. The default branch should retain only current project knowledge, accepted architectural history, implementation, active changes, and active epics.
 
 ## Output
 
 Report:
 
-- the change that was finished;
+- the standalone or qualified epic child that was finished;
 - the delivered behavior audited;
 - the documentation pages and ADRs reconciled, by path;
 - exact verification commands or scenarios and their results;
-- confirmation that `changes/<name>/` was removed.
+- confirmation that the resolved change directory was removed; and
+- for an epic child, confirmation that the exact parent entry is `[x]` and the epic remains for aggregate finishing.
 
 Do not report success while any completion gate remains unmet.

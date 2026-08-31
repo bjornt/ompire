@@ -1,25 +1,34 @@
 ---
 name: change-implement
-description: Implement a lightweight change from changes/<name>/SPEC.md and PLAN.md, keeping the plan, the project's own documentation, ADRs, tests, and optional vision alignment coherent. Use when the user wants to start or continue an existing planned change.
+description: Implement a lightweight standalone or epic child change from SPEC.md and PLAN.md, keeping plans, documentation, ADRs, tests, and optional vision alignment coherent.
 ---
 
-Implement an existing lightweight change completely. The change is defined by:
+Implement an existing lightweight change completely. A standalone change is defined by:
 
 ```text
-changes/<name>/SPEC.md
-changes/<name>/PLAN.md
+changes/<change>/SPEC.md
+changes/<change>/PLAN.md
+```
+
+An epic child is defined by:
+
+```text
+epics/<epic>/changes/<change>/SPEC.md
+epics/<epic>/changes/<change>/PLAN.md
 ```
 
 No specification CLI is involved.
 
 ## Resolve the change
 
-Use the name supplied by the user. Otherwise inspect `changes/`:
+Accept an explicit directory path, an epic-qualified `<epic>/<change>` name, or a bare change name. For a bare name, inspect exact candidates under both `changes/` and `epics/*/changes/`:
 
-- If exactly one change directory contains both files, use it.
-- If repository and conversation context identify one unambiguously, use it.
-- If multiple remain plausible, ask the user to select one.
-- If either artifact is missing, do not invent implementation scope. Create or repair the proposal with the `change-propose` workflow first.
+- If exactly one candidate contains both artifacts, use it.
+- If repository and conversation context identify one candidate unambiguously, use it.
+- If multiple candidates remain, ask the user for an explicit path or qualified name.
+- If either artifact is missing, do not invent implementation scope. Create or repair the proposal with `change-propose` first.
+
+For an epic child, also require and read its parent `EPIC.md`. The exact entry must be `[~]`, its dependencies must be `[x]`, and no other entry may be active. If the child exists under a `[ ]` entry, reconcile it through `change-propose` before implementation. If parent and child state are otherwise inconsistent, preserve the artifacts and repair the state rather than guessing or selecting different work.
 
 ## Re-establish context
 
@@ -137,4 +146,4 @@ This skill is complete when:
 - required ADRs are accepted or superseded;
 - optional vision alignment still holds when `VISION.md` exists.
 
-Do not delete the change directory. Deletion and final reconciliation belong to `change-finish`. Report implemented behavior, the documentation pages and ADRs changed by path, and exact verification results.
+Do not delete the change directory. Deletion and final reconciliation belong to `change-finish`. An epic child remains `[~]` after implementation because checked plan tasks do not prove the independent finish audit has passed. Report the qualified change when applicable, implemented behavior, documentation pages and ADRs changed by path, exact verification results, and that the parent marker remains active pending `change-finish`.

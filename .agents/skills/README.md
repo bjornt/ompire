@@ -1,166 +1,329 @@
-# Lightweight change workflow
+# Change Compass
 
-This repository can define and deliver changes with ordinary Markdown and three agent skills. It needs no specification CLI, generated metadata, sync operation, archive, or permanent completed-change directory.
+**Keep vision, change, implementation, and durable project knowledge aligned.**
 
-The model separates temporary coordination from durable project knowledge:
+Change Compass is a Markdown-first workflow for deliberate project change shared by humans and coding agents. It uses ordinary repository files and six agent skills. There is no specification CLI, generated metadata, sync operation, archive, or permanent completed-change database.
+
+The workflow is rigorous about where knowledge belongs:
+
+- `docs/VISION.md`, when maintained, owns stable product direction and boundaries;
+- active epic and change files own temporary intent, scope, approach, and status;
+- the project's own documentation owns current behavior for its real audiences;
+- ADRs own durable architectural reasoning; and
+- Git commits and pull requests own history and transient implementation discussion.
+
+Finishing reconciles every durable result into its owning artifact before deleting temporary coordination files. Checked boxes are status, not proof.
+
+## Model and terminology
 
 ```text
-                         durable project knowledge
-                    ┌───────────────────────────────┐
-                    │ docs/VISION.md     optional   │
-                    │ the project's documentation   │
-                    │ architecture decision records │
-                    └───────────────▲───────────────┘
-                                    │ reconcile
-                                    │
-idea ──▶ changes/<name>/SPEC.md ──▶ PLAN.md ──▶ implementation ──▶ delete change
+optional epic ──▶ change ──▶ implementation task
+ aggregate       deliverable   plan step
+ outcome          delta
 ```
+
+- An **epic** is a temporary coordination boundary for one coherent outcome that needs multiple independently deliverable changes.
+- A **change** is one independently specifiable and deliverable delta. It may be a feature, bug fix, refactor, migration, infrastructure, operations, or documentation change.
+- A **task** is one implementation step inside a change's `PLAN.md`.
+- A **roadmap** is longer-horizon planning across possible epics. It remains outside Change Compass.
+
+Changes are not called stories because the unit is broader than user-facing Agile stories.
 
 ## Files
 
+A standalone change uses the shortest path:
+
 ```text
-docs/VISION.md                    optional long-term direction
-changes/<name>/SPEC.md            temporary desired experience and requirements
-changes/<name>/PLAN.md            temporary implementation approach and task list
-docs/**                           the project's own documentation, in its own structure
-docs/adr/NNNN-*.md                default location for architectural decisions
+changes/<change>/
+  SPEC.md                         temporary desired experience and requirements
+  PLAN.md                         temporary approach, risks, and task list
 ```
 
-Durable product knowledge goes into the documentation the project already maintains, in the place that documentation's own structure assigns to it. The workflow defines no documentation location of its own and creates no side tree of change- or feature-specific pages. `docs/adr/` is a default only when the repository has not already established an ADR location.
+A multi-change outcome uses an optional epic:
 
-`changes/<name>/` contains exactly the active planning artifacts needed for the workflow. Once the change is complete and its durable knowledge is reconciled, the directory is deleted. Git and the associated commit or pull request retain history.
+```text
+epics/<epic>/
+  EPIC.md                         temporary outcome, boundaries, order, and status
+  changes/<change>/               created only when this child is selected
+    SPEC.md
+    PLAN.md
+```
+
+An epic proposal initially creates only `epics/<epic>/EPIC.md`. Its `changes/` subtree appears with the first active child; Git cannot preserve an empty directory. Planned children are not pre-generated.
+
+Durable files remain project-owned:
+
+```text
+docs/VISION.md                    optional long-term direction
+docs/**                           current project documentation in its own structure
+docs/adr/NNNN-*.md                default ADR location when none is established
+```
+
+There is no `no-epic` or `standalone` container. Small work remains under `changes/`. Completed changes and epics are deleted after reconciliation; Git retains their history.
 
 ## Skills
 
-Skills live one level below `.omp/skills/`, so Oh My Pi discovers them automatically in a new session.
+The repository's `.agents/skills` link points to `skills/`, so Oh My Pi discovers every lifecycle skill from the same source files.
 
 ### `change-propose`
 
-Creates or refines:
+Creates or refines `SPEC.md` and `PLAN.md` without implementation. It supports standalone names, explicit paths, and epic-qualified names.
 
 ```text
-changes/<name>/SPEC.md
-changes/<name>/PLAN.md
+/skill:change-propose <description-or-change>
+/skill:change-propose <epic>/<change>
 ```
 
-It reads the project's documentation, ADRs, relevant code, and `VISION.md` when present. It reviews requirement coverage, scope, documentation impact—naming the exact pages that will change—architecture decisions, risks, and plan completeness. It does not implement application code.
-
-Invoke explicitly with:
-
-```text
-/skill:change-propose <description or change name>
-```
+A new unqualified change defaults to `changes/<change>/`. A qualified child requires a matching epic entry, finished dependencies, and no other active child.
 
 ### `change-implement`
 
-Implements every unchecked task in an existing `PLAN.md`, verifies the specified behavior, updates the project's documentation in the categories that own the change, and creates or supersedes ADRs when durable decisions emerge. It keeps `SPEC.md` and `PLAN.md` accurate when implementation discoveries invalidate assumptions.
-
-Invoke with:
+Implements every unchecked task, verifies the changed behavior, updates project documentation, and creates or supersedes ADRs when durable decisions emerge.
 
 ```text
-/skill:change-implement <change name>
+/skill:change-implement <change>
+/skill:change-implement <epic>/<change>
 ```
 
-It leaves the completed change directory in place for the final audit.
+It leaves the completed change directory in place for the independent finish audit. An epic child remains `[~]` until that audit passes.
 
 ### `change-finish`
 
-Independently audits the completed behavior against the spec and plan, reconciles the project's documentation and ADRs, performs final verification, and removes `changes/<name>/`. It never archives the directory.
-
-Invoke with:
+Independently audits delivered behavior against `SPEC.md` and `PLAN.md`, reconciles documentation and ADRs, performs final verification, and removes the change directory.
 
 ```text
-/skill:change-finish <change name>
+/skill:change-finish <change>
+/skill:change-finish <epic>/<change>
 ```
 
-There is no separate review skill. Proposal, implementation, and finishing each contain the review appropriate to that stage.
+For an epic child, successful finishing removes the child and then marks its exact parent entry `[x]`. It does not delete the parent epic.
 
-## Lifecycle
+### `epic-propose`
 
-### 1. Propose
+Creates or refines one bounded `EPIC.md` without pre-creating children or implementing application behavior.
 
-`change-propose` researches the repository and creates two readable files.
+```text
+/skill:epic-propose <description-or-epic>
+```
 
-`SPEC.md` answers:
+Use it only when one coherent outcome genuinely needs multiple changes. Otherwise use `change-propose` directly.
 
-- Who benefits?
-- What becomes possible or better?
-- What does the user or operator experience?
-- What happens on success, failure, unavailability, and recovery?
-- What observable requirements and invariants apply?
-- What is in scope and explicitly out of scope?
-- Which documentation pages change, and in which category of the project's documentation?
-- When a vision exists, how does the change align with it?
+### `epic-propose-next`
 
-`PLAN.md` answers:
+Returns or refines the active child proposal, or selects the first planned dependency-ready entry and creates its `SPEC.md` and `PLAN.md` through the normal proposal rules.
 
-- What is the smallest coherent implementation approach?
-- Which components and interfaces are affected?
-- Does a durable decision require an ADR?
-- What material risks need mitigation or verification?
-- What ordered, verifiable tasks deliver every requirement?
+```text
+/skill:epic-propose-next <epic>
+```
 
-### 2. Implement
+It stops for review and never implements implicitly. To skip the pause, explicitly ask the agent to run `epic-propose-next` and `change-implement` sequentially; the same proposal and implementation gates still apply.
 
-`change-implement` treats the plan as a checked hypothesis, not unquestionable truth. It validates the plan against current code before editing, then completes and verifies each task. Markdown checkboxes are durable status; a session task tracker may mirror them but does not replace them.
+### `epic-finish`
 
-Implementation discoveries go to the artifact that owns them:
+Audits the aggregate outcome after every child is independently finished, reconciles any remaining durable knowledge, performs the epic completion scenario, and removes the epic.
 
-| Discovery | Action |
-|---|---|
-| Implementation approach changes, behavior does not | Update `PLAN.md` |
-| Desired observable behavior or scope changes | Update `SPEC.md` first |
-| Durable architectural decision emerges | Add or supersede an ADR |
-| Product behavior changes | Update the project's documentation |
-| Transient investigation detail | Leave it in the working conversation or Git history |
+```text
+/skill:epic-finish <epic>
+```
 
-A spec is never weakened after the fact to excuse incomplete implementation.
+It refuses to replace child finishing or archive an incomplete epic.
 
-### 3. Finish
+## Standalone lifecycle
 
-`change-finish` checks behavior rather than trusting task checkboxes. It confirms:
+```text
+idea
+  │
+  ▼
+changes/<change>/SPEC.md ──▶ PLAN.md ──▶ implementation ──▶ finish audit
+                                                                    │
+                              reconcile docs, ADRs, and vision ◀─────┘
+                                                                    │
+                                                           delete change
+```
 
-- implementation satisfies every spec requirement;
-- the plan is complete and no obsolete path remains;
-- the project's documentation stands alone without the change files and each part sits in the category that owns it;
-- durable architectural decisions are recorded as ADRs;
-- the delivered result aligns with `VISION.md` when one exists;
-- focused tests and the real changed surface pass.
+1. Propose:
 
-It then deletes the completed change directory. There is no validation command, spec sync, or archive step.
+   ```text
+   /skill:change-propose improve-session-recovery
+   ```
 
-## Optional `VISION.md`
+2. Review `changes/improve-session-recovery/SPEC.md` and `PLAN.md`.
+3. Implement:
 
-`VISION.md` is optional. If it is absent, all three skills skip vision alignment completely. They do not create it, treat its absence as a defect, insert placeholder vision sections, or add vision tasks.
+   ```text
+   /skill:change-implement improve-session-recovery
+   ```
 
-When present, it should describe stable long-term direction rather than current implementation or a task backlog:
+4. Finish independently:
+
+   ```text
+   /skill:change-finish improve-session-recovery
+   ```
+
+Finishing removes `changes/improve-session-recovery/` only after delivered behavior, verification, project documentation, ADRs, and optional vision alignment pass.
+
+## Epic lifecycle
+
+An epic keeps aggregate coordination readable while each child retains the complete change lifecycle:
+
+```text
+EPIC.md
+   │ propose next
+   ▼
+child SPEC.md + PLAN.md ──▶ review ──▶ implement ──▶ finish child ──▶ [x]
+   ▲                                                                    │
+   └──────────────────────────── next child ────────────────────────────┘
+                                                                        │
+                                            aggregate audit + delete epic
+```
+
+Example `epics/improve-account-recovery/EPIC.md`:
 
 ```markdown
-# Vision
+# Epic: Improve account recovery
 
-## Product promise
+## Outcome
 
-## Desired experience
+People can recover access safely without an administrator editing account state.
 
-## Product boundaries
+## Vision alignment
 
-## Principles
+Recovery remains understandable, self-service, and explicit about security boundaries.
 
-## Long-term direction
+## Boundaries
 
-## Strategic tensions
+This epic does not replace the authentication provider or add account delegation.
+
+## Changes
+
+### [ ] 1. add-recovery-codes
+Add one-time recovery codes with safe generation, storage, and use.
+- Depends on: None
+- Acceptance: A person can recover access once with an unused code and cannot reuse it.
+- Verification: Focused authentication tests and a real recovery smoke scenario.
+
+### [ ] 2. add-recovery-guidance
+Document and surface the complete recovery path and failure states.
+- Depends on: add-recovery-codes
+- Acceptance: A locked-out person can identify and complete the supported recovery path.
+- Verification: Documentation link validation and browser exercise of success and failure flows.
+
+## Completion
+
+The full recovery journey works from lockout through restored access, project documentation describes current behavior and security limits, and applicable architectural decisions are recorded.
 ```
 
-Each proposed and delivered change is compared against that vision. A conflict has two valid resolutions:
+Omit `## Vision alignment` when the project has no `docs/VISION.md`.
 
-1. reshape the change so it delivers the desired outcome while respecting the vision; or
-2. make an explicit strategic decision to update the vision.
+Operate it as follows:
 
-The skills never edit `VISION.md` merely to make a change appear aligned.
+1. Create the epic:
+
+   ```text
+   /skill:epic-propose improve-account-recovery
+   ```
+
+2. Propose only the next change:
+
+   ```text
+   /skill:epic-propose-next improve-account-recovery
+   ```
+
+   This creates:
+
+   ```text
+   epics/improve-account-recovery/changes/add-recovery-codes/
+     SPEC.md
+     PLAN.md
+   ```
+
+   and changes only that entry to `[~]`.
+
+3. Review the proposal, then implement and finish it explicitly:
+
+   ```text
+   /skill:change-implement improve-account-recovery/add-recovery-codes
+   /skill:change-finish improve-account-recovery/add-recovery-codes
+   ```
+
+   Successful finishing removes the child directory and marks the entry `[x]`.
+
+4. Repeat `epic-propose-next`, `change-implement`, and `change-finish` for `add-recovery-guidance`.
+5. Audit and remove the completed epic:
+
+   ```text
+   /skill:epic-finish improve-account-recovery
+   ```
+
+The final repository keeps current documentation, accepted ADRs, implementation, and Git history—not completed epic or change files.
+
+## `EPIC.md` reference
+
+Required shape:
+
+```markdown
+# Epic: <title>
+
+## Outcome
+
+## Vision alignment
+
+## Boundaries
+
+## Changes
+
+### [ ] 1. <change-name>
+<Why this independently deliverable change is needed and what it must achieve.>
+- Depends on: <earlier change names, or "None">
+- Acceptance: <observable completion condition>
+- Verification: <appropriate behavioral evidence>
+
+## Completion
+```
+
+`## Vision alignment` is conditional on a maintained `docs/VISION.md`. Extra prose and phase headings inside `## Changes` are allowed when useful. Change names are unique kebab-case identifiers. Dependencies use exact names and may point only to earlier entries in the same epic.
+
+Each entry is a seed, not a substitute for its future `SPEC.md` and `PLAN.md`. It should establish why the child exists, its independently observable delivery boundary, dependencies, acceptance, and verification without guessing detailed implementation too early.
+
+`## Completion` describes aggregate proof beyond “every entry is checked”: the composed behavior, end-to-end verification, documentation reconciliation, and durable decisions that must hold across the epic.
+
+## Epic status and selection invariants
+
+| Marker | Meaning | Child directory |
+|---|---|---|
+| `[ ]` | Planned, not activated | Must not exist |
+| `[~]` | Active from proposal through child finish | Must contain `SPEC.md` and `PLAN.md` |
+| `[x]` | Independently finished and reconciled | Must not exist |
+
+Additional invariants:
+
+- At most one entry is `[~]`.
+- A dependency is finished only when its exact entry is `[x]`.
+- Planned child directories are never created in advance.
+- `epic-propose-next` returns or refines an active proposal before considering another entry.
+- With no active child, it chooses the first `[ ]` entry in document order whose dependencies are `[x]`.
+- It never implements the selected proposal.
+- `change-finish` changes `[~]` to `[x]` only after removing the audited child.
+- `epic-finish` requires every entry `[x]` and no child artifacts.
+
+### Inconsistent state
+
+Plain files cannot make child removal and parent updates atomic. Manual edits can also create mismatches. Every epic skill therefore reconciles before advancing.
+
+Safe recoveries include:
+
+- `[ ]` plus one complete matching child: preserve it, restore `[~]`, and refine the same proposal;
+- incomplete matching child: preserve it and repair `SPEC.md` or `PLAN.md` through `change-propose`;
+- `[~]` plus complete matching child: continue that child;
+- child removed after a successful finish but marker still `[~]`: use finish evidence and Git to complete the parent update.
+
+Ambiguous cases—multiple active entries, multiple surviving children, unknown directories, `[x]` with surviving artifacts, or `[~]` without evidence of a completed finish—must not trigger new selection or deletion. Inspect child artifacts, delivered behavior, durable documentation, ADRs, and Git. Repair only what the evidence uniquely supports; otherwise report the exact recovery needed.
+
+A bare change name is resolved across both `changes/<name>/` and `epics/*/changes/<name>/`. When more than one candidate exists, use an explicit path or `<epic>/<change>` qualification.
 
 ## `SPEC.md` shape
 
-With `VISION.md`:
+With `docs/VISION.md`:
 
 ```markdown
 # <Change title>
@@ -180,9 +343,9 @@ With `VISION.md`:
 ## Documentation impact
 ```
 
-Without `VISION.md`, omit `## Vision alignment` entirely.
+Without a maintained vision, omit `## Vision alignment` entirely.
 
-The spec focuses on observable experience. Implementation files, classes, database columns, and task ordering belong in the plan unless they are themselves public interfaces. Examples are encouraged when they remove ambiguity, but formal SHALL statements and a scenario for every requirement are not required.
+The spec owns observable experience and scope. Implementation files, internal symbols, persistence details, and task ordering belong in the plan unless they are public interfaces. Documentation impact names real destination pages and their categories.
 
 ## `PLAN.md` shape
 
@@ -202,41 +365,59 @@ The spec focuses on observable experience. Implementation files, classes, databa
 - [ ] <concrete, verifiable task>
 ```
 
-Every requirement maps to one or more tasks, and every task maps back to stated scope. Applicable documentation, ADR work, behavioral tests, and real-surface verification are tasks rather than afterthoughts.
+The plan is a checked hypothesis. Every spec requirement maps to one or more tasks, and every task maps to stated scope. Applicable implementation, caller migration, obsolete-path removal, documentation, ADR work, behavioral tests, real-surface verification, and final vision alignment are tasks rather than afterthoughts.
 
-## Product documentation
+Implementation discoveries update the artifact that owns the affected truth:
 
-The project's documentation replaces cumulative capability specifications. It describes the product as it currently works and should be useful to users, operators, and agents.
-
-This workflow does not define where that documentation lives; the project does. Each skill finds the destination the same way:
-
-1. Read the documentation entry point—`docs/index.md`, `docs/README.md`, the repository README, or a contributing guide—to learn how the set is organized.
-2. Identify the framework and any audience split it uses. Diátaxis (`tutorials/`, `how-to/`, `reference/`, `explanation/`) and per-audience roots such as `docs/use/` and `docs/develop/` are common; a project may use its own structure.
-3. Read the pages that already cover the affected area. They are the default destination.
-
-Each piece of information goes to the category that owns it. With Diátaxis:
-
-| Information the change produces | Category |
+| Discovery | Action |
 |---|---|
-| Precise current behavior: interfaces, options, states, errors, schemas | Reference |
-| A goal the reader now accomplishes differently, or at all | How-to |
-| A changed mental model, concept, or rationale that is not architectural | Explanation |
-| A first-run path that no longer works as written | Tutorial |
-| Why a durable architectural choice was made | ADR |
+| Implementation approach changes, behavior does not | Update `PLAN.md` |
+| Desired observable behavior or scope changes | Update `SPEC.md` first |
+| Durable architectural decision emerges | Add or supersede an ADR |
+| Product behavior changes | Update the project's documentation |
+| Transient investigation detail | Leave it in working context or Git history |
 
-An audience split is respected the same way: operator-facing behavior goes to the operator set, contributor-facing behavior to the contributor set, and behavior serving both is written once for its primary audience and linked from the other.
+A spec is never weakened after implementation to excuse missing behavior.
 
-Between them, the updated pages should cover the applicable purpose, normal flow, states and actions, failures and recovery, configuration, and public interfaces—distributed across categories rather than concentrated in a single page per feature.
+## Project documentation
 
-Existing pages are updated in place. A new page is added only when the change introduces something the current structure has no home for, and it is then placed in the correct category and linked from that category's index. Superseded claims are removed rather than accumulating historical deltas. The change spec explains the intended delta while active; the project's documentation explains the resulting current state permanently.
+Change Compass does not define a product-documentation tree. It follows the structure and audience boundaries the project already uses.
 
-If a repository has no documentation set at all, the skills create the smallest useful set under `docs/` for the affected area and say so. They do not impose a framework the project has not chosen.
+Each lifecycle skill:
+
+1. reads the documentation entry point;
+2. identifies the project's categories and audiences;
+3. updates pages that already own the affected behavior; and
+4. adds a page only when no existing page can own the new information.
+
+With Diátaxis, place information by purpose:
+
+| Information | Destination |
+|---|---|
+| Precise current behavior, interfaces, states, errors, schemas | Reference |
+| A goal the reader accomplishes | How-to |
+| A changed mental model or non-architectural rationale | Explanation |
+| A first-run path | Tutorial |
+| Why a durable architectural choice exists | ADR |
+
+Current behavior is synthesized into these pages rather than copying active specs. Superseded claims are removed. If no documentation set exists, create the smallest useful set under `docs/` for the affected area rather than imposing a framework.
+
+## Optional `VISION.md`
+
+`VISION.md` is optional. When absent, all skills skip vision work; they do not create a placeholder or treat absence as a defect.
+
+When present, it is the strategic alignment point for epic proposal, change proposal, implementation, child finishing, and aggregate epic finishing. A conflict has two valid resolutions:
+
+1. reshape the work to deliver the desired outcome within the vision; or
+2. make an explicit strategic decision to update the vision.
+
+The vision is never weakened merely to make work appear aligned.
 
 ## Architecture decision records
 
-ADRs explain why durable architectural choices exist. They do not describe ordinary implementation details or duplicate feature behavior.
+ADRs preserve durable architectural reasoning, not implementation chronology or ordinary design detail. Use the repository's established ADR location, or `docs/adr/` by default. Accepted ADRs are not rewritten in substance; a reversal creates a new ADR and marks the old one superseded.
 
-Default format:
+Default shape:
 
 ```markdown
 # ADR 0007: <Decision>
@@ -253,43 +434,32 @@ Default format:
 ## Alternatives considered
 ```
 
-Use the next available zero-padded number. Never rewrite the substance of an accepted ADR. A later decision adds a new ADR and changes the earlier status to `Superseded by ADR-NNNN`.
-
-A placement test:
-
-| Information | Destination |
-|---|---|
-| Long-term product principle | `VISION.md`, when the project uses one |
-| Desired behavior for active work | `changes/<name>/SPEC.md` |
-| Implementation order and affected code | `changes/<name>/PLAN.md` |
-| Current user or operator behavior | The project's documentation, in the category its framework assigns |
-| Reason for a durable architecture choice | ADR |
-| Historical implementation discussion | Git commit or pull request |
-
 ## How this differs from OpenSpec
 
-| Concern | OpenSpec-style workflow | This workflow |
+| Concern | OpenSpec-style workflow | Change Compass |
 |---|---|---|
 | Change intent | Proposal plus delta specs | `SPEC.md` |
 | Technical design and tasks | Separate design and task artifacts | `PLAN.md` with embedded tasks |
-| Current behavior | Cumulative capability specs | The project's own documentation, in its own structure |
+| Multi-change outcome | Tool-managed change collection | Optional readable `EPIC.md` |
+| Current behavior | Cumulative capability specs | The project's own documentation |
 | Architecture history | Often embedded in change design | ADRs |
 | Long-term direction | External configured context | Optional `VISION.md` |
-| Status | CLI and artifact schema | Plan checkboxes |
-| Completion | Validate, sync, archive | Reconcile durable docs, then delete |
+| Status | CLI and artifact schema | Markdown status and plan checkboxes |
+| Completion | Validate, sync, archive | Reconcile durable knowledge, then delete |
 | Historical record | Archived change tree | Git and ADRs |
 
-The workflow trades machine-validated delta semantics for readability and a smaller number of authoritative places. Its rigor comes from semantic checks in every skill: scope, requirement-to-task coverage, correctly placed documentation, durable decisions, real verification, and optional vision alignment.
+Change Compass trades machine-validated delta semantics for readability and fewer authoritative places. Its rigor comes from repository research, explicit scope, requirement-to-task coverage, vision alignment, documentation ownership, ADRs, independent finishing audits, and real behavioral verification.
 
 ## Non-goals
 
-This workflow intentionally provides no:
+Change Compass intentionally provides no:
 
-- CLI;
-- YAML metadata or generated indexes;
-- archived or completed change directory;
-- sync operation;
-- formal requirement language requirement;
-- documentation location of its own;
-- separate review skill;
+- dedicated CLI, service, or artifact database;
+- YAML metadata, generated index, or schema validator;
+- required epic wrapper for standalone changes;
+- archived or completed change/epic tree;
+- roadmap, sprint, estimation, ownership, or project-management system;
+- automatic multi-change scheduling or parallel-agent orchestration;
+- cumulative capability-specification tree;
+- separate general-purpose review artifact or skill;
 - automatic `VISION.md` creation.

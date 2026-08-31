@@ -1,21 +1,37 @@
 ---
 name: change-propose
-description: Define a lightweight project change by creating changes/<name>/SPEC.md and PLAN.md. Use when the user wants to shape a feature, behavioral change, or architectural change before implementation, without OpenSpec or another specification CLI.
+description: Define a lightweight standalone or epic child change by creating SPEC.md and PLAN.md before implementation, without OpenSpec or another specification CLI.
 ---
 
 Create a complete, implementation-ready change proposal using ordinary Markdown. Do not implement application code while using this skill.
 
-## Inputs
+## Resolve the destination
 
-The user may provide a kebab-case change name, a description, or both. If only a description is supplied, derive a concise kebab-case name. The change lives at:
+The user may provide a kebab-case change name, a description, an explicit change-directory path, or an epic-qualified `<epic>/<change>` name. If only a description is supplied, derive a concise kebab-case change name.
+
+A standalone change lives at:
 
 ```text
-changes/<name>/
+changes/<change>/
   SPEC.md
   PLAN.md
 ```
 
-If that directory already exists, read it and continue refining it; never overwrite prior decisions blindly. If multiple existing changes could match and repository context cannot disambiguate them, ask the user which one to use.
+An epic child lives at:
+
+```text
+epics/<epic>/changes/<change>/
+  SPEC.md
+  PLAN.md
+```
+
+Use the epic path only when the user supplies it, uses a qualified name, or conversation and repository context identify the parent epic unambiguously. Otherwise default new work to the standalone path; never invent a synthetic epic.
+
+For a bare existing name, consider exact matches under both roots. Use it only when one candidate exists. If the same name exists in multiple locations or multiple candidates remain plausible, ask the user to select an explicit path or `<epic>/<change>` name.
+
+For an epic child, require `epics/<epic>/EPIC.md` and an exact change entry. Read the epic outcome, boundaries, seed, dependencies, completion conditions, and any completed or active siblings that affect current facts. Refuse to create the child when its dependencies are unfinished, another child is active, or the entry is already `[x]`. Do not add unapproved entries to the epic from this workflow; refine the epic first.
+
+If the destination exists, read it and continue refining it; never overwrite prior decisions blindly. Preserve unexpected files and resolve incomplete artifact pairs through this proposal workflow.
 
 ## Research first
 
@@ -133,4 +149,6 @@ Before finishing:
 6. If `VISION.md` exists, independently re-check alignment; if absent, confirm neither artifact invented vision work.
 7. Confirm there are no placeholders, deferred design decisions needed to start, or contradictory statements.
 
-Report the change name, artifact paths, major decisions, and any explicit user decision still blocking implementation. Otherwise state that the change is ready for `change-implement`.
+For an epic child, only after both artifacts pass self-review, ensure the exact parent entry is `[~]`. Change `[ ]` to `[~]`; preserve `[~]`; never change `[x]` here. Do not update another entry or implement the plan.
+
+Report the change name, qualified name when applicable, artifact paths, parent marker state, major decisions, and any explicit user decision still blocking implementation. Otherwise state that the change is ready for `change-implement`.
