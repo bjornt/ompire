@@ -1,9 +1,30 @@
 # Ompire
 
-Ompire is a local-first control plane for coding-agent work. It runs as a
-daemon on your own machine, gives every task an isolated clone and container,
-drives it through a declared workflow, and keeps review and publishing
-authority outside the agent's reach.
+Ompire is a personal AI engineering workbench: a daemon on your own machine
+that runs coding-agent work in four parts.
+
+- **Agent isolation.** Each task gets a disposable workshop container and a
+  full clone of the project. The agent never sees your signing key, your
+  forge credentials, or even the model provider's credentials — model access
+  arrives through a local auth gateway — and it cannot rewrite history in
+  your main repository.
+- **Parallel task oversight.** The founding motivation: running several
+  unrelated tasks at once, across projects, without a wall of terminals.
+  Tasks are organized by project with real state and context, not listed as
+  sessions the way a terminal multiplexer or a tool like herdr does.
+- **The workflow engine.** Workflows are declared deterministically —
+  reproduce, diagnose, fix, validate, review, gate, publish — instead of
+  being described to a single agent in markdown. Privileged steps like
+  signing and pushing are performed by the daemon, never by the agent, and
+  humans are asked for structured feedback at declared gates. This part is
+  expected to evolve the most.
+- **The refinement loop.** A retrospective over finished runs that proposes
+  improvements — skills, AGENTS.md rules, documentation — where agents
+  struggled. Direction today; it is what compounds over time.
+
+The first three parts are built and running today; the refinement loop is
+direction recorded in [`VISION.md`](docs/VISION.md). Agent isolation is the
+part most likely to be extracted into a standalone project first.
 
 It is not a way to put an agent terminal in a browser. Ompire owns the
 lifecycle around a session: preparing the workspace, executing the workflow,

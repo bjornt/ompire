@@ -10,8 +10,10 @@ Ompire prepares an isolated clone and container, runs a coding agent inside a
 declared workflow, and tells you when it needs you. When the work is done you
 review it and ship it as a signed commit and pull request.
 
-Nothing leaves your machine except the Git and forge operations you approve,
-and the agent never holds your credentials.
+That is the daily loop of a workbench built from four parts — agent
+isolation, parallel task oversight, the workflow engine, and the refinement
+loop described in [`VISION.md`](../VISION.md). See
+[What Ompire is](explanation/what-ompire-is.md) for the map.
 
 ## Start here
 

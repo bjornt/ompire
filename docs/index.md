@@ -1,6 +1,8 @@
 # Ompire documentation
 
-Ompire is a local-first control plane for coding-agent work. Documentation is
+Ompire is a personal AI engineering workbench built from four parts: agent
+isolation, oversight of parallel tasks across projects, a deterministic
+workflow engine, and — as direction — a refinement loop. Documentation is
 split by audience, because operating Ompire and building Ompire have almost
 nothing in common.
 

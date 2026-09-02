@@ -2,9 +2,9 @@
 
 ## Purpose
 
-Ompire is a local-first control plane for coding-agent work. It lets one
-operator run more work, with more rigor, by placing probabilistic coding agents
-inside secure, observable, and mostly deterministic workflows.
+Ompire is a personal AI engineering workbench for one operator. It lets you
+run more work, with more rigor, by placing probabilistic coding agents inside
+secure, observable, and mostly deterministic workflows.
 
 Ompire is not merely a way to put an agent terminal in a browser. It owns the
 lifecycle around an agent session: preparing an isolated workspace, executing a
@@ -15,6 +15,70 @@ operations through trusted integrations.
 The intended result is trustworthy leverage: an operator can delegate more work
 without losing control of credentials, source repositories, engineering
 standards, or authorship.
+
+## The four parts
+
+Ompire is one product built from four co-equal parts. Each part earns its
+place on its own; together they are the workbench.
+
+### 1. Agent isolation
+
+The agent works inside a disposable workshop container on a full clone of the
+project — never the operator's main checkout or its `.git` directory. The
+container holds no secrets: no signing keys, no forge credentials, and no raw
+LLM-provider credentials, since model access arrives through a local
+authentication gateway that hands the sandbox a scoped token rather than the
+credential behind it. An agent that leaks everything it can see leaks nothing
+that matters.
+
+This part maps to the "Secure by construction" and "Isolation enables
+parallelism" principles and the Task's isolated workspace. Its direction is
+stronger isolation (a lightweight VM rather than a container) and the gateway
+becoming the only credential path.
+
+Agent isolation is the part most likely to be extracted into a standalone
+project first: disposable containers, credential-free sandboxes, and per-task
+clones are useful to any coding-agent harness, not only to Ompire. The seam
+should stay clean enough that extraction does not change the product model.
+
+### 2. Parallel task oversight
+
+This is the founding motivation. The operator kept running several unrelated
+agent tasks at once, often across different projects, and lost track of them in
+a wall of terminals. Session trackers and terminal multiplexers list sessions;
+Ompire organizes the same work by project and task, shows what state each task
+is in, and says what needs attention now.
+
+This part maps to the "Human attention is the scarce resource" principle, the
+Project and Task core model, and the attention model's derived tiers. It is
+built today and is the part every other part must serve without breaking.
+
+### 3. The workflow engine
+
+Instead of telling one agent "do this workflow" in markdown, the workflow is
+declared deterministically: reproduce the bug, find the root cause, plan the
+fix, implement it, validate, review, gate for a human, publish. Mechanical and
+privileged steps — signing, pushing, creating pull requests, transitioning
+tickets — move outside the agent into code that behaves the same way every
+time. Humans are asked for structured feedback at declared gates instead of
+free-form chat.
+
+This part maps to the product thesis, the "Deterministic orchestration,
+explicit uncertainty" principle, and the Workflow, Run, and Step core model.
+It is the part expected to change most: workflow definition, step vocabulary,
+and how work-item and roadmap state is tracked deterministically are all still
+being learned by using the system for real work.
+
+### 4. The refinement loop
+
+The closing step of the feedback loop. After work finishes, a retrospective
+over the run's sessions looks at where agents struggled and proposes durable
+improvements: new or amended skills, AGENTS.md rules, documentation, better
+plans. Over time this is what compounds — each run leaves the system better at
+the next one. See "The refinement loop" below for the model.
+
+This part is direction today. It is named now so that session logs, outcomes,
+and artifacts stay rich enough to feed it.
 
 ## The problem
 
@@ -381,6 +445,34 @@ Supervision is a per-run policy, and may be tightened for an individual stage:
 Unattended does not mean unlimited autonomy. It means that all permitted
 autonomy was declared before the run.
 
+### The refinement loop
+
+Every completed run is raw material for making the next one better. A
+retrospective step — run after the work has landed or finished — examines the
+run's sessions, outcomes, and artifacts for places where agents struggled:
+repeated approaches that failed, context wasted on avoidable detours,
+instructions that were misunderstood, validation that arrived too late.
+
+From that evidence it proposes durable improvements:
+
+- new skills for recurring task shapes that had no guidance;
+- amendments to existing skills or AGENTS.md rules where guidance existed but
+  did not work;
+- documentation updates where agents had to rediscover something the project
+  already knew;
+- plan-template changes where the failure was in how the work was framed.
+
+Two invariants govern this part. Proposals are suggestions a human accepts,
+amends, or rejects — the loop never modifies skills, rules, or documentation
+silently. And the retrospective reads session history; it does not rely on an
+agent's own summary of how well it thinks it did.
+
+This is direction, not current behavior. Today the retrospective is the
+operator reading transcripts by hand. The reason it is named as a part now is
+that it constrains what the other parts must preserve: session logs, structured
+outcomes, and artifacts have to stay complete and queryable enough to feed an
+automated retrospective later.
+
 ## Identity and forge policy
 
 The default automation identity is a dedicated bot account. Automated commits,
@@ -546,6 +638,9 @@ Ompire is succeeding when:
   main repository;
 - human time is spent on judgment and exceptions rather than setup, polling,
   rebasing, or mechanical GitHub operations.
+- completed runs feed retrospectives whose accepted proposals — new or amended
+  skills, AGENTS.md rules, documentation — measurably reduce the struggles that
+  produced them.
 
 ## Relationship to project documentation
 
