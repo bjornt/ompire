@@ -1,6 +1,6 @@
 # ADR 0015: Keep agent credentials behind narrow brokers
 
-- Status: Proposed
+- Status: Accepted
 - Date: 2026-08-22
 
 ## Context
@@ -11,7 +11,7 @@ The current implementation does not satisfy that boundary. It accepts an arbitra
 
 The supported deployment already has a different mechanism: the Workshop exposes a tunnel to an authentication gateway. The gateway retains provider credentials outside the task and gives the sandbox access to a service operation rather than to the reusable secret behind it. This matches the broader security model, which keeps signing and forge credentials on the trusted side and requires host-side credential agents or narrow brokers for authenticated operations.
 
-The implementation and durable security direction therefore conflict. This ADR records the proposed reconciliation and remains proposed until arbitrary agent environment injection is removed and supported deployments use a brokered path without exposing raw credentials to task processes.
+The implementation and durable security direction therefore conflict. This ADR records the proposed reconciliation and is now Accepted: arbitrary agent environment injection has been removed and supported deployments use a brokered path without exposing raw credentials to task processes.
 
 ## Decision
 

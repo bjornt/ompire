@@ -38,33 +38,9 @@ Paths are expanded, so `~` works.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `agent_env` | table of strings | `{}` | Forwarded into the agent's command line, unfiltered. Not the intended way to supply model credentials. See the warning below. |
 | `agent_ready_timeout` | integer (s) | `30` | Positive. Covers container-side agent startup. |
 | `agent_ring_buffer_size` | integer | `1000` | Positive. Retained raw events per session. |
 | `judge_model` | string or unset | unset | Model for the workflow engine's LLM-judge step. Unset means the agent's configured default. |
-
-**On `agent_env`:** do not put credentials here.
-
-Agents get model authentication through the `pi-auth-gateway` tunnel declared
-in `workshop.yaml`, not through this key. That is the supported path, and the
-intended direction is for it to become the only one. `agent_env` exists
-because early testing found the agent refuses to start without credential
-environment variables in deployments that have no gateway — it is a fallback,
-not the design.
-
-Two things to understand before using it anyway:
-
-- **The daemon does not inspect what you put here.** There is no allowlist and
-  no name matching. It validates that keys and values are strings and forwards
-  them.
-- **Values end up in a process command line, not just an environment.** The
-  daemon builds `workshop exec ... -- env KEY=VALUE omp ...`, so anything here
-  is visible in the host process table (`ps auxww`, `/proc/<pid>/cmdline`) to
-  every process running as your user — including the agent itself and anything
-  it spawns.
-
-Treat any value placed here as disclosed to the agent and to anything sharing
-your user account.
 
 ## Sessions and attention
 
@@ -134,8 +110,8 @@ your file keeps its comments and cannot be corrupted by the daemon. Clearing
 the override with `DELETE /api/settings/{key}` falls back to whatever your
 file says, or the default if it says nothing.
 
-Everything else is TOML-only. Infrastructure settings — ports, paths, commands,
-credentials — are not editable from a browser.
+Everything else is TOML-only. Infrastructure settings — ports, paths, and
+commands — are not editable from a browser.
 
 ## Example
 
@@ -151,9 +127,4 @@ default_branch_pattern = "ompire/<slug>"
 
 # Long builds; don't call them stalled too eagerly.
 stall_threshold = 900
-
-# Non-secret values only — see the warning above. Model credentials come
-# from the auth gateway, not from here.
-[agent_env]
-SOME_TOOL_ENDPOINT = "https://internal.example"
 ```

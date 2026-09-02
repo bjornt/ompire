@@ -259,6 +259,3 @@ surfaces:
 | `my_workshop_command` | Container tooling |
 | `PATH` in the state root | `workshop`, `omp` |
 | `llmvet_command` | Not substituted — the real tool runs |
-
-The `env` prefix the daemon injects from `agent_env` is deliberately **not**
-faked; it is passed through as production does.

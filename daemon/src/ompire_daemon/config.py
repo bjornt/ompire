@@ -92,7 +92,6 @@ _KNOWN_KEYS = {
     "llmvet_command",
     "review_port_range",
     "workshop_step_timeout",
-    "agent_env",
     "agent_ready_timeout",
     "agent_ring_buffer_size",
     "session_idle_debounce",
@@ -133,9 +132,6 @@ class Config:
     llmvet_command: tuple[str, ...] = DEFAULT_LLMVET_COMMAND
     review_port_range: tuple[int, int] = DEFAULT_REVIEW_PORT_RANGE
     workshop_step_timeout: int = DEFAULT_WORKSHOP_STEP_TIMEOUT
-    # Injected verbatim into agent children (design D-3): the daemon does not
-    # know what a credential is, it forwards what the operator configured.
-    agent_env: dict[str, str] = field(default_factory=dict)
     agent_ready_timeout: int = DEFAULT_AGENT_READY_TIMEOUT
     agent_ring_buffer_size: int = DEFAULT_AGENT_RING_BUFFER_SIZE
     session_idle_debounce: float = DEFAULT_SESSION_IDLE_DEBOUNCE
@@ -172,6 +168,15 @@ def load_config(path: Path | None = None) -> Config:
         data = tomllib.loads(raw_bytes.decode("utf-8"))
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"malformed TOML in {config_path}: {exc}") from exc
+
+    # ADR-0015: arbitrary agent environment injection is removed. Reject the
+    # obsolete key explicitly so an operator does not mistake an
+    # unauthenticated or differently authenticated agent for the intended setup.
+    if "agent_env" in data:
+        raise ConfigError(
+            "config key 'agent_env' has been removed: model credentials reach "
+            "agents only through the auth-gateway tunnel declared in workshop.yaml"
+        )
 
     unknown_keys = set(data) - _KNOWN_KEYS
     if unknown_keys:
@@ -292,14 +297,6 @@ def load_config(path: Path | None = None) -> Config:
     if not isinstance(workshop_step_timeout, int) or isinstance(workshop_step_timeout, bool):
         raise ConfigError(
             f"config key 'workshop_step_timeout' must be an integer, got {workshop_step_timeout!r}"
-        )
-
-    agent_env = data.get("agent_env", {})
-    if not isinstance(agent_env, dict) or not all(
-        isinstance(key, str) and isinstance(value, str) for key, value in agent_env.items()
-    ):
-        raise ConfigError(
-            f"config key 'agent_env' must be a table of string values, got {agent_env!r}"
         )
 
     agent_ready_timeout = data.get("agent_ready_timeout", DEFAULT_AGENT_READY_TIMEOUT)
@@ -445,7 +442,6 @@ def load_config(path: Path | None = None) -> Config:
         llmvet_command=llmvet_command,
         review_port_range=review_port_range,
         workshop_step_timeout=workshop_step_timeout,
-        agent_env=agent_env,
         agent_ready_timeout=agent_ready_timeout,
         agent_ring_buffer_size=agent_ring_buffer_size,
         session_idle_debounce=float(session_idle_debounce),

@@ -238,7 +238,7 @@ def tracked(monkeypatch: pytest.MonkeyPatch):
     confirming the tracker hooks actually fire (not just the sampler's public
     methods in isolation)."""
     monkeypatch.setattr(
-        agent_module, "build_agent_argv", lambda clone, env, resume=None, model=None, thinking=None: fake_omp_argv("happy")
+        agent_module, "build_agent_argv", lambda clone, resume=None, model=None, thinking=None: fake_omp_argv("happy")
     )
 
     async def no_preflight(clone_path: str) -> None:

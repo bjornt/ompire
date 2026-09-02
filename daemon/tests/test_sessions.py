@@ -30,7 +30,7 @@ def tracked(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, env, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
+        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -52,7 +52,7 @@ def tracked_stall(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, env, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
+        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
     )
 
     async def no_preflight(clone_path: str) -> None:

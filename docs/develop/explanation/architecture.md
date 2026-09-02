@@ -143,12 +143,8 @@ See [Why the control plane is trusted and the agent is not](trust-model.md).
 
 ## Where the design is unsettled
 
-Documentation that only described the intended architecture would mislead. Four
+Documentation that only described the intended architecture would mislead. Three
 areas are known-unreconciled and tracked in `ADR.PLAN.md`:
-
-**[Credential delivery](../../adr/0015-keep-agent-credentials-behind-narrow-brokers.md).**
-`agent_env` injects configured values verbatim into the agent's container. The
-vision requires brokers and no raw secrets. ADR-0015 proposes closing that gap.
 
 **[The durability boundary](../../adr/0016-persist-authority-bearing-task-history-and-provenance.md).**
 Workflow steps, session identity, tasks, settings, and PR state are durable.

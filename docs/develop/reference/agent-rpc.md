@@ -14,8 +14,8 @@ agent's frame vocabulary can grow without breaking Ompire.
 ### Spawning
 
 The child is spawned as an asyncio subprocess with PIPE stdio, via
-`workshop exec` in the task's clone — argument list, never a shell — with the
-configured agent environment injected and a stream limit of at least 4 MiB.
+`workshop exec` in the task's clone — argument list, never a shell — with a
+stream limit of at least 4 MiB.
 
 The large stream limit matters: agent frames routinely exceed the default
 64 KiB line limit, and a truncated frame is an unrecoverable protocol error.
@@ -124,7 +124,6 @@ it would hide that.
 
 | Key | Default | Effect |
 |---|---|---|
-| `agent_env` | `{}` | Forwarded into the agent's command line. See [the trust boundary](../../use/explanation/trust-boundary.md) before using it. |
 | `agent_ready_timeout` | `30` | Bound on the ready handshake |
 | `agent_ring_buffer_size` | `1000` | Retained raw events per session |
 | `shutdown_grace` | `10.0` | SIGTERM-to-SIGKILL grace on daemon shutdown |

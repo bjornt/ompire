@@ -151,7 +151,7 @@ async def test_run_recovery_resumes_with_resume_argv_and_no_reprompt(
 
     captured_resume = {}
 
-    def fake_build(clone, env, resume=None, model=None, thinking=None):
+    def fake_build(clone, resume=None, model=None, thinking=None):
         captured_resume["value"] = resume
         return fake_omp_argv("happy")
 
@@ -197,7 +197,7 @@ async def test_run_recovery_failure_marks_task_and_session_failed(
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, env, resume=None, model=None, thinking=None: fake_omp_argv("crash"),
+        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv("crash"),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -241,7 +241,7 @@ async def test_run_recovery_legacy_complete_run_is_not_redriven(
     finish_step_record(engine, task.id, record.seq, status="ok")
     task = set_run_status(engine, task.id, "complete", None)
 
-    def fake_build(clone, env, resume=None, model=None, thinking=None):
+    def fake_build(clone, resume=None, model=None, thinking=None):
         return fake_omp_argv("happy")
 
     monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)

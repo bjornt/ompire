@@ -124,18 +124,17 @@ def _argv(workdir: Path) -> list[str]:
     ]
 
 
-def _env(port: int) -> dict[str, str]:
-    return {
-        "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
-        "ANTHROPIC_API_KEY": "capture-server-not-a-real-key",
-    }
-
-
-async def _prompt_real_omp(workdir: Path, message: str) -> str:
+async def _prompt_real_omp(
+    monkeypatch: pytest.MonkeyPatch, workdir: Path, message: str
+) -> str:
     """Send one prompt through the production path; return the provider body."""
     with _CaptureServer() as server:
+        monkeypatch.setenv(
+            "ANTHROPIC_BASE_URL", f"http://127.0.0.1:{server.port}"
+        )
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "capture-server-not-a-real-key")
         handle = await AgentHandle.start(
-            _argv(workdir), env=_env(server.port), ready_timeout=90, ring_buffer_size=200
+            _argv(workdir), ready_timeout=90, ring_buffer_size=200
         )
         try:
             response = await asyncio.wait_for(handle.prompt(message), timeout=60)
@@ -154,11 +153,12 @@ def workdir(tmp_path: Path) -> Path:
 
 
 async def test_mention_in_the_rpc_message_reaches_the_model_as_file_context(
+    monkeypatch: pytest.MonkeyPatch,
     workdir: Path,
 ) -> None:
     """The property the whole feature depends on: `@path` in the `message`
     field of a `prompt` request becomes file content in the model request."""
-    texts = _message_texts(await _prompt_real_omp(workdir, "What does @probe-target.txt say?"))
+    texts = _message_texts(await _prompt_real_omp(monkeypatch, workdir, "What does @probe-target.txt say?"))
 
     assert MARKER in texts, "the mentioned file's content never reached the model"
     # Delivered as file context, not merely as the characters the operator typed.
@@ -166,6 +166,7 @@ async def test_mention_in_the_rpc_message_reaches_the_model_as_file_context(
 
 
 async def test_an_unresolvable_mention_is_dropped_silently_by_omp(
+    monkeypatch: pytest.MonkeyPatch,
     workdir: Path,
 ) -> None:
     """The justification for the daemon's pre-flight check: Omp fails open.
@@ -175,15 +176,17 @@ async def test_an_unresolvable_mention_is_dropped_silently_by_omp(
     than the only thing standing between the operator and silently missing
     context.
     """
-    texts = _message_texts(await _prompt_real_omp(workdir, "What does @no-such-file.txt say?"))
+    texts = _message_texts(await _prompt_real_omp(monkeypatch, workdir, "What does @no-such-file.txt say?"))
 
     assert "<file path=" not in texts
     # The turn still succeeded: nothing anywhere reports the missing file.
     assert "no-such-file.txt" in texts
 
 
-async def test_an_email_address_is_not_treated_as_a_mention(workdir: Path) -> None:
+async def test_an_email_address_is_not_treated_as_a_mention(
+    monkeypatch: pytest.MonkeyPatch, workdir: Path
+) -> None:
     """Omp's word-boundary rule matches the daemon's mention rule."""
-    texts = _message_texts(await _prompt_real_omp(workdir, "Mail someone@example.com about it."))
+    texts = _message_texts(await _prompt_real_omp(monkeypatch, workdir, "Mail someone@example.com about it."))
 
     assert "<file path=" not in texts

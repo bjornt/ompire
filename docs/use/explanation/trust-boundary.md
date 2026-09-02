@@ -76,24 +76,8 @@ intended key's signature before pushing anything.
 
 ## Where the boundary is currently weaker than intended
 
-Two gaps are worth knowing about, because documentation that only describes
-the intended model would be misleading.
-
-**`agent_env` is an unfiltered passthrough.** Model authentication is supposed
-to reach the agent through the auth-gateway tunnel declared in
-`workshop.yaml`, and that is the path this project uses. `agent_env` is a
-fallback for deployments with no gateway: the daemon forwards whatever you put
-in it, without inspecting it, because it has no way to tell a credential from
-an endpoint URL.
-
-The exposure is broader than it looks. The values are not passed as a private
-environment — they are placed in the agent's command line, so they appear in
-the host process table and can be read by any process running as your user,
-the agent included.
-
-The intended direction is that the gateway becomes the only credential path
-and this fallback goes away. Until then, treat anything in `agent_env` as
-disclosed, and keep credentials out of it.
+One gap is worth knowing about, because documentation that only describes the
+intended model would be misleading.
 
 **Network access is ambient.** Policy-controlled network access per workflow
 is direction, not current behavior. The container has the network access its

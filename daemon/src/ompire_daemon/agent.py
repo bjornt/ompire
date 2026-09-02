@@ -14,9 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 from collections import deque
-from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from ompire_daemon import rpc
@@ -59,15 +57,14 @@ class NoLiveAgentError(Exception):
 
 def build_agent_argv(
     clone_path: str,
-    agent_env: Mapping[str, str],
     *,
     resume: str | None = None,
     model: str | None = None,
     thinking: str | None = None,
 ) -> list[str]:
     """The spike's spawn recipe (design D-2): sessions ON (no `--no-session`),
-    no `-s` flag (nonexistent), credentials via an `env` prefix inside the
-    container (design D-3). `resume` appends `--resume <session-id>`
+    no `-s` flag (nonexistent), and no environment-injection prefix
+    (ADR-0015). `resume` appends `--resume <session-id>`
     (crash-recovery capability, design D-1/D-3) — a bare session id, not a
     file path, confirmed against the omp source (see the
     `omp-rpc-field-assumptions` memory note). `model`/`thinking` append
@@ -75,7 +72,6 @@ def build_agent_argv(
     verified against omp v17.2.12); unset means omp's defaults."""
     argv = [
         "workshop", "exec", "-p", clone_path, "--",
-        "env", *[f"{key}={value}" for key, value in agent_env.items()],
         "omp", "--mode", "rpc-ui", "--no-title",
     ]
     if model is not None:
@@ -147,12 +143,14 @@ class AgentHandle:
         cls,
         argv: list[str],
         *,
-        env: Mapping[str, str] | None = None,
         ready_timeout: float,
         ring_buffer_size: int,
     ) -> AgentHandle:
         """Spawn and complete the ready handshake; on failure the child is
-        dead and the captured stderr rides on the raised AgentStartError."""
+        dead and the captured stderr rides on the raised AgentStartError.
+
+        The launcher inherits the daemon's process environment and nothing
+        else (ADR-0015)."""
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv,
@@ -160,7 +158,6 @@ class AgentHandle:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=rpc.STREAM_LIMIT,
-                env={**os.environ, **env} if env else None,
             )
         except OSError as exc:
             raise AgentStartError(f"cannot exec {argv[0]!r}: {exc}") from exc
@@ -360,7 +357,7 @@ class AgentSupervisor:
             await verify_ask_timeout(clone_path)
             self._ask_timeout_verified.add(task_id)
         argv = build_agent_argv(
-            clone_path, self._config.agent_env, resume=resume, model=model, thinking=thinking
+            clone_path, resume=resume, model=model, thinking=thinking
         )
         if self._tracker is not None and resume is None:
             # `starting` covers the spawn and ready handshake (design D-2). A

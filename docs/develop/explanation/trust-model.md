@@ -76,34 +76,10 @@ A yes to any of these is a design problem, not a detail.
 
 ## The known gaps
 
-Two are real and currently unresolved:
-
-**`agent_env`.** The supported credential path is the auth-gateway tunnel
-declared in `workshop.yaml`; `agent_env` is a fallback for deployments without
-one, and the daemon forwards its contents without inspecting them.
-
-Two properties make it a hole rather than an accepted cost:
-
-- `build_agent_argv` places the values in the **argv** —
-  `workshop exec ... -- env KEY=VALUE omp ...` — not in a passed environment.
-  They are therefore readable from the host process table by anything running
-  as the operator, and by the agent itself. An agent that runs `ps` finds them
-  without doing anything adversarial.
-- The recorded mitigation for this key covers the config file at rest and the
-  daemon's logs. It does not address argv exposure at all, so this is an
-  unexamined gap rather than a documented trade.
-
-The intended resolution is that the gateway becomes the only path and this
-fallback is removed. Do not build anything that assumes `agent_env` is a safe
-place to put a secret, and do not extend it.
+One is real and currently unresolved:
 
 **Ambient network access.** Per-workflow network policy is direction, not
 behavior. The container has whatever access its environment provides.
 
-Both are tracked as decisions requiring reconciliation in `ADR.PLAN.md`. Do
-not resolve either incidentally.
-
-Note that the credential decision has two parts, not one: whether credentials
-may reach the agent's environment at all, and — if any fallback survives —
-whether it may use argv. Replacing `agent_env` with a broker resolves both.
-Keeping it and moving it out of argv resolves only the second.
+It is tracked as a decision requiring reconciliation in `ADR.PLAN.md`. Do not
+resolve it incidentally.

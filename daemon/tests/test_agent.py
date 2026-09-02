@@ -108,29 +108,30 @@ async def test_ring_buffer_replays_in_order_and_caps_size() -> None:
 
 
 def test_build_agent_argv_recipe() -> None:
-    argv = build_agent_argv("/clones/t1", {"ANTHROPIC_API_KEY": "sk-x"})
+    argv = build_agent_argv("/clones/t1")
     assert argv == [
         "workshop", "exec", "-p", "/clones/t1", "--",
-        "env", "ANTHROPIC_API_KEY=sk-x",
         "omp", "--mode", "rpc-ui", "--no-title",
     ]
+    # No environment-injection prefix (ADR-0015).
+    assert "env" not in argv
     # Sessions stay ON and the nonexistent -s flag is never used (design D-2).
     assert "--no-session" not in argv
     assert "-s" not in argv
 
 
 def test_build_agent_argv_resume_appends_flag() -> None:
-    argv = build_agent_argv("/clones/t1", {}, resume="sess-abc")
+    argv = build_agent_argv("/clones/t1", resume="sess-abc")
     assert argv[-2:] == ["--resume", "sess-abc"]
 
 
 def test_build_agent_argv_no_resume_by_default() -> None:
-    argv = build_agent_argv("/clones/t1", {})
+    argv = build_agent_argv("/clones/t1")
     assert "--resume" not in argv
 
 
 def test_build_agent_argv_model_and_thinking() -> None:
-    argv = build_agent_argv("/clones/t1", {}, model="fable-5", thinking="high")
+    argv = build_agent_argv("/clones/t1", model="fable-5", thinking="high")
     assert "--model" in argv
     assert argv[argv.index("--model") + 1] == "fable-5"
     assert "--thinking" in argv
@@ -138,13 +139,13 @@ def test_build_agent_argv_model_and_thinking() -> None:
 
 
 def test_build_agent_argv_omits_unset_model_thinking() -> None:
-    argv = build_agent_argv("/clones/t1", {})
+    argv = build_agent_argv("/clones/t1")
     assert "--model" not in argv
     assert "--thinking" not in argv
 
 
 def test_build_agent_argv_model_only() -> None:
-    argv = build_agent_argv("/clones/t1", {}, model="fable-5")
+    argv = build_agent_argv("/clones/t1", model="fable-5")
     assert "--model" in argv
     assert "--thinking" not in argv
 
@@ -189,7 +190,7 @@ def supervisor(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, env, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
+        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -242,7 +243,7 @@ async def test_supervisor_resume_appends_resume_flag(monkeypatch) -> None:
     sup = AgentSupervisor(config, hub)
     captured = {}
 
-    def fake_build(clone, env, resume=None, model=None, thinking=None):
+    def fake_build(clone, resume=None, model=None, thinking=None):
         captured["resume"] = resume
         return fake_omp_argv("happy")
 
@@ -264,7 +265,7 @@ async def test_supervisor_threads_model_and_thinking(monkeypatch) -> None:
     sup = AgentSupervisor(config, hub)
     captured = {}
 
-    def fake_build(clone, env, resume=None, model=None, thinking=None):
+    def fake_build(clone, resume=None, model=None, thinking=None):
         captured["model"] = model
         captured["thinking"] = thinking
         return fake_omp_argv("happy")
@@ -291,7 +292,7 @@ def tracked_supervisor(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, env, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
+        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
     )
 
     async def no_preflight(clone_path: str) -> None:

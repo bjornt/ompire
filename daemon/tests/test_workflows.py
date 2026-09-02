@@ -112,7 +112,7 @@ async def rig(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, env, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
+        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -1085,7 +1085,7 @@ async def test_judge_spawn_failure_degrades_without_judging(
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, env, resume=None, model=None, thinking=None: fake_omp_argv(
+        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv(
             "crash" if model == "judge-boom" else "happy"
         ),
     )
@@ -1127,7 +1127,7 @@ async def test_judge_spawn_uses_judge_model(
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, env, resume=None, model=None, thinking=None: (
+        lambda clone, resume=None, model=None, thinking=None: (
             seen_models.append(model),
             fake_omp_argv("happy"),
         )[1],

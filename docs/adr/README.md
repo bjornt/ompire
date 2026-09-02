@@ -32,7 +32,7 @@ relying on it.
 | [0012](0012-derive-attention-centrally-from-session-state.md) | Derive attention centrally from session state | Accepted |
 | [0013](0013-layer-daemon-writable-settings-over-operator-configuration.md) | Layer daemon-writable settings over operator configuration | Accepted |
 | [0014](0014-test-end-to-end-behavior-at-external-process-boundaries.md) | Test end-to-end behavior at external process boundaries | Accepted |
-| [0015](0015-keep-agent-credentials-behind-narrow-brokers.md) | Keep agent credentials behind narrow brokers | Proposed |
+| [0015](0015-keep-agent-credentials-behind-narrow-brokers.md) | Keep agent credentials behind narrow brokers | Accepted |
 | [0016](0016-persist-authority-bearing-task-history-and-provenance.md) | Persist authority-bearing task history and provenance | Proposed |
 | [0017](0017-use-dedicated-bot-as-default-publishing-identity.md) | Use a dedicated bot as the default publishing identity | Proposed |
 | [0018](0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md) | Keep built-in workflows in Python until portable versioning is required | Accepted |

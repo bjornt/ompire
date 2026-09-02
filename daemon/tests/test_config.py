@@ -107,7 +107,6 @@ def test_invalid_workshop_step_timeout_fails_fast(tmp_path: Path) -> None:
 def test_agent_config_defaults(tmp_path: Path) -> None:
     config = load_config(tmp_path / "does-not-exist.toml")
 
-    assert config.agent_env == {}
     assert config.agent_ready_timeout == 30
     assert config.agent_ring_buffer_size == 1000
 
@@ -117,26 +116,19 @@ def test_agent_config_values(tmp_path: Path) -> None:
     config_path.write_text(
         "agent_ready_timeout = 60\n"
         "agent_ring_buffer_size = 500\n"
-        "[agent_env]\n"
-        'ANTHROPIC_BASE_URL = "http://localhost:4000"\n'
-        'ANTHROPIC_API_KEY = "sk-test"\n'
     )
 
     config = load_config(config_path)
 
-    assert config.agent_env == {
-        "ANTHROPIC_BASE_URL": "http://localhost:4000",
-        "ANTHROPIC_API_KEY": "sk-test",
-    }
     assert config.agent_ready_timeout == 60
     assert config.agent_ring_buffer_size == 500
 
 
-def test_agent_env_must_be_string_table(tmp_path: Path) -> None:
+def test_agent_env_rejected_with_migration_hint(tmp_path: Path) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text("[agent_env]\nTIMEOUT = 5\n")
 
-    with pytest.raises(ConfigError, match="agent_env"):
+    with pytest.raises(ConfigError, match="agent_env.*workshop\\.yaml"):
         load_config(config_path)
 
 
