@@ -27,6 +27,53 @@ xdg-open "http://127.0.0.1:4173/?token=$(cat ~/.local/share/ompire/token)"
 If the token was rotated, every open WebSocket is closed with code `1008` and
 every client must re-authenticate with the new token.
 
+## The UI is empty after a snap upgrade
+
+Your state is not stored in the snap revision. It lives in
+`~/snap/ompire/common`, and the daemon reports the directory it actually
+opened:
+
+```sh
+curl -H "Authorization: Bearer $(cat ~/snap/ompire/common/token)" \
+  http://127.0.0.1:4173/api/daemon/info
+```
+
+A `data_dir` ending in a revision, such as `~/snap/ompire/x8`, means the common
+directory was not available and the daemon fell back to the revision
+directory.
+
+Upgrading from a snap old enough to have stored state per revision moves it
+once, on the first start of the new revision, and logs it:
+
+```
+carried operator state (token, ompire.db-wal, ompire.db) from /home/you/snap/ompire/x8 to /home/you/snap/ompire/common
+```
+
+No such line means there was nothing to carry. That is normal on every start
+after the first. Nothing is ever deleted from the revision directory, so look
+there before concluding anything is lost:
+
+```sh
+ls ~/snap/ompire/*/db/ompire.db
+```
+
+A carry-forward that cannot finish stops the daemon instead of starting it on
+an empty database, and names both directories:
+
+```
+ompire-daemon: could not carry operator state from /home/you/snap/ompire/x8 to /home/you/snap/ompire/common: ...
+```
+
+Two things suppress the carry-forward deliberately: a `data_dir` set in
+[`config.toml`](../reference/configuration.md), because a directory you named
+is yours and another install's state does not get written into it; and a data
+directory that already holds a database, because a carry-forward never
+overwrites.
+
+Finally, an empty **Tasks** list is not the same as empty state — archived
+tasks are hidden from it. Check **Projects** before concluding that an upgrade
+lost anything.
+
 ## The daemon chip shows disconnected
 
 The WebSocket dropped. The frontend reconnects on its own and receives a fresh

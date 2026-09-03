@@ -21,6 +21,21 @@ from ompire_daemon.migrate import upgrade_head
 REAL_ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 
 
+def test_upgrade_head_keeps_existing_loggers_enabled(tmp_path: Path) -> None:
+    """Migrations run in-process at daemon startup, so alembic's `fileConfig`
+    must not disable existing loggers. The default (`True`) silently killed
+    every ompire_daemon.* logger, and no daemon log line reached the journal
+    (dogfooding: a failed ship was invisible in journald)."""
+    import logging
+
+    logger = logging.getLogger("ompire_daemon.ship")
+    logger.disabled = False
+
+    upgrade_head(tmp_path / "ompire.db", alembic_ini=REAL_ALEMBIC_INI)
+
+    assert not logger.disabled
+
+
 def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
     db_path = tmp_path / "ompire.db"
 

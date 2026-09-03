@@ -17,7 +17,20 @@ DEFAULT_BIND = "127.0.0.1"
 
 
 def _default_data_dir() -> Path:
-    """Use per-user snap data, otherwise the XDG data directory."""
+    """Use per-user snap common data, otherwise the XDG data directory.
+
+    Revision-independent operator state: ADR-0024
+    (docs/adr/0024-keep-operator-state-outside-package-revisions.md).
+    `$SNAP_USER_COMMON` outlives revisions; `$SNAP_USER_DATA` does not, so a
+    store placed there follows `snap revert` and is pruned with the revision
+    that owns it. `$SNAP_USER_DATA` stays as a fallback so a snapd context
+    that exports only the revision directory keeps its store inside the snap
+    instead of silently relocating to the host's XDG directory.
+    """
+    snap_user_common = os.environ.get("SNAP_USER_COMMON")
+    if snap_user_common:
+        return Path(snap_user_common)
+
     snap_user_data = os.environ.get("SNAP_USER_DATA")
     if snap_user_data:
         return Path(snap_user_data)

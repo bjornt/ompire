@@ -41,6 +41,7 @@ relying on it.
 | [0021](0021-admit-signing-key-selection-as-bounded-daemon-writable-setting.md) | Admit signing-key selection as a bounded daemon-writable setting | Accepted |
 | [0022](0022-create-or-adopt-base-checkouts-without-mutating-them.md) | Create or adopt a project's base checkout without mutating operator repositories | Accepted |
 | [0023](0023-admit-checkout-root-as-bounded-daemon-writable-setting.md) | Admit `checkout_root` as a bounded daemon-writable setting | Accepted |
+| [0024](0024-keep-operator-state-outside-package-revisions.md) | Keep operator state outside package revisions | Accepted |
 
 ## Template
 

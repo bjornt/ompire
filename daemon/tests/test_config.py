@@ -10,15 +10,36 @@ def test_defaults_when_file_absent(tmp_path: Path) -> None:
     config = load_config(tmp_path / "does-not-exist.toml")
     assert config == Config()
 
-def test_snap_default_data_dir_is_per_user(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SNAP_USER_DATA", "/home/alice/snap/ompire/current")
+def test_snap_default_data_dir_is_revision_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The revision directory must lose to the common one when both exist.
+
+    A store under `$SNAP_USER_DATA` follows `snap revert` and is pruned with
+    its revision (ADR-0024).
+    """
+    monkeypatch.setenv("SNAP_USER_COMMON", "/home/alice/snap/ompire/common")
+    monkeypatch.setenv("SNAP_USER_DATA", "/home/alice/snap/ompire/x8")
     monkeypatch.setenv("SNAP_NAME", "ompire")
     monkeypatch.setenv("XDG_DATA_HOME", "/tmp/xdg")
 
-    assert config_module._default_data_dir() == Path("/home/alice/snap/ompire/current")
+    assert config_module._default_data_dir() == Path("/home/alice/snap/ompire/common")
+
+
+def test_snap_default_data_dir_falls_back_to_revision_dir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Still inside the snap, never the host's XDG directory."""
+    monkeypatch.delenv("SNAP_USER_COMMON", raising=False)
+    monkeypatch.setenv("SNAP_USER_DATA", "/home/alice/snap/ompire/x8")
+    monkeypatch.setenv("SNAP_NAME", "ompire")
+    monkeypatch.setenv("XDG_DATA_HOME", "/tmp/xdg")
+
+    assert config_module._default_data_dir() == Path("/home/alice/snap/ompire/x8")
 
 
 def test_default_data_dir_uses_xdg_data_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SNAP_USER_COMMON", raising=False)
     monkeypatch.delenv("SNAP_USER_DATA", raising=False)
     monkeypatch.setenv("XDG_DATA_HOME", "/home/alice/.data")
 

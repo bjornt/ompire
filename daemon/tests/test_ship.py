@@ -651,7 +651,7 @@ async def test_clone_local_signing_config_cannot_redirect_the_commit(
 
 
 async def test_commit_failure_restores_head_and_cleans_ref(
-    tmp_root, engine, ships, gpg, monkeypatch
+    tmp_root, engine, ships, gpg, monkeypatch, caplog
 ):
     monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
 
@@ -686,6 +686,16 @@ async def test_commit_failure_restores_head_and_cleans_ref(
 
     assert state.status == "error"
     assert state.commit_sha is None
+    # The commit's stderr must reach the operator, not just the step name
+    # (dogfooding: "spawn step 'ship-commit' failed" carried no diagnosis).
+    assert state.error is not None
+    assert state.error.startswith("commit failed:")
+    assert "gpg failed to sign" in state.error
+    # And the failure must reach the daemon log so journald shows it too.
+    assert any(
+        "ship commit failed" in rec.getMessage() and "gpg failed to sign" in rec.getMessage()
+        for rec in caplog.records
+    )
 
     # HEAD restored to original.
     head_sha = subprocess.run(

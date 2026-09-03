@@ -398,12 +398,14 @@ class ShipManager:
                 "ok",
                 {"sha": sha, "count": commit_count},
             )
+        except StepFailedError as exc:
+            # The step's stderr is the real git/gpg failure; str(exc) alone
+            # would only name the step (dogfooding found the bare message).
+            return self._finish_commit_error(
+                task.id, f"commit failed: {exc.stderr.strip() or str(exc)}"
+            )
         except Exception as exc:  # noqa: BLE001
-            message = f"commit failed: {exc}"
-            self._set_state(task.id, status="error", error=message)
-            self._publish_step(task.id, "commit", "failed", message)
-            self._hub.publish("ship_finished", {"task_id": task.id, "status": "error"})
-            return self._ships[task.id]
+            return self._finish_commit_error(task.id, f"commit failed: {exc}")
         finally:
             await self._delete_ship_orig(clone_path, timeout)
 
@@ -1004,12 +1006,23 @@ class ShipManager:
         self._hub.publish("ship_step", payload)
         return state
 
+    def _finish_commit_error(self, task_id: int, message: str) -> ShipState:
+        # Ship errors otherwise surface only as UI state; log them so the
+        # daemon journal shows why a ship died (dogfooding gap).
+        logger.warning("ship commit failed for task %d: %s", task_id, message)
+        state = self._set_state(task_id, status="error", error=message)
+        self._publish_step(task_id, "commit", "failed", message)
+        self._hub.publish("ship_finished", {"task_id": task_id, "status": "error"})
+        return state
+
     def _finish_draft_error(self, task_id: int, message: str) -> ShipState:
+        logger.warning("ship draft failed for task %d: %s", task_id, message)
         state = self._set_state(task_id, status="error", error=message)
         self._publish_step(task_id, "draft", "failed", message)
         return state
 
     def _finish_publish_error(self, task_id: int, step: str, message: str) -> ShipState:
+        logger.warning("ship %s failed for task %d: %s", step, task_id, message)
         state = self._set_state(task_id, status="error", error=message)
         self._publish_step(task_id, step, "failed", message)
         self._hub.publish("ship_finished", {"task_id": task_id, "status": "error"})

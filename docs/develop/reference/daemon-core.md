@@ -40,6 +40,25 @@ A fresh start creates the database and applies every migration. An existing
 database at an earlier version receives only the missing ones, preserving
 rows.
 
+### Carrying state out of a snap revision
+
+The snap once stored operator state per revision, under `$SNAP_USER_DATA`.
+Before migrations run, the daemon carries such a store into the
+revision-independent data directory exactly once: only when the data directory
+is the snap default, holds no database, and the revision directory does hold
+one.
+
+The database moves together with its write-ahead log, the token verbatim, and
+the audit log when present. The database is placed last, so a store is never
+half-carried. The source is left untouched as the operator's fallback copy,
+and a carry that cannot complete stops startup rather than leaving an empty
+database in place of the operator's own.
+
+Everything downstream, migrations included, then treats the result as an
+ordinary existing database.
+
+Rationale: [ADR-0024](../../adr/0024-keep-operator-state-outside-package-revisions.md).
+
 ### Authentication
 
 A random token is generated on first run and stored with owner-only (0600)
@@ -78,7 +97,7 @@ honest `404` rather than a 200 of HTML that a client would fail to parse.
 |---|---|---|
 | `bind` | `127.0.0.1` | The single-user security boundary |
 | `port` | `4173` | |
-| `data_dir` | `$SNAP_USER_DATA`, else `$XDG_DATA_HOME/ompire` | Database, token, audit log |
+| `data_dir` | `$SNAP_USER_COMMON`, else `$XDG_DATA_HOME/ompire` | Database, token, audit log |
 
 ## Interfaces
 

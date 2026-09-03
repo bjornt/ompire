@@ -23,6 +23,7 @@ from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
+from ompire_daemon.datadir import audit_log_path_for
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import (
@@ -1583,7 +1584,7 @@ def daemon_info_route(
     config: Config = Depends(_config),
 ) -> DaemonInfoOut:
     data_dir = config.data_dir
-    audit_path = data_dir / "audit.log"
+    audit_path = audit_log_path_for(data_dir)
     audit_log_path = str(audit_path) if audit_path.is_file() else None
     return DaemonInfoOut(
         bind=config.bind,

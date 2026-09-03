@@ -137,3 +137,4 @@ nav:
           - 0021 Signing-key selection as a setting: adr/0021-admit-signing-key-selection-as-bounded-daemon-writable-setting.md
           - 0022 Adopt or clone base checkouts: adr/0022-create-or-adopt-base-checkouts-without-mutating-them.md
           - 0023 Checkout root as a setting: adr/0023-admit-checkout-root-as-bounded-daemon-writable-setting.md
+          - 0024 State outside package revisions: adr/0024-keep-operator-state-outside-package-revisions.md

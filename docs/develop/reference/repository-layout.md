@@ -55,4 +55,7 @@ Nothing the daemon writes lives in the repository.
 | `~/tasks/<project>/<slug>/` | Task clones |
 | `~/proj/<project>/` | Project checkouts, by default |
 
-Under the snap, the data directory is `$SNAP_USER_DATA` instead.
+Under the snap, the data directory is `$SNAP_USER_COMMON`
+(`~/snap/ompire/common`) instead — shared by every revision, so an upgrade,
+a revert, or snapd pruning an old revision cannot move or delete it
+([ADR-0024](../../adr/0024-keep-operator-state-outside-package-revisions.md)).

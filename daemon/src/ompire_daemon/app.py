@@ -26,6 +26,7 @@ from ompire_daemon.api.rest import router as api_router
 from ompire_daemon.api.ws import router as ws_router
 from ompire_daemon.auth import load_or_create_token
 from ompire_daemon.config import DEFAULT_CONFIG_PATH, Config
+from ompire_daemon.datadir import carry_forward_snap_state
 from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
@@ -170,6 +171,10 @@ def create_app(
 ) -> FastAPI:
     config.data_dir.mkdir(parents=True, exist_ok=True)
     config.data_dir.chmod(0o755)
+    # Before any database work: a snap that used to store state per revision
+    # leaves it behind on upgrade (ADR-0024). Anything carried in is an
+    # ordinary existing database from here on, including to `upgrade_head`.
+    carry_forward_snap_state(config.data_dir)
     db_path = db_path_for(config.data_dir)
     ensure_db_dir(db_path)
     upgrade_head(db_path)

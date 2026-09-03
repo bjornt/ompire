@@ -18,7 +18,7 @@ that are also editable at runtime (marked below).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `data_dir` | string | `$SNAP_USER_DATA`, else `$XDG_DATA_HOME/ompire` | Holds the database, the bearer token, and the audit log. |
+| `data_dir` | string | `$SNAP_USER_COMMON`, else `$XDG_DATA_HOME/ompire` | Holds the database, the bearer token, and the audit log. Under the snap that is `~/snap/ompire/common`, which every revision shares. Setting this key also suppresses the [upgrade carry-forward](../how-to/troubleshoot.md#the-ui-is-empty-after-a-snap-upgrade). |
 | `task_dir_root` | string | `~/tasks` | Task clones live under `<root>/<project>/<slug>`. Cleanup refuses paths outside this root. |
 | `checkout_root` | string | `~/proj` | Parent directory a project's `checkout_path` is derived from. A registry override takes precedence — see [Daemon settings](daemon-settings.md#the-recognized-settings). |
 

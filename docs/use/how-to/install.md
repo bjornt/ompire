@@ -53,6 +53,12 @@ Classic confinement is required: Ompire needs to reach your container tooling,
 your GPG agent, and `gh`. The prerequisites above are not bundled in the snap
 and must be present on the host.
 
+Your state — projects, tasks, templates, settings, and the bearer token —
+lives in `~/snap/ompire/common`, outside any snap revision. Refreshing,
+reverting, and snapd's pruning of old revisions all leave it alone. Upgrading
+from a snap old enough to have stored state per revision moves it there once,
+on the first start of the new revision, and says so in the daemon's log.
+
 ## First run
 
 ```sh
@@ -61,8 +67,8 @@ uv run ompire-daemon
 
 On first run the daemon generates a bearer token and writes it with owner-only
 permissions to `$XDG_DATA_HOME/ompire/token` — by default
-`~/.local/share/ompire/token`. Under the snap it goes to `$SNAP_USER_DATA`
-instead.
+`~/.local/share/ompire/token`. Under the snap it goes to `$SNAP_USER_COMMON`
+instead, at `~/snap/ompire/common/token`.
 
 The daemon listens on `http://127.0.0.1:4173`. Open it once with the token in
 the query string; the frontend stores it in `localStorage` and subsequent
