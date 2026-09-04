@@ -34,6 +34,7 @@ parts:
     source: daemon
     build-packages:
       - curl
+      - git
       - python3
       - python3-dev
     build-attributes:
@@ -73,9 +74,11 @@ parts:
       cp alembic.ini "$INSTALL_DIR/lib/python$PYVER/alembic.ini"
       cp -r alembic "$INSTALL_DIR/lib/python$PYVER/alembic"
 
-      # Expose the version from pyproject.toml to snapcraft.
+      # Expose the version from pyproject.toml to snapcraft, appending the
+      # current git commit so locally rebuilt snaps are distinguishable.
       VERSION=$(python3 -c "import tomllib, pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
-      craftctl set version="$VERSION"
+      COMMIT=$(git -C "${CRAFT_PROJECT_DIR}" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+      craftctl set version="${VERSION}-g.${COMMIT}"
 
   ompire-frontend:
     plugin: nil
