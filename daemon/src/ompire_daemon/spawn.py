@@ -41,9 +41,12 @@ _STDERR_LIMIT = 64 * 1024
 
 WORKSHOP_LOCK_FILENAME = ".workshop.lock"
 
-# The daemon-owned outcome directory (workflow-engine design D-3): excluded
-# from git per clone so outcome files never appear in status/diffs/reviews.
+# Daemon-owned paths, excluded from git per clone: the outcome directory
+# (workflow-engine design D-3) and the workshop lock (design D-1). They must
+# never appear in status, diffs, reviews, or a ship commit — the ship flow
+# stages the agent's whole delta, lock file included (dogfooding).
 GIT_EXCLUDE_OMPIRE_ENTRY = ".ompire/"
+_GIT_EXCLUDE_ENTRIES = (GIT_EXCLUDE_OMPIRE_ENTRY, WORKSHOP_LOCK_FILENAME)
 
 
 class StepFailedError(Exception):
@@ -68,7 +71,7 @@ async def _run_step(step: Step) -> str:
             *step.argv,
             cwd=step.cwd,
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except OSError as exc:
@@ -76,7 +79,9 @@ async def _run_step(step: Step) -> str:
         # instead of letting the background job die with the task stuck.
         raise StepFailedError(step.name, f"cannot exec {step.argv[0]!r}: {exc}") from exc
     try:
-        _, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=step.timeout)
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            process.communicate(), timeout=step.timeout
+        )
     except asyncio.CancelledError:
         if process.returncode is None:
             process.kill()
@@ -95,8 +100,21 @@ async def _run_step(step: Step) -> str:
             await asyncio.wait_for(process.wait(), timeout=5)
         raise StepFailedError(step.name, f"timed out after {step.timeout}s") from None
     stderr = stderr_bytes[-_STDERR_LIMIT:].decode("utf-8", errors="replace")
-    if process.returncode != 0:
-        raise StepFailedError(step.name, stderr)
+    code = process.returncode
+    assert code is not None  # communicate() has reaped the process
+    if code != 0:
+        # A hook or gpg wrapper can fail with nothing on stderr; stdout and
+        # the exit code are then the only diagnosis (dogfooding: a ship
+        # commit died silently and the error carried no cause at all).
+        stdout = stdout_bytes[-_STDERR_LIMIT:].decode("utf-8", errors="replace")
+        detail = stderr.strip() or stdout.strip()
+        if not detail:
+            detail = (
+                f"killed by signal {-code}"
+                if code < 0
+                else f"exited with code {code}"
+            )
+        raise StepFailedError(step.name, detail)
     return stderr
 
 
@@ -122,22 +140,29 @@ def _git_steps(config: Config, project: Project, template: Template, task: Task)
     ]
 
 
-def _exclude_outcome_dir(clone_path: str) -> None:
-    """Append `.ompire/` to the clone's `.git/info/exclude` (idempotent) so
-    outcome files are invisible to git status, llmvet, and PRs (SPEC D8)."""
+def _ensure_git_excludes(clone_path: str, step: str = "clone") -> None:
+    """Append every daemon-owned entry to the clone's `.git/info/exclude`
+    (idempotent) so outcome files and the workshop lock are invisible to
+    git status, staging, reviews, and PRs (workflow-engine design D-3/D-8;
+    workshop design D-1)."""
     exclude_path = Path(clone_path) / ".git" / "info" / "exclude"
     try:
         existing = exclude_path.read_text(encoding="utf-8")
     except OSError:
         existing = ""
-    if GIT_EXCLUDE_OMPIRE_ENTRY in existing.splitlines():
+    missing = [
+        entry
+        for entry in _GIT_EXCLUDE_ENTRIES
+        if entry not in existing.splitlines()
+    ]
+    if not missing:
         return
     separator = "" if existing.endswith("\n") or not existing else "\n"
     try:
         with exclude_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{separator}{GIT_EXCLUDE_OMPIRE_ENTRY}\n")
+            handle.write(separator + "\n".join(missing) + "\n")
     except OSError as exc:
-        raise StepFailedError("clone", f"cannot write {exclude_path}: {exc}") from exc
+        raise StepFailedError(step, f"cannot write {exclude_path}: {exc}") from exc
 
 
 def _read_workshop_lock(clone_path: str) -> str:
@@ -205,7 +230,7 @@ async def run_spawn_pipeline(
     async def run_clone_step(step: Step) -> None:
         await _run_step(step)
         if step.name == "clone":
-            _exclude_outcome_dir(task.clone_path)
+            _ensure_git_excludes(task.clone_path)
 
     async def run_workshop() -> None:
         # my-workshop creates/augments workshop.yaml, hides it from git, and

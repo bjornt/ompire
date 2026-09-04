@@ -587,8 +587,20 @@ async def test_commit_and_ship_squashes_delta(
     assert len(log.strip().splitlines()) == 1
     assert "Final squash commit" in log
 
-    # The uncommitted file made it into the commit.
-    assert (clone / "file3.txt").read_text() == "three\n"
+    # The ship commits the agent's pending work: the untracked file made it
+    # into the signed commit (not just the working tree, which ship leaves
+    # alone — dogfooding: this assert used to read the working tree and the
+    # untracked delta silently never shipped).
+    committed = subprocess.run(
+        ["git", "-C", str(clone), "log", "-1", "--format=", "--name-only"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "file3.txt" in committed.splitlines()
+    # No ship plumbing leaks into the commit or the clone.
+    assert "ompire-ship-msg" not in committed
+    assert not list(clone.glob("ompire-ship-msg-*"))
 
 
 async def test_clone_local_signing_config_cannot_redirect_the_commit(
@@ -650,6 +662,104 @@ async def test_clone_local_signing_config_cannot_redirect_the_commit(
     assert signer == fingerprint
 
 
+async def test_commit_and_ship_commits_agent_pending_changes(
+    tmp_root, engine, ships, gpg, monkeypatch
+):
+    """The common case: the agent committed nothing (dogfooding: the ship
+    died with `no changes added to commit`). Squash mode stages the pending
+    working tree itself, and daemon-owned files never ride along."""
+    origin = tmp_root / "origin.git"
+    _project, task = _make_project_and_task(engine, tmp_root)
+
+    bin_dir = tmp_root / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    _write_script(
+        bin_dir, "gh", "#!/bin/sh\necho 'https://github.com/owner/repo/pull/42'\n"
+    )
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    _setup_git_clone(origin, Path(task.clone_path))
+    clone = Path(task.clone_path)
+    # The agent committed nothing: the task branch sits at its base with the
+    # whole delta pending in the working tree.
+    _run_git(clone, "checkout", "main")
+    _run_git(clone, "checkout", "-B", "ompire/task-1")
+    (clone / "base.txt").write_text("edited by agent\n", encoding="utf-8")
+    (clone / "pending.txt").write_text("brand new\n", encoding="utf-8")
+    # A live workshop leaves its lock in the clone; it must never ship.
+    (clone / ".workshop.lock").write_text("ws-lock\n", encoding="utf-8")
+
+    _wrapper, fingerprint = _setup_signing_gpg(bin_dir, monkeypatch)
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(fingerprint))
+
+    real_ensure = ships._ensure_ship_remote
+
+    async def ensure_local(clone_path, url, timeout):
+        return await real_ensure(clone_path, str(origin), timeout)
+
+    monkeypatch.setattr(ships, "_ensure_ship_remote", ensure_local)
+
+    state = await ships.commit_and_ship(
+        task, message="Pending work", pr_title="Title", pr_body="Body"
+    )
+
+    assert state.status == "shipped", state.error
+
+    committed = subprocess.run(
+        ["git", "-C", str(clone), "log", "-1", "--format=", "--name-only"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert "base.txt" in committed
+    assert "pending.txt" in committed
+    assert ".workshop.lock" not in committed
+    assert not any(name.startswith("ompire-ship-msg") for name in committed)
+
+
+async def test_commit_and_ship_names_empty_delta(
+    tmp_root, engine, ships, gpg, monkeypatch
+):
+    """A task with no changes at all fails with a diagnosis, not git noise."""
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
+
+    origin = tmp_root / "origin.git"
+    _project, task = _make_project_and_task(engine, tmp_root)
+
+    _setup_git_clone(origin, Path(task.clone_path))
+    clone = Path(task.clone_path)
+    _run_git(clone, "checkout", "main")
+    _run_git(clone, "checkout", "-B", "ompire/task-1")
+    (clone / "file3.txt").unlink()
+
+    state = await ships.commit_and_ship(
+        task, message="m", pr_title="t", pr_body="b"
+    )
+
+    assert state.status == "error"
+    assert "nothing to ship" in (state.error or "")
+
+
+async def test_retain_preconditions_ignore_workshop_lock(
+    tmp_root, engine, ships, gpg, monkeypatch
+):
+    """The daemon-owned workshop lock is not a dirty tree (dogfooding: retain
+    mode would have refused every live clone as dirty)."""
+    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
+
+    origin = tmp_root / "origin.git"
+    _project, task = _make_project_and_task(engine, tmp_root)
+
+    _setup_git_clone(origin, Path(task.clone_path))
+    clone = Path(task.clone_path)
+    _run_git(clone, "add", "file3.txt")
+    _run_git(clone, "commit", "-m", "commit the pending edit")
+    (clone / ".workshop.lock").write_text("ws-lock\n", encoding="utf-8")
+
+    # Clean tree apart from the lock: retain must be allowed.
+    await ships.check_retain_preconditions(task)
+
+
 async def test_commit_failure_restores_head_and_cleans_ref(
     tmp_root, engine, ships, gpg, monkeypatch, caplog
 ):
@@ -689,7 +799,7 @@ async def test_commit_failure_restores_head_and_cleans_ref(
     # The commit's stderr must reach the operator, not just the step name
     # (dogfooding: "spawn step 'ship-commit' failed" carried no diagnosis).
     assert state.error is not None
-    assert state.error.startswith("commit failed:")
+    assert state.error.startswith("commit failed (ship-commit):")
     assert "gpg failed to sign" in state.error
     # And the failure must reach the daemon log so journald shows it too.
     assert any(

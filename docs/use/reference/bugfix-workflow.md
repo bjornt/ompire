@@ -82,9 +82,10 @@ working tree — and, on loop revisits, the latest validation report.
 It forbids editing `.ompire/` and weakening the reproducer, and instructs the
 coder to **commit the fix on the task branch** and never push.
 
-Committing is not optional. The review flow's reset dance unstages everything
-for the reviewer, and the ship flow's squash commit is built from the branch
-tip's tree — a worktree-only fix would ship as an empty commit.
+Committing is instructed, not load-bearing: the review flow's reset dance
+unstages everything for the reviewer either way, and the ship flow's squash
+commit stages the whole working tree — committed or pending — so an agent
+that stops at a worktree-only fix still ships correctly.
 
 ### 4. Route validation
 

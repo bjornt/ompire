@@ -36,7 +36,7 @@ from ompire_daemon.registry.tasks import Task, mark_pr_url
 from ompire_daemon.registry.templates import get_template
 from ompire_daemon.review import _run_git_output
 from ompire_daemon.sessions import wait_for_idle
-from ompire_daemon.spawn import Step, StepFailedError, _run_step
+from ompire_daemon.spawn import Step, StepFailedError, _ensure_git_excludes, _run_step
 
 if TYPE_CHECKING:
     from ompire_daemon.agent import AgentSupervisor
@@ -399,10 +399,11 @@ class ShipManager:
                 {"sha": sha, "count": commit_count},
             )
         except StepFailedError as exc:
-            # The step's stderr is the real git/gpg failure; str(exc) alone
-            # would only name the step (dogfooding found the bare message).
+            # The step's captured output is the real git/gpg failure; name
+            # the step too, since this phase runs several (dogfooding: the
+            # bare message named neither the step's output nor its exit code).
             return self._finish_commit_error(
-                task.id, f"commit failed: {exc.stderr.strip() or str(exc)}"
+                task.id, f"commit failed ({exc.step}): {exc.stderr.strip() or str(exc)}"
             )
         except Exception as exc:  # noqa: BLE001
             return self._finish_commit_error(task.id, f"commit failed: {exc}")
@@ -520,9 +521,10 @@ class ShipManager:
         email = await self._git_config(clone_path, "user.email")
 
         def write_message() -> str:
-            fd, path = tempfile.mkstemp(
-                dir=clone_path, prefix="ompire-ship-msg-", suffix=".txt"
-            )
+            # Outside the clone: the file must never show up in `git status`
+            # or get staged by the ship's `git add --all` (dogfooding: it
+            # appeared as an untracked file and nearly shipped).
+            fd, path = tempfile.mkstemp(prefix="ompire-ship-msg-", suffix=".txt")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(message)
             return path
@@ -553,12 +555,38 @@ class ShipManager:
         finally:
             await asyncio.to_thread(Path(msg_path).unlink)
 
+    async def _stage_delta(self, clone_path: str, timeout: int) -> None:
+        """Stage the task's whole delta vs base — committed or pending.
+
+        Agents routinely leave their work uncommitted in the clone
+        (dogfooding: `git commit` failed with nothing staged), so the ship
+        must stage new, modified, and deleted files itself. Daemon-owned
+        files (workshop lock, outcome dir) are excluded first, and an empty
+        delta is named for the operator instead of letting `git commit`
+        dump its generic status output.
+        """
+        await asyncio.to_thread(_ensure_git_excludes, clone_path, "ship-exclude")
+        await _run_step(
+            Step("ship-stage", ["git", "-C", clone_path, "add", "--all"], timeout)
+        )
+        status = (
+            await _run_git_output(
+                ["git", "-C", clone_path, "status", "--porcelain"],
+                clone_path,
+                timeout,
+                "ship-stage-status",
+            )
+        ).strip()
+        if not status:
+            raise ShipError("nothing to ship: the task has no changes to commit")
+
     async def _squash_commit(
         self, clone_path: str, base: str, message: str, signing_key: str, timeout: int
     ) -> tuple[str, int]:
         """Soft-reset to merge-base and create one signed operator commit."""
         await self._soft_reset(clone_path, base, timeout)
         try:
+            await self._stage_delta(clone_path, timeout)
             sha = await self._commit(clone_path, message, signing_key, timeout)
             await self._assert_signed_by(clone_path, base, signing_key, timeout)
         except Exception:
@@ -579,6 +607,9 @@ class ShipManager:
     async def _assert_retain_preconditions(
         self, clone_path: str, base: str, timeout: int
     ) -> None:
+        # Daemon-owned files (workshop lock, outcome dir) must not read as a
+        # dirty tree on clones created before they were excluded.
+        await asyncio.to_thread(_ensure_git_excludes, clone_path, "ship-exclude")
         stdout, stderr, code = await _run_command(
             ["git", "-C", clone_path, "status", "--porcelain"],
             clone_path,
@@ -588,7 +619,8 @@ class ShipManager:
             raise ShipError(f"git status failed: {stderr}")
         if stdout.strip():
             raise ShipError(
-                "working tree is dirty; commit or stash changes before retain mode"
+                "working tree is dirty; use squash mode (it commits pending "
+                "changes) or commit/stash before retain mode"
             )
 
         range_commits = (

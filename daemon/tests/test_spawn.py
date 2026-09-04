@@ -30,7 +30,7 @@ from ompire_daemon.registry.tasks import (
 )
 from ompire_daemon.registry.templates import create_template
 from ompire_daemon.sessions import SessionTracker
-from ompire_daemon.spawn import run_spawn_pipeline
+from ompire_daemon.spawn import Step, StepFailedError, _run_step, run_spawn_pipeline
 from ompire_daemon.workflows import WorkflowRunner
 from tests.conftest import FAKE_WORKSHOP_SCRIPT
 
@@ -44,9 +44,46 @@ def fake_my_workshop(tmp_path: Path):
         script.write_text(f"#!/bin/sh\n{body}\n")
         script.chmod(0o755)
         return str(script)
-
     return make
 
+
+
+def _failing_script(tmp_path: Path, body: str) -> str:
+    script = tmp_path / "fail-step.sh"
+    script.write_text(f"#!/bin/sh\n{body}\n")
+    script.chmod(0o755)
+    return str(script)
+
+
+async def test_run_step_failure_detail_prefers_stderr(tmp_path: Path) -> None:
+    """stderr is the primary diagnosis when a step fails."""
+    script = _failing_script(tmp_path, "echo 'to stdout'\necho 'to stderr' >&2\nexit 3")
+    with pytest.raises(StepFailedError) as exc_info:
+        await _run_step(Step("step", [script], 10))
+    assert exc_info.value.stderr.strip() == "to stderr"
+
+
+async def test_run_step_failure_detail_falls_back_to_stdout(tmp_path: Path) -> None:
+    """A hook or wrapper that only writes stdout must not die silently
+    (dogfooding: a ship commit failed with an empty diagnosis)."""
+    script = _failing_script(tmp_path, "echo 'hook says no'\nexit 3")
+    with pytest.raises(StepFailedError) as exc_info:
+        await _run_step(Step("step", [script], 10))
+    assert exc_info.value.stderr.strip() == "hook says no"
+
+
+async def test_run_step_failure_detail_reports_silent_exit_code(tmp_path: Path) -> None:
+    script = _failing_script(tmp_path, "exit 3")
+    with pytest.raises(StepFailedError) as exc_info:
+        await _run_step(Step("step", [script], 10))
+    assert exc_info.value.stderr.strip() == "exited with code 3"
+
+
+async def test_run_step_failure_detail_reports_signal_kill(tmp_path: Path) -> None:
+    script = _failing_script(tmp_path, "kill -9 $$")
+    with pytest.raises(StepFailedError) as exc_info:
+        await _run_step(Step("step", [script], 10))
+    assert exc_info.value.stderr.strip() == "killed by signal 9"
 
 @pytest.fixture
 def pipeline(app):
