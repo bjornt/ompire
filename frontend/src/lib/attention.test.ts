@@ -6,7 +6,8 @@ function task(id: number, state: Task["state"]): Task {
   return {
     id,
     project_name: "p",
-    template_name: "t",
+    execution_inputs: null,
+    needs_configuration: true,
     slug: "fix",
     branch: "p/fix",
     clone_path: "/",

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { applyEnvelope, initialDaemonState } from "./daemonReducer";
-import type { Envelope, ModelProfile, Project, Template } from "../types";
+import type { Envelope, ModelProfile, Project, WorkflowDescriptor } from "../types";
 
 const project: Project = {
   name: "maas",
@@ -13,6 +13,11 @@ const project: Project = {
   setup_state: "ready",
   setup_error: null,
   default_model_profile: null,
+  base_branch: "master",
+  branch_pattern: "bjornt/<slug>",
+  workshop_additions: "project",
+  preamble: "",
+  launch_config_state: "reconciled",
 };
 
 const modelProfile: ModelProfile = {
@@ -27,18 +32,15 @@ const modelProfile: ModelProfile = {
   updated_at: "2026-09-01T00:00:00Z",
 };
 
-const template: Template = {
-  name: "maas",
-  project_name: "maas",
-  base_branch: "master",
-  branch_pattern: "bjornt/<slug>",
-  workflow: "single-step",
-  workshop_additions: "project",
-  model: null,
-  thinking: null,
-  preamble: "",
-  created_at: "2026-07-18T00:00:00Z",
-  updated_at: "2026-07-18T00:00:00Z",
+const singleStep: WorkflowDescriptor = {
+  name: "single-step",
+  primary_session: "main",
+  sessions: ["main"],
+  steps: [
+    { name: "work", kind: "agent", session: "main", role: "default", conditional: false },
+  ],
+  judge_session: "judge",
+  judge_role: "slow",
 };
 
 describe("applyEnvelope", () => {
@@ -47,24 +49,24 @@ describe("applyEnvelope", () => {
       seq: 0,
       ts: "2026-07-18T00:00:00Z",
       type: "snapshot",
-      payload: { projects: [project], templates: [template], tasks: [] },
+      payload: { projects: [project], workflow_catalog: [singleStep], tasks: [] },
     };
     expect(initialDaemonState.snapshotReady).toBe(false);
     const next = applyEnvelope(initialDaemonState, envelope);
     expect(next.projects).toEqual([project]);
-    expect(next.templates).toEqual([template]);
+    expect(next.workflowCatalog).toEqual([singleStep]);
     expect(next.tasks).toEqual([]);
     expect(next.snapshotReady).toBe(true);
   });
 
-  it("tolerates a snapshot without a templates list", () => {
+  it("tolerates a snapshot without a workflow catalog", () => {
     const next = applyEnvelope(initialDaemonState, {
       seq: 0,
       ts: "",
       type: "snapshot",
       payload: { projects: [], tasks: [] },
     });
-    expect(next.templates).toEqual([]);
+    expect(next.workflowCatalog).toEqual([]);
   });
 
   it("applies project_created as a delta", () => {
@@ -241,53 +243,70 @@ describe("applyEnvelope", () => {
     expect(next.projects).toEqual([]);
   });
 
-  it("applies template_created as a delta", () => {
+  it("records the native model a session reports without disturbing its status", () => {
     const start = applyEnvelope(initialDaemonState, {
       seq: 0,
       ts: "",
       type: "snapshot",
-      payload: { projects: [], templates: [], tasks: [] },
+      payload: {
+        projects: [],
+        tasks: [],
+        sessions: { "1": { main: { status: "working", reason: "agent_start", since: "t0" } } },
+      },
     });
     const next = applyEnvelope(start, {
       seq: 1,
-      ts: "",
-      type: "template_created",
-      payload: template,
+      ts: "t1",
+      type: "session_model",
+      payload: {
+        task_id: 1,
+        session: "main",
+        model: "anthropic/claude-sonnet-4.5",
+        thinking: "max",
+        resolved_thinking: "xhigh",
+      },
     });
-    expect(next.templates).toEqual([template]);
+    expect(next.sessions[1].main.status).toBe("working");
+    // The accepted policy and the level omp resolved it to are both kept:
+    // `max` normalizing to `xhigh` is native behavior, not a lost override.
+    expect(next.sessions[1].main.model).toEqual({
+      model: "anthropic/claude-sonnet-4.5",
+      thinking: "max",
+      resolved_thinking: "xhigh",
+    });
   });
 
-  it("applies template_updated by name", () => {
+  it("keeps the observed model across a status change", () => {
     const start = applyEnvelope(initialDaemonState, {
       seq: 0,
       ts: "",
       type: "snapshot",
-      payload: { projects: [], templates: [template], tasks: [] },
+      payload: {
+        projects: [],
+        tasks: [],
+        sessions: {
+          "1": {
+            main: {
+              status: "starting",
+              reason: "",
+              since: "t0",
+              model: {
+                model: "anthropic/claude-sonnet-4.5",
+                thinking: "medium",
+                resolved_thinking: "medium",
+              },
+            },
+          },
+        },
+      },
     });
-    const updated = { ...template, preamble: "Run pytest from the repo root." };
     const next = applyEnvelope(start, {
       seq: 1,
-      ts: "",
-      type: "template_updated",
-      payload: updated,
+      ts: "t1",
+      type: "status_changed",
+      payload: { task_id: 1, session: "main", from: "starting", to: "working", reason: "x" },
     });
-    expect(next.templates).toEqual([updated]);
-  });
-
-  it("applies template_deleted by name", () => {
-    const start = applyEnvelope(initialDaemonState, {
-      seq: 0,
-      ts: "",
-      type: "snapshot",
-      payload: { projects: [], templates: [template], tasks: [] },
-    });
-    const next = applyEnvelope(start, {
-      seq: 1,
-      ts: "",
-      type: "template_deleted",
-      payload: { name: template.name },
-    });
-    expect(next.templates).toEqual([]);
+    expect(next.sessions[1].main.model?.model).toBe("anthropic/claude-sonnet-4.5");
   });
 
   it("ignores unknown event types", () => {

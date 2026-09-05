@@ -13,11 +13,12 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** What the transitional state is, stated wherever a profile is configured.
- * Saving a profile or a project default must not read as if it already
- * governs how tasks run — templates still do, until the next change. */
+/** What a profile does, stated wherever one is configured. A profile governs
+ * the *next* launch that selects it; a task pins its own snapshot at
+ * acceptance, so editing one here never reaches work already under way
+ * (ADR-0026). */
 export const EXECUTION_BOUNDARY_NOTE =
-  "Profiles are saved configuration only. Tasks still run with their template's model and thinking settings; nothing here changes a running or newly spawned task.";
+  "A profile governs launches that select it from now on. Tasks already accepted keep the bindings they were accepted with — editing a profile never changes a running task.";
 
 /** The editor's own draft. Kept as free text, including the thinking level,
  * so a half-filled row survives while the operator is still typing — the
@@ -323,12 +324,12 @@ export function ModelProfilesPanel() {
             first authoritative snapshot. Before that the truthful answer is
             "still loading", not "you have none". */}
         {!snapshotReady ? (
-          <div className="empty templatesEmpty" role="status" data-testid="model-profiles-loading">
+          <div className="empty profilesEmpty" role="status" data-testid="model-profiles-loading">
             <strong>Loading model profiles…</strong>
             <span>Waiting for the daemon's current state.</span>
           </div>
         ) : sorted.length === 0 ? (
-          <div className="empty templatesEmpty" data-testid="model-profiles-empty-state">
+          <div className="empty profilesEmpty" data-testid="model-profiles-empty-state">
             <strong>No model profiles yet</strong>
             <span>
               Create one to name a model and thinking level for each of the four roles, then
@@ -355,7 +356,7 @@ export function ModelProfilesPanel() {
         )}
         <button
           type="button"
-          className="newTemplateButton"
+          className="newModelProfileButton"
           onClick={() =>
             setEditor((current) => (current?.mode === "create" ? null : { mode: "create" }))
           }

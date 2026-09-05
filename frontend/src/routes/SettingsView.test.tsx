@@ -354,7 +354,7 @@ describe("SettingsView commit-signing panel", () => {
       candidate(KEY_B, "Bob <bob@example.com>"),
     ],
     cache_ttl: null,
-    detail: "2 usable signing keys; choose one in Templates & settings",
+    detail: "2 usable signing keys; choose one in Settings",
     checked_at: "t0",
   };
 
@@ -572,38 +572,4 @@ describe("SettingsView checkout-root panel (ADR-0023)", () => {
     );
   });
 
-  it("disables a template's project until its checkout is ready", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockImplementation(buildFetchHandler()));
-    render(
-      <DaemonProvider>
-        <SettingsView />
-      </DaemonProvider>,
-    );
-    act(() => {
-      socket().emitSnapshot({
-        projects: [
-          {
-            name: "fresh",
-            title: "Fresh",
-            upstream_url: "https://example.com/fresh.git",
-            fork_url: null,
-            checkout_path: "/home/op/proj/fresh",
-            checkout_mode: "cloned",
-            fetch_remote: "origin",
-            setup_state: "cloning",
-            setup_error: null,
-          },
-        ],
-        tasks: [],
-        templates: [],
-        settings: {},
-      });
-    });
-
-    const user = userEvent.setup();
-    await user.click(screen.getByTestId("new-template-toggle"));
-
-    expect(screen.getByRole("option", { name: /fresh/ })).toBeDisabled();
-    expect(screen.getByTestId("template-project-not-ready")).toHaveTextContent("cloning");
-  });
 });

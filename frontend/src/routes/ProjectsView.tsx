@@ -1,14 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
+  confirmProjectReconciliation,
   createProject,
   deleteProject,
+  getProjectReconciliation,
   inspectCheckout,
   retryProjectSetup,
   updateProject,
+  type ProjectReconciliation,
 } from "../lib/api";
 import { useDaemonReconcile, useDaemonState } from "../lib/useDaemonState";
-import type { CheckoutInspection, ModelProfile, Project, ProjectSetupStep, Task } from "../types";
+import type {
+  CheckoutInspection,
+  ModelProfile,
+  Project,
+  ProjectSetupStep,
+  Task,
+  WorkshopAdditionsSource,
+} from "../types";
 import { EXECUTION_BOUNDARY_NOTE } from "./ModelProfilesPanel";
 import "./ProjectsView.css";
 
@@ -70,7 +80,7 @@ function DefaultProfileField({
         {profiles.length === 0 && (
           <>
             {" "}
-            <Link to="/settings">Create one in Templates &amp; settings</Link>.
+            <Link to="/settings">Create one in Settings</Link>.
           </>
         )}
       </span>
@@ -449,6 +459,13 @@ function ProjectEditPanel({
   const [checkoutPath, setCheckoutPath] = useState(project.checkout_path);
   const [fetchRemote, setFetchRemote] = useState(project.fetch_remote);
   const [defaultProfile, setDefaultProfile] = useState(project.default_model_profile ?? "");
+  // Workspace and prompt defaults a launch inherits (ADR-0026). Always sent
+  // from this form, so what the operator sees is what is saved — including
+  // an empty preamble, which means "no preamble".
+  const [baseBranch, setBaseBranch] = useState(project.base_branch);
+  const [branchPattern, setBranchPattern] = useState(project.branch_pattern);
+  const [additions, setAdditions] = useState(project.workshop_additions);
+  const [preamble, setPreamble] = useState(project.preamble);
   const { modelProfiles } = useDaemonState();
   const reconcile = useDaemonReconcile();
   const [error, setError] = useState<string | null>(null);
@@ -480,6 +497,10 @@ function ProjectEditPanel({
           // Always sent from this form: the operator sees the selector, so an
           // explicit "No default" here means clear it.
           default_model_profile: defaultProfile || null,
+          base_branch: baseBranch.trim(),
+          branch_pattern: branchPattern.trim(),
+          workshop_additions: additions,
+          preamble,
           ...(renaming ? { new_name: newName } : {}),
         }),
       );
@@ -594,6 +615,61 @@ function ProjectEditPanel({
           />
         </label>
       </div>
+      <div className="formGrid formGridUrls">
+        <label className="formField">
+          <span className="fieldLabel">
+            Base branch <span className="fieldHint">— default for new tasks</span>
+          </span>
+          <input
+            className="mono"
+            value={baseBranch}
+            onChange={(e) => setBaseBranch(e.target.value)}
+            required
+            disabled={submitting}
+            data-testid={`edit-base-branch-${project.name}`}
+          />
+        </label>
+        <label className="formField">
+          <span className="fieldLabel">
+            Branch pattern <span className="fieldHint">— must contain &lt;slug&gt;</span>
+          </span>
+          <input
+            className="mono"
+            value={branchPattern}
+            onChange={(e) => setBranchPattern(e.target.value)}
+            required
+            disabled={submitting}
+            data-testid={`edit-branch-pattern-${project.name}`}
+          />
+        </label>
+      </div>
+      <label className="formField">
+        <span className="fieldLabel">
+          Workshop additions{" "}
+          <span className="fieldHint">— exclusive; no fallback to the other source</span>
+        </span>
+        <select
+          value={additions}
+          onChange={(e) => setAdditions(e.target.value as typeof additions)}
+          disabled={submitting}
+          data-testid={`edit-workshop-additions-${project.name}`}
+        >
+          <option value="project">project — this repository&apos;s workshop.my.yaml</option>
+          <option value="global">global — your own my-workshop additions</option>
+        </select>
+      </label>
+      <label className="formField">
+        <span className="fieldLabel">
+          Standing prompt preamble <span className="fieldHint">— empty means none</span>
+        </span>
+        <textarea
+          rows={3}
+          value={preamble}
+          onChange={(e) => setPreamble(e.target.value)}
+          disabled={submitting}
+          data-testid={`edit-preamble-${project.name}`}
+        />
+      </label>
       <DefaultProfileField
         profiles={modelProfiles}
         value={defaultProfile}
@@ -630,6 +706,229 @@ function ProjectEditPanel({
         </div>
       )}
     </form>
+  );
+}
+
+/** The decision a project still owes after the template retirement.
+ *
+ * Candidates are shown with the template each came from and none is
+ * pre-selected: the migration deliberately refused to pick, so the editor
+ * asks rather than filling in a plausible-looking answer (ADR-0026). Nothing
+ * here is a partial-profile editor — a legacy `model`/`thinking` pair is one
+ * old choice, not four roles, and the replacement is a complete profile.
+ */
+function LaunchReconciliationPanel({ project }: { project: Project }) {
+  const { modelProfiles } = useDaemonState();
+  const reconcile = useDaemonReconcile();
+  const [evidence, setEvidence] = useState<ProjectReconciliation | null>(null);
+  const [baseBranch, setBaseBranch] = useState("");
+  const [branchPattern, setBranchPattern] = useState("");
+  const [additions, setAdditions] = useState<WorkshopAdditionsSource>("project");
+  const [preamble, setPreamble] = useState("");
+  const [profile, setProfile] = useState("");
+  const [ackModels, setAckModels] = useState(false);
+  const [ackJudge, setAckJudge] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const blocked = project.launch_config_state !== "reconciled";
+
+  useEffect(() => {
+    if (!blocked) {
+      setEvidence(null);
+      return;
+    }
+    getProjectReconciliation(project.name)
+      .then((loaded) => {
+        setEvidence(loaded);
+        setBaseBranch(loaded.current.base_branch);
+        setBranchPattern(loaded.current.branch_pattern);
+        setAdditions(loaded.current.workshop_additions);
+        setPreamble(loaded.current.preamble);
+        setProfile(loaded.current.default_model_profile ?? "");
+      })
+      .catch((err: unknown) => setError(errorText(err)));
+  }, [blocked, project.name]);
+
+  if (!blocked || evidence === null) return null;
+
+  async function onConfirm() {
+    if (submitting) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const saved = asProject(
+        await confirmProjectReconciliation(project.name, {
+          evidence_fingerprint: evidence!.evidence_fingerprint,
+          base_branch: baseBranch.trim(),
+          branch_pattern: branchPattern.trim(),
+          workshop_additions: additions,
+          preamble,
+          default_model_profile: profile || null,
+          acknowledge_model_candidates: ackModels,
+          acknowledge_judge_model: ackJudge,
+        }),
+      );
+      if (saved === null) {
+        setError(MALFORMED_PROJECT_RESPONSE);
+        return;
+      }
+      reconcile("project_updated", saved);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const conflicts = Object.entries(evidence.workspace_conflicts ?? {});
+
+  return (
+    <section
+      className="setupPanel"
+      data-testid={`launch-reconciliation-${project.name}`}
+    >
+      <h3 className="panelTitle">Launch configuration needs a decision</h3>
+      <p className="fieldNote">
+        This project&apos;s templates carried settings that no longer have one obvious
+        answer. Nothing was guessed; pick what this project should use from now on. The old
+        values stay recorded either way.
+      </p>
+
+      {conflicts.length > 0 && (
+        <div data-testid={`reconcile-conflicts-${project.name}`}>
+          {conflicts.map(([field, values]) => (
+            <p className="fieldNote" key={field}>
+              <strong>{field}</strong>: templates disagreed —{" "}
+              {values.map((value) => (value === "" ? "(empty)" : String(value))).join(", ")}
+            </p>
+          ))}
+        </div>
+      )}
+
+      {(evidence.model_candidates ?? []).length > 0 && (
+        <div data-testid={`reconcile-models-${project.name}`}>
+          <p className="fieldNote">
+            Old model choices, one per template. A single concrete pair cannot answer for
+            the four roles a profile binds, so these are history — select a complete
+            profile instead.
+          </p>
+          <ul className="unknownList">
+            {(evidence.model_candidates ?? []).map((candidate) => (
+              <li key={candidate.source}>
+                {candidate.source}: {candidate.model ?? "unset"} ·{" "}
+                {candidate.thinking ?? "unset"}
+              </li>
+            ))}
+          </ul>
+          <label className="checkboxField">
+            <input
+              type="checkbox"
+              checked={ackModels}
+              onChange={(e) => setAckModels(e.target.checked)}
+              data-testid={`ack-models-${project.name}`}
+            />
+            <span>The selected profile replaces these old model choices.</span>
+          </label>
+        </div>
+      )}
+
+      {evidence.retired_judge_model !== null && (
+        <div data-testid={`reconcile-judge-${project.name}`}>
+          <p className="fieldNote">
+            <code>judge_model = {evidence.retired_judge_model}</code> is still set in your{" "}
+            <code>config.toml</code>. It configures nothing now: the workflow judge runs on
+            the selected profile&apos;s <code>{evidence.judge_role}</code> binding. Your
+            file is not modified — if you want that exact model, bind it as{" "}
+            <code>{evidence.judge_role}</code> in a profile.
+          </p>
+          <label className="checkboxField">
+            <input
+              type="checkbox"
+              checked={ackJudge}
+              onChange={(e) => setAckJudge(e.target.checked)}
+              data-testid={`ack-judge-${project.name}`}
+            />
+            <span>
+              The profile&apos;s <code>{evidence.judge_role}</code> binding replaces it.
+            </span>
+          </label>
+        </div>
+      )}
+
+      <div className="formGrid formGridUrls">
+        <label className="formField">
+          <span className="fieldLabel">Base branch</span>
+          <input
+            className="mono"
+            value={baseBranch}
+            onChange={(e) => setBaseBranch(e.target.value)}
+            data-testid={`reconcile-base-branch-${project.name}`}
+          />
+        </label>
+        <label className="formField">
+          <span className="fieldLabel">Branch pattern</span>
+          <input
+            className="mono"
+            value={branchPattern}
+            onChange={(e) => setBranchPattern(e.target.value)}
+            data-testid={`reconcile-branch-pattern-${project.name}`}
+          />
+        </label>
+      </div>
+      <label className="formField">
+        <span className="fieldLabel">Workshop additions</span>
+        <select
+          value={additions}
+          onChange={(e) => setAdditions(e.target.value as WorkshopAdditionsSource)}
+          data-testid={`reconcile-additions-${project.name}`}
+        >
+          <option value="project">project</option>
+          <option value="global">global</option>
+        </select>
+      </label>
+      <label className="formField">
+        <span className="fieldLabel">Standing prompt preamble</span>
+        <textarea
+          rows={3}
+          value={preamble}
+          onChange={(e) => setPreamble(e.target.value)}
+          data-testid={`reconcile-preamble-${project.name}`}
+        />
+      </label>
+      <label className="formField">
+        <span className="fieldLabel">Default model profile</span>
+        <select
+          value={profile}
+          onChange={(e) => setProfile(e.target.value)}
+          data-testid={`reconcile-profile-${project.name}`}
+        >
+          <option value="">
+            No default — choose a profile at every launch
+          </option>
+          {modelProfiles.map((candidate) => (
+            <option key={candidate.name} value={candidate.name}>
+              {candidate.name}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <button
+        type="button"
+        className="primary"
+        onClick={onConfirm}
+        disabled={submitting}
+        data-testid={`reconcile-confirm-${project.name}`}
+      >
+        Save launch configuration
+      </button>
+      {error && (
+        <span className="submitError" role="alert" data-testid={`reconcile-error-${project.name}`}>
+          {error}
+        </span>
+      )}
+    </section>
   );
 }
 
@@ -783,10 +1082,14 @@ function ProjectCard({
         <span className="metaLabel">model profile</span>
         <span className="metaValue" data-testid={`default-profile-${project.name}`}>
           {project.default_model_profile ?? "no default configured"}
-          <span className="noForkNote"> · saved for launching; templates still run tasks</span>
+          <span className="noForkNote">
+            {" "}
+            · inherited by a launch unless the task selects another
+          </span>
         </span>
       </div>
       <ProjectSetupPanel project={project} />
+      <LaunchReconciliationPanel project={project} />
       {editing && (
         <ProjectEditPanel
           project={project}

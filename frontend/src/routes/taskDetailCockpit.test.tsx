@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
-import type { Task } from "../types";
+import type { Task, TaskExecutionInputs } from "../types";
 
 /* Full-app cockpit tests: the transcript reads a second WebSocket (the agent
  * event channel), and the status strip / composer hit the agent-interaction
@@ -56,11 +56,46 @@ const project = {
   checkout_path: "/home/op/proj/maas",
 };
 
+/** The launch decision an accepted task carries (ADR-0026). Present here so
+ * the detail view renders its accepted-configuration panel rather than the
+ * legacy confirmation form. */
+const acceptedInputs: TaskExecutionInputs = {
+  version: 1,
+  provenance: "accepted",
+  accepted_at: "2026-07-18T00:00:00Z",
+  project_name: "maas",
+  workflow_name: "single-step",
+  model_profile_name: "balanced",
+  model_profile_source: "project",
+  roles: {
+    default: { model: "anthropic/claude-sonnet-4.5", thinking: "medium" },
+    smol: { model: "openai/gpt-4.1-mini", thinking: "off" },
+    slow: { model: "openai/o3", thinking: "high" },
+    plan: { model: "google/gemini-2.5-pro", thinking: "max" },
+  },
+  step_roles: { work: "default" },
+  judge_role: "slow",
+  workspace: {
+    base_branch: "master",
+    branch_pattern: "bjornt/<slug>",
+    workshop_additions: "project",
+    preamble: "",
+  },
+  workspace_overrides: [],
+  branch: "bjornt/fix-bug",
+  checkout_path: "/home/op/proj/maas",
+  fetch_remote: "origin",
+  upstream_url: "https://example.com/maas.git",
+  fork_url: null,
+  unknown_inputs: [],
+};
+
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
     id: 1,
     project_name: "maas",
-    template_name: "maas",
+    execution_inputs: acceptedInputs,
+    needs_configuration: false,
     slug: "fix-bug",
     branch: "bjornt/fix-bug",
     clone_path: "/home/op/tasks/maas/fix-bug",
@@ -922,7 +957,10 @@ describe("gate card", () => {
           json: () => Promise.resolve({ detail: "workflow run is not waiting" }),
         });
       }
-      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ ...makeTask(), workshop_status: "present" }),
+      });
     });
     await renderDetail(twoSessionSnapshots.sessions, waitingGate);
 

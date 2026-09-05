@@ -13,10 +13,24 @@ export interface Project {
   setup_state: "ready" | "cloning" | "failed";
   setup_error: string | null;
   /** The global model profile this project selects as its default, or null
-   * (ADR-0025). A stored reference for workflow-first launching — it does not
-   * govern today's template-driven tasks. */
+   * (ADR-0025). A launch inherits it unless the operator selects a task
+   * profile; what a task then runs is the snapshot pinned at acceptance. */
   default_model_profile: string | null;
+  /** Workspace and prompt defaults a launch inherits (ADR-0026). Each is
+   * independently overridable for one task. */
+  base_branch: string;
+  branch_pattern: string;
+  workshop_additions: WorkshopAdditionsSource;
+  preamble: string;
+  /** Whether the configuration carried over from templates still needs the
+   * operator's decision. Independent of `setup_state` — a ready checkout can
+   * still be unlaunchable, and both are reported so the UI can say which. */
+  launch_config_state: "reconciled" | "needs-reconciliation";
 }
+
+/** Which additions file a task's clone gets. Exclusive: the project's own or
+ * the operator's global one, never an implicit fallback to the other. */
+export type WorkshopAdditionsSource = "project" | "global";
 
 /** Read-only look at a candidate checkout, used by the create form to
  * prefill and to explain a refusal before submission. */
@@ -45,9 +59,10 @@ export interface ProjectFiles {
   truncated: boolean;
 }
 
-/** Thinking levels omp accepts (`--thinking`, verified against omp
- * v17.2.12); null on a template or unset on a spawn override means the omp
- * default. */
+/** Thinking levels omp accepts (`--thinking`, verified against omp v18.1.10).
+ * Every binding carries one explicitly: `off` and `auto` are policies, not
+ * absence. omp may resolve `auto`/`max` to a model-specific level at run
+ * time; that resolved state is reported separately from the policy. */
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "auto";
 
 /** The four fixed roles a model profile binds (ADR-0025), in presentation
@@ -72,20 +87,69 @@ export interface ModelProfile {
   updated_at: string;
 }
 
-/** SPEC Decision 6 setup template: everything spawn needs. Checkout path and
- * remotes come from the referenced project (Decision 9), never stored here. */
-export interface Template {
+/** One declared step of a workflow, as the daemon describes it (ADR-0026).
+ * `role` is set only for agent steps — a command, decision, or gate has no
+ * model and is never shown with one. `conditional` says a decision declared
+ * earlier can route past this step, so it may not execute. */
+export interface WorkflowStepDescriptor {
   name: string;
-  project_name: string;
+  kind: "agent" | "command" | "decision" | "gate";
+  session: string | null;
+  role: ModelRole | null;
+  conditional: boolean;
+}
+
+/** A registered built-in workflow. Definitions ship with the daemon
+ * (ADR-0018), so this catalog arrives in the snapshot and never changes while
+ * the daemon runs — there is no CRUD and no change event. */
+export interface WorkflowDescriptor {
+  name: string;
+  primary_session: string;
+  sessions: string[];
+  steps: WorkflowStepDescriptor[];
+  /** The engine-reserved judge, described apart from the declared steps: it
+   * runs only when a route or outcome cannot be resolved, and it binds
+   * `slow` rather than a step's role. */
+  judge_session: string;
+  judge_role: ModelRole;
+}
+
+/** The workspace and prompt inputs one task actually runs under. */
+export interface WorkspaceInputs {
   base_branch: string;
   branch_pattern: string;
-  workflow: string;
-  workshop_additions: "project" | "global";
-  model: string | null;
-  thinking: ThinkingLevel | null;
+  workshop_additions: WorkshopAdditionsSource;
   preamble: string;
-  created_at: string;
-  updated_at: string;
+}
+
+/** The launch decision a task was accepted under (ADR-0026), pinned at
+ * acceptance and never recomputed. `model_profile_name` is provenance, not a
+ * live reference: the profile may be edited, renamed, or deleted and this
+ * task keeps running exactly as accepted. */
+export interface TaskExecutionInputs {
+  version: number;
+  provenance: "accepted" | "legacy-confirmed";
+  accepted_at: string;
+  project_name: string;
+  workflow_name: string;
+  model_profile_name: string | null;
+  model_profile_source: "task" | "project" | "legacy-confirmed";
+  roles: Record<ModelRole, ModelRoleBinding>;
+  /** Agent step name to abstract role, pinned so a later workflow edit
+   * cannot silently rebind a step. */
+  step_roles: Record<string, ModelRole>;
+  judge_role: ModelRole;
+  workspace: WorkspaceInputs;
+  /** Which workspace fields this task overrode rather than inheriting. */
+  workspace_overrides: string[];
+  branch: string;
+  checkout_path: string;
+  fetch_remote: string;
+  upstream_url: string;
+  fork_url: string | null;
+  /** Historical inputs a legacy task could not recover. Empty for anything
+   * accepted through the normal launch path. */
+  unknown_inputs: string[];
 }
 
 export type TaskState = "created" | "failed" | "archived";
@@ -97,9 +161,13 @@ export type PrState = "open" | "merged" | "closed";
 export interface Task {
   id: number;
   project_name: string;
-  /** Template this task was spawned from; null for tasks that predate
-   * templates (templates capability). */
-  template_name: string | null;
+  /** The decision this task runs under, or null for a task created before
+   * pinned inputs existed (ADR-0026). */
+  execution_inputs: TaskExecutionInputs | null;
+  /** True exactly when `execution_inputs` is null: the task keeps its
+   * history and stays readable, but anything needing a model or a base
+   * branch is blocked until the operator confirms a continuation. */
+  needs_configuration: boolean;
   slug: string;
   branch: string;
   clone_path: string;
@@ -111,8 +179,7 @@ export interface Task {
   pr_url: string | null;
   pr_state: PrState | null;
   pr_merged_at: string | null;
-  /** Workflow denormalized from the template at creation (workflow-engine
-   * capability). */
+  /** The workflow chosen at creation (workflow-engine capability). */
   workflow_name: string;
   /** Run status; null for tasks whose run hasn't started (or that predate
    * workflows). */
@@ -287,6 +354,24 @@ export interface SessionInfo {
   since: string;
   /** Present while the session is `waiting-input` / `waiting-approval`. */
   question?: PendingQuestion;
+  /** What this session's omp child reports it is actually running, recorded
+   * once its model handshake succeeded (ADR-0026). Absent until then. */
+  model?: NativeModelInfo;
+}
+
+/** The accepted policy beside the level omp resolved it to. `thinking` is
+ * the operator's choice, spelled as they chose it; `resolved_thinking` is
+ * what the model actually uses, which legitimately differs for `auto` and
+ * `max`. Showing both keeps normalization from reading as a lost override. */
+export interface NativeModelInfo {
+  model: string;
+  thinking: ThinkingLevel;
+  resolved_thinking: string | null;
+}
+
+export interface SessionModelPayload extends NativeModelInfo {
+  task_id: number;
+  session: string;
 }
 
 export interface QuestionPostedPayload {
@@ -531,10 +616,12 @@ export interface DaemonInfo {
 
 export interface SnapshotPayload {
   projects: Project[];
-  templates: Template[];
   /** The complete sorted model-profile registry (ADR-0025); absent from
    * snapshots emitted before this capability. */
   model_profiles?: ModelProfile[];
+  /** Every registered built-in workflow (ADR-0026). Snapshot-only: the
+   * catalog is constant for the life of the daemon process. */
+  workflow_catalog?: WorkflowDescriptor[];
   tasks: Task[];
   /** Nested task id → session name → info (workflow-engine design D-7; JSON
    * object keys arrive as strings). */

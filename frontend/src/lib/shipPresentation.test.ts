@@ -6,7 +6,8 @@ function task(overrides: Partial<Task> = {}): Task {
   return {
     id: 1,
     project_name: "maas",
-    template_name: "maas",
+    execution_inputs: null,
+    needs_configuration: true,
     slug: "fix-bug",
     branch: "bjornt/fix-bug",
     clone_path: "/home/op/tasks/maas/fix-bug",
