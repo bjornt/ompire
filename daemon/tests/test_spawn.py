@@ -28,11 +28,10 @@ from ompire_daemon.registry.tasks import (
     create_task,
     get_task,
 )
-from ompire_daemon.registry.templates import create_template
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.spawn import Step, StepFailedError, _run_step, run_spawn_pipeline
 from ompire_daemon.workflows import WorkflowRunner
-from tests.conftest import FAKE_WORKSHOP_SCRIPT
+from tests.conftest import FAKE_WORKSHOP_SCRIPT, make_execution_inputs
 
 
 @pytest.fixture
@@ -96,10 +95,10 @@ def pipeline(app):
     tracker = SessionTracker(hub, idle_debounce=0.1)
     supervisor = AgentSupervisor(config, hub, tracker)
 
-    async def run(engine, task_id: int, run_config: Config | None = None, **overrides):
+    async def run(engine, task_id: int, run_config: Config | None = None):
         effective = run_config or config
         runner = WorkflowRunner(engine, effective, hub, supervisor, tracker)
-        await run_spawn_pipeline(engine, hub, effective, task_id, runner, **overrides)
+        await run_spawn_pipeline(engine, hub, effective, task_id, runner)
 
     return run, hub, tracker, supervisor
 
@@ -115,38 +114,30 @@ def _make_project(engine, checkout: Path):
     )
 
 
-def _make_template(
+def _make_inputs(checkout: Path, **overrides):
+    """The accepted launch inputs a spawned task carries (ADR-0026); the
+    pipeline reads only these, never a project or profile row."""
+    return make_execution_inputs(checkout_path=str(checkout), **overrides)
+
+
+def _make_task(
     engine,
+    config: Config,
     checkout: Path,
     *,
-    base_branch: str = "main",
-    preamble: str = "",
-    model: str | None = None,
-    thinking: str | None = None,
+    prompt: str = "fix the bug",
+    **input_overrides,
 ):
     _make_project(engine, checkout)
-    return create_template(
-        engine,
-        name="demo",
-        project_name="demo",
-        base_branch=base_branch,
-        branch_pattern="ompire/<slug>",
-        preamble=preamble,
-        model=model,
-        thinking=thinking,
-    )
-
-
-def _make_task(engine, config: Config, *, prompt: str = "fix the bug"):
     clone_path = clone_path_for(config.task_dir_root, "demo", "fix-bug")
     return create_task(
         engine,
         project_name="demo",
-        template_name="demo",
         slug="fix-bug",
         branch="ompire/fix-bug",
         clone_path=str(clone_path),
         prompt=prompt,
+        execution_inputs=_make_inputs(checkout, **input_overrides),
     )
 
 
@@ -192,8 +183,7 @@ async def test_successful_pipeline(app, git_checkout: Path, fake_my_workshop, pi
     )
     queue = hub.subscribe()
 
-    _make_template(engine, git_checkout)
-    task = _make_task(engine, config)
+    task = _make_task(engine, config, git_checkout)
 
     await run(engine, task.id, config)
     settled = await _wait_workflow_settled(engine, task.id)
@@ -254,8 +244,7 @@ async def test_empty_prompt_skips_prompt_step(
     )
     queue = hub.subscribe()
 
-    _make_template(engine, git_checkout)
-    task = _make_task(engine, config, prompt="")
+    task = _make_task(engine, config, git_checkout, prompt="")
 
     await run(engine, task.id, config)
     settled = await _wait_workflow_settled(engine, task.id)
@@ -292,8 +281,7 @@ async def test_clone_excludes_outcome_dir_from_git(
         my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
     )
 
-    _make_template(engine, git_checkout)
-    task = _make_task(engine, config)
+    task = _make_task(engine, config, git_checkout)
 
     await run(engine, task.id, config)
     await _wait_workflow_settled(engine, task.id)
@@ -331,8 +319,7 @@ async def test_agent_step_failure_fails_the_run(
     fake_workshop_cli.write_text(FAKE_WORKSHOP_SCRIPT.replace(" happy", " crash"))
     queue = hub.subscribe()
 
-    _make_template(engine, git_checkout)
-    task = _make_task(engine, config)
+    task = _make_task(engine, config, git_checkout)
 
     await run(engine, task.id, config)
     settled = await _wait_workflow_settled(engine, task.id)
@@ -370,14 +357,13 @@ async def test_session_id_capture_failure_leaves_it_null_and_spawn_succeeds(
         app.state.config,
         my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
     )
-    # The agent starts fine, but `get_state` (used to capture the session id)
-    # answers success: false — capture must degrade gracefully, not fail the
-    # spawn (design D-2).
-    fake_workshop_cli.write_text(FAKE_WORKSHOP_SCRIPT.replace(" happy", " get-state-fails"))
+    # The agent starts fine and reports its model, but `get_state` carries no
+    # `sessionId` — capture must degrade gracefully, not fail the spawn
+    # (design D-2).
+    fake_workshop_cli.write_text(FAKE_WORKSHOP_SCRIPT.replace(" happy", " no-session-id"))
     queue = hub.subscribe()
 
-    _make_template(engine, git_checkout)
-    task = _make_task(engine, config)
+    task = _make_task(engine, config, git_checkout)
 
     await run(engine, task.id, config)
     settled = await _wait_workflow_settled(engine, task.id)
@@ -408,9 +394,8 @@ async def test_prompt_failure_fails_the_run(
         app.state.config,
         my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
     )
-    _make_template(engine, git_checkout)
     # The magic "fail" prompt makes fake omp answer success: false, "boom".
-    task = _make_task(engine, config, prompt="fail")
+    task = _make_task(engine, config, git_checkout, prompt="fail")
 
     await run(engine, task.id, config)
     settled = await _wait_workflow_settled(engine, task.id)
@@ -430,8 +415,7 @@ async def test_step_failure_captures_stderr(app, git_checkout: Path, pipeline) -
     run, hub, _, _ = pipeline
     queue = hub.subscribe()
 
-    _make_template(engine, git_checkout, base_branch="no-such-branch")
-    task = _make_task(engine, app.state.config)
+    task = _make_task(engine, app.state.config, git_checkout, base_branch="no-such-branch")
 
     await run(engine, task.id)
 
@@ -454,8 +438,7 @@ async def test_leftover_directory_fails(app, git_checkout: Path, pipeline) -> No
     run, hub, _, _ = pipeline
     queue = hub.subscribe()
 
-    _make_template(engine, git_checkout)
-    task = _make_task(engine, app.state.config)
+    task = _make_task(engine, app.state.config, git_checkout)
     Path(task.clone_path).mkdir(parents=True)
 
     await run(engine, task.id)
@@ -478,8 +461,7 @@ async def test_workshop_step_failure(app, git_checkout: Path, fake_my_workshop, 
     )
     queue = hub.subscribe()
 
-    _make_template(engine, git_checkout)
-    task = _make_task(engine, config)
+    task = _make_task(engine, config, git_checkout)
 
     await run(engine, task.id, config)
 
@@ -505,8 +487,7 @@ async def test_workshop_step_timeout(app, git_checkout: Path, fake_my_workshop, 
         workshop_step_timeout=1,
     )
 
-    _make_template(engine, git_checkout)
-    task = _make_task(engine, config)
+    task = _make_task(engine, config, git_checkout)
 
     await run(engine, task.id, config)
 
@@ -526,8 +507,7 @@ async def test_workshop_lock_missing_after_success(
     )
     queue = hub.subscribe()
 
-    _make_template(engine, git_checkout)
-    task = _make_task(engine, config)
+    task = _make_task(engine, config, git_checkout)
 
     await run(engine, task.id, config)
 
@@ -550,8 +530,7 @@ async def test_workshop_tool_missing(app, git_checkout: Path, pipeline) -> None:
         my_workshop_command=("/no/such/my-workshop",),
     )
 
-    _make_template(engine, git_checkout)
-    task = _make_task(engine, config)
+    task = _make_task(engine, config, git_checkout)
 
     await run(engine, task.id, config)
 
@@ -563,9 +542,51 @@ async def test_workshop_tool_missing(app, git_checkout: Path, pipeline) -> None:
 # --- Template-driven spawn (templates capability) ---------------------------
 
 
-async def test_template_missing_at_pipeline_start_fails_before_git(
+async def test_unverifiable_model_fails_the_run_before_prompting(
+    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, pipeline
+) -> None:
+    """A child that will not say which model it is running is killed, not
+    prompted (ADR-0026). omp fuzzy-matches `--model`, so "it started" is not
+    evidence that the accepted model is the one answering."""
+    engine = app.state.engine
+    run, hub, tracker, _ = pipeline
+    config: Config = replace(
+        app.state.config,
+        my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
+    )
+    fake_workshop_cli.write_text(
+        FAKE_WORKSHOP_SCRIPT.replace(" happy", " get-state-fails")
+    )
+    queue = hub.subscribe()
+
+    task = _make_task(engine, config, git_checkout)
+
+    await run(engine, task.id, config)
+    settled = await _wait_workflow_settled(engine, task.id)
+
+    assert settled.workflow_status == "failed"
+    # The workspace was built; only the agent step failed.
+    assert settled.spawn_completed_at is not None
+    assert tracker.get(task.id, "main").status == "failed"
+    # No prompt was ever delivered.
+    assert not [
+        e
+        for e in _drain(queue)
+        if e.type == "workflow_step"
+        and e.payload["step"] == "work"
+        and e.payload["status"] == "ok"
+    ]
+
+
+async def test_task_without_pinned_inputs_fails_before_git(
     app, git_checkout: Path, fake_my_workshop, pipeline
 ) -> None:
+    """A task with no accepted launch inputs never reaches a git command.
+
+    Acceptance writes the inputs in the same transaction as the row, so this
+    is the paranoid case (a restored database, a hand-edited row). It must
+    fail loudly rather than fall back to a project's current base branch.
+    """
     engine = app.state.engine
     run, hub, tracker, _ = pipeline
     config: Config = replace(
@@ -574,22 +595,21 @@ async def test_template_missing_at_pipeline_start_fails_before_git(
     )
     queue = hub.subscribe()
 
-    _make_template(engine, git_checkout)
-    task = _make_task(engine, config)
-    # The template disappears between the 202 and pipeline start (raw delete:
-    # the REST guard blocks this once the task row exists — the race needs
-    # the row gone underneath a live task, e.g. a DB restore).
-    from ompire_daemon.db import templates as templates_table
+    task = _make_task(engine, config, git_checkout)
+    from ompire_daemon.db import tasks as tasks_table
 
     with engine.begin() as conn:
-        conn.execute(templates_table.delete().where(templates_table.c.name == "demo"))
+        conn.execute(
+            tasks_table.update()
+            .where(tasks_table.c.id == task.id)
+            .values(execution_inputs_json=None)
+        )
 
     await run(engine, task.id, config)
 
     refreshed = get_task(engine, task.id)
     assert refreshed.state == "failed"
-    assert "template" in (refreshed.error or "")
-    assert "'demo'" in (refreshed.error or "")
+    assert "launch configuration" in (refreshed.error or "")
     # No clone ever happened: the failure lands before any git command, and
     # no spawn_step events are published.
     assert not Path(task.clone_path).exists()
@@ -609,8 +629,7 @@ async def test_preamble_prepended_to_prompt(
         my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
     )
 
-    _make_template(engine, git_checkout, preamble="You are on team omega.")
-    task = _make_task(engine, config, prompt="fix the bug")
+    task = _make_task(engine, config, git_checkout, prompt="fix the bug", preamble="You are on team omega.")
 
     await run(engine, task.id, config)
     settled = await _wait_workflow_settled(engine, task.id)
@@ -636,8 +655,7 @@ async def test_empty_preamble_sends_prompt_unchanged(
         my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
     )
 
-    _make_template(engine, git_checkout, preamble="")
-    task = _make_task(engine, config, prompt="fix the bug")
+    task = _make_task(engine, config, git_checkout, prompt="fix the bug", preamble="")
 
     await run(engine, task.id, config)
     await _wait_workflow_settled(engine, task.id)
@@ -659,8 +677,7 @@ async def test_preamble_alone_never_prompts(
     )
     queue = hub.subscribe()
 
-    _make_template(engine, git_checkout, preamble="You are on team omega.")
-    task = _make_task(engine, config, prompt="")
+    task = _make_task(engine, config, git_checkout, prompt="", preamble="You are on team omega.")
 
     await run(engine, task.id, config)
     settled = await _wait_workflow_settled(engine, task.id)
@@ -688,16 +705,19 @@ case "$*" in
   *"config get ask.timeout"*) echo 0 ;;
   *"--mode rpc-ui"*)
     printf '%s\\n' "$*" > {argv_file}
-    exec {__import__("sys").executable} -u {FAKE_OMP} happy ;;
+    exec {__import__("sys").executable} -u {FAKE_OMP} happy "$@" ;;
   *) exit 0 ;;
 esac
 """
     )
 
 
-async def test_template_model_thinking_on_agent_argv(
+async def test_accepted_policy_reaches_the_agent_argv(
     app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, tmp_path: Path, pipeline
 ) -> None:
+    """Every native role pair on the task's accepted profile reaches the omp
+    child, each with its own thinking level (ADR-0026). There is no "unset
+    means omp's default" case left: a profile always answers all four."""
     engine = app.state.engine
     run, _, _, supervisor = pipeline
     config: Config = replace(
@@ -707,65 +727,17 @@ async def test_template_model_thinking_on_agent_argv(
     argv_file = tmp_path / "argv.txt"
     _argv_capturing_workshop(fake_workshop_cli, argv_file)
 
-    _make_template(engine, git_checkout, model="fable-5", thinking="medium")
-    task = _make_task(engine, config)
+    task = _make_task(engine, config, git_checkout)
 
     await run(engine, task.id, config)
     await _wait_workflow_settled(engine, task.id)
 
     argv = argv_file.read_text()
-    assert "--model fable-5" in argv
+    assert "--model testing/main-model" in argv
     assert "--thinking medium" in argv
-    await supervisor.stop(task.id, "main")
-
-
-async def test_overrides_beat_template_values(
-    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, tmp_path: Path, pipeline
-) -> None:
-    engine = app.state.engine
-    run, _, _, supervisor = pipeline
-    config: Config = replace(
-        app.state.config,
-        my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
-    )
-    argv_file = tmp_path / "argv.txt"
-    _argv_capturing_workshop(fake_workshop_cli, argv_file)
-
-    _make_template(engine, git_checkout, model="fable-5", thinking="medium")
-    task = _make_task(engine, config)
-
-    await run(engine, task.id, config, model_override="zephyr-9", thinking_override="high")
-    await _wait_workflow_settled(engine, task.id)
-
-    argv = argv_file.read_text()
-    assert "--model zephyr-9" in argv
-    assert "--thinking high" in argv
-    assert "fable-5" not in argv
-    assert "medium" not in argv
-    await supervisor.stop(task.id, "main")
-
-
-async def test_template_defaults_omit_flags(
-    app, git_checkout: Path, fake_my_workshop, fake_workshop_cli, tmp_path: Path, pipeline
-) -> None:
-    engine = app.state.engine
-    run, _, _, supervisor = pipeline
-    config: Config = replace(
-        app.state.config,
-        my_workshop_command=(fake_my_workshop('echo "ws-x" > .workshop.lock'),),
-    )
-    argv_file = tmp_path / "argv.txt"
-    _argv_capturing_workshop(fake_workshop_cli, argv_file)
-
-    _make_template(engine, git_checkout)  # null model/thinking
-    task = _make_task(engine, config)
-
-    await run(engine, task.id, config)
-    await _wait_workflow_settled(engine, task.id)
-
-    argv = argv_file.read_text()
-    assert "--model" not in argv
-    assert "--thinking" not in argv
+    assert "--smol testing/smol-model:low" in argv
+    assert "--slow testing/slow-model:high" in argv
+    assert "--plan testing/plan-model:xhigh" in argv
     await supervisor.stop(task.id, "main")
 
 
@@ -801,14 +773,15 @@ async def test_fetch_uses_the_project_fetch_remote(
         default_checkout_root=git_checkout.parent,
         fetch_remote="upstream",
     )
-    create_template(
+    task = create_task(
         engine,
-        name="demo",
         project_name="demo",
-        base_branch="main",
-        branch_pattern="ompire/<slug>",
+        slug="fix-bug",
+        branch="ompire/fix-bug",
+        clone_path=str(clone_path_for(config.task_dir_root, "demo", "fix-bug")),
+        prompt="fix the bug",
+        execution_inputs=_make_inputs(git_checkout, fetch_remote="upstream"),
     )
-    task = _make_task(engine, config)
 
     await run(engine, task.id, config)
     await _wait_workflow_settled(engine, task.id)

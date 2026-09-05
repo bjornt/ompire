@@ -21,7 +21,7 @@ reference](../../use/reference/api.md); the generated OpenAPI schema at
 profile contract, including its identifier grammar and status codes, is in
 [Model profiles](../../use/reference/model-profiles.md).
 
-Two mutation boundaries are worth knowing before adding routes near them.
+Three mutation boundaries are worth knowing before adding routes near them.
 
 Profile input schemas forbid unknown fields at every nesting level, so a
 misspelled role or binding key is a `422` rather than silently ignored
@@ -35,6 +35,24 @@ distinction into the registry, which resolves an omission against the stored
 row inside its write transaction rather than against the route's earlier
 read. This is one optional field with that behavior — project `PUT` is
 otherwise still a full replacement, not a PATCH.
+
+Task creation is a two-call boundary. `POST /api/tasks/preview` resolves the
+submitted workflow, project and profile into the effective inputs and returns
+them with a `preview_token`; `POST /api/tasks` requires that token back. The
+token is a fingerprint of the normalized inputs, their resolved values and
+source attribution, and the workflow descriptor — not a timestamp — so an
+unrelated profile or project edit does not invalidate a launch, and a relevant
+one does. It is a comparison value, not a credential.
+
+Acceptance then resolves twice. The first resolution validates and is what the
+Git and file-mention work runs against; the authoritative one is taken again
+inside a `BEGIN IMMEDIATE` reservation, compared against the same token, and
+followed by the insert before the lock is released. Nothing is awaited,
+spawned, or published inside that reservation. A token that no longer matches
+is a `409` carrying the current preview for review, and creates no task,
+workspace, or background job — the operator re-reviews rather than the daemon
+retrying under settings they never saw. What this pins is configuration, not
+the future contents of a Git branch.
 
 ## Observation over WebSocket
 

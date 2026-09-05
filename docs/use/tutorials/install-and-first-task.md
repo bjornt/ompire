@@ -50,8 +50,8 @@ connection. If the chip shows disconnected, the daemon is not running.
 
 ## 4. Configure signing
 
-Shipping is blocked until Ompire has a usable signing key. Open **Templates &
-settings → Daemon → Commit signing** and look at the state.
+Shipping is blocked until Ompire has a usable signing key. Open
+**Settings → Daemon → Commit signing** and look at the state.
 
 If you have exactly one signing key, Ompire has already picked it and there is
 nothing to configure. If you have several, the panel says `gpg unselected` and
@@ -72,7 +72,23 @@ A key with no passphrase is ready as soon as it is selected — there is nothing
 to cache. Any other state names its own problem and its own fix; see
 [Configure GPG signing](../how-to/configure-gpg-signing.md).
 
-## 5. Register the project
+## 5. Create a model profile
+
+A task runs on a model profile: four roles — `default`, `smol`, `slow`, `plan`
+— each bound to a concrete model and a thinking level. Ompire never picks one
+for you and never falls back to whatever your own `omp` is set to, so you need
+one before your first task.
+
+In **Settings → Model profiles**, create one. Give it a name such as
+`balanced`, then fill all four rows with provider-qualified model ids —
+`anthropic/claude-sonnet-4-5`, say — and a thinking level each. The same model
+may be used for more than one role.
+
+Saving checks the shape of what you typed and nothing else: it never contacts a
+provider, so it is not a claim that your credentials work. You will find out at
+the first turn.
+
+## 6. Register the project
 
 Ompire clones each task workspace from a local checkout rather than from the
 network, so the task starts from refs already on disk. Ompire can create that
@@ -95,11 +111,20 @@ If you already have the repository checked out somewhere, keep **Use an
 existing checkout** instead and give its absolute path. Ompire validates it
 while you submit, and only ever reads it.
 
-## 6. Spawn a task
+Set **Default model profile** to the profile you just made, so launches against
+this project inherit it.
 
-In the Spawn view, choose the project, give the task a slug such as
-`add-readme-badge`, and write a prompt describing a small, self-contained
-change. Something a competent contributor would finish in ten minutes.
+## 7. Spawn a task
+
+In the Spawn view, choose the workflow — start with `single-step` — and the
+project, give the task a slug such as `add-readme-badge`, and write a prompt
+describing a small, self-contained change. Something a competent contributor
+would finish in ten minutes.
+
+Beside the form, Ompire lists every step this run may execute and the model
+each one would use. For `single-step` that is one agent step on your profile's
+`default` binding, plus the workflow engine's judge — which only runs if
+something cannot be resolved — on the `slow` binding.
 
 Submit, and watch the four spawn steps run:
 
@@ -117,7 +142,7 @@ When it completes, Ompire opens the task for you. It has its own clone under
 `~/tasks/scratch-repo/add-readme-badge` and an agent running inside its own
 container.
 
-## 7. Watch it work — or don't
+## 8. Watch it work — or don't
 
 You are now on the task's detail view, where the agent's output appears as it
 works.
@@ -129,7 +154,7 @@ notification with sound if it needs an approval or has failed.
 
 Go do something else. Ompire will tell you when it needs you.
 
-## 8. Review the work
+## 9. Review the work
 
 When the agent is idle, start a review from the task detail view.
 
@@ -141,7 +166,7 @@ If you want changes, send a review comment back to the agent. It becomes the
 agent's next prompt and the session returns to `working`. Repeat until you are
 satisfied.
 
-## 9. Ship it
+## 10. Ship it
 
 Shipping is two steps, so you see what will be published before it is.
 
@@ -158,7 +183,7 @@ Re-cache it and try again; nothing was written, so there is nothing to undo.
 When it succeeds, the pull-request URL is attached to the task. Check GitHub:
 the commit should show as **Verified**.
 
-## 10. Clean up
+## 11. Clean up
 
 Once the pull request has landed, clean up the task. The container is removed,
 the clone is deleted, and the task is archived — its record and publishing
@@ -175,8 +200,8 @@ better evidence between them.
 
 ## Next
 
-- [Spawn a task](../how-to/spawn-a-task.md) — templates, workflows, and the
-  `bugfix` workflow
+- [Spawn a task](../how-to/spawn-a-task.md) — workflows, model profiles, and
+  the `bugfix` workflow
 - [The trust boundary](../explanation/trust-boundary.md) — why the pieces are
   arranged this way, and where the model is currently weaker than intended
 - [Configuration](../reference/configuration.md) — every setting

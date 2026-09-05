@@ -13,20 +13,28 @@ from ompire_daemon.agent import (
     AgentHandle,
     AgentStartError,
     AgentSupervisor,
+    ModelConfigurationError,
     NoLiveAgentError,
     build_agent_argv,
+    role_flag_value,
 )
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.rpc import AgentGoneError
 from ompire_daemon.sessions import SessionTracker
+from tests.conftest import fake_argv_builder, make_test_policy
 from tests.test_rpc import fake_omp_argv
 
 
 async def start_fake(scenario: str = "happy", **kwargs) -> AgentHandle:
     kwargs.setdefault("ready_timeout", 5)
     kwargs.setdefault("ring_buffer_size", 100)
-    return await AgentHandle.start(fake_omp_argv(scenario), **kwargs)
+    # Started with the real native flags so the fake reports the policy back
+    # through `get_state`, the way the daemon's handshake expects.
+    argv = build_agent_argv("/clone", policy=make_test_policy())
+    return await AgentHandle.start(
+        fake_omp_argv(scenario, *argv[argv.index("--no-title") + 1 :]), **kwargs
+    )
 
 
 async def drain_until(queue: asyncio.Queue, event_type: str, timeout: float = 5.0) -> list:
@@ -108,8 +116,8 @@ async def test_ring_buffer_replays_in_order_and_caps_size() -> None:
 
 
 def test_build_agent_argv_recipe() -> None:
-    argv = build_agent_argv("/clones/t1")
-    assert argv == [
+    argv = build_agent_argv("/clones/t1", policy=make_test_policy())
+    assert argv[:9] == [
         "workshop", "exec", "-p", "/clones/t1", "--",
         "omp", "--mode", "rpc-ui", "--no-title",
     ]
@@ -121,33 +129,79 @@ def test_build_agent_argv_recipe() -> None:
 
 
 def test_build_agent_argv_resume_appends_flag() -> None:
-    argv = build_agent_argv("/clones/t1", resume="sess-abc")
+    argv = build_agent_argv("/clones/t1", policy=make_test_policy(), resume="sess-abc")
     assert argv[-2:] == ["--resume", "sess-abc"]
 
 
 def test_build_agent_argv_no_resume_by_default() -> None:
-    argv = build_agent_argv("/clones/t1")
+    argv = build_agent_argv("/clones/t1", policy=make_test_policy())
     assert "--resume" not in argv
 
 
-def test_build_agent_argv_model_and_thinking() -> None:
-    argv = build_agent_argv("/clones/t1", model="fable-5", thinking="high")
-    assert "--model" in argv
-    assert argv[argv.index("--model") + 1] == "fable-5"
-    assert "--thinking" in argv
-    assert argv[argv.index("--thinking") + 1] == "high"
+def test_build_agent_argv_carries_every_role_pair() -> None:
+    """All four roles reach the child, each with its own thinking level
+    (ADR-0026). Flags and the `provider/model-id:LEVEL` encoding verified
+    against omp v18.1.10."""
+    argv = build_agent_argv("/clones/t1", policy=make_test_policy())
+    assert argv[argv.index("--model") + 1] == "testing/main-model"
+    assert argv[argv.index("--thinking") + 1] == "medium"
+    assert argv[argv.index("--smol") + 1] == "testing/smol-model:low"
+    assert argv[argv.index("--slow") + 1] == "testing/slow-model:high"
+    assert argv[argv.index("--plan") + 1] == "testing/plan-model:xhigh"
 
 
-def test_build_agent_argv_omits_unset_model_thinking() -> None:
-    argv = build_agent_argv("/clones/t1")
-    assert "--model" not in argv
-    assert "--thinking" not in argv
+def test_build_agent_argv_never_omits_the_policy() -> None:
+    """There is no "unset means omp's default" case: inheriting the host's
+    model settings is what a profile exists to prevent."""
+    argv = build_agent_argv("/clones/t1", policy=make_test_policy())
+    for flag in ("--model", "--thinking", "--smol", "--slow", "--plan"):
+        assert flag in argv
 
 
-def test_build_agent_argv_model_only() -> None:
-    argv = build_agent_argv("/clones/t1", model="fable-5")
-    assert "--model" in argv
-    assert "--thinking" not in argv
+def test_role_flag_value_keeps_nested_model_ids_intact() -> None:
+    """Only the *first* slash separates provider from model id, so a nested
+    catalog path survives into the flag."""
+    from ompire_daemon.execution_inputs import split_model_identifier
+    from ompire_daemon.registry.model_profiles import RoleBinding
+
+    binding = RoleBinding(model="vendor/family/model-9", thinking="low")
+    assert role_flag_value(binding) == "vendor/family/model-9:low"
+    assert split_model_identifier(binding.model) == ("vendor", "family/model-9")
+
+
+async def test_start_refuses_a_child_running_a_different_model() -> None:
+    """omp fuzzy-matches `--model`, so a started child is not proof it obeyed:
+    the supervisor reads the active model back and refuses to prompt when it
+    disagrees with the accepted policy (ADR-0026)."""
+    handle = await start_fake()
+    policy = make_test_policy(default={"model": "testing/other-model", "thinking": "medium"})
+    with pytest.raises(ModelConfigurationError) as exc_info:
+        await handle.apply_model_policy(policy, reassert=False)
+    assert "substituted model" in str(exc_info.value)
+    await handle.kill()
+
+
+async def test_resume_reasserts_the_accepted_pair_before_any_prompt() -> None:
+    """A resumed omp restores its own model settings from the session file,
+    so the accepted pair is re-asserted over the acknowledged native controls
+    and then verified."""
+    handle = await start_fake()
+    policy = make_test_policy()
+    state = await handle.apply_model_policy(policy, reassert=True)
+    assert state.model == "testing/main-model"
+    assert state.thinking_level == "medium"
+    await handle.kill()
+
+
+async def test_refused_model_is_not_silently_accepted() -> None:
+    """Real omp answers `success: false` and leaves the previous model in
+    place for an unknown id (v18.1.10 probe); that must fail, not fall back."""
+    handle = await start_fake()
+    policy = make_test_policy(default={"model": "testing/unknown-model", "thinking": "low"})
+    with pytest.raises(ModelConfigurationError) as exc_info:
+        await handle.apply_model_policy(policy, reassert=True)
+    assert "Model not found" in str(exc_info.value)
+    await handle.kill()
 
 
 async def test_read_session_id_from_get_state() -> None:
@@ -190,7 +244,7 @@ def supervisor(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
+        fake_argv_builder(scenario),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -205,10 +259,10 @@ def supervisor(monkeypatch: pytest.MonkeyPatch):
 async def test_supervisor_start_get_stop(supervisor) -> None:
     sup, hub, _ = supervisor
     hub_queue = hub.subscribe()
-    handle = await sup.start(1, "main", "/clone")
+    handle = await sup.start(1, "main", "/clone", policy=make_test_policy())
     assert sup.get(1, "main") is handle
     with pytest.raises(AgentAlreadyRunningError):
-        await sup.start(1, "main", "/clone")
+        await sup.start(1, "main", "/clone", policy=make_test_policy())
     await sup.stop(1, "main")
     event = await asyncio.wait_for(hub_queue.get(), timeout=5)
     assert event.type == "agent_exited"
@@ -229,9 +283,9 @@ async def test_supervisor_stop_without_agent() -> None:
 
 async def test_supervisor_publishes_exit_code_on_crash(supervisor) -> None:
     sup, hub, scenario = supervisor
-    scenario["name"] = "exit-after-ready"
+    scenario["name"] = "exit-after-start"
     hub_queue = hub.subscribe()
-    await sup.start(2, "main", "/clone")
+    await sup.start(2, "main", "/clone", policy=make_test_policy())
     event = await asyncio.wait_for(hub_queue.get(), timeout=5)
     assert event.type == "agent_exited"
     assert event.payload == {"task_id": 2, "session": "main", "exit_code": 7}
@@ -243,9 +297,11 @@ async def test_supervisor_resume_appends_resume_flag(monkeypatch) -> None:
     sup = AgentSupervisor(config, hub)
     captured = {}
 
-    def fake_build(clone, resume=None, model=None, thinking=None):
+    build = fake_argv_builder("happy")
+
+    def fake_build(clone, *, policy, resume=None):
         captured["resume"] = resume
-        return fake_omp_argv("happy")
+        return build(clone, policy=policy, resume=resume)
 
     monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
 
@@ -254,21 +310,24 @@ async def test_supervisor_resume_appends_resume_flag(monkeypatch) -> None:
 
     monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
 
-    await sup.start(1, "main", "/clone", resume="sess-abc")
+    await sup.start(1, "main", "/clone", policy=make_test_policy(), resume="sess-abc")
     assert captured["resume"] == "sess-abc"
     await sup.stop(1, "main")
 
 
-async def test_supervisor_threads_model_and_thinking(monkeypatch) -> None:
+async def test_supervisor_threads_the_whole_policy(monkeypatch) -> None:
+    """The supervisor passes the complete role map through, and records what
+    the child reports back on the handle so a later step can tell whether a
+    cached session is running the policy it needs (ADR-0026)."""
     hub = EventHub()
     config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100)
     sup = AgentSupervisor(config, hub)
     captured = {}
+    build = fake_argv_builder("happy")
 
-    def fake_build(clone, resume=None, model=None, thinking=None):
-        captured["model"] = model
-        captured["thinking"] = thinking
-        return fake_omp_argv("happy")
+    def fake_build(clone, *, policy, resume=None):
+        captured["policy"] = policy
+        return build(clone, policy=policy, resume=resume)
 
     monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
 
@@ -277,9 +336,10 @@ async def test_supervisor_threads_model_and_thinking(monkeypatch) -> None:
 
     monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
 
-    await sup.start(1, "main", "/clone", model="fable-5", thinking="high")
-    assert captured["model"] == "fable-5"
-    assert captured["thinking"] == "high"
+    policy = make_test_policy()
+    handle = await sup.start(1, "main", "/clone", policy=policy)
+    assert captured["policy"] == policy
+    assert handle.policy == policy
     await sup.stop(1, "main")
 
 
@@ -292,7 +352,7 @@ def tracked_supervisor(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
+        fake_argv_builder(scenario),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -309,7 +369,7 @@ async def test_supervisor_resume_does_not_clobber_recovering_reason(tracked_supe
     sup, tracker, _, _ = tracked_supervisor
     tracker.recovering(1, "main")
 
-    await sup.start(1, "main", "/clone", resume="sess-abc")
+    await sup.start(1, "main", "/clone", policy=make_test_policy(), resume="sess-abc")
 
     # `agent_spawning`'s generic "agent spawned" reason is skipped for a
     # resume (design D-4): the recovery reason painted before the resume
@@ -322,7 +382,7 @@ async def test_supervisor_resume_does_not_clobber_recovering_reason(tracked_supe
 async def test_supervisor_shutdown_terminates_without_marking_failed(tracked_supervisor) -> None:
     sup, tracker, hub, _ = tracked_supervisor
     hub_queue = hub.subscribe()
-    await sup.start(1, "main", "/clone")
+    await sup.start(1, "main", "/clone", policy=make_test_policy())
     assert tracker.get(1, "main").status == "starting"
 
     await asyncio.wait_for(sup.shutdown(), timeout=5)

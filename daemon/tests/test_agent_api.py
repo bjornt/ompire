@@ -12,6 +12,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.tasks import create_task
+from tests.conftest import make_execution_inputs, spawn_task
 
 
 @pytest.fixture
@@ -33,6 +34,9 @@ def registry_task_id(app, tmp_path: Path) -> int:
         branch="ompire/agent-test",
         clone_path=str(tmp_path / "clone"),
         prompt="do things",
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(tmp_path / "checkout"),
+        ),
     )
     return task.id
 
@@ -47,11 +51,7 @@ def _spawn_live_task(
     live, burst flushed to the ring buffer), not `spawn_completed_at`."""
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         ws.receive_json()  # snapshot
-        response = client.post(
-            "/api/tasks",
-            headers=auth_headers,
-            json={"template_name": "demo", "slug": slug, "prompt": prompt},
-        )
+        response = spawn_task(client, auth_headers, slug=slug, prompt=prompt)
         assert response.status_code == 202, response.text
         task_id = response.json()["id"]
         while True:
@@ -117,7 +117,7 @@ def test_stop_409_without_live_agent(
 
 
 def test_spawned_agent_events_and_stop_end_to_end(
-    client: TestClient, auth_headers: dict, auth_token: str, demo_template: dict
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
 ) -> None:
     task_id = _spawn_live_task(client, auth_headers, auth_token)
 
@@ -163,7 +163,7 @@ def test_spawned_agent_events_and_stop_end_to_end(
 
 
 def test_replay_then_live_on_late_connect(
-    client: TestClient, auth_headers: dict, auth_token: str, demo_template: dict
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
 ) -> None:
     task_id = _spawn_live_task(client, auth_headers, auth_token)
 
@@ -189,7 +189,7 @@ def test_composer_action_reaches_live_agent(
     client: TestClient,
     auth_headers: dict,
     auth_token: str,
-    demo_template: dict,
+    demo_project: dict,
     path: str,
     command: str,
 ) -> None:
@@ -206,7 +206,7 @@ def test_composer_action_reaches_live_agent(
 
 
 def test_composer_action_surfaces_agent_rejection(
-    client: TestClient, auth_headers: dict, auth_token: str, demo_template: dict
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
 ) -> None:
     task_id = _spawn_live_task(client, auth_headers, auth_token)
     # `fail` makes the fake agent answer success: false → 502 upstream error.
@@ -221,7 +221,7 @@ def test_composer_action_surfaces_agent_rejection(
 
 
 def test_state_and_stats_pass_through(
-    client: TestClient, auth_headers: dict, auth_token: str, demo_template: dict
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
 ) -> None:
     task_id = _spawn_live_task(client, auth_headers, auth_token)
     state = client.get(f"/api/tasks/{task_id}/sessions/main/agent/state", headers=auth_headers)
@@ -307,15 +307,11 @@ def test_agent_ws_rejects_missing_agent(
 
 
 def test_answer_resolves_ask_and_returns_to_working(
-    client: TestClient, auth_headers: dict, auth_token: str, demo_template: dict
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
 ) -> None:
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         ws.receive_json()  # snapshot
-        response = client.post(
-            "/api/tasks",
-            headers=auth_headers,
-            json={"template_name": "demo", "slug": "agent-ask", "prompt": "ask"},
-        )
+        response = spawn_task(client, auth_headers, slug="agent-ask", prompt="ask")
         assert response.status_code == 202, response.text
         task_id = response.json()["id"]
 
@@ -357,15 +353,11 @@ def test_answer_resolves_ask_and_returns_to_working(
 
 
 def test_answer_resolves_approval(
-    client: TestClient, auth_headers: dict, auth_token: str, demo_template: dict
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
 ) -> None:
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         ws.receive_json()  # snapshot
-        response = client.post(
-            "/api/tasks",
-            headers=auth_headers,
-            json={"template_name": "demo", "slug": "agent-approve", "prompt": "approve"},
-        )
+        response = spawn_task(client, auth_headers, slug="agent-approve", prompt="approve")
         assert response.status_code == 202, response.text
         task_id = response.json()["id"]
 
@@ -383,15 +375,11 @@ def test_answer_resolves_approval(
 
 
 def test_answer_stale_question_id_conflicts(
-    client: TestClient, auth_headers: dict, auth_token: str, demo_template: dict
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
 ) -> None:
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         ws.receive_json()  # snapshot
-        response = client.post(
-            "/api/tasks",
-            headers=auth_headers,
-            json={"template_name": "demo", "slug": "agent-ask-stale", "prompt": "ask"},
-        )
+        response = spawn_task(client, auth_headers, slug="agent-ask-stale", prompt="ask")
         task_id = response.json()["id"]
         _wait_for_question_posted(ws, task_id)
 
@@ -426,15 +414,11 @@ def test_answer_404_for_unknown_task(client: TestClient, auth_headers: dict) -> 
 
 
 def test_interrupt_clears_pending_question(
-    client: TestClient, auth_headers: dict, auth_token: str, demo_template: dict
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
 ) -> None:
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         ws.receive_json()  # snapshot
-        response = client.post(
-            "/api/tasks",
-            headers=auth_headers,
-            json={"template_name": "demo", "slug": "agent-ask-interrupt", "prompt": "ask"},
-        )
+        response = spawn_task(client, auth_headers, slug="agent-ask-interrupt", prompt="ask")
         task_id = response.json()["id"]
         question = _wait_for_question_posted(ws, task_id)
 
@@ -457,7 +441,7 @@ def test_interrupt_clears_pending_question(
 
 
 def test_judge_session_admitted_on_session_routes(
-    client: TestClient, auth_headers: dict, auth_token: str, demo_template: dict
+    client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
 ) -> None:
     """The engine-reserved judge session is reachable on session-scoped routes
     (its transcript is the audit trail), while undeclared names still 404.
@@ -468,17 +452,12 @@ def test_judge_session_admitted_on_session_routes(
     judge session live."""
     import time
 
-    created = client.post(
-        "/api/templates",
-        headers=auth_headers,
-        json={"name": "qa-bugfix", "project_name": "demo", "workflow": "bugfix"},
-    )
-    assert created.status_code == 201, created.text
-
-    response = client.post(
-        "/api/tasks",
-        headers=auth_headers,
-        json={"template_name": "qa-bugfix", "slug": "judge-route", "prompt": "fix the bug"},
+    response = spawn_task(
+        client,
+        auth_headers,
+        slug="judge-route",
+        prompt="fix the bug",
+        workflow_name="bugfix",
     )
     assert response.status_code == 202, response.text
     task_id = response.json()["id"]

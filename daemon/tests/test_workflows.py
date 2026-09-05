@@ -27,11 +27,6 @@ from ompire_daemon.events import EventHub
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.tasks import Task, create_task, get_task
-from ompire_daemon.registry.templates import (
-    Template,
-    UnknownWorkflowError,
-    create_template,
-)
 from ompire_daemon.registry.workflows import list_step_records
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.workflows import (
@@ -49,7 +44,7 @@ from ompire_daemon.workflows import (
     registered_workflows,
     unregister_workflow,
 )
-from tests.test_rpc import fake_omp_argv
+from tests.conftest import fake_argv_builder, make_execution_inputs, make_test_policy
 
 DEBOUNCE = 0.1
 
@@ -76,31 +71,35 @@ def project(engine: Engine, tmp_path: Path):
     )
 
 
-def _make_template(engine: Engine, workflow: str = "single-step", preamble: str = "") -> Template:
-    return create_template(
-        engine,
-        name=f"tpl-{workflow}",
-        project_name="demo",
-        branch_pattern="ompire/<slug>",
-        workflow=workflow,
-        preamble=preamble,
-    )
-
-
 def _make_task(
-    engine: Engine, tmp_path: Path, template: Template, prompt: str = "do it"
+    engine: Engine,
+    tmp_path: Path,
+    workflow: str = "single-step",
+    prompt: str = "do it",
+    *,
+    preamble: str = "",
+    roles: dict | None = None,
 ) -> Task:
-    clone_path = tmp_path / "tasks" / f"task-{template.name}"
+    """A task carrying the launch inputs it was accepted under (ADR-0026).
+    The engine reads preamble and role bindings off the task; there is no
+    second object to hand it."""
+    clone_path = tmp_path / "tasks" / f"task-{workflow}"
     clone_path.mkdir(parents=True, exist_ok=True)
     return create_task(
         engine,
         project_name="demo",
-        template_name=template.name,
-        slug=f"task-{template.name}",
+        slug=f"task-{workflow}",
         branch="ompire/task",
         clone_path=str(clone_path),
         prompt=prompt,
-        workflow_name=template.workflow,
+        workflow_name=workflow,
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(tmp_path / "checkout"),
+            workflow_name=workflow,
+            preamble=preamble,
+            roles=roles,
+            branch="ompire/task",
+        ),
     )
 
 
@@ -109,11 +108,7 @@ async def rig(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Runner + supervisor + tracker wired to fake omp with a fast debounce.
     `scenario` lets a test switch the fake omp behavior before the run."""
     scenario = {"name": "happy"}
-    monkeypatch.setattr(
-        agent_module,
-        "build_agent_argv",
-        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
-    )
+    monkeypatch.setattr(agent_module, "build_agent_argv", fake_argv_builder(scenario))
 
     async def no_preflight(clone_path: str) -> None:
         return None
@@ -193,10 +188,24 @@ def test_workflow_definition_validation() -> None:
         )
 
 
-def test_template_validation_uses_engine_registry(engine: Engine, project) -> None:
+def test_launch_rejects_an_unregistered_workflow(engine: Engine, project) -> None:
+    """The engine's registry is the only source of valid workflow names, and
+    a launch names one directly now (ADR-0026)."""
+    from ompire_daemon.launch import LaunchInputError, LaunchRequest, resolve_launch
+
     assert "single-step" in registered_workflows()
-    with pytest.raises(UnknownWorkflowError):
-        _make_template(engine, workflow="no-such-workflow")
+    request = LaunchRequest(
+        project_name="demo",
+        workflow_name="no-such-workflow",
+        slug="x",
+        prompt="p",
+        model_profile=None,
+        profile_explicit=False,
+        workspace_overrides={},
+    )
+    with engine.connect() as conn, pytest.raises(LaunchInputError) as exc_info:
+        resolve_launch(conn, request)
+    assert exc_info.value.field == "workflow_name"
 
 
 # --- single-step parity (2.4, D-10) ------------------------------------------
@@ -204,10 +213,9 @@ def test_template_validation_uses_engine_registry(engine: Engine, project) -> No
 
 async def test_single_step_delivers_preamble_plus_prompt(rig, engine, project, tmp_path: Path) -> None:
     runner, supervisor, tracker, _hub, _scenario = rig
-    template = _make_template(engine, preamble="PRE")
-    task = _make_task(engine, tmp_path, template, prompt="do it")
+    task = _make_task(engine, tmp_path, preamble="PRE", prompt="do it")
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     final = await wait_for_run(engine, task.id, {"complete"})
 
     assert final.workflow_status == "complete"
@@ -232,10 +240,9 @@ async def test_single_step_delivers_preamble_plus_prompt(rig, engine, project, t
 
 async def test_single_step_empty_prompt_sends_nothing(rig, engine, project, tmp_path: Path) -> None:
     runner, supervisor, tracker, _hub, _scenario = rig
-    template = _make_template(engine, preamble="PRE")
-    task = _make_task(engine, tmp_path, template, prompt="")
+    task = _make_task(engine, tmp_path, preamble="PRE", prompt="")
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"complete"})
 
     assert user_prompts(supervisor, task.id, "main") == []
@@ -248,10 +255,9 @@ async def test_single_step_empty_prompt_sends_nothing(rig, engine, project, tmp_
 async def test_run_fails_when_session_spawn_fails(rig, engine, project, tmp_path: Path) -> None:
     runner, _supervisor, tracker, _hub, scenario = rig
     scenario["name"] = "crash"
-    template = _make_template(engine)
-    task = _make_task(engine, tmp_path, template)
+    task = _make_task(engine, tmp_path)
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     final = await wait_for_run(engine, task.id, {"failed"})
 
     assert final.workflow_status == "failed"
@@ -306,8 +312,7 @@ async def _write_outcome_when_prompted(
 
 async def test_outcome_written(rig, engine, project, tmp_path: Path, outcome_workflow) -> None:
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="outcome-wf")
-    task = _make_task(engine, tmp_path, template)
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
     # A stale file from "an earlier step" must be unlinked before prompting.
     (Path(task.clone_path) / ".ompire").mkdir(parents=True)
     (Path(task.clone_path) / ".ompire" / "outcome.json").write_text('{"version": 1, "status": "failed", "summary": "stale"}')
@@ -327,7 +332,7 @@ async def test_outcome_written(rig, engine, project, tmp_path: Path, outcome_wor
             ),
         )
     )
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"complete"})
     await writer
 
@@ -344,10 +349,9 @@ async def test_outcome_written(rig, engine, project, tmp_path: Path, outcome_wor
 
 async def test_outcome_missing_is_data_not_failure(rig, engine, project, tmp_path: Path, outcome_workflow) -> None:
     runner, _supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="outcome-wf")
-    task = _make_task(engine, tmp_path, template)
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"complete"})
 
     record = list_step_records(engine, task.id)[0]
@@ -358,15 +362,14 @@ async def test_outcome_missing_is_data_not_failure(rig, engine, project, tmp_pat
 
 async def test_outcome_malformed_recorded_as_null(rig, engine, project, tmp_path: Path, outcome_workflow) -> None:
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="outcome-wf")
-    task = _make_task(engine, tmp_path, template)
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
 
     writer = asyncio.create_task(
         _write_outcome_when_prompted(
             supervisor, task.id, Path(task.clone_path), "not json {"
         )
     )
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"complete"})
     await writer
 
@@ -409,10 +412,9 @@ def branch_workflow(fake_workshop_cli: Path):
 
 async def test_command_and_decision_routing(rig, engine, project, tmp_path: Path, branch_workflow) -> None:
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="branch-wf")
-    task = _make_task(engine, tmp_path, template)
+    task = _make_task(engine, tmp_path, workflow="branch-wf")
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"complete"})
 
     records = list_step_records(engine, task.id)
@@ -438,10 +440,9 @@ async def test_command_exit_code_is_outcome_data(
         "esac\n"
     )
     runner, _supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="branch-wf")
-    task = _make_task(engine, tmp_path, template)
+    task = _make_task(engine, tmp_path, workflow="branch-wf")
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"waiting"})
 
     records = list_step_records(engine, task.id)
@@ -487,10 +488,9 @@ async def test_command_infra_failure_fails_run(
     register_workflow(workflow)
     try:
         runner, _supervisor, _tracker, _hub, _scenario = rig
-        template = _make_template(engine, workflow="slow-cmd-wf")
-        task = _make_task(engine, tmp_path, template)
+        task = _make_task(engine, tmp_path, workflow="slow-cmd-wf")
 
-        runner.start_run(task, template)
+        runner.start_run(task)
         final = await wait_for_run(engine, task.id, {"failed"})
 
         assert final.state == "created"
@@ -516,10 +516,9 @@ async def test_decision_unresolvable_escalates_to_gate(rig, engine, project, tmp
     register_workflow(workflow)
     try:
         runner, _supervisor, _tracker, _hub, _scenario = rig
-        template = _make_template(engine, workflow="raise-wf")
-        task = _make_task(engine, tmp_path, template)
+        task = _make_task(engine, tmp_path, workflow="raise-wf")
 
-        runner.start_run(task, template)
+        runner.start_run(task)
         await wait_for_run(engine, task.id, {"waiting"})
 
         records = list_step_records(engine, task.id)
@@ -542,13 +541,12 @@ async def test_decision_unresolvable_escalates_to_gate(rig, engine, project, tmp
 
 async def test_resume_gate_rejects_non_waiting_run(rig, engine, project, tmp_path: Path) -> None:
     runner, _supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine)
-    task = _make_task(engine, tmp_path, template)
+    task = _make_task(engine, tmp_path)
 
     with pytest.raises(WorkflowNotWaitingError):
         runner.resume_gate(task.id, note=None)
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"complete"})
     with pytest.raises(WorkflowNotWaitingError):
         runner.resume_gate(task.id, note=None)
@@ -575,10 +573,9 @@ async def test_multi_step_run_with_two_named_sessions(rig, engine, project, tmp_
     register_workflow(TWO_SESSION_WORKFLOW)
     try:
         runner, supervisor, tracker, _hub, _scenario = rig
-        template = _make_template(engine, workflow="two-session-wf")
-        task = _make_task(engine, tmp_path, template)
+        task = _make_task(engine, tmp_path, workflow="two-session-wf")
 
-        runner.start_run(task, template)
+        runner.start_run(task)
         await wait_for_run(engine, task.id, {"complete"})
 
         # Each session ran exactly its own step, on its own child process.
@@ -610,10 +607,9 @@ async def test_interrupted_agent_step_is_nudged_once(
     completes from the following turn boundary."""
     runner, supervisor, _tracker, _hub, scenario = rig
     scenario["name"] = "no-end"  # burst without agent_end: the turn never ends
-    template = _make_template(engine, workflow="outcome-wf")
-    task = _make_task(engine, tmp_path, template)
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     # Wait until the prompt is durably marked sent (the crash window the
     # nudge path exists for).
     deadline = time.monotonic() + 5
@@ -646,9 +642,9 @@ async def test_interrupted_agent_step_is_nudged_once(
     sessions = list_resumable_sessions(engine, task.id)
     assert len(sessions) == 1
     tracker2.recovering(task.id, "main")
-    await supervisor2.start(task.id, "main", task.clone_path, resume=sessions[0].omp_session_id)
+    await supervisor2.start(task.id, "main", task.clone_path, resume=sessions[0].omp_session_id, policy=make_test_policy())
     tracker2.session_recovered(task.id, "main")
-    runner2.recover_run(get_task(engine, task.id), template)
+    runner2.recover_run(get_task(engine, task.id))
 
     await wait_for_run(engine, task.id, {"complete"})
 
@@ -667,10 +663,9 @@ async def test_unsent_agent_step_sends_fresh_after_restart(
     """Crash after the step record was created but before the prompt went
     out: recovery sends the step prompt, not a nudge."""
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine)
-    task = _make_task(engine, tmp_path, template)
+    task = _make_task(engine, tmp_path)
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     # Wait for the record to exist, then "restart" before the prompt lands.
     # (Racy by nature; prompted_at NULL is what matters, and the nudge path
     # is separately covered — so force the record state deterministically.)
@@ -701,7 +696,7 @@ async def test_unsent_agent_step_sends_fresh_after_restart(
     )
     supervisor2 = AgentSupervisor(config2, hub2, tracker2)
     runner2 = WorkflowRunner(engine, config2, hub2, supervisor2, tracker2)
-    runner2.recover_run(get_task(engine, task.id), template)
+    runner2.recover_run(get_task(engine, task.id))
 
     await wait_for_run(engine, task.id, {"complete"})
     prompts = user_prompts(supervisor2, task.id, "main")
@@ -722,10 +717,9 @@ async def test_gate_survives_restart(rig, engine, project, tmp_path: Path) -> No
     register_workflow(workflow)
     try:
         runner, _supervisor, _tracker, _hub, _scenario = rig
-        template = _make_template(engine, workflow="gate-wf")
-        task = _make_task(engine, tmp_path, template)
+        task = _make_task(engine, tmp_path, workflow="gate-wf")
 
-        runner.start_run(task, template)
+        runner.start_run(task)
         await wait_for_run(engine, task.id, {"waiting"})
         assert list_step_records(engine, task.id)[0].outcome == {"message": "ship it?"}
 
@@ -752,7 +746,7 @@ async def test_gate_survives_restart(rig, engine, project, tmp_path: Path) -> No
                     events.append(event.payload)
 
         collector = asyncio.create_task(collect())
-        runner2.recover_run(get_task(engine, task.id), template)
+        runner2.recover_run(get_task(engine, task.id))
         await asyncio.sleep(0.2)
         assert get_task(engine, task.id).workflow_status == "waiting"
         # Exactly one waiting re-broadcast, same record, same message.
@@ -804,22 +798,16 @@ def test_workflow_resume_endpoint_404_and_409(
         },
     )
     assert r.status_code == 201, r.text
-    r = client.post(
-        "/api/templates",
-        headers=auth_headers,
-        json={"name": "demo", "project_name": "demo"},
-    )
-    assert r.status_code == 201, r.text
     from ompire_daemon.registry.tasks import create_task as _create
 
     task = _create(
         client.app.state.engine,
         project_name="demo",
-        template_name="demo",
         slug="idle-task",
         branch="ompire/idle-task",
         clone_path="/tmp/nonexistent-clone",
         prompt="x",
+        execution_inputs=make_execution_inputs(checkout_path=str(checkout)),
     )
     response = client.post(
         f"/api/tasks/{task.id}/workflow/resume", headers=auth_headers, json={}
@@ -847,10 +835,9 @@ async def test_decision_route_complete_finishes_run_early(
     register_workflow(workflow)
     try:
         runner, _supervisor, _tracker, _hub, _scenario = rig
-        template = _make_template(engine, workflow="complete-wf")
-        task = _make_task(engine, tmp_path, template)
+        task = _make_task(engine, tmp_path, workflow="complete-wf")
 
-        runner.start_run(task, template)
+        runner.start_run(task)
         final = await wait_for_run(engine, task.id, {"complete"})
 
         assert final.workflow_status == "complete"
@@ -914,8 +901,7 @@ async def test_step_judge_synthesizes_missing_outcome(
     """The work step idles with no outcome file; the judge session then
     classifies the step and its document becomes the step's outcome."""
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="outcome-wf")
-    task = _make_task(engine, tmp_path, template)
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
 
     judge_write = asyncio.create_task(
         _write_outcome_when_session_prompted(
@@ -926,7 +912,7 @@ async def test_step_judge_synthesizes_missing_outcome(
             json.dumps({"version": 1, "status": "success", "summary": "the work is done"}),
         )
     )
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"complete"})
     await judge_write
 
@@ -958,10 +944,9 @@ async def test_step_judge_uncertain_leaves_null_outcome(
     """A judge that writes nothing is uncertain: the null outcome stands with
     its original note — no guessing."""
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="outcome-wf")
-    task = _make_task(engine, tmp_path, template)
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"complete"})
 
     record = list_step_records(engine, task.id)[0]
@@ -990,8 +975,7 @@ async def test_decision_judge_resolves_route(rig, engine, project, tmp_path: Pat
     register_workflow(workflow)
     try:
         runner, supervisor, _tracker, _hub, _scenario = rig
-        template = _make_template(engine, workflow="judge-route-wf")
-        task = _make_task(engine, tmp_path, template)
+        task = _make_task(engine, tmp_path, workflow="judge-route-wf")
 
         judge_write = asyncio.create_task(
             _write_outcome_when_session_prompted(
@@ -1009,7 +993,7 @@ async def test_decision_judge_resolves_route(rig, engine, project, tmp_path: Pat
                 ),
             )
         )
-        runner.start_run(task, template)
+        runner.start_run(task)
         await wait_for_run(engine, task.id, {"complete"})
         await judge_write
 
@@ -1044,8 +1028,7 @@ async def test_decision_judge_invalid_route_escalates(
     register_workflow(workflow)
     try:
         runner, supervisor, _tracker, _hub, _scenario = rig
-        template = _make_template(engine, workflow="judge-bad-route-wf")
-        task = _make_task(engine, tmp_path, template)
+        task = _make_task(engine, tmp_path, workflow="judge-bad-route-wf")
 
         judge_write = asyncio.create_task(
             _write_outcome_when_session_prompted(
@@ -1063,7 +1046,7 @@ async def test_decision_judge_invalid_route_escalates(
                 ),
             )
         )
-        runner.start_run(task, template)
+        runner.start_run(task)
         await wait_for_run(engine, task.id, {"waiting"})
         await judge_write
 
@@ -1080,15 +1063,16 @@ async def test_judge_spawn_failure_degrades_without_judging(
 ) -> None:
     """The judge session failing to spawn never fails the run: the null
     outcome stands with its original note."""
-    # The judge alone crashes: it's the only session spawned with the
-    # judge_model override.
-    monkeypatch.setattr(
-        agent_module,
-        "build_agent_argv",
-        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv(
-            "crash" if model == "judge-boom" else "happy"
-        ),
-    )
+    # The judge alone crashes: it is the only session started on the
+    # profile's `slow` binding (ADR-0026).
+    happy = fake_argv_builder("happy")
+    crash = fake_argv_builder("crash")
+
+    def build(clone, *, policy, resume=None):
+        chosen = crash if policy.active.model == "testing/slow-model" else happy
+        return chosen(clone, policy=policy, resume=resume)
+
+    monkeypatch.setattr(agent_module, "build_agent_argv", build)
 
     async def no_preflight(clone_path: str) -> None:
         return None
@@ -1102,14 +1086,12 @@ async def test_judge_spawn_failure_degrades_without_judging(
         checkout_root=tmp_path / "proj",
         session_idle_debounce=DEBOUNCE,
         spawn_step_timeout=10,
-        judge_model="judge-boom",
     )
     supervisor = AgentSupervisor(config, hub, tracker)
     runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
-    template = _make_template(engine, workflow="outcome-wf")
-    task = _make_task(engine, tmp_path, template)
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"complete"})
 
     record = list_step_records(engine, task.id)[0]
@@ -1118,39 +1100,38 @@ async def test_judge_spawn_failure_degrades_without_judging(
     assert record.error and "no outcome file" in record.error
 
 
-async def test_judge_spawn_uses_judge_model(
+async def test_judge_spawn_uses_the_profiles_slow_binding(
     rig, engine, project, tmp_path: Path, outcome_workflow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The judge session spawns with the config's judge_model override while
-    workflow sessions get the run's (here absent) model."""
-    seen_models: list[str | None] = []
-    monkeypatch.setattr(
-        agent_module,
-        "build_agent_argv",
-        lambda clone, resume=None, model=None, thinking=None: (
-            seen_models.append(model),
-            fake_omp_argv("happy"),
-        )[1],
-    )
-    runner, supervisor, _tracker, _hub, _scenario = rig
-    # Re-point the runner at a config carrying judge_model.
-    config = Config(
-        data_dir=tmp_path / "data",
-        task_dir_root=tmp_path / "tasks",
-        checkout_root=tmp_path / "proj",
-        session_idle_debounce=DEBOUNCE,
-        spawn_step_timeout=10,
-        judge_model="judge-x",
-    )
-    runner._config = config
-    supervisor._config = config
+    """The judge has no model setting of its own (ADR-0026): it runs on the
+    task profile's disclosed `slow` binding, while workflow sessions run the
+    `default` one — and it still carries the full auxiliary role map."""
+    seen: list[tuple[str, str, tuple[str, ...]]] = []
+    build = fake_argv_builder("happy")
 
-    template = _make_template(engine, workflow="outcome-wf")
-    task = _make_task(engine, tmp_path, template)
-    runner.start_run(task, template)
-    await wait_for_run(engine, task.id, {"complete"})
+    def capture(clone, *, policy, resume=None):
+        seen.append(
+            (
+                policy.active.model,
+                policy.active.thinking,
+                (policy.smol.model, policy.slow.model, policy.plan.model),
+            )
+        )
+        return build(clone, policy=policy, resume=resume)
 
-    assert seen_models == [None, "judge-x"]
+    runner, _supervisor, _tracker, _hub, _scenario = rig
+    monkeypatch.setattr(agent_module, "build_agent_argv", capture)
+
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
+    runner.start_run(task)
+    final = await wait_for_run(engine, task.id, {"complete", "failed"})
+    assert final.workflow_status == "complete", list_step_records(engine, task.id)
+
+    auxiliary = ("testing/smol-model", "testing/slow-model", "testing/plan-model")
+    assert seen == [
+        ("testing/main-model", "medium", auxiliary),
+        ("testing/slow-model", "high", auxiliary),
+    ]
 
 
 # --- the bugfix workflow (bugfix-workflow 3.x, design D-1/D-2/D-6) -------------
@@ -1167,8 +1148,7 @@ async def test_bugfix_happy_path_script_validates(rig, engine, project, tmp_path
     """reproduce → triage → fix → script validation → COMPLETE, with the
     agent-validation step skipped and the escalate gate never reached."""
     runner, supervisor, tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="bugfix", preamble="PRE")
-    task = _make_task(engine, tmp_path, template, prompt="bug: off by one")
+    task = _make_task(engine, tmp_path, workflow="bugfix", preamble="PRE", prompt="bug: off by one")
 
     async def drive() -> None:
         await _write_outcome_when_session_prompted(
@@ -1185,7 +1165,7 @@ async def test_bugfix_happy_path_script_validates(rig, engine, project, tmp_path
         )
 
     driver = asyncio.create_task(drive())
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"complete"})
     await driver
 
@@ -1225,8 +1205,7 @@ async def test_bugfix_unreproducible_bug_escalates_before_fix(
     rig, engine, project, tmp_path: Path
 ) -> None:
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="bugfix")
-    task = _make_task(engine, tmp_path, template, prompt="bug: flaky test")
+    task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: flaky test")
 
     driver = asyncio.create_task(
         _write_outcome_when_session_prompted(
@@ -1234,7 +1213,7 @@ async def test_bugfix_unreproducible_bug_escalates_before_fix(
             _bugfix_outcome("failed", "cannot reproduce: no failing input found"),
         )
     )
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"waiting"})
     await driver
 
@@ -1266,8 +1245,7 @@ async def test_bugfix_rejection_loops_then_escalates(
         "esac\n"
     )
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="bugfix")
-    task = _make_task(engine, tmp_path, template, prompt="bug: crash")
+    task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: crash")
 
     async def drive() -> None:
         await _write_outcome_when_session_prompted(
@@ -1282,7 +1260,7 @@ async def test_bugfix_rejection_loops_then_escalates(
             )
 
     driver = asyncio.create_task(drive())
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"waiting"})
     await driver
 
@@ -1312,8 +1290,7 @@ async def test_bugfix_agent_validation_when_no_script(rig, engine, project, tmp_
     """No repro_command artifact: validation is a turn on the reproducer
     session (which keeps its reproduction context), not the command step."""
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="bugfix")
-    task = _make_task(engine, tmp_path, template, prompt="bug: colors wrong")
+    task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: colors wrong")
 
     async def drive() -> None:
         await _write_outcome_when_session_prompted(
@@ -1331,7 +1308,7 @@ async def test_bugfix_agent_validation_when_no_script(rig, engine, project, tmp_
         )
 
     driver = asyncio.create_task(drive())
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"complete"})
     await driver
 
@@ -1353,8 +1330,7 @@ async def test_bugfix_judge_fires_on_missing_reproduce_outcome(
     """The reproducer idles without an outcome file; the judge classifies the
     step and the run routes on the judged outcome."""
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="bugfix")
-    task = _make_task(engine, tmp_path, template, prompt="bug: crash")
+    task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: crash")
 
     async def drive() -> None:
         # No outcome for the reproduce step: the judge is prompted next.
@@ -1371,7 +1347,7 @@ async def test_bugfix_judge_fires_on_missing_reproduce_outcome(
         )
 
     driver = asyncio.create_task(drive())
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"complete"})
     await driver
 
@@ -1400,8 +1376,7 @@ async def test_bugfix_restart_mid_loop_nudges_and_continues(
         "esac\n"
     )
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="bugfix")
-    task = _make_task(engine, tmp_path, template, prompt="bug: crash")
+    task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: crash")
 
     async def drive_first_half() -> None:
         await _write_outcome_when_session_prompted(
@@ -1414,7 +1389,7 @@ async def test_bugfix_restart_mid_loop_nudges_and_continues(
         )
 
     driver = asyncio.create_task(drive_first_half())
-    runner.start_run(task, template)
+    runner.start_run(task)
     # Wait until the loop is back at fix #2 with its prompt durably sent.
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -1457,7 +1432,7 @@ async def test_bugfix_restart_mid_loop_nudges_and_continues(
 
     for row in list_resumable_sessions(engine, task.id):
         tracker2.recovering(task.id, row.name)
-        await supervisor2.start(task.id, row.name, task.clone_path, resume=row.omp_session_id)
+        await supervisor2.start(task.id, row.name, task.clone_path, resume=row.omp_session_id, policy=make_test_policy())
         tracker2.session_recovered(task.id, row.name)
 
     async def drive_second_half() -> None:
@@ -1468,7 +1443,7 @@ async def test_bugfix_restart_mid_loop_nudges_and_continues(
         )
 
     driver2 = asyncio.create_task(drive_second_half())
-    runner2.recover_run(get_task(engine, task.id), template)
+    runner2.recover_run(get_task(engine, task.id))
     await wait_for_run(engine, task.id, {"complete"})
     await driver2
 
@@ -1488,8 +1463,7 @@ async def test_bugfix_escalate_gate_survives_restart(
     """A run parked at the escalate gate re-arms after a restart with the
     same message and resumes to completion."""
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, workflow="bugfix")
-    task = _make_task(engine, tmp_path, template, prompt="bug: flaky")
+    task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: flaky")
 
     driver = asyncio.create_task(
         _write_outcome_when_session_prompted(
@@ -1497,7 +1471,7 @@ async def test_bugfix_escalate_gate_survives_restart(
             _bugfix_outcome("failed", "not reproducible"),
         )
     )
-    runner.start_run(task, template)
+    runner.start_run(task)
     await wait_for_run(engine, task.id, {"waiting"})
     await driver
 
@@ -1518,9 +1492,9 @@ async def test_bugfix_escalate_gate_survives_restart(
 
     for row in list_resumable_sessions(engine, task.id):
         tracker2.recovering(task.id, row.name)
-        await supervisor2.start(task.id, row.name, task.clone_path, resume=row.omp_session_id)
+        await supervisor2.start(task.id, row.name, task.clone_path, resume=row.omp_session_id, policy=make_test_policy())
         tracker2.session_recovered(task.id, row.name)
-    runner2.recover_run(get_task(engine, task.id), template)
+    runner2.recover_run(get_task(engine, task.id))
     await asyncio.sleep(0.3)
 
     assert get_task(engine, task.id).workflow_status == "waiting"
@@ -1540,11 +1514,10 @@ async def test_mention_resolving_in_the_clone_is_delivered_verbatim(
     """Omp parses `@path` out of the `message` field itself, so the daemon
     delivers the literal mention (findings-omp-file-mentions.md)."""
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine)
-    task = _make_task(engine, tmp_path, template, prompt="read @notes.md")
+    task = _make_task(engine, tmp_path, prompt="read @notes.md")
     (Path(task.clone_path) / "notes.md").write_text("notes\n")
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     final = await wait_for_run(engine, task.id, {"complete"})
 
     assert final.workflow_status == "complete"
@@ -1557,10 +1530,9 @@ async def test_mention_missing_from_the_clone_fails_the_step_without_prompting(
     """The base checkout moved between submit and clone. Omp would drop the
     mention silently, so the daemon refuses to send the prompt at all."""
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine)
-    task = _make_task(engine, tmp_path, template, prompt="read @gone.md")
+    task = _make_task(engine, tmp_path, prompt="read @gone.md")
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     final = await wait_for_run(engine, task.id, {"failed"})
 
     assert final.state == "created"
@@ -1575,13 +1547,12 @@ async def test_mention_missing_from_the_clone_fails_the_step_without_prompting(
 async def test_a_preamble_at_sign_is_prose_and_never_fails_the_step(
     rig, engine, project, tmp_path: Path
 ) -> None:
-    """Only the operator's own mentions are gated; template text is not a
-    place where `@word` means a file."""
+    """Only the operator's own mentions are gated; the standing preamble is
+    prose, not a place where `@word` means a file."""
     runner, supervisor, _tracker, _hub, _scenario = rig
-    template = _make_template(engine, preamble="ping @nobody about this")
-    task = _make_task(engine, tmp_path, template, prompt="do it")
+    task = _make_task(engine, tmp_path, preamble="ping @nobody about this", prompt="do it")
 
-    runner.start_run(task, template)
+    runner.start_run(task)
     final = await wait_for_run(engine, task.id, {"complete"})
 
     assert final.workflow_status == "complete"

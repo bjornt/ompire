@@ -51,6 +51,7 @@ from ompire_daemon.ship import (
     _parse_draft,
 )
 from ompire_daemon.spawn import StepFailedError
+from tests.conftest import make_execution_inputs
 
 
 @pytest.fixture
@@ -390,6 +391,13 @@ def _make_project_and_task(
         branch="ompire/task-1",
         clone_path=str(clone_path),
         prompt="do the thing",
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(checkout_dir),
+            project_name="myproject",
+            branch="ompire/task-1",
+            upstream_url=upstream_url,
+            fork_url=fork_url,
+        ),
     )
     return project, task
 

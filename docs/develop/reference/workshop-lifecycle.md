@@ -22,6 +22,32 @@ launching a container includes SDK installation.
 On success the daemon reads the workshop identity from `.workshop.lock` in the
 clone and records it on the task.
 
+#### Additions source
+
+The task's accepted Workshop additions source — `project` or `global` — is
+made to apply by staging, because my-workshop resolves additions itself and
+its rule is local-first with no source-selecting flag: a `workshop.my.yaml`
+beside the resolved `workshop.yaml` always wins over the operator's
+`~/.config/my-workshop/my.yaml`. Leaving the argv alone would therefore
+silently fall back to whichever source happened to exist, which
+[ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)
+forbids.
+
+So the daemon puts the *selected* source's content at the clone's local
+additions path before the launcher runs, invokes the launcher unchanged, and
+restores the clone's original file — or its original absence — whether the
+launcher succeeded or failed, before any agent starts. A selected source that
+is absent is staged as an explicitly empty file, so the launcher's local-first
+rule cannot reach the other source; that is reported as no additions, never as
+a successful application of the other one.
+
+The original content and the fact that staging is in progress live in the
+daemon's data directory, never in the clone: a backup inside the task's
+working tree would be readable by the agent and would surface in status,
+diffs, and reviews. Unfinished staging is reconciled at startup before agents
+run. The operator's own files are never modified — the registered checkout is
+untouched and the global additions file is only ever read.
+
 ### Existence
 
 The daemon never persists live container status. "Does this container still
@@ -58,6 +84,7 @@ dogfooding — a changed message would turn a benign absence into an abort.
 |---|---|
 | Launch exits non-zero or exceeds its timeout | Pipeline stops, task `failed`, stderr stored |
 | Launch exits zero but no non-empty `.workshop.lock` | Step treated as failed, error names the missing lock file |
+| The selected additions source is unreadable or escapes its expected location | Workspace setup fails before an agent starts; the clone's original additions file is restored |
 | Status check fails or times out | Reported as `unknown`; the enclosing request still succeeds |
 | `workshop remove` fails for any reason other than absence | Cleanup aborts, the clone directory is **not** deleted, and the task stays un-archived |
 

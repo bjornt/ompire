@@ -1,10 +1,10 @@
 import type { ModelRole, ThinkingLevel } from "../types";
 
-/** Thinking levels omp accepts, in the order every select offers them. Shared
- * by the template/spawn selects (where the level may be left unset) and the
- * model-profile editor (where it is required) — one vocabulary, different
- * permitted absences. Kept in sync with the `ThinkingLevel` union by the
- * `satisfies` check. */
+/** Thinking levels omp accepts, in the order every select offers them. Since
+ * the template retirement (ADR-0026) the model-profile editor is the only
+ * consumer, and it always requires a level: a role binding is a model and a
+ * thinking level together, with no "leave it unset" case left to support.
+ * Kept in sync with the `ThinkingLevel` union by the `satisfies` check. */
 export const THINKING_LEVELS = [
   "off",
   "minimal",

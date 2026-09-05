@@ -174,7 +174,7 @@ _REASON_TEXT = {
     "missing": "no such file in the project's checkout",
     "not_a_file": "not a regular file",
     "not_on_base_branch": (
-        "not on the template's base branch, so the task's clone will not contain it "
+        "not on the task's base branch, so the task's clone will not contain it "
         "(commit it to the base branch, or remove the mention)"
     ),
 }
@@ -236,7 +236,7 @@ async def _paths_on_branch(
 ) -> set[str] | None:
     """Which of `candidates` exist in `base_branch`'s tree, or None if unknown.
 
-    None means the branch ref does not resolve — a broken template or checkout
+    None means the branch ref does not resolve — a broken base branch or checkout
     that the spawn pipeline's own `branch` step will report accurately. The
     mention check is skipped rather than blamed for it.
     """

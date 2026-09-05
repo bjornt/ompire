@@ -54,6 +54,21 @@ projects = Table(
         ForeignKey("model_profiles.name", name="fk_projects_default_model_profile"),
         nullable=True,
     ),
+    # Workspace and prompt defaults a launch inherits and one task may
+    # override (ADR-0026). They moved here from templates: they describe the
+    # project, not a saved launch preset. `preamble` is not nullable — an
+    # empty string means "no preamble", which is a real answer.
+    Column("base_branch", String, nullable=False, server_default="main"),
+    Column("branch_pattern", String, nullable=False, server_default="ompire/<slug>"),
+    Column("workshop_additions", String, nullable=False, server_default="project"),
+    Column("preamble", Text, nullable=False, server_default=""),
+    # Whether this project's *launch configuration* still needs the operator's
+    # decision after the template upgrade. Deliberately separate from
+    # `setup_state`: a checkout can be perfectly ready while the migration
+    # found two templates disagreeing about the base branch.
+    Column(
+        "launch_config_state", String, nullable=False, server_default="reconciled"
+    ),
     Index("ix_projects_default_model_profile", "default_model_profile"),
 )
 
@@ -70,22 +85,45 @@ model_profiles = Table(
     Column("updated_at", String, nullable=False),
 )
 
-# SPEC Decision 6/9: spawn configuration lives on templates; checkout path and
-# remotes come from the referenced project. model/thinking NULL = omp default.
-templates = Table(
-    "templates",
+# Inert upgrade history from the template retirement (ADR-0026).
+#
+# Every old template row, every task's template attribution, and any
+# explicitly configured `judge_model` is copied here before the live storage
+# is removed, including null and empty values. This table is *evidence*: it is
+# read to show the operator what used to be configured and to detect a changed
+# retired setting, and it is never read to execute anything. There is no CRUD,
+# no launch selector, and no path from a row here to a running agent — that is
+# the whole reason it can be kept indefinitely without becoming a second
+# source of launch policy.
+#
+# `scope_kind`/`scope` say what the evidence is about (`project` + name,
+# `task` + id, `daemon` + ""), `source` names where it came from (the template
+# name, or `config.toml`), and `payload_json` is the original values verbatim.
+launch_migration_evidence = Table(
+    "launch_migration_evidence",
     metadata,
-    Column("name", String, primary_key=True),
-    Column("project_name", String, ForeignKey("projects.name"), nullable=False),
-    Column("base_branch", String, nullable=False, server_default="main"),
-    Column("branch_pattern", String, nullable=False),
-    Column("workflow", String, nullable=False, server_default="single-step"),
-    Column("workshop_additions", String, nullable=False, server_default="project"),
-    Column("model", String, nullable=True),
-    Column("thinking", String, nullable=True),
-    Column("preamble", Text, nullable=False, server_default=""),
-    Column("created_at", String, nullable=False),
-    Column("updated_at", String, nullable=False),
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("kind", String, nullable=False),
+    Column("scope_kind", String, nullable=False),
+    Column("scope", String, nullable=False),
+    Column("source", String, nullable=False),
+    Column("payload_json", Text, nullable=False),
+    Column("recorded_at", String, nullable=False),
+    Index("ix_launch_migration_evidence_scope", "scope_kind", "scope"),
+)
+
+# Operator decisions that closed out a reconciliation, and the acknowledgement
+# of a retired `judge_model` value. Keyed by scope like the evidence rows.
+# `acknowledged_value` lets a *changed* retired setting reopen as new evidence
+# while an unchanged one stays quiet across restarts.
+launch_reconciliations = Table(
+    "launch_reconciliations",
+    metadata,
+    Column("scope_kind", String, primary_key=True),
+    Column("scope", String, primary_key=True),
+    Column("kind", String, primary_key=True),
+    Column("acknowledged_value", Text, nullable=True),
+    Column("decided_at", String, nullable=False),
 )
 
 tasks = Table(
@@ -93,9 +131,13 @@ tasks = Table(
     metadata,
     Column("id", Integer, primary_key=True, autoincrement=True),
     Column("project_name", String, ForeignKey("projects.name"), nullable=False),
-    # Plain column, no FK: pre-existing rows stay NULL, and archived rows keep
-    # the name as history even after the template is deleted.
-    Column("template_name", String, nullable=True),
+    # The launch decision this task was accepted under (ADR-0026), as one
+    # version-tagged JSON document. NULL means the task predates pinned
+    # inputs: it keeps its history and stays readable, but anything that would
+    # need a model, a base branch, or a preamble is blocked until the operator
+    # confirms a continuation configuration. NULL is never quietly filled in
+    # from today's project or profile settings.
+    Column("execution_inputs_json", Text, nullable=True),
     Column("slug", String, nullable=False),
     Column("branch", String, nullable=False),
     Column("clone_path", String, nullable=False),
@@ -103,9 +145,9 @@ tasks = Table(
     Column("prompt", Text, nullable=False),
     Column("error", Text, nullable=True),
     Column("workshop_id", String, nullable=True),
-    # Workflow run state (workflow-engine capability): name denormalized from
-    # the template at creation; status/step NULL for legacy rows and whenever
-    # no run is active.
+    # Workflow run state (workflow-engine capability): the workflow chosen at
+    # creation; status/step NULL for legacy rows and whenever no run is
+    # active.
     Column("workflow_name", String, nullable=False, server_default="single-step"),
     Column("workflow_status", String, nullable=True),
     Column("workflow_step", String, nullable=True),

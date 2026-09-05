@@ -18,6 +18,7 @@ from ompire_daemon.gh import (
 )
 from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.tasks import Task, create_task
+from tests.conftest import make_execution_inputs
 
 
 @pytest.fixture
@@ -392,6 +393,11 @@ def _registered_task(
         branch="ompire/preflight",
         clone_path=str(tmp_path / "tasks" / "github-target" / "preflight"),
         prompt="test",
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(checkout),
+            project_name="github-target",
+            branch="ompire/preflight",
+        ),
     )
 
 

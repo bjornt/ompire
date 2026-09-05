@@ -25,6 +25,22 @@ Supplying your own build still wins: `local-test/env up --my-workshop PATH`,
 `--llmvet PATH`, `--my-workshop-src DIR`, or the matching `LOCAL_TEST_*`
 variables. See [Local testing harness](../reference/local-testing.md).
 
+## What `env up` provisions
+
+Bringing the harness up registers a complete model profile named `sandbox`
+alongside the project, and sets it as the project's default. A launch needs
+one — the daemon has no default of its own and refuses without one — and the
+profile's four bindings name the offline fake `omp`, so nothing the harness
+runs can reach a provider.
+
+That profile is harness data, not a production fallback. The daemon never
+creates one; the harness does, in the same way it creates the sandbox
+repository.
+
+Scenarios launch through the real contract: `spawn_task` in
+`local-test/scenarios/lib.sh` previews first and submits the reviewed token,
+because that is what `POST /api/tasks` requires.
+
 ## Run the scenarios
 
 ```sh

@@ -117,6 +117,26 @@ Python definitions are the current form, not the intended end state.
 
 See [ADR-0008](../../adr/0008-model-tasks-as-workflows-over-named-sessions.md).
 
+## A launch is resolved once and pinned to the task
+
+Starting a task is three choices — a workflow, a project, and a model profile
+— with no saved preset in between. The project supplies workspace and prompt
+defaults a task may override; the profile binds four abstract model roles to
+concrete models, and a workflow step names a role rather than a model.
+
+Preview and acceptance run the same resolution, and acceptance re-runs it under
+the registry's write reservation and compares the reviewed fingerprint, so what
+was approved is what is stored. The result is one immutable document on the
+task, and every later stage — the spawn pipeline, the engine, recovery, review,
+shipping — reads it instead of re-reading mutable configuration. Editing a
+project or a profile changes the next launch and nothing already accepted.
+
+Templates were the previous form. Retiring them meant an upgrade that
+preserves every old value as inert evidence and asks the operator wherever it
+would otherwise have had to guess.
+
+See [ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md).
+
 ## Attention is derived centrally
 
 One state machine interprets agent lifecycle into a session status. One pure

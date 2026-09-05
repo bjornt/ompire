@@ -90,7 +90,7 @@ for characteristic reasons:
 |---|---|
 | `fetch` | The project's checkout has gone missing, or its [fetch remote](../reference/projects.md#fetch-remote) is unreachable |
 | `clone` | No write access to `task_dir_root`, or the target path exists |
-| `branch` | `origin/<base_branch>` does not exist — check the template's base branch |
+| `branch` | `origin/<base_branch>` does not exist — check the base branch the task was accepted with, on its detail view |
 | `workshop` | Container tooling unavailable, or the launch exceeded its timeout |
 
 A `workshop` failure after a successful launch usually means the container
@@ -187,3 +187,50 @@ curl -sS http://127.0.0.1:4173/api/daemon/info \
 
 Returns the version, bind address, port, config path, data directory, and the
 audit log path when one exists.
+
+## A project says its launch configuration needs a decision
+
+This appears after upgrading from a release that had templates, when the
+upgrade found something it would not decide for you: two templates that
+disagreed about a field, a template that pinned a model, or a `judge_model`
+still set in your `config.toml`. It is separate from checkout setup — a
+perfectly healthy checkout can still be blocked here.
+
+Open the project's card. The panel lists every distinct old value with the
+template it came from, and nothing is pre-selected: pick the values you want,
+choose a [model profile](../reference/model-profiles.md) or explicitly choose
+no default, tick any acknowledgement it asks for, and save. Launching works
+again immediately, and the old values stay recorded afterwards in case you
+want to look at them.
+
+Nothing else is affected while you decide. Other projects launch normally, and
+tasks already running are untouched.
+
+## A task says it needs a configuration before it can continue
+
+The task was created before Ompire recorded launch inputs. Its workspace,
+branch, sessions, run history, review history and pull-request facts are all
+intact — what was never persisted is the model, thinking level, preamble, and
+any spawn-time overrides it actually used. Today's project and profile settings
+are not evidence of those, so Ompire will not guess them, and there is no
+fallback to `main`.
+
+Open the task. It shows what is known, names what is unknown, and asks you to
+confirm what should happen **from here on**: a model profile, a base branch, an
+additions source, and a preamble. Tick the acknowledgement and confirm. That
+pins future behavior only — it makes no claim about the turns already taken,
+recreates nothing, and changes no recorded branch or session identity.
+
+If the run was interrupted mid-flight, a **Continue** action appears afterwards.
+Review and shipping stay separate, explicit actions. An archived task of this
+vintage needs no confirmation at all, and reading, stopping, and cleaning up
+were never blocked.
+
+## The judge is not using the model I configured
+
+`judge_model` in `config.toml` is retired and configures nothing. The workflow
+engine's judge runs on the model profile the task was launched with — its
+`slow` binding — which the Spawn view shows before you launch.
+
+To give the judge a specific model, bind that model as `slow` in a profile and
+launch with it. See [Configuration](../reference/configuration.md#retired-keys).

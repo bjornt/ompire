@@ -25,6 +25,7 @@ from ompire_daemon.registry.reviews import (
     set_status,
 )
 from ompire_daemon.registry.tasks import create_task, mark_archived, purge_task
+from tests.conftest import make_execution_inputs
 
 
 @pytest.fixture
@@ -45,6 +46,10 @@ def engine_task(app, git_checkout: Path, tmp_path: Path) -> tuple[Engine, int]:
         branch="ompire/task1",
         clone_path=str(tmp_path / "tasks" / "task1"),
         prompt="hello",
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(tmp_path / "checkout"),
+            project_name=project.name,
+        ),
     )
     return engine, task.id
 

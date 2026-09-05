@@ -25,6 +25,7 @@ from ompire_daemon.app import create_app
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
+from ompire_daemon.registry.model_profiles import create_model_profile
 from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.sessions import (
     get_session,
@@ -45,7 +46,12 @@ from ompire_daemon.registry.workflows import (
 from ompire_daemon.review import REVIEW_GIT_REF
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.workflows import WorkflowRunner
-from tests.test_rpc import fake_omp_argv
+from tests.conftest import (
+    TEST_ROLES,
+    fake_argv_builder,
+    make_execution_inputs,
+    spawn_task,
+)
 
 
 @pytest.fixture
@@ -71,6 +77,11 @@ def _make_task(engine, project, tmp_path: Path, slug: str):
         branch=f"ompire/{slug}",
         clone_path=str(clone_path),
         prompt="fix it",
+        execution_inputs=make_execution_inputs(
+            checkout_path=project.checkout_path,
+            project_name=project.name,
+            branch=f"ompire/{slug}",
+        ),
     )
 
 
@@ -151,9 +162,12 @@ async def test_run_recovery_resumes_with_resume_argv_and_no_reprompt(
 
     captured_resume = {}
 
-    def fake_build(clone, resume=None, model=None, thinking=None):
+    build = fake_argv_builder("happy")
+
+    def fake_build(clone, *, policy, resume=None):
         captured_resume["value"] = resume
-        return fake_omp_argv("happy")
+        captured_resume["policy"] = policy
+        return build(clone, policy=policy, resume=resume)
 
     monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
 
@@ -197,7 +211,7 @@ async def test_run_recovery_failure_marks_task_and_session_failed(
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv("crash"),
+        fake_argv_builder("crash"),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -241,8 +255,7 @@ async def test_run_recovery_legacy_complete_run_is_not_redriven(
     finish_step_record(engine, task.id, record.seq, status="ok")
     task = set_run_status(engine, task.id, "complete", None)
 
-    def fake_build(clone, resume=None, model=None, thinking=None):
-        return fake_omp_argv("happy")
+    fake_build = fake_argv_builder("happy")
 
     monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
 
@@ -320,6 +333,7 @@ def test_shutdown_then_restart_resumes_without_reprompt(
         my_workshop_command=(str(fake_my_workshop),),
     )
     app = create_app(config, frontend_dist=tmp_path / "no-dist")
+    create_model_profile(app.state.engine, name="demo", roles=TEST_ROLES)
     with TestClient(app) as client:
         headers = {"Authorization": f"Bearer {app.state.auth_token}"}
         client.post(
@@ -330,19 +344,10 @@ def test_shutdown_then_restart_resumes_without_reprompt(
                 "title": "Demo",
                 "upstream_url": "https://example.com/demo.git",
                 "checkout_path": str(git_checkout),
+                "default_model_profile": "demo",
             },
         )
-        tpl = client.post(
-            "/api/templates",
-            headers=headers,
-            json={"name": "demo", "project_name": "demo"},
-        )
-        assert tpl.status_code == 201
-        response = client.post(
-            "/api/tasks",
-            headers=headers,
-            json={"template_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
-        )
+        response = spawn_task(client, headers, slug="fix-bug", prompt="fix it")
         assert response.status_code == 202
         task_id = response.json()["id"]
         settled = _wait_settled(client, headers, task_id)
@@ -406,6 +411,7 @@ def _restart_config(tmp_path: Path) -> Config:
 
 def _spawn_live_task(app, client: TestClient, git_checkout: Path) -> int:
     headers = {"Authorization": f"Bearer {app.state.auth_token}"}
+    create_model_profile(client.app.state.engine, name="demo", roles=TEST_ROLES)
     client.post(
         "/api/projects",
         headers=headers,
@@ -414,19 +420,10 @@ def _spawn_live_task(app, client: TestClient, git_checkout: Path) -> int:
             "title": "Demo",
             "upstream_url": "https://example.com/demo.git",
             "checkout_path": str(git_checkout),
+            "default_model_profile": "demo",
         },
     )
-    assert (
-        client.post(
-            "/api/templates", headers=headers, json={"name": "demo", "project_name": "demo"}
-        ).status_code
-        == 201
-    )
-    response = client.post(
-        "/api/tasks",
-        headers=headers,
-        json={"template_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
-    )
+    response = spawn_task(client, headers, slug="fix-bug", prompt="fix it")
     assert response.status_code == 202
     task_id = response.json()["id"]
     _wait_settled(client, headers, task_id)

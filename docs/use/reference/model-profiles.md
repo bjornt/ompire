@@ -10,16 +10,19 @@ Profiles are global. They belong to no project and carry no repository,
 workflow, prompt, or credential settings — only model identifiers and
 reasoning levels.
 
-**Profiles do not run tasks yet.** Saving a profile, and assigning one to a
-project, is stored configuration only. Tasks are still created from
-[templates](templates.md) and still run with the template's own `model` and
-`thinking` values, or a per-spawn override. Nothing on this page changes a
-running task, a newly spawned task, or the reviewer. The assignment is
-recorded now so that workflow-first task launching can use it; until that
-lands, a project's default profile has no effect on execution.
+A profile is what a launch selects. Every task chooses one — inherited from
+its project, or picked for that task — and the profile's four bindings are
+what the task's agents, and the workflow engine's judge, actually run.
+
+**Editing a profile changes the next launch, not a task already accepted.** A
+task pins its own copy of the four bindings when it is accepted, so a running
+task keeps the models it was approved with even across a daemon restart, and
+even if the profile is edited or deleted afterwards.
 
 The rationale is in
-[ADR-0025](../../adr/0025-store-global-model-profiles-separately-from-launch-policy.md).
+[ADR-0025](../../adr/0025-store-global-model-profiles-separately-from-launch-policy.md)
+and
+[ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md).
 
 ## Fields
 
@@ -38,12 +41,18 @@ A slug is lowercase alphanumerics separated by single hyphens — `balanced` and
 Every profile binds all four, in this order. There are no other roles, no
 custom aliases, and no way to leave one out.
 
-| Role | Intended use |
-|---|---|
-| `default` | The ordinary active agent |
-| `smol` | Lightweight work |
-| `slow` | Thorough reasoning |
-| `plan` | Planning |
+| Role | Intended use | Who consumes it |
+|---|---|---|
+| `default` | The ordinary active agent | Every agent step of the built-in workflows |
+| `smol` | Lightweight work | omp's own auxiliary use inside the container |
+| `slow` | Thorough reasoning | omp's auxiliary use, and the workflow engine's conditional judge |
+| `plan` | Planning | omp's own auxiliary use inside the container |
+
+All four reach every omp process Ompire starts for a task, each with its own
+thinking level — the active pair as `--model`/`--thinking`, and the other three
+as omp's `--smol`, `--slow`, and `--plan` role flags. There is no separate
+setting for the judge: it runs on this profile's `slow` binding, shown in the
+launch preview like every other model consumer.
 
 The same model and level may be used for several roles — the roles are
 distinct bindings, not distinct models.
@@ -65,7 +74,7 @@ model's name — `openrouter/qwen3-coder:free`, or a dated id like
 
 Rejected: whitespace inside the identifier, control characters, backslashes,
 URLs, and the characters `*`, `?`, and `#`. A bare fuzzy name such as `sonnet`
-is also rejected — that is what a template accepts, but a profile binding is
+is also rejected — that is omp's own argv encoding, but a profile binding is
 concrete.
 
 A trailing `:<thinking level>`, such as `openai/o3:high`, is rejected with a
@@ -78,9 +87,16 @@ second level inside the model field where the two could disagree.
 `thinking` is required on every binding and must be exactly one of `off`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `auto`.
 
-There is no null, empty, or "omp default" choice for a profile binding. A
-template may leave thinking unset — a profile may not, because the point of a
-profile is to say what a role uses rather than to defer.
+There is no null, empty, or "omp default" choice for a binding. `off` is a
+policy — reasoning disabled — not the absence of one, and the point of a
+profile is to say what a role uses rather than to defer to whatever the host
+`omp` happens to be set to.
+
+`auto` and `max` are model-dependent policies rather than fixed levels: omp
+resolves them per model at run time, so a session started on `max` may report
+`xhigh`, and one on `auto` may report `high`. That is native normalization,
+not a dropped override — [task detail](task-detail.md) shows the level omp
+resolved beside the policy the profile states.
 
 ### What validation does not check
 
@@ -95,8 +111,8 @@ cannot reach. No model is ever substituted for another.
 
 ## Using model profiles
 
-Model profiles live in their own section of **Templates & settings**, beside
-the existing template and daemon settings, which are unchanged.
+Model profiles live in their own section of **Settings**, beside
+the daemon settings, which are unchanged.
 
 The list shows each saved profile's name and all four role bindings, model and
 thinking level together, sorted by name. Before the daemon's first state
@@ -158,8 +174,7 @@ profile, and reassigning or clearing one project's default changes only that
 project.
 
 Each project card shows the chosen profile name, or that no default is
-configured, with a reminder that the assignment is stored for launching and
-does not override today's template-driven tasks.
+configured, noting that a launch inherits it unless the task selects another.
 
 If the profile a draft selected has been deleted since you chose it, the
 selection stays visible and is marked unavailable. It does not silently become

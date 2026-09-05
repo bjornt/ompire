@@ -13,8 +13,11 @@ from ompire_daemon import rpc
 FAKE_OMP = Path(__file__).parent / "fake_omp.py"
 
 
-def fake_omp_argv(scenario: str = "happy") -> list[str]:
-    return [sys.executable, "-u", str(FAKE_OMP), scenario]
+def fake_omp_argv(scenario: str = "happy", *omp_args: str) -> list[str]:
+    """The fake's argv. Trailing arguments are the native omp flags the
+    daemon built, so the fake can parse and report them back through
+    `get_state` exactly as the real child does."""
+    return [sys.executable, "-u", str(FAKE_OMP), scenario, *omp_args]
 
 
 async def spawn_fake(scenario: str = "happy") -> asyncio.subprocess.Process:

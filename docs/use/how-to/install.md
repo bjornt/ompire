@@ -53,7 +53,7 @@ Classic confinement is required: Ompire needs to reach your container tooling,
 your GPG agent, and `gh`. The prerequisites above are not bundled in the snap
 and must be present on the host.
 
-Your state — projects, tasks, templates, settings, and the bearer token —
+Your state — projects, tasks, model profiles, settings, and the bearer token —
 lives in `~/snap/ompire/common`, outside any snap revision. Refreshing,
 reverting, and snapd's pruning of old revisions all leave it alone. Upgrading
 from a snap old enough to have stored state per revision moves it there once,
@@ -129,7 +129,7 @@ Every key is listed in [Configuration](../reference/configuration.md).
    http://127.0.0.1:4173/api/daemon/info` returns the version, bind address,
    config path, and data directory.
 4. The GitHub chip is `gh @login`, not `gh missing`, `gh auth`, or `gh error`.
-   Use **Re-check GitHub** in **Templates & settings** if it is not ready.
+   Use **Re-check GitHub** in **Settings** if it is not ready.
 
 ## Next
 

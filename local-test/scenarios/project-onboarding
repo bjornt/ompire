@@ -8,7 +8,7 @@
 #   2. checkout-inspect reports the remotes of an unregistered path
 #   3. clone mode creates a usable checkout, visibly, in the background
 #   4. a failed clone leaves nothing behind and can be retried to success
-#   5. a project that is not ready cannot be pointed at by a template
+#   5. a project that is not ready cannot be launched against
 #   6. unregistering never deletes the checkout
 #
 # Both clone targets are forge repos, so everything stays offline. The
@@ -137,11 +137,13 @@ grep -q "clone" <<<"$err" && ok "failure names the step and carries git's stderr
 [ ! -e "$broken_dest" ] && ok "nothing left at the destination" ||
 	fail "destination clean after failure" "$broken_dest exists"
 
-# A project that is not ready has no clone source, so nothing may point at it.
-code=$(api_code POST /api/templates \
-	"$(jq -nc --arg n "$BROKEN" --arg p "$BROKEN" '{name: $n, project_name: $p}')")
-[ "$code" = 409 ] && ok "template refuses a project that is not ready (409)" ||
-	fail "template refuses unready project" "code $code"
+# A project that is not ready has no clone source, so a launch against it is
+# refused at resolution rather than at the pipeline's first git command.
+code=$(api_code POST /api/tasks/preview \
+	"$(jq -nc --arg p "$BROKEN" '{project_name: $p, workflow_name: "single-step",
+	  slug: "never", prompt: "x"}')")
+[ "$code" = 409 ] && ok "launch refuses a project that is not ready (409)" ||
+	fail "launch refuses unready project" "code $code"
 
 # Fix the URL the way an operator would, then retry.
 _api_run PUT "/api/projects/$BROKEN" "$(jq -nc --arg c "$broken_dest" \

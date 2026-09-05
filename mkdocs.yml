@@ -64,7 +64,6 @@ nav:
           - States: use/reference/states.md
           - HTTP and WebSocket API: use/reference/api.md
           - Projects: use/reference/projects.md
-          - Templates: use/reference/templates.md
           - Model profiles: use/reference/model-profiles.md
           - Tasks: use/reference/tasks.md
           - Task spawn: use/reference/task-spawn.md
@@ -139,3 +138,5 @@ nav:
           - 0022 Adopt or clone base checkouts: adr/0022-create-or-adopt-base-checkouts-without-mutating-them.md
           - 0023 Checkout root as a setting: adr/0023-admit-checkout-root-as-bounded-daemon-writable-setting.md
           - 0024 State outside package revisions: adr/0024-keep-operator-state-outside-package-revisions.md
+          - 0025 Global model profiles: adr/0025-store-global-model-profiles-separately-from-launch-policy.md
+          - 0026 Pinned launch inputs: adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md

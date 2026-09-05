@@ -59,10 +59,10 @@ full current registry state:
 | Key | Contents |
 |---|---|
 | `projects` | All projects |
-| `templates` | All templates |
+| `workflow_catalog` | Every registered built-in workflow: sessions, each declared step with its kind, session, abstract role and conditional flag, and the reserved judge with its role. Snapshot-only — definitions ship with the daemon, so there is no change event |
 | `model_profiles` | All model profiles, sorted by name, each with its four role bindings |
-| `tasks` | All non-purged tasks, each carrying its workflow fields |
-| `sessions` | Per task, a per-session map of current status |
+| `tasks` | All non-purged tasks, each carrying its workflow fields, its accepted `execution_inputs`, and `needs_configuration` |
+| `sessions` | Per task, a per-session map of current status, plus the native model a live session reports |
 | workflow state | Per-task run status, current step, and gate message |
 | `settings` | The effective settings map |
 | `gpg` | Current signing status: `state`, `selected` key, `candidates`, `cache_ttl`, `detail`, `checked_at` — public identifiers only |
@@ -130,11 +130,12 @@ Published on the dashboard channel:
 | Type | Fires when |
 |---|---|
 | `project_created`, `project_updated`, `project_renamed`, `project_deleted` | Project mutations |
-| `template_created`, `template_updated`, `template_deleted` | Template mutations |
 | `model_profile_created`, `model_profile_updated`, `model_profile_deleted` | Model profile mutations |
 | `task_created`, `task_updated`, `task_deleted` | Task mutations |
 | `project_setup_step` | A clone-mode project setup step starts, succeeds, or fails |
 | `spawn_step` | A spawn step starts, succeeds, or fails |
+| `workshop_additions` | Which additions source applied for a task's launch, including when the selected one was absent |
+| `session_model` | A session's omp child reported the model it is running and the thinking level omp resolved |
 | `workflow_step` | A workflow step transitions |
 | `status_changed` | A session's status transitions |
 | `question_posted`, `question_resolved` | A pending question appears or clears |

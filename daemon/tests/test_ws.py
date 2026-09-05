@@ -8,6 +8,8 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from tests.conftest import spawn_task
+
 from .conftest import make_adoptable_checkout
 
 
@@ -28,8 +30,8 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         payload = message["payload"]
         assert payload.keys() == {
             "projects",
-            "templates",
             "model_profiles",
+            "workflow_catalog",
             "tasks",
             "sessions",
             "workflows",
@@ -41,8 +43,13 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
             "settings",
         }
         assert payload["projects"] == []
-        assert payload["templates"] == []
         assert payload["model_profiles"] == []
+        # Definitions ship with the daemon (ADR-0018): the catalog is in the
+        # snapshot and has no change event, because it cannot change.
+        assert [w["name"] for w in payload["workflow_catalog"]] == [
+            "bugfix",
+            "single-step",
+        ]
         assert payload["tasks"] == []
         assert payload["sessions"] == {}
         assert payload["workflows"] == {}
@@ -157,69 +164,30 @@ def test_every_project_mutation_reaches_a_connected_client(
         assert event["payload"] == {"name": "ompire-ng"}
 
 
-def test_template_events_and_snapshot(
+def test_workflow_catalog_rides_the_snapshot_with_no_change_event(
     client: TestClient,
     auth_token: str,
     auth_headers: dict[str, str],
     git_checkout: Path,
 ) -> None:
-    client.post(
-        "/api/projects",
-        headers=auth_headers,
-        json={
-            "name": "demo",
-            "title": "Demo",
-            "upstream_url": "https://example.com/demo.git",
-            "checkout_path": str(git_checkout),
-        },
-    )
-
+    """A reconnecting client gets the catalog authoritatively; nothing
+    publishes catalog deltas because there are none to publish."""
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         snapshot = ws.receive_json()
-        assert snapshot["payload"]["templates"] == []
-
-        response = client.post(
-            "/api/templates",
-            headers=auth_headers,
-            json={"name": "demo", "project_name": "demo"},
-        )
-        assert response.status_code == 201
-
-        event = ws.receive_json()
-        assert event["type"] == "template_created"
-        assert event["payload"]["name"] == "demo"
-        assert event["payload"]["base_branch"] == "main"
-        assert event["seq"] > snapshot["seq"]
-
-        stored = event["payload"]
-        renamed = client.put(
-            "/api/templates/demo",
-            headers=auth_headers,
-            json={
-                "project_name": stored["project_name"],
-                "base_branch": "develop",
-                "branch_pattern": stored["branch_pattern"],
-                "workflow": stored["workflow"],
-                "workshop_additions": stored["workshop_additions"],
-                "model": stored["model"],
-                "thinking": stored["thinking"],
-                "preamble": stored["preamble"],
-            },
-        )
-        assert renamed.status_code == 200, renamed.text
-        event = ws.receive_json()
-        assert event["type"] == "template_updated"
-        assert event["payload"]["base_branch"] == "develop"
-
-        deleted = client.delete("/api/templates/demo", headers=auth_headers)
-        assert deleted.status_code == 200
-        event = ws.receive_json()
-        assert event["type"] == "template_deleted"
-        assert event["payload"] == {"name": "demo"}
-
-    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
-        snapshot = ws.receive_json()
-        assert snapshot["payload"]["templates"] == []
+        catalog = {w["name"]: w for w in snapshot["payload"]["workflow_catalog"]}
+        assert catalog["single-step"]["primary_session"] == "main"
+        assert catalog["single-step"]["sessions"] == ["main"]
+        assert catalog["single-step"]["steps"] == [
+            {
+                "name": "work",
+                "kind": "agent",
+                "session": "main",
+                "role": "default",
+                "conditional": False,
+            }
+        ]
+        assert catalog["single-step"]["judge_session"] == "judge"
+        assert catalog["single-step"]["judge_role"] == "slow"
 
 
 def test_reconnect_gets_fresh_snapshot(
@@ -256,17 +224,13 @@ def test_task_events_and_snapshot(
     client: TestClient,
     auth_token: str,
     auth_headers: dict[str, str],
-    demo_template: dict,
+    demo_project: dict,
 ) -> None:
 
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         ws.receive_json()  # snapshot
 
-        response = client.post(
-            "/api/tasks",
-            headers=auth_headers,
-            json={"template_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
-        )
+        response = spawn_task(client, auth_headers, slug="fix-bug", prompt="fix it")
         assert response.status_code == 202
         task_id = response.json()["id"]
 
@@ -296,11 +260,19 @@ def test_task_events_and_snapshot(
                 "status_changed",
                 "task_updated",
                 "workflow_step",
+                "workshop_additions",
+                "session_model",
             )
             if event["type"] == "spawn_step":
                 steps.append((event["payload"]["step"], event["payload"]["status"]))
+            if event["type"] == "workshop_additions":
+                # Which additions source applied is disclosed, including when
+                # the selected one is simply absent (ADR-0026).
+                additions = event["payload"]
         assert ("clone", "ok") in steps
         assert ("workshop", "ok") in steps
+        assert additions["source"] == "project"
+        assert "no additions" in additions["detail"]
 
         # The workflow engine runs the single-step `work` step on the `main`
         # session to completion once the fake omp's burst idles.
@@ -343,16 +315,12 @@ def test_snapshot_carries_session_statuses(
     client: TestClient,
     auth_token: str,
     auth_headers: dict[str, str],
-    demo_template: dict,
+    demo_project: dict,
 ) -> None:
 
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         ws.receive_json()  # snapshot
-        response = client.post(
-            "/api/tasks",
-            headers=auth_headers,
-            json={"template_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
-        )
+        response = spawn_task(client, auth_headers, slug="fix-bug", prompt="fix it")
         assert response.status_code == 202
         task_id = response.json()["id"]
         # The fake omp's burst ends quietly: wait for the idle transition.
@@ -387,18 +355,14 @@ def test_snapshot_serves_durable_review_history_with_no_live_process(
     client: TestClient,
     auth_token: str,
     auth_headers: dict[str, str],
-    demo_template: dict,
+    demo_project: dict,
 ) -> None:
     """The `reviews` map is composed from durable rows, so a reconnect after
     a restart serves the restored history — with `url`/`port` null, because
     the reviewer process did not survive (review capability; ADR-0016)."""
     from ompire_daemon.registry.reviews import append_iteration, open_review
 
-    response = client.post(
-        "/api/tasks",
-        headers=auth_headers,
-        json={"template_name": "demo", "slug": "fix-bug", "prompt": "fix it"},
-    )
+    response = spawn_task(client, auth_headers, slug="fix-bug", prompt="fix it")
     assert response.status_code == 202
     task_id = response.json()["id"]
 

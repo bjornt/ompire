@@ -40,8 +40,7 @@ from ompire_daemon.registry.reviews import (
     list_reviews,
     open_review,
 )
-from ompire_daemon.registry.tasks import Task
-from ompire_daemon.registry.templates import get_template
+from ompire_daemon.registry.tasks import Task, require_task_inputs
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.spawn import Step, _run_step
 
@@ -242,12 +241,14 @@ class ReviewManager:
     # --- reset dance --------------------------------------------------------
 
     def _base_branch(self, task: Task) -> str:
-        """`<base>` for the reset dance: the task's template base branch
-        (templates capability, design D-3). Tasks that predate templates
-        (null `template_name`) fall back to `main`."""
-        if task.template_name is None:
-            return "main"
-        return get_template(self._engine, task.template_name).base_branch
+        """`<base>` for the reset dance: the base branch the task was
+        accepted with (ADR-0026).
+
+        There is no `main` fallback. A task without confirmed inputs never
+        reaches here — the readiness guard refuses review before this runs —
+        because resetting the wrong base is a silent way to review the wrong
+        diff."""
+        return require_task_inputs(task).workspace.base_branch
 
     async def _fetch(self, clone_path: str, timeout: int) -> None:
         await _run_step(

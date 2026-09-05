@@ -36,6 +36,34 @@ An agent counts as started only after a `ready` frame is read from stdout,
 bounded by `agent_ready_timeout`. A timeout kills the child and fails the
 start.
 
+### Model policy
+
+Every child is started under the task's accepted model policy — there is no
+"unset means omp's default", because inheriting the host's model settings is
+what a globally reusable profile exists to prevent
+([ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)).
+The argv carries the active pair as `--model provider/model-id` and
+`--thinking LEVEL`, plus all three auxiliary roles as
+`--smol/--slow/--plan provider/model-id:LEVEL`, so omp's own subagent and
+planning operations see the same policy the daemon resolved. Identifiers are
+split at the *first* slash only, keeping provider-specific names that contain
+further slashes intact.
+
+After the ready handshake, and before any prompt or resume nudge, the daemon
+confirms what the child is actually running:
+
+- On a **resumed** process the pair is reasserted with `set_model` and
+  `set_thinking_level`. A resumed child is restored from its session file, so
+  `--model` on the argv is not by itself proof of the model in force.
+- Either way the active model identity is read back and compared exactly. omp
+  fuzzy-matches `--model`, so a typo or a retired id would otherwise quietly
+  run a neighbouring model.
+
+A child that cannot be put on the accepted model is killed rather than
+prompted. Thinking is a policy, not a resolved value: omp may resolve `auto`
+and `max` to a model-specific level, and the accepted policy and the observed
+resolved level stay separately visible rather than one overwriting the other.
+
 ### Request correlation
 
 Requests are NDJSON frames with daemon-generated unique ids. `response` frames
@@ -117,6 +145,7 @@ it would hide that.
 | Child exits before the handshake — missing credentials, for instance | Start fails with the child's captured stderr; no live agent registered |
 | No `ready` frame within the timeout | Child killed, start fails with a timeout error |
 | `response` reports failure | The request fails with the frame's error text |
+| omp refuses the model or thinking level, reports no active model, or resolves to a different one | Start fails with a model-configuration error and the child is killed; no prompt is sent under substituted settings |
 | Stop on a session with no live agent | `409` |
 | Stop for an unknown task or undeclared session name | `404` |
 

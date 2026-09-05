@@ -44,6 +44,17 @@ A task with a present container but no recorded sessions is recovered with
 zero resumes. That is not an error: sessions are spawned lazily, and a
 command-only workflow may never create one.
 
+A task carrying no confirmed launch configuration is skipped instead. These
+are tasks accepted before launch inputs were pinned to the task
+([ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)):
+resuming one would need a model policy nobody recorded, and the project's
+settings today are not evidence of what it ran under. Skipping keeps the run
+at its position with its sessions, workspace and history untouched, and task
+detail offers the operator a confirmation. Confirming pins the inputs and
+enables an explicit Continue, which runs the same per-task recovery routine a
+restart would. It governs future turns only — it is never a claim about what
+an earlier turn used.
+
 Recovery runs in the background. The daemon serves REST requests and WebSocket
 snapshots while it proceeds, bounded by `recovery_concurrency` — deliberately
 small, because each resume is a real container-side agent startup.
@@ -132,6 +143,7 @@ Ship progress other than `pr_url` remains transient.
 | Reviewer process, its URL and port | Discarded; the review's history is restored, the clone's Git state too |
 | Ship progress other than `pr_url` | Discarded |
 | Attention entries | Rebuilt from recovered session status |
+| A task with no confirmed launch configuration | Skipped, not failed; run position, sessions and workspace are kept until the operator confirms |
 
 The durable boundary is still narrower than [`VISION.md`](../../VISION.md)
 calls for. Review history now sits inside it; human decisions,

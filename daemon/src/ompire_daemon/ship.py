@@ -24,6 +24,7 @@ from sqlalchemy import Engine
 
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
+from ompire_daemon.execution_inputs import TaskExecutionInputs
 from ompire_daemon.gh import (
     GitHubProbe,
     GitHubStatus,
@@ -31,9 +32,12 @@ from ompire_daemon.gh import (
     parse_github_owner,
 )
 from ompire_daemon.gpg import STATE_READY, gpg_signing_refusal
-from ompire_daemon.registry.projects import Project, get_project
-from ompire_daemon.registry.tasks import Task, mark_pr_url
-from ompire_daemon.registry.templates import get_template
+from ompire_daemon.registry.tasks import (
+    Task,
+    mark_pr_url,
+    require_task_inputs,
+    task_payload,
+)
 from ompire_daemon.review import _run_git_output
 from ompire_daemon.sessions import wait_for_idle
 from ompire_daemon.spawn import Step, StepFailedError, _ensure_git_excludes, _run_step
@@ -255,8 +259,8 @@ class ShipManager:
     async def _preflight_target(
         self, task: Task
     ) -> tuple[GitHubStatus, GitHubTargetStatus]:
-        project = self._project(task)
-        status, target = await self._gh.probe_target(project.upstream_url)
+        routing = self._routing(task)
+        status, target = await self._gh.probe_target(routing.upstream_url)
         if status.identity.state != "ready" or target.state != "allowed":
             raise GitHubPreflightError(status, target)
         return status, target
@@ -373,8 +377,8 @@ class ShipManager:
         if existing is None or existing.status != "committing":
             self._publish_step(task.id, "commit", "started")
 
-        project = self._project(task)
-        base_branch = self._base_branch(task)
+        routing = self._routing(task)
+        base_branch = routing.workspace.base_branch
         clone_path = task.clone_path
         timeout = self._config.spawn_step_timeout
 
@@ -413,7 +417,7 @@ class ShipManager:
         self._set_state(task.id, status="pushing")
         try:
             pr_url = await self._push_and_pr(
-                task, project, base_branch, pr_title, pr_body
+                task, routing, base_branch, pr_title, pr_body
             )
         except SshAuthenticationError as exc:
             return self._finish_publish_error(
@@ -435,7 +439,7 @@ class ShipManager:
             )
 
         updated = mark_pr_url(self._engine, task.id, pr_url)
-        self._hub.publish("task_updated", asdict(updated))
+        self._hub.publish("task_updated", task_payload(updated))
         state = self._set_state(task.id, status="shipped", pr_url=pr_url, error=None)
         self._hub.publish(
             "ship_finished",
@@ -445,16 +449,25 @@ class ShipManager:
 
     # --- git / gh steps ----------------------------------------------------
 
-    def _project(self, task: Task) -> Project:
-        return get_project(self._engine, task.project_name)
+    def _routing(self, task: Task) -> TaskExecutionInputs:
+        """Where this task publishes, as accepted (ADR-0026).
+
+        Upstream and fork URLs are read off the task rather than the project
+        row: editing a project must not silently redirect a pull request for
+        work that was already approved against a different target. The
+        credential and identity checks around this are unchanged and still
+        live (ADR-0011/0017) — only the destination is pinned."""
+        return require_task_inputs(task)
 
     def _base_branch(self, task: Task) -> str:
-        """`<base>` for the squash/PR: the task's template base branch
-        (templates capability, design D-3). Tasks that predate templates
-        (null `template_name`) fall back to `main`."""
-        if task.template_name is None:
-            return "main"
-        return get_template(self._engine, task.template_name).base_branch
+        """`<base>` for the squash/PR: the base branch the task was accepted
+        with (ADR-0026).
+
+        There is no `main` fallback. A task without confirmed inputs is
+        refused by the readiness guard before any ship step runs, because
+        squashing or opening a PR against a guessed base is a publishing
+        action taken on invented information."""
+        return require_task_inputs(task).workspace.base_branch
 
     async def _fetch(self, clone_path: str, timeout: int) -> None:
         await _run_step(
@@ -858,7 +871,7 @@ class ShipManager:
     async def _push_and_pr(
         self,
         task: Task,
-        project: Project,
+        routing: TaskExecutionInputs,
         base_branch: str,
         pr_title: str,
         pr_body: str,
@@ -866,14 +879,14 @@ class ShipManager:
         clone_path = task.clone_path
         branch = task.branch
 
-        if project.fork_url:
-            remote_url = project.fork_url
-            head = f"{parse_github_owner(project.fork_url)}:{branch}"
+        if routing.fork_url:
+            remote_url = routing.fork_url
+            head = f"{parse_github_owner(routing.fork_url)}:{branch}"
         else:
             # Task clones are hardlink-cloned from the local checkout, so their
             # `origin` is a *local path* — pushing to `origin` never reaches
             # GitHub (found via dogfooding). Push to the upstream URL instead.
-            remote_url = project.upstream_url
+            remote_url = routing.upstream_url
             head = branch
 
         self._publish_step(task.id, "push", "started")

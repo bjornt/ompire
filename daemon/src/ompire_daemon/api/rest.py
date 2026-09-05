@@ -18,13 +18,16 @@ from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, statu
 from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import Engine
 
-from ompire_daemon import auth
+from ompire_daemon import auth, launchconfig
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.datadir import audit_log_path_for
 from ompire_daemon.events import EventHub
+from ompire_daemon.execution_inputs import (
+    WORKSPACE_FIELDS,
+)
 from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import (
     FINGERPRINT_RE,
@@ -32,7 +35,14 @@ from ompire_daemon.gpg import (
     GpgProbe,
     gpg_signing_refusal,
 )
-from ompire_daemon.model_config import InvalidThinkingLevelError, validate_thinking
+from ompire_daemon.launch import (
+    LaunchInputError,
+    LaunchRequest,
+    PreviewChangedError,
+    ProjectNotLaunchableError,
+    resolution_payload,
+    resolve_launch,
+)
 from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.projectcheckout import (
     InvalidRemoteNameError,
@@ -72,13 +82,18 @@ from ompire_daemon.registry.model_profiles import (
     delete_model_profile,
     get_model_profile,
     list_model_profiles,
+    reserved_write,
     update_model_profile,
     validate_profile_name,
 )
 from ompire_daemon.registry.projects import (
+    DEFAULT_BASE_BRANCH,
     DEFAULT_FETCH_REMOTE,
+    DEFAULT_WORKSHOP_ADDITIONS,
     UNSUPPLIED,
     DuplicateProjectError,
+    InvalidBranchPatternError,
+    InvalidWorkshopAdditionsError,
     Project,
     ProjectHasReferencingTasksError,
     ProjectNotFoundError,
@@ -100,6 +115,8 @@ from ompire_daemon.registry.tasks import (
     ClonePathOutsideRootError,
     DuplicateTaskError,
     Task,
+    TaskConfigurationRequiredError,
+    TaskInputsAlreadyPinnedError,
     TaskNotArchivedError,
     TaskNotFoundError,
     clone_path_for,
@@ -108,22 +125,9 @@ from ompire_daemon.registry.tasks import (
     list_tasks,
     mark_archived,
     purge_task,
+    require_task_inputs,
+    task_payload,
     validate_task_slug,
-)
-from ompire_daemon.registry.templates import (
-    DuplicateTemplateError,
-    InvalidBranchPatternError,
-    InvalidWorkshopAdditionsError,
-    Template,
-    TemplateHasReferencingTasksError,
-    TemplateNotFoundError,
-    UnknownTemplateProjectError,
-    UnknownWorkflowError,
-    create_template,
-    delete_template,
-    get_template,
-    list_templates,
-    update_template,
 )
 from ompire_daemon.review import ReviewAlreadyOpenError, ReviewError, ReviewManager
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
@@ -136,6 +140,7 @@ from ompire_daemon.workflows import (
     Workflow,
     WorkflowNotWaitingError,
     WorkflowRunner,
+    describe_workflows,
     get_workflow,
 )
 from ompire_daemon.workshop import WorkshopRemoveError, remove_workshop, workshop_status
@@ -159,8 +164,15 @@ class ProjectCreate(BaseModel):
     checkout_mode: str = "adopt"
     fetch_remote: str = DEFAULT_FETCH_REMOTE
     # Optional global model profile (ADR-0025). Omitted or null means no
-    # default; nothing is inferred from templates, credentials, or the name.
+    # default; nothing is inferred from credentials or the project name.
     default_model_profile: str | None = None
+    # Workspace and prompt defaults a launch inherits (ADR-0026). The branch
+    # pattern defaults to the daemon's `default_branch_pattern` *setting* at
+    # registration time — a seed, not a value anything reads later.
+    base_branch: str = DEFAULT_BASE_BRANCH
+    branch_pattern: str | None = None
+    workshop_additions: str = DEFAULT_WORKSHOP_ADDITIONS
+    preamble: str = ""
 
     @field_validator("name")
     @classmethod
@@ -188,6 +200,12 @@ class ProjectUpdate(BaseModel):
     # route reads `model_fields_set` to tell the first two apart, so a caller
     # written before profiles existed cannot clear one by not mentioning it.
     default_model_profile: str | None = None
+    # Same omission rule for the workspace defaults, but they are never null:
+    # an empty preamble is the value "no preamble".
+    base_branch: str | None = None
+    branch_pattern: str | None = None
+    workshop_additions: str | None = None
+    preamble: str | None = None
 
     @field_validator("new_name")
     @classmethod
@@ -230,6 +248,15 @@ class ProjectOut(BaseModel):
     setup_state: str
     setup_error: str | None
     default_model_profile: str | None
+    base_branch: str
+    branch_pattern: str
+    workshop_additions: str
+    preamble: str
+    # `reconciled` or `needs-reconciliation` — whether the carried-over
+    # template configuration still needs a decision (ADR-0026). Independent of
+    # `setup_state`, and reported alongside it so the UI can say which of the
+    # two is blocking a launch.
+    launch_config_state: str
 
     model_config = {"from_attributes": True}
 
@@ -300,6 +327,29 @@ def _gh(request: Request) -> GitHubProbe:
     return request.app.state.gh
 
 
+def _supplied_workspace_defaults(body: ProjectUpdate) -> dict[str, Any]:
+    """Only the workspace defaults the caller actually mentioned. Everything
+    else stays `UNSUPPLIED`, so a client written before these fields existed
+    cannot blank them by omission — and an explicit null is refused rather
+    than read as a reset, because none of them has a meaningful empty value
+    except `preamble`, whose empty string is a real choice."""
+    supplied: dict[str, Any] = {}
+    for field in WORKSPACE_FIELDS:
+        if field not in body.model_fields_set:
+            continue
+        value = getattr(body, field)
+        if value is None:
+            if field == "preamble":
+                supplied[field] = ""
+                continue
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                f"{field}: null is not a reset; omit the field to leave it unchanged",
+            )
+        supplied[field] = value
+    return supplied
+
+
 def _project_setup(request: Request) -> ProjectSetupManager:
     return request.app.state.project_setup
 
@@ -325,20 +375,6 @@ def _refuse_unready(project: Project) -> None:
             status.HTTP_409_CONFLICT,
             str(ProjectNotReadyError(project.name, project.setup_state)),
         )
-
-
-def _refuse_unready_named(engine: Engine, name: str) -> None:
-    """Readiness guard for template routes.
-
-    An *unknown* project is deliberately left to the template registry, whose
-    `UnknownTemplateProjectError` is already a 422; only an existing but
-    unusable project is refused here.
-    """
-    try:
-        project = get_project(engine, name)
-    except ProjectNotFoundError:
-        return
-    _refuse_unready(project)
 
 
 def _apply_settings_live(
@@ -504,10 +540,18 @@ async def create_project_route(
             fetch_remote=fetch_remote,
             setup_state=setup_state,
             default_model_profile=body.default_model_profile,
+            base_branch=body.base_branch,
+            branch_pattern=body.branch_pattern or config.default_branch_pattern,
+            workshop_additions=body.workshop_additions,
+            preamble=body.preamble,
         )
     except DuplicateProjectError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except UnknownModelProfileReferenceError as exc:
+    except (
+        UnknownModelProfileReferenceError,
+        InvalidBranchPatternError,
+        InvalidWorkshopAdditionsError,
+    ) as exc:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)
         ) from exc
@@ -637,6 +681,7 @@ async def update_project_route(
                 if "default_model_profile" in body.model_fields_set
                 else UNSUPPLIED
             ),
+            **_supplied_workspace_defaults(body),
         )
     except ProjectNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
@@ -644,7 +689,11 @@ async def update_project_route(
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except ProjectHasReferencingTasksError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except UnknownModelProfileReferenceError as exc:
+    except (
+        UnknownModelProfileReferenceError,
+        InvalidBranchPatternError,
+        InvalidWorkshopAdditionsError,
+    ) as exc:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)
         ) from exc
@@ -824,167 +873,78 @@ def delete_model_profile_route(
     return {"deleted": name}
 
 
-# --- Templates --------------------------------------------------------------
-# SPEC Decision 6: spawn configuration lives on templates; projects carry
-# only identity/checkout/remotes (Decision 9).
+# --- Workflow catalog ---------------------------------------------------------
+# Workflow definitions ship with the daemon (ADR-0018), so this is read-only:
+# there is no CRUD and no change event, because the catalog cannot change while
+# the process runs.
 
 
-class TemplateCreate(BaseModel):
+class StepDescriptorOut(BaseModel):
     name: str
-    project_name: str
-    base_branch: str = "main"
+    kind: str
+    session: str | None
+    # Agent steps declare an abstract role; commands, decisions, and gates
+    # have none and never reach a model.
+    role: str | None
+    # A decision declared earlier can route past this step, so it may not run.
+    conditional: bool
+
+
+class WorkflowOut(BaseModel):
+    name: str
+    primary_session: str
+    sessions: list[str]
+    steps: list[StepDescriptorOut]
+    judge_session: str
+    judge_role: str
+
+
+@router.get("/workflows", response_model=list[WorkflowOut])
+def list_workflows_route() -> list[dict[str, Any]]:
+    return [asdict(descriptor) for descriptor in describe_workflows()]
+
+
+# --- Task launch --------------------------------------------------------------
+
+
+class WorkspaceOverridesIn(BaseModel):
+    """Task-local overrides of the project's workspace defaults.
+
+    Each field is genuinely optional: leaving a key out inherits the project
+    value. An explicit empty `preamble` is an override to "no preamble", which
+    is why the route distinguishes omitted from present via `model_fields_set`
+    rather than treating empty as absent. The other three have no meaningful
+    null — a task cannot run with no base branch — so an explicit null is
+    refused instead of being read as a reset.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    base_branch: str | None = None
     branch_pattern: str | None = None
-    workflow: str = "single-step"
-    workshop_additions: str = "project"
-    model: str | None = None
-    thinking: str | None = None
-    preamble: str = ""
-
-    @field_validator("name")
-    @classmethod
-    def _validate_name(cls, value: str) -> str:
-        validate_slug(value)
-        return value
-
-
-class TemplateUpdate(BaseModel):
-    project_name: str
-    base_branch: str
-    branch_pattern: str
-    workflow: str
-    workshop_additions: str
-    model: str | None = None
-    thinking: str | None = None
-    preamble: str = ""
-
-
-class TemplateOut(BaseModel):
-    name: str
-    project_name: str
-    base_branch: str
-    branch_pattern: str
-    workflow: str
-    workshop_additions: str
-    model: str | None
-    thinking: str | None
-    preamble: str
-    created_at: str
-    updated_at: str
-
-    model_config = {"from_attributes": True}
-
-
-def _template_error(exc: Exception) -> HTTPException:
-    if isinstance(exc, TemplateNotFoundError):
-        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    if isinstance(exc, (DuplicateTemplateError, TemplateHasReferencingTasksError)):
-        return HTTPException(status.HTTP_409_CONFLICT, str(exc))
-    # InvalidSlugError rides FastAPI's request validation (field_validator);
-    # the rest are registry-level 422s.
-    return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
-
-
-@router.get("/templates", response_model=list[TemplateOut])
-def list_templates_route(engine: Engine = Depends(_engine)) -> list[Template]:
-    return list_templates(engine)
-
-
-@router.post(
-    "/templates", response_model=TemplateOut, status_code=status.HTTP_201_CREATED
-)
-def create_template_route(
-    body: TemplateCreate,
-    engine: Engine = Depends(_engine),
-    config: Config = Depends(_config),
-    events: EventHub = Depends(_events),
-) -> Template:
-    _refuse_unready_named(engine, body.project_name)
-    try:
-        template = create_template(
-            engine,
-            name=body.name,
-            project_name=body.project_name,
-            base_branch=body.base_branch,
-            branch_pattern=body.branch_pattern or config.default_branch_pattern,
-            workflow=body.workflow,
-            workshop_additions=body.workshop_additions,
-            model=body.model,
-            thinking=body.thinking,
-            preamble=body.preamble,
-        )
-    except (
-        InvalidBranchPatternError,
-        InvalidThinkingLevelError,
-        InvalidWorkshopAdditionsError,
-        UnknownTemplateProjectError,
-        UnknownWorkflowError,
-        DuplicateTemplateError,
-    ) as exc:
-        raise _template_error(exc) from exc
-    events.publish("template_created", asdict(template))
-    return template
-
-
-@router.get("/templates/{name}", response_model=TemplateOut)
-def get_template_route(name: str, engine: Engine = Depends(_engine)) -> Template:
-    try:
-        return get_template(engine, name)
-    except TemplateNotFoundError as exc:
-        raise _template_error(exc) from exc
-
-
-@router.put("/templates/{name}", response_model=TemplateOut)
-def update_template_route(
-    name: str,
-    body: TemplateUpdate,
-    engine: Engine = Depends(_engine),
-    events: EventHub = Depends(_events),
-) -> Template:
-    _refuse_unready_named(engine, body.project_name)
-    try:
-        template = update_template(
-            engine,
-            name,
-            project_name=body.project_name,
-            base_branch=body.base_branch,
-            branch_pattern=body.branch_pattern,
-            workflow=body.workflow,
-            workshop_additions=body.workshop_additions,
-            model=body.model,
-            thinking=body.thinking,
-            preamble=body.preamble,
-        )
-    except (
-        TemplateNotFoundError,
-        InvalidBranchPatternError,
-        InvalidThinkingLevelError,
-        InvalidWorkshopAdditionsError,
-        UnknownTemplateProjectError,
-        UnknownWorkflowError,
-    ) as exc:
-        raise _template_error(exc) from exc
-    events.publish("template_updated", asdict(template))
-    return template
-
-
-@router.delete("/templates/{name}")
-def delete_template_route(
-    name: str, engine: Engine = Depends(_engine), events: EventHub = Depends(_events)
-) -> dict[str, str]:
-    try:
-        delete_template(engine, name)
-    except (TemplateNotFoundError, TemplateHasReferencingTasksError) as exc:
-        raise _template_error(exc) from exc
-    events.publish("template_deleted", {"name": name})
-    return {"deleted": name}
+    workshop_additions: str | None = None
+    preamble: str | None = None
 
 
 class TaskCreate(BaseModel):
-    template_name: str
+    """The one supported creation contract (ADR-0026).
+
+    `extra="forbid"` is load-bearing: `template_name`, and the old scalar
+    `model`/`thinking` spawn overrides, must be refused rather than ignored,
+    or a stale caller would silently get a launch it did not ask for. Future
+    per-step overrides are refused the same way until they exist.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_name: str
+    workflow_name: str
     slug: str
     prompt: str
-    model: str | None = None
-    thinking: str | None = None
+    # Omitted or null means "inherit the project default". A name selects that
+    # profile for this task and replaces the inheritance.
+    model_profile: str | None = None
+    workspace_overrides: WorkspaceOverridesIn | None = None
 
     @field_validator("slug")
     @classmethod
@@ -992,18 +952,95 @@ class TaskCreate(BaseModel):
         validate_task_slug(value)
         return value
 
-    @field_validator("thinking")
-    @classmethod
-    def _validate_thinking(cls, value: str | None) -> str | None:
-        if value is not None:
-            validate_thinking(value)
-        return value
+
+class TaskAccept(TaskCreate):
+    """Creation adds the reviewed resolution's token. It identifies *what was
+    reviewed*, not who is asking: it authorizes nothing, and a mismatch is a
+    409 asking for a fresh review rather than a permission error."""
+
+    preview_token: str
+
+
+def _launch_request(body: TaskCreate) -> LaunchRequest:
+    overrides: dict[str, str] = {}
+    supplied = body.workspace_overrides
+    if supplied is not None:
+        for field in WORKSPACE_FIELDS:
+            if field not in supplied.model_fields_set:
+                continue
+            value = getattr(supplied, field)
+            if value is None:
+                if field == "preamble":
+                    # A null preamble says the same thing as an empty one.
+                    overrides[field] = ""
+                    continue
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    f"workspace_overrides.{field}: null is not a reset; omit the "
+                    "field to inherit the project default",
+                )
+            overrides[field] = value
+    return LaunchRequest(
+        project_name=body.project_name,
+        workflow_name=body.workflow_name,
+        slug=body.slug,
+        prompt=body.prompt,
+        model_profile=body.model_profile,
+        profile_explicit=(
+            "model_profile" in body.model_fields_set and body.model_profile is not None
+        ),
+        workspace_overrides=overrides,
+    )
+
+
+def _preview_changed(resolved) -> HTTPException:
+    """409 with a machine-readable reason and the current resolution, so the
+    form can show the operator exactly what changed instead of retrying under
+    settings they never reviewed."""
+    exc = PreviewChangedError(resolved)
+    return HTTPException(
+        status.HTTP_409_CONFLICT,
+        {
+            "reason": exc.reason,
+            "message": str(exc),
+            "preview": resolution_payload(resolved) if resolved is not None else None,
+        },
+    )
+
+
+def _launch_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, LaunchInputError):
+        return HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, f"{exc.field}: {exc.detail}"
+        )
+    if isinstance(exc, ProjectNotLaunchableError):
+        return HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+    return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
+
+
+@router.post("/tasks/preview")
+def preview_task_route(
+    body: TaskCreate, engine: Engine = Depends(_engine)
+) -> dict[str, Any]:
+    """Resolve the operator's selections without creating anything.
+
+    Same rules, same module, and same output as acceptance — that identity is
+    what makes reviewing a preview worth anything.
+    """
+    request = _launch_request(body)
+    with engine.connect() as conn:
+        try:
+            resolved = resolve_launch(conn, request)
+        except (LaunchInputError, ProjectNotLaunchableError) as exc:
+            raise _launch_error(exc) from exc
+    return resolution_payload(resolved)
 
 
 class TaskOut(BaseModel):
     id: int
     project_name: str
-    template_name: str | None
+    execution_inputs: dict[str, Any] | None
+    needs_configuration: bool
     slug: str
     branch: str
     clone_path: str
@@ -1025,8 +1062,8 @@ class TaskOut(BaseModel):
 
 
 @router.get("/tasks", response_model=list[TaskOut])
-def list_tasks_route(engine: Engine = Depends(_engine)) -> list[Task]:
-    return list_tasks(engine)
+def list_tasks_route(engine: Engine = Depends(_engine)) -> list[dict[str, Any]]:
+    return [task_payload(task) for task in list_tasks(engine)]
 
 
 class TaskDetailOut(TaskOut):
@@ -1045,32 +1082,50 @@ async def get_task_route(
     derived_status = (
         await workshop_status(task.clone_path) if task.workshop_id else None
     )
-    return TaskDetailOut(**asdict(task), workshop_status=derived_status)
+    return TaskDetailOut(**task_payload(task), workshop_status=derived_status)
 
 
 @router.post("/tasks", response_model=TaskOut, status_code=status.HTTP_202_ACCEPTED)
 async def spawn_task_route(
-    body: TaskCreate,
+    body: TaskAccept,
     request: Request,
     engine: Engine = Depends(_engine),
     config: Config = Depends(_config),
     events: EventHub = Depends(_events),
-) -> Task:
-    try:
-        template = get_template(engine, body.template_name)
-    except TemplateNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    project = _require_ready_project(engine, template.project_name)
+) -> dict[str, Any]:
+    """Accept one reviewed launch.
+
+    The order is deliberate. Everything slow — git, mention validation, path
+    checks — runs first, against a resolution made outside any lock. Then the
+    same rules run again on a reserved connection, the reviewed token is
+    compared against what they now produce, and the task plus its pinned
+    inputs are inserted before the reservation is released. Nothing is
+    published or scheduled until that transaction has committed, so a refused
+    or stale submission leaves no task, workspace, agent, or background job.
+    """
+    launch_request = _launch_request(body)
+
+    # First resolution: validation only. Its results are what the Git work
+    # below is done against; the authoritative one is taken again under the
+    # write reservation.
+    with engine.connect() as conn:
+        try:
+            resolved = resolve_launch(conn, launch_request)
+        except (LaunchInputError, ProjectNotLaunchableError) as exc:
+            raise _launch_error(exc) from exc
+    if resolved.fingerprint != body.preview_token:
+        raise _preview_changed(resolved)
 
     # Mentions are validated before anything is created: Omp drops one it
     # cannot resolve without a word (findings-omp-file-mentions.md), so a
     # mention that will not survive into the clone must be refused here, not
-    # discovered after the workspace is built.
+    # discovered after the workspace is built. Against the *accepted* base
+    # branch and checkout, not today's project defaults.
     try:
         rejections = await validate_mentions(
             body.prompt,
-            checkout_path=project.checkout_path,
-            base_branch=template.base_branch,
+            checkout_path=resolved.inputs.checkout_path,
+            base_branch=resolved.inputs.workspace.base_branch,
             timeout=config.spawn_step_timeout,
         )
     except ProjectFilesError as exc:
@@ -1083,26 +1138,39 @@ async def spawn_task_route(
         )
 
     try:
-        clone_path = clone_path_for(config.task_dir_root, project.name, body.slug)
+        clone_path = clone_path_for(
+            config.task_dir_root, resolved.inputs.project_name, body.slug
+        )
     except ClonePathOutsideRootError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
 
-    branch = template.branch_pattern.replace("<slug>", body.slug)
-    try:
-        task = create_task(
-            engine,
-            project_name=project.name,
-            template_name=template.name,
-            slug=body.slug,
-            branch=branch,
-            clone_path=str(clone_path),
-            prompt=body.prompt,
-            workflow_name=template.workflow,
-        )
-    except DuplicateTaskError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    # The consistency boundary. `BEGIN IMMEDIATE` up front means the re-read
+    # cannot go stale before the insert commits, and nothing awaited, spawned,
+    # or published happens inside it.
+    with reserved_write(engine) as conn:
+        try:
+            final = resolve_launch(conn, launch_request)
+        except (LaunchInputError, ProjectNotLaunchableError) as exc:
+            raise _launch_error(exc) from exc
+        if final.fingerprint != body.preview_token:
+            raise _preview_changed(final)
+        try:
+            task = create_task(
+                engine,
+                project_name=final.inputs.project_name,
+                slug=body.slug,
+                branch=final.inputs.branch,
+                clone_path=str(clone_path),
+                prompt=body.prompt,
+                execution_inputs=final.inputs,
+                workflow_name=final.inputs.workflow_name,
+                conn=conn,
+            )
+        except DuplicateTaskError as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
-    events.publish("task_created", asdict(task))
+    payload = task_payload(task)
+    events.publish("task_created", payload)
     job = asyncio.create_task(
         run_spawn_pipeline(
             engine,
@@ -1110,15 +1178,192 @@ async def spawn_task_route(
             config,
             task.id,
             request.app.state.workflow_runner,
-            model_override=body.model,
-            thinking_override=body.thinking,
         )
     )
     # Keep a reference so the job isn't garbage-collected mid-pipeline.
     jobs: set[asyncio.Task] = request.app.state.spawn_jobs
     jobs.add(job)
     job.add_done_callback(jobs.discard)
-    return task
+    return payload
+
+
+# --- Upgrade reconciliation ---------------------------------------------------
+# Two separate blockers with two separate flows: a project's carried-over
+# launch configuration, and a legacy task's missing continuation configuration.
+# Neither is ever resolved by guessing (ADR-0026).
+
+
+class ProjectReconciliationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Names exactly the evidence the operator read. A decision made against a
+    # stale reading is refused rather than applied.
+    evidence_fingerprint: str
+    base_branch: str
+    branch_pattern: str
+    workshop_additions: str
+    preamble: str = ""
+    # Explicit either way: a name, or `null` meaning "this project has no
+    # default; a profile is selected at each launch".
+    default_model_profile: str | None = None
+    acknowledge_model_candidates: bool = False
+    acknowledge_judge_model: bool = False
+
+
+@router.get("/projects/{name}/launch-reconciliation")
+def get_project_reconciliation_route(
+    name: str, engine: Engine = Depends(_engine)
+) -> dict[str, Any]:
+    try:
+        return launchconfig.project_reconciliation(engine, name)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+
+@router.post("/projects/{name}/launch-reconciliation", response_model=ProjectOut)
+def confirm_project_reconciliation_route(
+    name: str,
+    body: ProjectReconciliationIn,
+    engine: Engine = Depends(_engine),
+    events: EventHub = Depends(_events),
+) -> Project:
+    try:
+        project = launchconfig.confirm_project_reconciliation(
+            engine,
+            name,
+            launchconfig.ProjectDecision(
+                evidence_fingerprint=body.evidence_fingerprint,
+                base_branch=body.base_branch,
+                branch_pattern=body.branch_pattern,
+                workshop_additions=body.workshop_additions,
+                preamble=body.preamble,
+                default_model_profile=body.default_model_profile,
+                acknowledge_model_candidates=body.acknowledge_model_candidates,
+                acknowledge_judge_model=body.acknowledge_judge_model,
+            ),
+        )
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except launchconfig.ReconciliationConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except (LaunchInputError, InvalidBranchPatternError, InvalidWorkshopAdditionsError) as exc:
+        raise _launch_error(exc) from exc
+    events.publish("project_updated", asdict(project))
+    return project
+
+
+class TaskContinuationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_profile: str
+    base_branch: str
+    workshop_additions: str = DEFAULT_WORKSHOP_ADDITIONS
+    preamble: str = ""
+
+
+class TaskContinuationConfirmIn(TaskContinuationIn):
+    preview_token: str
+    # The operator says, in as many words, that the original model, thinking
+    # level, preamble, and overrides are unrecoverable. Confirmation pins what
+    # happens next; it never claims the past turns used these values.
+    acknowledge_unknown: bool = False
+
+
+def _continuation(body: TaskContinuationIn) -> launchconfig.TaskContinuation:
+    return launchconfig.TaskContinuation(
+        model_profile=body.model_profile,
+        base_branch=body.base_branch,
+        workshop_additions=body.workshop_additions,
+        preamble=body.preamble,
+    )
+
+
+@router.get("/tasks/{task_id}/configuration")
+def get_task_configuration_route(
+    task_id: int, engine: Engine = Depends(_engine)
+) -> dict[str, Any]:
+    try:
+        return launchconfig.task_configuration(engine, task_id)
+    except TaskNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+
+@router.post("/tasks/{task_id}/configuration/preview")
+def preview_task_configuration_route(
+    task_id: int,
+    body: TaskContinuationIn,
+    engine: Engine = Depends(_engine),
+) -> dict[str, Any]:
+    try:
+        return launchconfig.preview_task_configuration(
+            engine, task_id, _continuation(body)
+        )
+    except TaskNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    except launchconfig.ReconciliationConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except (LaunchInputError, InvalidWorkshopAdditionsError) as exc:
+        raise _launch_error(exc) from exc
+
+
+@router.post("/tasks/{task_id}/configuration/confirm", response_model=TaskOut)
+def confirm_task_configuration_route(
+    task_id: int,
+    body: TaskContinuationConfirmIn,
+    engine: Engine = Depends(_engine),
+    events: EventHub = Depends(_events),
+) -> dict[str, Any]:
+    try:
+        task = launchconfig.confirm_task_configuration(
+            engine,
+            task_id,
+            _continuation(body),
+            preview_token=body.preview_token,
+            acknowledge_unknown=body.acknowledge_unknown,
+        )
+    except TaskNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
+    except (launchconfig.ReconciliationConflictError, TaskInputsAlreadyPinnedError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except (LaunchInputError, InvalidWorkshopAdditionsError) as exc:
+        raise _launch_error(exc) from exc
+    payload = task_payload(task)
+    events.publish("task_updated", payload)
+    return payload
+
+
+@router.post("/tasks/{task_id}/continue", response_model=TaskOut)
+async def continue_task_route(
+    task_id: int,
+    request: Request,
+    engine: Engine = Depends(_engine),
+) -> dict[str, Any]:
+    """Resume a task whose run was left in place while it was unconfigured.
+
+    Deliberately explicit and deliberately narrow: only a run that was already
+    `running` or `waiting` is eligible. A failed or completed task is not
+    silently restarted, and review and ship remain their own actions.
+    """
+    try:
+        task = get_task(engine, task_id)
+    except TaskNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    try:
+        require_task_inputs(task)
+    except TaskConfigurationRequiredError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    if task.workflow_status not in ("running", "waiting"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"task {task_id} workflow is {task.workflow_status or 'not running'}; "
+            "only an interrupted run can be continued",
+        )
+    await request.app.state.continue_task(task)
+    return task_payload(task)
 
 
 @router.post("/tasks/{task_id}/cleanup", response_model=TaskOut)
@@ -1132,7 +1377,7 @@ async def cleanup_task_route(
     reviews: ReviewManager = Depends(_reviews),
     ships: ShipManager = Depends(_ships),
     notifications: AttentionNotifier = Depends(_notifications),
-) -> Task:
+) -> dict[str, Any]:
     try:
         task = get_task(engine, task_id)
     except TaskNotFoundError as exc:
@@ -1166,8 +1411,9 @@ async def cleanup_task_route(
     sessions.discard(task_id)
     advisories.clear_task(task_id)
     notifications.clear_task(task_id)
-    events.publish("task_updated", asdict(archived))
-    return archived
+    payload = task_payload(archived)
+    events.publish("task_updated", payload)
+    return payload
 
 
 # --- Agent control surface --------------------------------------------------

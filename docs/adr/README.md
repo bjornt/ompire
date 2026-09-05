@@ -27,7 +27,7 @@ relying on it.
 | [0007](0007-use-native-omp-rpc.md) | Integrate agents through supervised native Omp RPC processes | Accepted |
 | [0008](0008-model-tasks-as-workflows-over-named-sessions.md) | Model tasks as workflows over named sessions | Accepted |
 | [0009](0009-use-structured-git-excluded-outcomes.md) | Use structured, Git-excluded files for agent-step outcomes | Proposed |
-| [0010](0010-separate-projects-templates-and-task-snapshots.md) | Separate projects, templates, and task snapshots | Proposed |
+| [0010](0010-separate-projects-templates-and-task-snapshots.md) | Separate projects, templates, and task snapshots | Superseded by ADR-0026 |
 | [0011](0011-keep-review-and-publishing-authority-outside-agent-sandbox.md) | Keep review and publishing authority outside the agent sandbox | Accepted |
 | [0012](0012-derive-attention-centrally-from-session-state.md) | Derive attention centrally from session state | Accepted |
 | [0013](0013-layer-daemon-writable-settings-over-operator-configuration.md) | Layer daemon-writable settings over operator configuration | Accepted |
@@ -43,6 +43,7 @@ relying on it.
 | [0023](0023-admit-checkout-root-as-bounded-daemon-writable-setting.md) | Admit `checkout_root` as a bounded daemon-writable setting | Accepted |
 | [0024](0024-keep-operator-state-outside-package-revisions.md) | Keep operator state outside package revisions | Accepted |
 | [0025](0025-store-global-model-profiles-separately-from-launch-policy.md) | Store global model profiles separately from launch policy | Accepted |
+| [0026](0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md) | Resolve launch inputs once and pin them to the task | Accepted |
 
 ## Template
 

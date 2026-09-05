@@ -42,7 +42,7 @@ import re
 import signal
 import traceback
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -51,8 +51,11 @@ from sqlalchemy import Engine as SAEngine
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
+from ompire_daemon.execution_inputs import ModelPolicy, TaskExecutionInputs
+from ompire_daemon.model_config import JUDGE_ROLE, MODEL_ROLES
 from ompire_daemon.projectfiles import mention_tokens, unresolved_mentions
 from ompire_daemon.registry.sessions import mark_session_id, record_session_spawned
+from ompire_daemon.registry.tasks import require_task_inputs, task_payload
 from ompire_daemon.registry.workflows import (
     StepRecord,
     append_step_record,
@@ -68,7 +71,6 @@ from ompire_daemon.sessions import SessionTracker
 
 if TYPE_CHECKING:
     from ompire_daemon.registry.tasks import Task
-    from ompire_daemon.registry.templates import Template
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,11 @@ COMPLETE = "__complete__"
 # task runtime.
 JUDGE_SESSION = "judge"
 
+# The judge is not a configurable model any more (ADR-0026): it runs on the
+# task profile's `slow` binding, disclosed in the launch preview like any
+# other model consumer.
+JUDGE_STEP_NAME = "judge"
+
 
 
 # --- step/workflow definitions (design D-2) -----------------------------------
@@ -114,7 +121,10 @@ class RunContext(Protocol):
     """What a workflow's prompt/route/message callables see."""
 
     task: Task  # registry row (prompt, branch, paths, …)
-    template: Template  # resolved at pipeline start (preamble, model, …)
+    # The task's accepted launch inputs (ADR-0026): preamble, workspace
+    # values, and role bindings as reviewed at acceptance. Never a live read
+    # of today's project or profile settings.
+    inputs: TaskExecutionInputs
 
     def outcome(self, step: str) -> dict[str, Any] | None:
         """The latest ok record's outcome for a step name, or None."""
@@ -131,6 +141,11 @@ class AgentStep:
     session: str  # must be in Workflow.sessions
     prompt: Callable[[RunContext], str]  # '' → no prompt sent
     expects_outcome: bool = False
+    # The abstract model role this step consumes (ADR-0026). A definition
+    # names a role, never a concrete model or a profile: which model answers
+    # to `default` is the operator's launch-time choice. Validated at
+    # registration, so a typo breaks daemon startup, not a task at runtime.
+    role: str = "default"
 
 
 @dataclass(frozen=True)
@@ -228,11 +243,18 @@ class Workflow:
                     f"workflow {self.name!r} declares duplicate step {step.name!r}"
                 )
             seen.add(step.name)
-            if isinstance(step, AgentStep) and step.session not in self.sessions:
-                raise WorkflowDefinitionError(
-                    f"workflow {self.name!r} step {step.name!r} names undeclared "
-                    f"session {step.session!r}"
-                )
+            if isinstance(step, AgentStep):
+                if step.session not in self.sessions:
+                    raise WorkflowDefinitionError(
+                        f"workflow {self.name!r} step {step.name!r} names undeclared "
+                        f"session {step.session!r}"
+                    )
+                if step.role not in MODEL_ROLES:
+                    raise WorkflowDefinitionError(
+                        f"workflow {self.name!r} step {step.name!r} names unknown "
+                        f"model role {step.role!r}; must be one of "
+                        f"{', '.join(MODEL_ROLES)}"
+                    )
 
     def step_named(self, name: str) -> Step | None:
         for step in self.steps:
@@ -275,6 +297,80 @@ def registered_workflows() -> tuple[str, ...]:
     return tuple(sorted(_WORKFLOWS))
 
 
+# --- the read-only catalog (ADR-0026) ------------------------------------------
+
+
+@dataclass(frozen=True)
+class StepDescriptor:
+    """One declared step, as the launch preview and the API describe it.
+
+    `conditional` says the step *may* not execute: a decision declared before
+    it can route past it. It is a statement about the declaration, not a
+    prediction — the engine does not introspect route callables, and a preview
+    is a list of possible steps, never a promise of the run.
+    """
+
+    name: str
+    kind: str
+    session: str | None
+    role: str | None  # agent steps only; other kinds have no model
+    conditional: bool
+
+
+@dataclass(frozen=True)
+class WorkflowDescriptor:
+    name: str
+    primary_session: str
+    sessions: tuple[str, ...]
+    steps: tuple[StepDescriptor, ...]
+    # The engine-reserved judge, described separately: it is not a declared
+    # step, it runs only when a deterministic route or outcome fails, and it
+    # binds `slow` rather than the step role.
+    judge_session: str
+    judge_role: str
+
+
+def describe_workflow(workflow: Workflow) -> WorkflowDescriptor:
+    steps: list[StepDescriptor] = []
+    after_decision = False
+    for step in workflow.steps:
+        steps.append(
+            StepDescriptor(
+                name=step.name,
+                kind=step_kind(step),
+                session=step.session if isinstance(step, AgentStep) else None,
+                role=step.role if isinstance(step, AgentStep) else None,
+                conditional=after_decision,
+            )
+        )
+        if isinstance(step, DecisionStep):
+            after_decision = True
+    return WorkflowDescriptor(
+        name=workflow.name,
+        primary_session=workflow.primary,
+        sessions=workflow.sessions,
+        steps=tuple(steps),
+        judge_session=JUDGE_SESSION,
+        judge_role=JUDGE_ROLE,
+    )
+
+
+def describe_workflows() -> list[WorkflowDescriptor]:
+    """Every registered workflow, in name order. Definitions ship with the
+    daemon (ADR-0018), so there is no CRUD and no change event: the catalog
+    is constant for the life of the process."""
+    return [describe_workflow(get_workflow(name)) for name in registered_workflows()]
+
+
+def agent_step_roles(workflow: Workflow) -> dict[str, str]:
+    """Agent step name → abstract role, pinned onto a task at acceptance."""
+    return {
+        step.name: step.role
+        for step in workflow.steps
+        if isinstance(step, AgentStep)
+    }
+
+
 # --- the single-step workflow (design D-10) ------------------------------------
 
 
@@ -294,7 +390,8 @@ register_workflow(
             AgentStep(
                 name="work",
                 session="main",
-                prompt=lambda ctx: join_preamble(ctx.template.preamble, ctx.task.prompt),
+                prompt=lambda ctx: join_preamble(ctx.inputs.preamble, ctx.task.prompt),
+                role="default",
             ),
         ),
     )
@@ -312,7 +409,7 @@ BUGFIX_REPRO_PATH = ".ompire/repro.sh"
 
 def _bugfix_reproduce_prompt(ctx: RunContext) -> str:
     return join_preamble(
-        ctx.template.preamble,
+        ctx.inputs.preamble,
         f"""\
 You are the reproducer on a bugfix task. The reported issue:
 
@@ -413,7 +510,7 @@ def _bugfix_fix_prompt(ctx: RunContext) -> str:
         "for review and the ship flow squashes later — but never push). Then "
         "write your outcome: a summary of the root cause and the fix."),
     ]
-    return join_preamble(ctx.template.preamble, "\n".join(lines))
+    return join_preamble(ctx.inputs.preamble, "\n".join(lines))
 
 
 def _bugfix_validate_agent_prompt(ctx: RunContext) -> str:
@@ -438,7 +535,7 @@ def _bugfix_validate_agent_prompt(ctx: RunContext) -> str:
                 if isinstance(value, str) and value:
                     handoff += f"\n- {key}: {value}"
     return join_preamble(
-        ctx.template.preamble,
+        ctx.inputs.preamble,
         f"""\
 Validate the fix for the bug you reproduced earlier.{handoff}
 
@@ -517,6 +614,7 @@ register_workflow(
                 session="reproducer",
                 prompt=_bugfix_reproduce_prompt,
                 expects_outcome=True,
+                role="default",
             ),
             DecisionStep(name="triage", route=_bugfix_triage),
             AgentStep(
@@ -524,6 +622,7 @@ register_workflow(
                 session="coder",
                 prompt=_bugfix_fix_prompt,
                 expects_outcome=True,
+                role="default",
             ),
             DecisionStep(name="route-validate", route=_bugfix_route_validate),
             CommandStep(name="validate-script", argv=("bash", BUGFIX_REPRO_PATH)),
@@ -532,6 +631,7 @@ register_workflow(
                 session="reproducer",
                 prompt=_bugfix_validate_agent_prompt,
                 expects_outcome=True,
+                role="default",
             ),
             DecisionStep(name="check", route=_bugfix_check),
             GateStep(name="escalate", message=_bugfix_escalate_message),
@@ -638,9 +738,11 @@ class _NudgedAgentStep:
 class _RunContext:
     """RunContext over the step history captured at step start."""
 
-    def __init__(self, task: Task, template: Template, records: list[StepRecord]) -> None:
+    def __init__(
+        self, task: Task, inputs: TaskExecutionInputs, records: list[StepRecord]
+    ) -> None:
         self.task = task
-        self.template = template
+        self.inputs = inputs
         self._records = records
 
     def outcome(self, step: str) -> dict[str, Any] | None:
@@ -678,40 +780,33 @@ class WorkflowRunner:
 
     # --- public surface -------------------------------------------------------
 
-    def start_run(
-        self,
-        task: Task,
-        template: Template,
-        *,
-        model: str | None = None,
-        thinking: str | None = None,
-    ) -> None:
+    def start_run(self, task: Task) -> None:
         """Begin the task's workflow from its first step (spawn-pipeline
-        handoff, design D-4). Model/thinking are the spawn-resolved effective
-        values, carried to every lazy session spawn of the run."""
+        handoff, design D-4).
+
+        Everything the run needs comes off the task itself: the inputs it was
+        accepted under carry the preamble, the role bindings, and the branch.
+        Nothing is re-read from the project or the profile registry, so an
+        edit made while the task was queuing cannot change what runs.
+        """
         if task.id in self._runs:
             logger.warning("task %d already has a workflow run; ignoring", task.id)
             return
+        inputs = require_task_inputs(task)
         workflow = get_workflow(task.workflow_name)
         updated = set_run_status(self._engine, task.id, "running", None)
         self._publish_task_updated(updated)
-        self._kick(task.id, template, workflow, model=model, thinking=thinking, recover=False)
+        self._kick(task.id, inputs, workflow, recover=False)
 
-    def recover_run(
-        self,
-        task: Task,
-        template: Template,
-        *,
-        model: str | None = None,
-        thinking: str | None = None,
-    ) -> None:
+    def recover_run(self, task: Task) -> None:
         """Re-drive a `running`/`waiting` run from persisted state after a
         daemon restart (design D-6). Runs `complete`/`failed` are never
         re-driven. Sessions must already be resumed (crash-recovery)."""
         if task.id in self._runs or task.workflow_status not in ("running", "waiting"):
             return
+        inputs = require_task_inputs(task)
         workflow = get_workflow(task.workflow_name)
-        self._kick(task.id, template, workflow, model=model, thinking=thinking, recover=True)
+        self._kick(task.id, inputs, workflow, recover=True)
 
     def resume_gate(self, task_id: int, *, note: str | None) -> None:
         """Operator resume for a parked gate: finishes the gate `ok` with the
@@ -740,15 +835,13 @@ class WorkflowRunner:
     def _kick(
         self,
         task_id: int,
-        template: Template,
+        inputs: TaskExecutionInputs,
         workflow: Workflow,
         *,
-        model: str | None,
-        thinking: str | None,
         recover: bool,
     ) -> None:
         run = asyncio.create_task(
-            self._execute(task_id, template, workflow, model=model, thinking=thinking, recover=recover)
+            self._execute(task_id, inputs, workflow, recover=recover)
         )
         self._runs[task_id] = run
         run.add_done_callback(lambda t: self._run_done(task_id, t))
@@ -771,18 +864,16 @@ class WorkflowRunner:
     async def _execute(
         self,
         task_id: int,
-        template: Template,
+        inputs: TaskExecutionInputs,
         workflow: Workflow,
         *,
-        model: str | None,
-        thinking: str | None,
         recover: bool,
     ) -> None:
         from ompire_daemon.registry.tasks import get_task
 
         records = list_step_records(self._engine, task_id)
         if recover:
-            step = await self._recover_step(task_id, template, workflow, records)
+            step = await self._recover_step(task_id, workflow, records)
             if step is None:
                 return  # run completed, failed, or re-parked during recovery
         else:
@@ -790,7 +881,7 @@ class WorkflowRunner:
 
         while step is not None:
             task = get_task(self._engine, task_id)
-            ctx = _RunContext(task, template, list_step_records(self._engine, task_id))
+            ctx = _RunContext(task, inputs, list_step_records(self._engine, task_id))
             if isinstance(step, _NudgedAgentStep):
                 declared: Step = step._step
                 is_nudge = True
@@ -808,7 +899,7 @@ class WorkflowRunner:
             self._publish_task_updated(updated)
             self._publish_step(task_id, declared, "started")
             try:
-                result = await self._run_step(step, ctx, record, workflow, model, thinking)
+                result = await self._run_step(step, ctx, record, workflow)
             except _StepInfraFailure as exc:
                 self._fail_step(task_id, declared, record.seq, str(exc))
                 return
@@ -916,7 +1007,6 @@ class WorkflowRunner:
     async def _recover_step(
         self,
         task_id: int,
-        template: Template,
         workflow: Workflow,
         records: list[StepRecord],
 ) -> Step | _NudgedAgentStep | None:
@@ -995,13 +1085,9 @@ class WorkflowRunner:
         ctx: _RunContext,
         record: StepRecord,
         workflow: Workflow,
-        model: str | None,
-        thinking: str | None,
     ) -> _StepResult:
-        if isinstance(step, _NudgedAgentStep):
-            return await self._run_agent_step(step, ctx, record, model, thinking)
-        if isinstance(step, AgentStep):
-            return await self._run_agent_step(step, ctx, record, model, thinking)
+        if isinstance(step, (AgentStep, _NudgedAgentStep)):
+            return await self._run_agent_step(step, ctx, record)
         if isinstance(step, CommandStep):
             return await self._run_command_step(step, ctx)
         if isinstance(step, DecisionStep):
@@ -1023,7 +1109,7 @@ class WorkflowRunner:
             if route is not None:
                 return _StepResult(outcome={"route": route}, route=route)
             assert failure is not None
-            judged = await self._judge_route(ctx.task, workflow, step, ctx, failure)
+            judged = await self._judge_route(workflow, step, ctx, failure)
             if judged is not None:
                 return _StepResult(
                     outcome={"route": judged},
@@ -1036,23 +1122,32 @@ class WorkflowRunner:
         assert isinstance(step, GateStep)
         return _StepResult(gate_message=step.message(ctx))
 
-    async def _ensure_session(
-        self, task: Task, session: str, *, model: str | None, thinking: str | None
-    ):
+    async def _ensure_session(self, task: Task, session: str, *, policy: ModelPolicy):
         """Lazy spawn (design D-1): the same supervised start the old
-        pipeline used — ask-timeout preflight, ready handshake, then
-        per-session omp identity capture — shared by workflow sessions and
-        the engine-reserved judge session. Raises on failure."""
+        pipeline used — ask-timeout preflight, ready handshake, native model
+        policy handshake, then per-session omp identity capture — shared by
+        workflow sessions and the engine-reserved judge session. Raises on
+        failure.
+
+        A cached handle is reused only when it was started under this same
+        policy. Every step of this change's built-in workflows resolves to the
+        task's single active pair, so that condition always holds today; the
+        check is what keeps it honest once per-step overrides arrive.
+        """
         handle = self._supervisor.get(task.id, session)
         if handle is not None and handle.returncode is None:
-            return handle
+            if handle.policy == policy:
+                return handle
+            raise _StepInfraFailure(
+                f"session {session!r} is running under a different model policy "
+                "than this step requires"
+            )
         try:
             handle = await self._supervisor.start(
                 task.id,
                 session,
                 task.clone_path,
-                model=model,
-                thinking=thinking,
+                policy=policy,
             )
         except Exception as exc:
             detail = str(exc)
@@ -1076,11 +1171,10 @@ class WorkflowRunner:
         step: AgentStep | _NudgedAgentStep,
         ctx: _RunContext,
         record: StepRecord,
-        model: str | None,
-        thinking: str | None,
     ) -> _StepResult:
         task = ctx.task
-        await self._ensure_session(task, step.session, model=model, thinking=thinking)
+        policy = ModelPolicy.for_step(ctx.inputs, step.name)
+        await self._ensure_session(task, step.session, policy=policy)
         handle = self._supervisor.get(task.id, step.session)
         assert handle is not None
 
@@ -1112,7 +1206,7 @@ class WorkflowRunner:
         # and drops silently what it cannot find (findings-omp-file-mentions.md),
         # so a mention the clone no longer carries would cost the operator
         # context with nothing anywhere saying so. Only the operator's own
-        # mentions are gated; a template preamble's stray `@word` is prose.
+        # mentions are gated; the standing preamble's stray `@word` is prose.
         operator_mentions = set(mention_tokens(task.prompt))
         if operator_mentions:
             dangling = [
@@ -1143,7 +1237,7 @@ class WorkflowRunner:
             # LLM-judge fallback (bugfix-workflow design D-5): the agent had
             # its chance (a prompt went out) and produced nothing parseable —
             # judge before recording the null.
-            judged = await self._judge_step(task, step, record, prompt)
+            judged = await self._judge_step(ctx, step, record, prompt)
             if judged is not None:
                 note = "outcome synthesized by LLM judge"
                 if result.error_note:
@@ -1166,7 +1260,7 @@ class WorkflowRunner:
 
     async def _judge_step(
         self,
-        task: Task,
+        ctx: _RunContext,
         step: AgentStep | _NudgedAgentStep,
         record: StepRecord,
         prompt: str,
@@ -1185,11 +1279,12 @@ class WorkflowRunner:
             '(`status` "success" or "failed", `summary` stating the evidence). '
             "If you cannot determine the result with confidence, write NO file at all."
         )
-        return await self._run_judge(task, record.seq, step.session, purpose, instruction)
+        return await self._run_judge(
+            ctx, record.seq, step.session, purpose, instruction
+        )
 
     async def _judge_route(
         self,
-        task: Task,
         workflow: Workflow,
         step: DecisionStep,
         ctx: _RunContext,
@@ -1217,9 +1312,7 @@ class WorkflowRunner:
             if record.session is not None:
                 transcript_session = record.session
                 break
-        judged = await self._run_judge(
-            task, 0, transcript_session, purpose, instruction
-        )
+        judged = await self._run_judge(ctx, 0, transcript_session, purpose, instruction)
         if judged is None:
             return None
         artifacts = judged.get("artifacts")
@@ -1231,19 +1324,25 @@ class WorkflowRunner:
 
     async def _run_judge(
         self,
-        task: Task,
+        ctx: _RunContext,
         record_seq: int,
         transcript_session: str | None,
         purpose: str,
         instruction: str,
     ) -> dict[str, Any] | None:
         """One judgment on the engine-reserved `judge` session (design D-4):
-        spawn lazily with `judge_model`, dump the judged session's transcript
-        tail into the clone, prompt, await the turn, read the outcome. Any
-        failure degrades to None — judging never fails a run."""
+        spawn lazily on the task profile's `slow` binding, dump the judged
+        session's transcript tail into the clone, prompt, await the turn, read
+        the outcome. Any failure degrades to None — judging never fails a run.
+
+        The judge has no model setting of its own any more (ADR-0026): its
+        active pair is the disclosed `slow` role of the same profile the rest
+        of the task runs under, and it carries the full auxiliary role map
+        like every other process."""
+        task = ctx.task
         try:
             handle = await self._ensure_session(
-                task, JUDGE_SESSION, model=self._config.judge_model, thinking=None
+                task, JUDGE_SESSION, policy=ModelPolicy.for_judge(ctx.inputs)
             )
         except _StepInfraFailure as exc:
             logger.warning("judge session unavailable for task %d: %s", task.id, exc)
@@ -1363,7 +1462,7 @@ class WorkflowRunner:
     # --- events ------------------------------------------------------------------
 
     def _publish_task_updated(self, task: Task) -> None:
-        self._hub.publish("task_updated", asdict(task))
+        self._hub.publish("task_updated", task_payload(task))
 
     def _publish_step(self, task_id: int, step: Step, status: str, **extra: Any) -> None:
         self._hub.publish(

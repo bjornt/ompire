@@ -8,10 +8,23 @@ Scenarios:
   happy             ready, then answer requests (default)
   silent            never emit ready; swallow stdin until killed
   crash             exit 1 with "No models available" on stderr before ready
-  exit-after-ready  emit ready then exit 7
+  exit-after-ready  emit ready then exit 7 (a child that dies before the
+                    daemon's model handshake can complete)
+  exit-after-start  emit ready, answer the model handshake, then exit 7 (a
+                    child that dies after a successful start — the
+                    exit-watcher path, not a start failure)
   ignore-term       emit ready, then ignore SIGTERM and hang until killed
                     (AgentHandle.terminate()'s SIGKILL-fallback path)
   get-state-fails   like happy, but get_state responds success: false
+                    (including the daemon's start-time model handshake, so
+                    the session never starts)
+  get-state-fails-after-start
+                    the first get_state (the model handshake) succeeds and
+                    every later one responds success: false — isolates the
+                    turn-boundary state check from the start handshake
+  no-session-id     like happy, but get_state omits `sessionId` (the model
+                    handshake still succeeds, so this isolates a session-id
+                    capture miss from a model-verification failure)
 
 `get_state` requests get the response shape verified against omp 16.5.2
 (see the add-session-states change's findings-omp-verification.md):
@@ -199,21 +212,66 @@ def approval_finish(pending_ui: dict, reply: dict) -> None:
     emit({"type": "agent_end", "messages": [pending_ui["user_message"], assistant_message]})
 
 
-def get_state_response(request_id: str, queued: int, message_count: int) -> dict:
-    """The response shape verified against omp 16.5.2: isStreaming and
-    queuedMessageCount at the top level of `data`."""
+# The native model policy this fake was started with, parsed from its own
+# argv exactly as the daemon writes it. Reporting these back through
+# `get_state` is what makes the daemon's "verify the child actually runs the
+# accepted model" check a real check here rather than an echo of its own
+# argument list.
+MODEL_STATE = {"provider": None, "id": None, "thinking": None}
+# How many `get_state` requests have been answered, for the scenarios that
+# behave differently on the daemon's start-time handshake than afterwards.
+STATE_CALLS = [0]
+ROLE_FLAGS: dict[str, str] = {}
+
+
+def parse_model_flags(argv: list[str]) -> None:
+    """Read `--model`, `--thinking`, and the `--smol/--slow/--plan`
+    `provider/model-id:LEVEL` flags out of the omp argv."""
+    index = 0
+    while index < len(argv):
+        flag = argv[index]
+        value = argv[index + 1] if index + 1 < len(argv) else ""
+        if flag == "--model":
+            provider, _, model_id = value.partition("/")
+            MODEL_STATE["provider"] = provider
+            MODEL_STATE["id"] = model_id
+            index += 2
+            continue
+        if flag == "--thinking":
+            MODEL_STATE["thinking"] = value
+            index += 2
+            continue
+        if flag in ("--smol", "--slow", "--plan"):
+            ROLE_FLAGS[flag.lstrip("-")] = value
+            index += 2
+            continue
+        index += 1
+
+
+def get_state_response(
+    request_id: str, queued: int, message_count: int, *, session_id: bool = True
+) -> dict:
+    """The response shape verified against omp 16.5.2 (isStreaming and
+    queuedMessageCount at the top level of `data`) plus the model block and
+    `thinkingLevel` verified against omp 18.1.10."""
+    data = {
+        "isStreaming": False,
+        "isCompacting": False,
+        "queuedMessageCount": queued,
+        "messageCount": message_count,
+        "thinkingLevel": MODEL_STATE["thinking"],
+        "roleFlags": dict(ROLE_FLAGS),
+    }
+    if session_id:
+        data["sessionId"] = "fake-session-id"
+    if MODEL_STATE["id"] is not None:
+        data["model"] = {"provider": MODEL_STATE["provider"], "id": MODEL_STATE["id"]}
     return {
         "id": request_id,
         "type": "response",
         "command": "get_state",
         "success": True,
-        "data": {
-            "isStreaming": False,
-            "isCompacting": False,
-            "queuedMessageCount": queued,
-            "messageCount": message_count,
-            "sessionId": "fake-session-id",
-        },
+        "data": data,
     }
 
 
@@ -223,7 +281,11 @@ def handle_generic_request(request: dict, scenario: str, queued: int, message_co
     (real omp's rpc reader is not blocked on the ask tool call either)."""
     request_id = request.get("id", "")
     if request.get("type") == "get_state":
-        if scenario == "get-state-fails":
+        STATE_CALLS[0] += 1
+        fails = scenario == "get-state-fails" or (
+            scenario == "get-state-fails-after-start" and STATE_CALLS[0] > 1
+        )
+        if fails:
             emit(
                 {
                     "id": request_id,
@@ -234,7 +296,55 @@ def handle_generic_request(request: dict, scenario: str, queued: int, message_co
                 }
             )
         else:
-            emit(get_state_response(request_id, queued, message_count))
+            emit(
+                get_state_response(
+                    request_id,
+                    queued,
+                    message_count,
+                    session_id=scenario != "no-session-id",
+                )
+            )
+            if scenario == "exit-after-start":
+                # The daemon's model handshake has been answered, so the
+                # start succeeds; the child then dies, which is the
+                # exit-watcher path rather than a start failure.
+                sys.exit(7)
+        return
+    if request.get("type") == "set_model":
+        # Real omp refuses an unknown model and leaves the active one in
+        # place (v18.1.10 probe); `unknown-model` reproduces that here.
+        if request.get("modelId") == "unknown-model":
+            emit(
+                {
+                    "id": request_id,
+                    "type": "response",
+                    "command": "set_model",
+                    "success": False,
+                    "error": f"Model not found: {request.get('provider')}/unknown-model",
+                }
+            )
+            return
+        MODEL_STATE["provider"] = request.get("provider")
+        MODEL_STATE["id"] = request.get("modelId")
+        emit(
+            {
+                "id": request_id,
+                "type": "response",
+                "command": "set_model",
+                "success": True,
+            }
+        )
+        return
+    if request.get("type") == "set_thinking_level":
+        MODEL_STATE["thinking"] = request.get("level")
+        emit(
+            {
+                "id": request_id,
+                "type": "response",
+                "command": "set_thinking_level",
+                "success": True,
+            }
+        )
         return
     if request.get("type") == "get_session_stats":
         emit(
@@ -275,6 +385,7 @@ def handle_generic_request(request: dict, scenario: str, queued: int, message_co
 
 def main() -> None:
     scenario = sys.argv[1] if len(sys.argv) > 1 else "happy"
+    parse_model_flags(sys.argv[2:])
 
     if scenario == "crash":
         print("Error: No models available", file=sys.stderr, flush=True)

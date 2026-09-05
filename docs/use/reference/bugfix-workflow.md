@@ -50,7 +50,7 @@ flowchart TD
 
 ### 1. Reproduce
 
-The prompt is the template preamble joined to the task's stored prompt — the
+The prompt is the accepted preamble joined to the task's stored prompt — the
 issue — and instructs the agent to investigate, write an executable reproducer
 at `.ompire/repro.sh` that exits non-zero while the bug is present and zero
 once fixed, confirm the script currently fails, and finish through the outcome
@@ -146,8 +146,15 @@ cleanup.
 
 ## Using it
 
-Set a template's `workflow` field to `bugfix`. Tasks spawned from that
-template run this workflow instead of `single-step`.
+Choose `bugfix` as the workflow on the Spawn view, or pass
+`"workflow_name": "bugfix"` to `POST /api/tasks/preview` and
+`POST /api/tasks`. Every project can run it; nothing has to be configured
+first.
+
+Every agent step of this workflow declares the `default` role, so all of them
+run the profile's `default` binding. The judge, which fires only when a route
+or an outcome cannot be resolved, runs the `slow` binding. The Spawn view
+lists all of that before launch.
 
 The task prompt should be the issue — what is wrong, and how to observe it.
 The workflow supplies the procedure.

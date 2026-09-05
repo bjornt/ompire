@@ -65,6 +65,15 @@ artifacts rather than a canned reply.
 Sessions persist transcripts, and resume restores context, which is what makes
 crash-recovery testable.
 
+The fake parses the native model flags it is started with — `--model`,
+`--thinking`, and the `--smol`/`--slow`/`--plan` role flags — and reports them
+back through `get_state` the way real omp does, and it answers `set_model` and
+`set_thinking_level`. That is not decoration: the daemon reads the child's
+active model back and refuses to prompt unless it matches the accepted policy,
+so a fake that ignored the flags would fail every session start. `set_model`
+with `unknown-model` reproduces omp's refusal, which leaves the previous model
+in place rather than substituting one.
+
 ### Reviewer
 
 The **real** llmvet serves review unchanged. A driver steers its UI over HTTP,

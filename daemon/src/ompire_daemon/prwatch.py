@@ -18,7 +18,6 @@ import asyncio
 import contextlib
 import json
 import logging
-from dataclasses import asdict
 from typing import Any
 
 from sqlalchemy import Engine
@@ -26,7 +25,12 @@ from sqlalchemy import Engine
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
-from ompire_daemon.registry.tasks import Task, list_pr_pollable_tasks, mark_pr_state
+from ompire_daemon.registry.tasks import (
+    Task,
+    list_pr_pollable_tasks,
+    mark_pr_state,
+    task_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +119,7 @@ class PrWatcher:
             mark_pr_state, self._engine, task.id, pr_state, merged_at
         )
         logger.info("task %d pr_state -> %s", task.id, pr_state)
-        self._hub.publish("task_updated", asdict(updated))
+        self._hub.publish("task_updated", task_payload(updated))
 
 
 def _parse_pr_view(stdout: str) -> tuple[str | None, str | None]:

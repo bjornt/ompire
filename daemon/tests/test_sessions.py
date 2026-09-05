@@ -12,7 +12,7 @@ from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.sessions import SessionTracker
-from tests.test_rpc import fake_omp_argv
+from tests.conftest import fake_argv_builder, make_test_policy
 
 DEBOUNCE = 0.2
 # Deliberately much larger than DEBOUNCE/the sleeps unrelated tests use, so
@@ -30,7 +30,7 @@ def tracked(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
+        fake_argv_builder(scenario),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -52,7 +52,7 @@ def tracked_stall(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         agent_module,
         "build_agent_argv",
-        lambda clone, resume=None, model=None, thinking=None: fake_omp_argv(scenario["name"]),
+        fake_argv_builder(scenario),
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -84,7 +84,7 @@ async def wait_for_status(
 async def test_starting_to_working(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     assert tracker.get(1, "main").status == "starting"
     assert tracker.get(1, "main").reason == "agent spawned"
 
@@ -98,7 +98,7 @@ async def test_starting_to_working(tracked) -> None:
 async def test_quiet_end_goes_idle(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle.prompt("hi")
 
     transitions = await wait_for_status(queue, "idle")
@@ -111,7 +111,7 @@ async def test_quiet_end_goes_idle(tracked) -> None:
 async def test_chained_turns_never_flicker_through_idle(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     # Second prompt right after the first burst's agent_end: its agent_start
     # lands inside the debounce window and cancels the pending idle.
     await handle.prompt("hi")
@@ -127,7 +127,7 @@ async def test_chained_turns_never_flicker_through_idle(tracked) -> None:
 async def test_queued_messages_stay_working(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle.prompt("queue")  # fake omp reports queuedMessageCount: 1
 
     transitions = await wait_for_status(queue, "working")
@@ -141,9 +141,9 @@ async def test_queued_messages_stay_working(tracked) -> None:
 
 async def test_get_state_failure_falls_back_to_debounce_only(tracked) -> None:
     supervisor, _tracker, hub, scenario = tracked
-    scenario["name"] = "get-state-fails"
+    scenario["name"] = "get-state-fails-after-start"
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle.prompt("hi")
 
     transitions = await wait_for_status(queue, "idle")
@@ -154,7 +154,7 @@ async def test_get_state_failure_falls_back_to_debounce_only(tracked) -> None:
 async def test_exit_during_debounce_wins(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle.prompt("hi")
     # agent_end just arrived; kill the child inside the debounce window.
     await supervisor.stop(1, "main")
@@ -169,9 +169,9 @@ async def test_exit_during_debounce_wins(tracked) -> None:
 
 async def test_crash_reason_names_exit_code(tracked) -> None:
     supervisor, _tracker, hub, scenario = tracked
-    scenario["name"] = "exit-after-ready"
+    scenario["name"] = "exit-after-start"
     queue = hub.subscribe()
-    await supervisor.start(1, "main", "/clone")
+    await supervisor.start(1, "main", "/clone", policy=make_test_policy())
 
     transitions = await wait_for_status(queue, "failed")
     assert transitions[-1]["reason"] == "process exited with code 7"
@@ -180,7 +180,7 @@ async def test_crash_reason_names_exit_code(tracked) -> None:
 async def test_operator_stop_reason(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    await supervisor.start(1, "main", "/clone")
+    await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     tracker.expect_operator_stop(1, "main")
     await supervisor.stop(1, "main")
 
@@ -190,9 +190,9 @@ async def test_operator_stop_reason(tracked) -> None:
 
 async def test_failed_status_outlives_deregistration(tracked) -> None:
     supervisor, tracker, hub, scenario = tracked
-    scenario["name"] = "exit-after-ready"
+    scenario["name"] = "exit-after-start"
     queue = hub.subscribe()
-    await supervisor.start(1, "main", "/clone")
+    await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await wait_for_status(queue, "failed")
 
     # The supervisor has dropped the handle, but the status sticks.
@@ -205,9 +205,9 @@ async def test_failed_status_outlives_deregistration(tracked) -> None:
 
 async def test_cleanup_discards_entry(tracked) -> None:
     supervisor, tracker, hub, scenario = tracked
-    scenario["name"] = "exit-after-ready"
+    scenario["name"] = "exit-after-start"
     queue = hub.subscribe()
-    await supervisor.start(1, "main", "/clone")
+    await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await wait_for_status(queue, "failed")
 
     tracker.discard(1)
@@ -218,7 +218,7 @@ async def test_cleanup_discards_entry(tracked) -> None:
 async def test_prompt_skipped_goes_idle_from_starting(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    await supervisor.start(1, "main", "/clone")
+    await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     tracker.prompt_skipped(1, "main")
 
     transitions = await wait_for_status(queue, "idle")
@@ -290,7 +290,7 @@ def test_snapshot_shape(tracked) -> None:
 async def test_ask_enters_waiting_input_and_posts_question(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle.prompt("hi")
     await wait_for_status(queue, "working")
 
@@ -328,7 +328,7 @@ async def test_answering_ask_clears_and_returns_to_working(tracked) -> None:
     # stdin, then tell the tracker the question was answered.
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle.prompt("hi")
     await wait_for_status(queue, "working")
 
@@ -361,7 +361,7 @@ async def test_answering_ask_clears_and_returns_to_working(tracked) -> None:
 async def test_approval_enters_waiting_approval(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle.prompt("hi")
     await wait_for_status(queue, "working")
 
@@ -388,7 +388,7 @@ async def test_ask_cancelled_without_answer_returns_to_working(tracked) -> None:
     # ask leaves the session stuck in `waiting-input` forever.
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle.prompt("hi")
     await wait_for_status(queue, "working")
 
@@ -408,7 +408,7 @@ async def test_ask_cancelled_without_answer_returns_to_working(tracked) -> None:
 async def test_silence_stalls_a_working_session(tracked_stall) -> None:
     supervisor, tracker, hub, _ = tracked_stall
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     # "no-end" bursts through agent_start with no trailing agent_end, so the
     # session stays working and silent past the stall threshold.
     await handle.prompt("no-end")
@@ -423,7 +423,7 @@ async def test_silence_stalls_a_working_session(tracked_stall) -> None:
 async def test_frame_recovers_a_stalled_session(tracked_stall) -> None:
     supervisor, _tracker, hub, _ = tracked_stall
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle.prompt("no-end")
     await wait_for_status(queue, "stalled")
 
@@ -443,7 +443,7 @@ async def test_frame_recovers_a_stalled_session(tracked_stall) -> None:
 async def test_exit_during_stall_still_fails(tracked_stall) -> None:
     supervisor, tracker, hub, _ = tracked_stall
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle.prompt("no-end")
     await wait_for_status(queue, "stalled")
 
@@ -460,14 +460,14 @@ async def test_exit_during_stall_still_fails(tracked_stall) -> None:
 async def test_new_stall_threshold_applies_to_new_arms_only(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle1 = await supervisor.start(1, "main", "/clone")
+    handle1 = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle1.prompt("no-end")
     await wait_for_status(queue, "working")
 
     # The first session's watchdog is sleeping under the original threshold.
     tracker.set_stall_threshold(FAST_STALL_THRESHOLD)
 
-    handle2 = await supervisor.start(2, "main", "/clone")
+    handle2 = await supervisor.start(2, "main", "/clone", policy=make_test_policy())
     await handle2.prompt("no-end")
     await wait_for_status(queue, "stalled", timeout=FAST_STALL_THRESHOLD * 5)
     assert tracker.get(2, "main").status == "stalled"
@@ -481,7 +481,7 @@ async def test_new_stall_threshold_applies_to_new_arms_only(tracked) -> None:
 async def test_auto_retry_start_and_end_transitions(tracked) -> None:
     supervisor, _tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
 
     await handle.prompt("auto-retry")
 
@@ -502,7 +502,7 @@ async def test_auto_retry_start_and_end_transitions(tracked) -> None:
 async def test_exit_during_retry_still_fails(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
 
     await handle.prompt("auto-retry-hang")
     await wait_for_status(queue, "retrying")
@@ -517,7 +517,7 @@ async def test_exit_during_retry_still_fails(tracked) -> None:
 async def test_exit_during_waiting_discards_pending_no_resolve(tracked) -> None:
     supervisor, tracker, hub, _ = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle.prompt("hi")
     await wait_for_status(queue, "working")
 

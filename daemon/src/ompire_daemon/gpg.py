@@ -195,7 +195,7 @@ class GpgProbe:
                     (
                         f"selected key {override} is no longer a usable signing "
                         "key in the daemon's keyring; choose another in "
-                        "Templates & settings"
+                        "Settings"
                     ),
                 )
             return _select_from(match, SOURCE_OVERRIDE), STATE_READY, None
@@ -219,7 +219,7 @@ class GpgProbe:
                     (
                         f"{_where(source)} names {value!r}, which matches "
                         f"{len(matches)} signing keys; choose one in "
-                        "Templates & settings"
+                        "Settings"
                     ),
                 )
             return (
@@ -238,7 +238,7 @@ class GpgProbe:
             STATE_AMBIGUOUS,
             (
                 f"{len(candidates)} usable signing keys; "
-                "choose one in Templates & settings"
+                "choose one in Settings"
             ),
         )
 
@@ -539,7 +539,7 @@ def gpg_signing_refusal(status: GpgStatus) -> str:
         STATE_READY: "GPG signing key is usable",
         STATE_LOCKED: "GPG signing key is locked; warm its passphrase cache",
         STATE_AMBIGUOUS: (
-            "no GPG signing key is selected; choose one in Templates & settings"
+            "no GPG signing key is selected; choose one in Settings"
         ),
         STATE_NO_KEY: "no signing-capable GPG key is available to the daemon",
         STATE_MISSING: "the GPG command-line tools are unavailable to the daemon",

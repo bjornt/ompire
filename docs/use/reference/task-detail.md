@@ -13,8 +13,30 @@ It is reached from a task's card, not from the nav.
 ### Metadata panel
 
 Project, branch, clone path, workshop identity with its derived status,
-creation time, and elapsed time. When the task carries a template, the
-"spawned" row is annotated `· template <name>`.
+creation time, and elapsed time.
+
+### Accepted configuration panel
+
+The launch decision this task was accepted under: its workflow, its model
+profile and where that profile came from, the effective base branch, Workshop
+additions source and preamble with any task-local override marked, and all four
+role bindings with the steps that consume each. The judge appears as a
+consumer of the `slow` binding.
+
+These are the stored values, not a recomputation — a project or profile edited
+since acceptance does not change what this panel shows or what the task runs.
+
+While a session is live, a **Running now** table adds what omp reports it is
+actually running: the active model, the thinking policy the profile states, and
+the level omp resolved it to. Those last two differ legitimately for `auto` and
+`max`, which resolve per model.
+
+A task created before launch inputs were recorded shows a **Configuration
+needed** form instead: what is known, what is unknown and unrecoverable, and
+the fields to confirm for future behavior. Confirming requires an explicit
+acknowledgement and changes no recorded history; an interrupted run can then be
+continued explicitly. An archived task of that vintage says so and asks for
+nothing. See [Tasks](tasks.md#tasks-without-recorded-launch-inputs).
 
 When a task has no live agent, the transcript, composer, and status-strip
 regions degrade to an inactive or empty state rather than disappearing. A

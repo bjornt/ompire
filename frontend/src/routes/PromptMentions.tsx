@@ -16,7 +16,7 @@ interface Props {
   id: string;
   value: string;
   onChange: (value: string) => void;
-  /** The template's project. Null disables lookup without disabling typing. */
+  /** The selected project. Null disables lookup without disabling typing. */
   projectName: string | null;
   disabled: boolean;
   rows: number;
@@ -61,7 +61,7 @@ export function PromptMentions({
     requestSeq.current += 1;
   }, []);
 
-  // A new template means a different repository; stale paths must not linger.
+  // A different project means a different repository; stale paths must not linger.
   useEffect(() => close(), [projectName, close]);
   useEffect(() => {
     if (disabled) close();

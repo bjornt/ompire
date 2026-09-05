@@ -87,10 +87,14 @@ DEFAULT_SHUTDOWN_GRACE = 10.0
 # Startup-recovery fan-out bound (crash-recovery capability, design D-4):
 # deliberately small — each resume is a real container-side omp startup.
 DEFAULT_RECOVERY_CONCURRENCY = 4
-# Model for the workflow engine's LLM-judge session (bugfix-workflow change,
-# design D-4): None = omp's configured default model. Model naming is
-# deployment-specific, so the daemon hardcodes nothing.
-DEFAULT_JUDGE_MODEL: str | None = None
+# Retired keys: still accepted by the parser so an existing `config.toml`
+# keeps loading, but they configure nothing. `judge_model` was the engine's
+# separate LLM-judge model; the judge now runs on the task profile's `slow`
+# binding like any other disclosed model consumer (ADR-0026). The value is
+# carried on `Config.retired` purely so startup can record it as migration
+# evidence and ask the operator to acknowledge its replacement. Nothing reads
+# it to run anything, and the daemon never rewrites the operator's TOML.
+RETIRED_KEYS = ("judge_model",)
 
 _KNOWN_KEYS = {
     "port",
@@ -118,7 +122,7 @@ _KNOWN_KEYS = {
     "gpg_signing_key",
     "gh_command",
     "pr_poll_interval",
-    "judge_model",
+    *RETIRED_KEYS,
 }
 
 
@@ -158,7 +162,9 @@ class Config:
     gpg_signing_key: str | None = DEFAULT_GPG_SIGNING_KEY
     gh_command: tuple[str, ...] = DEFAULT_GH_COMMAND
     pr_poll_interval: float = DEFAULT_PR_POLL_INTERVAL
-    judge_model: str | None = DEFAULT_JUDGE_MODEL
+    # Values found under a retired key, verbatim. Present so the retirement
+    # can be surfaced and acknowledged; never consumed by execution.
+    retired: dict[str, Any] = field(default_factory=dict, compare=False)
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -268,11 +274,10 @@ def load_config(path: Path | None = None) -> Config:
             f"config key 'gpg_signing_key' must be a string or unset, got {gpg_signing_key!r}"
         )
 
-    judge_model = data.get("judge_model", DEFAULT_JUDGE_MODEL)
-    if judge_model is not None and not isinstance(judge_model, str):
-        raise ConfigError(
-            f"config key 'judge_model' must be a string or unset, got {judge_model!r}"
-        )
+    # Retired keys are read but not validated into behavior: the only thing
+    # that happens to them is being reported. Refusing an unchanged file the
+    # operator has had for months would be a worse trade than ignoring a key.
+    retired = {key: data[key] for key in RETIRED_KEYS if key in data}
 
     gh_command = data.get("gh_command")
     if gh_command is None:
@@ -468,7 +473,7 @@ def load_config(path: Path | None = None) -> Config:
         gpg_signing_key=gpg_signing_key,
         gh_command=gh_command,
         pr_poll_interval=float(pr_poll_interval),
-        judge_model=judge_model,
+        retired=retired,
     )
 
 

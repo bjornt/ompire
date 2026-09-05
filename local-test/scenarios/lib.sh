@@ -162,15 +162,26 @@ primary_session() { # primary_session TASK_ID
 
 # Spawn a task; echoes the task id. Deliberately does not wait for idle —
 # see the header's idle-waiting convention.
-spawn_task() { # spawn_task SLUG PROMPT
-	local slug=$1 prompt=$2 body id
-	body=$(jq -n --arg t "$PROJECT" --arg s "$slug" --arg p "$prompt" \
-		'{template_name: $t, slug: $s, prompt: $p}')
+# Launch is preview-then-accept (ADR-0026): the same selections are resolved
+# once for review and again under the write reservation, and the reviewed
+# token is what ties the two together. The harness follows the real contract
+# rather than posting straight to /api/tasks.
+spawn_task() { # spawn_task SLUG PROMPT [WORKFLOW]
+	local slug=$1 prompt=$2 workflow=${3:-single-step} body token id
+	body=$(jq -n --arg pr "$PROJECT" --arg w "$workflow" --arg s "$slug" --arg p "$prompt" \
+		'{project_name: $pr, workflow_name: $w, slug: $s, prompt: $p}')
+	_api_run POST /api/tasks/preview "$body"
+	[ "$API_CODE" = 200 ] || die "preview failed ($API_CODE): $API_BODY"
+	token=$(jq -r .preview_token <<<"$API_BODY")
+	body=$(jq -n --arg pr "$PROJECT" --arg w "$workflow" --arg s "$slug" --arg p "$prompt" \
+		--arg tok "$token" \
+		'{project_name: $pr, workflow_name: $w, slug: $s, prompt: $p,
+		  preview_token: $tok}')
 	_api_run POST /api/tasks "$body"
 	body=$API_BODY
 	[ "$API_CODE" = 202 ] || die "spawn failed ($API_CODE): $body"
 	id=$(jq -r .id <<<"$body")
-	ok "task $id spawned (slug $slug)"
+	ok "task $id spawned (slug $slug, workflow $workflow)"
 	echo "$id"
 }
 

@@ -115,6 +115,7 @@ so the loop is visible rather than being a sequence of unrelated reviews.
 | Primary session not `idle`, or no live agent | `409`, no process launched |
 | A review is already open | `409`, no second process launched |
 | Cancel with no open review | `409` |
+| The task's launch configuration is not confirmed yet | Refused; confirm the task's configuration first (see [States](states.md)) |
 | Comments arrive but the primary session has no live agent | Review recorded `error` naming the missing agent; the session is left unchanged |
 
 ### Retention and restart

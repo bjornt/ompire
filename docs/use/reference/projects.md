@@ -7,7 +7,9 @@ publish against it. Every task belongs to exactly one project, so registering
 a project is the first thing an operator does.
 
 The project owns the checkout location and the upstream/fork routing. It does
-not own spawn configuration — that belongs to [templates](templates.md).
+also owns the workspace and prompt defaults a launch inherits, but not the
+launch itself: which workflow runs and which models it uses are chosen per
+task (ADR-0026).
 
 ## Fields
 
@@ -82,10 +84,15 @@ A project may name one [model profile](model-profiles.md) as its default. The
 field is optional and defaults to `null`; several projects may name the same
 profile.
 
-**This is stored configuration, not execution.** Tasks are still created from
-[templates](templates.md) and still run with the template's `model` and
-`thinking` values or a per-spawn override. The assignment is recorded for
-workflow-first task launching; today it changes nothing about how a task runs.
+A launch inherits this profile unless the operator selects another for that
+task. What the task then runs is the snapshot pinned at acceptance, so editing
+or reassigning the default afterwards changes the next launch and nothing about
+work already accepted.
+
+A project with no default is perfectly usable: the operator selects a profile
+at each launch. What is not possible is launching with no profile at all —
+nothing is inferred from the project, from provider credentials, or from omp's
+own settings.
 
 The field is three-valued on `PUT /api/projects/{name}`:
 
@@ -108,10 +115,60 @@ projects; see
 [Removing a profile](model-profiles.md#removing-a-profile). Removing a project
 releases its reference and never removes the profile.
 
-Existing projects have no default after upgrading. None is inferred from a
-template, from provider credentials, from omp's own settings, or from the
-project's name. Setup completion, setup retry, and a permitted rename all
-preserve an assigned reference.
+Existing projects have no default after upgrading. None is inferred from an
+old template's model, from provider credentials, from omp's own settings, or
+from the project's name. Setup completion, setup retry, and a permitted rename
+all preserve an assigned reference.
+
+## Workspace and prompt defaults
+
+Four fields describe what a launch against this project starts from. Each is a
+default the operator can override for one task, not a rule the task must
+follow.
+
+| Field | Meaning | Default for a new project |
+|---|---|---|
+| `base_branch` | Branch a task's clone is made from | `main` |
+| `branch_pattern` | How a task's branch name is derived; must contain exactly one `<slug>` | the daemon's `default_branch_pattern` at registration |
+| `workshop_additions` | Which additions file the task's container gets: `project` or `global` | `project` |
+| `preamble` | Standing text prepended to the task's prompt | empty |
+
+`branch_pattern`'s default is a *seed*, read from the daemon setting once, when
+the project is registered. Nothing reads that setting again: the project owns
+its pattern from that moment, and changing the daemon setting later does not
+move any project.
+
+The additions choice is exclusive. `project` uses the repository's own
+`workshop.my.yaml`; `global` uses `~/.config/my-workshop/my.yaml`. Neither
+falls back to the other — a selected source that does not exist means no
+additions, and that is disclosed at launch rather than silently substituted.
+
+Like the default profile, these four follow the omission rule on
+`PUT /api/projects/{name}`: a body that leaves a field out preserves it. They
+are never null — an empty `preamble` is the value "no preamble", and an
+explicit null for any of the other three is refused rather than read as a
+reset.
+
+## Launch configuration state
+
+`launch_config_state` is `reconciled` or `needs-reconciliation`. It is
+independent of `setup_state`: a checkout can be perfectly ready while the
+project's carried-over configuration still needs a decision, and both are
+reported so the UI can say which one is blocking.
+
+A project is `needs-reconciliation` only after upgrading from a release that
+had templates, and only when the upgrade found something it refused to decide:
+templates that disagreed about a field, a template that pinned a model, or a
+still-configured `judge_model`. A newly registered project is always
+`reconciled`. A launch against an unreconciled project is refused with `409`.
+
+`GET /api/projects/{name}/launch-reconciliation` returns every distinct old
+value with the template it came from, and `POST` to the same path records the
+operator's final values. The submission carries the fingerprint of the evidence
+that was read, so a decision made against a stale reading is refused rather
+than applied, and it must explicitly acknowledge any old model choice or
+retired judge model it supersedes. The evidence is kept afterwards, so an
+unselected preamble or candidate is not lost.
 
 ## Fork routing
 
@@ -176,7 +233,7 @@ project record is reported the same way and adds nothing to the list.
 An adopted project is `ready` the moment it is registered — validation already
 happened. Only clone mode passes through `cloning`.
 
-While a project is not ready it cannot be selected in the template editor and
+While a project is not ready it cannot be launched against and
 cannot be spawned against; both surfaces say why rather than hiding it. A
 project cannot be removed while its clone is running.
 
@@ -198,17 +255,15 @@ never deleted** — not one you registered, and not one Ompire cloned. The
 confirmation says so, and names the path that stays.
 
 Deleting a project fails with `409` while **any** task row references it,
-archived ones included, and while any template references it. The response
-names the referencing tasks and templates.
+archived ones included. The response names the referencing tasks.
 
 Archived tasks block deletion deliberately: they are the historical record of
-work done against that project. Purging them, and deleting or repointing the
-templates, unblocks removal.
+work done against that project. Purging them unblocks removal.
 
 ### Guarded rename
 
 Project update accepts an optional new name. A rename requires zero
-referencing task rows and zero referencing templates — the same guard as
+referencing task rows — the same guard as
 removal, with no cascade.
 
 A successful rename is atomic. Reads under the new name succeed, reads under
@@ -250,7 +305,6 @@ nothing under `.git`.
 | Edit or delete while setup is running | `409` |
 | Template or task references a project that is not `ready` | `409` |
 | Delete or rename while tasks reference it | `409` naming the tasks |
-| Delete or rename while templates reference it | `409` naming the templates |
 | Rename to a name already in use | `409`, both projects unchanged |
 | `default_model_profile` names a profile that does not exist | `422`, the entire create or update unapplied |
 | File search for an unknown project | `404` |

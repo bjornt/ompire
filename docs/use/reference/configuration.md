@@ -28,11 +28,12 @@ Paths are expanded, so `~` works.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `default_branch_pattern` | string | `"ompire/<slug>"` | Used when a template does not override it. |
+| `default_branch_pattern` | string | `"ompire/<slug>"` | Seeds a project's branch pattern **at registration**. Never read again — the project owns its pattern from that moment. |
 | `spawn_step_timeout` | integer (s) | `120` | Applies to the Git steps. |
 | `project_clone_timeout` | integer (s) | `900` | Bounds "clone it for me" [project setup](projects.md#checkout-modes), which pulls a whole repository over the network. |
 | `workshop_step_timeout` | integer (s) | `600` | Much larger than the Git timeout because container launch includes SDK installation. |
 | `my_workshop_command` | list of strings | `["my-workshop"]` | Must be non-empty. |
+
 
 ## Agents
 
@@ -40,7 +41,6 @@ Paths are expanded, so `~` works.
 |---|---|---|---|
 | `agent_ready_timeout` | integer (s) | `30` | Positive. Covers container-side agent startup. |
 | `agent_ring_buffer_size` | integer | `1000` | Positive. Retained raw events per session. |
-| `judge_model` | string or unset | unset | Model for the workflow engine's LLM-judge step. Unset means the agent's configured default. |
 
 ## Sessions and attention
 
@@ -59,7 +59,7 @@ Paths are expanded, so `~` works.
 |---|---|---|---|
 | `llmvet_command` | list of strings | `["llmvet"]` | Must be non-empty. |
 | `review_port_range` | `[low, high]` | `[7180, 7280]` | Positive integers, `low <= high`. Probed with an ephemeral bind so concurrent reviews do not collide. |
-| `gpg_signing_key` | string or unset | unset | The signing key, as a fingerprint, key ID, or user-ID substring. Also a daemon-writable setting: a selection made in Templates & settings takes precedence over this file. Unset auto-detects when the host holds exactly one usable signing key. See [daemon settings](daemon-settings.md). |
+| `gpg_signing_key` | string or unset | unset | The signing key, as a fingerprint, key ID, or user-ID substring. Also a daemon-writable setting: a selection made in Settings takes precedence over this file. Unset auto-detects when the host holds exactly one usable signing key. See [daemon settings](daemon-settings.md). |
 | `gh_command` | list of strings | `["gh"]` | Non-empty GitHub CLI prefix. The daemon uses it non-interactively for version detection, explicit-host identity/repository reads, PR creation, and PR polling. |
 | `pr_poll_interval` | number (s) | `60` | Positive. Spacing between pull-request state polls. |
 
@@ -113,11 +113,32 @@ file says, or the default if it says nothing.
 Everything else is TOML-only. Infrastructure settings — ports, paths, and
 commands — are not editable from a browser.
 
+## Retired keys
+
+A key listed here is still accepted so an existing file keeps loading, and it
+configures nothing.
+
+| Key | Retired in favour of |
+|---|---|
+| `judge_model` | The task model profile's `slow` binding |
+
+The workflow engine's judge has no separate model setting any more: it runs on
+the profile the task was launched with, disclosed in the launch preview like
+every other model consumer (ADR-0026).
+
+Ompire never rewrites your `config.toml`. If it finds `judge_model` set, it
+records the value and asks you to acknowledge, per affected project, that the
+profile's `slow` binding replaces it — see
+[Projects](projects.md#launch-configuration-state). Acknowledging an unchanged
+value is a one-time step; changing the value later surfaces it again as new
+evidence rather than applying it to anything. If you want that exact model for
+judging, bind it as `slow` in a profile and remove the key.
+
 ## Example
 
 ```toml
 # Optional: only needed when the host holds more than one signing key and you
-# would rather seed the choice here than pick it in Templates & settings.
+# would rather seed the choice here than pick it in Settings.
 gpg_signing_key = "3AA5C34371567BD2"
 
 checkout_root = "~/src"

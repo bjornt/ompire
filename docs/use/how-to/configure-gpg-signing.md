@@ -6,7 +6,7 @@ required before a task can produce a pull request.
 
 ## Check what Ompire sees
 
-Open **Templates & settings → Daemon → Commit signing**. It shows the current
+Open **Settings → Daemon → Commit signing**. It shows the current
 state, which key will sign, and how that key was chosen. The same state appears
 as a `gpg` chip in the header on every page.
 
@@ -68,7 +68,7 @@ set.
 
 | State | What to do |
 |---|---|
-| `gpg unselected` | Choose a key in **Templates & settings → Commit signing**. |
+| `gpg unselected` | Choose a key in **Settings → Commit signing**. |
 | `gpg locked` | Run the unlock command above, then **Re-check key**. |
 | `gpg agent` | Start the agent with `gpg-connect-agent /bye`, then re-check. |
 | `gpg no key` | Generate or import a signing key for the account running the daemon. |

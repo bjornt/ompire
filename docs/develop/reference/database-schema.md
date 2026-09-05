@@ -22,6 +22,11 @@ The rationale is in
 | `setup_state` | string | `ready`, `cloning`, or `failed` |
 | `setup_error` | text, nullable | Failing step and git stderr |
 | `default_model_profile` | string, nullable | FK to `model_profiles.name`, indexed. NULL means no default |
+| `base_branch` | string | Default `main`. A launch default, overridable per task |
+| `branch_pattern` | string | Seeded from the daemon setting at registration |
+| `workshop_additions` | string | `project` or `global`; default `project` |
+| `preamble` | text | Standing prompt preamble; empty means none |
+| `launch_config_state` | string | `reconciled` or `needs-reconciliation`; independent of `setup_state` |
 
 The four onboarding columns arrived with migration `0011`
 ([ADR-0022](../../adr/0022-create-or-adopt-base-checkouts-without-mutating-them.md)).
@@ -33,6 +38,15 @@ records only what the operator supplied.
 ([ADR-0025](../../adr/0025-store-global-model-profiles-separately-from-launch-policy.md)).
 It is purely additive: existing rows backfill to `NULL`, and nothing is
 inferred from a template, a credential, omp's own settings, or the name.
+
+The five launch-default columns arrived with migration `0013`
+([ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)),
+which retired templates. Where every template of a project agreed on a field,
+its value was copied here; where they disagreed, the column keeps its default
+and `launch_config_state` becomes `needs-reconciliation` until the operator
+decides. `branch_pattern` for a project that had no templates is seeded from
+the daemon's `default_branch_pattern` at startup, recorded as a decision so it
+happens once.
 
 ## `model_profiles`
 
@@ -75,20 +89,40 @@ Turning FK enforcement on globally was deliberately not done here — it would
 change enforcement for every existing table at once and can surface unrelated
 legacy inconsistencies.
 
-## `templates`
+## `launch_migration_evidence`
+
+Inert upgrade history from the template retirement. Every old template row,
+every task's template attribution, and any explicitly configured `judge_model`
+is copied here — nulls, empty strings and timestamps included — before the live
+storage goes away.
 
 | Column | Type | Notes |
 |---|---|---|
-| `name` | string | Primary key |
-| `project_name` | string | FK to `projects.name` |
-| `base_branch` | string | Default `main` |
-| `branch_pattern` | string | |
-| `workflow` | string | Default `single-step` |
-| `workshop_additions` | string | Default `project` |
-| `model` | string, nullable | |
-| `thinking` | string, nullable | |
-| `preamble` | text | Prepended to every prompt |
-| `created_at`, `updated_at` | string | ISO-8601 |
+| `id` | integer | Primary key, autoincrement |
+| `kind` | string | `template`, `task-template`, `workspace-conflict`, `model-candidates`, `new-defaults`, `retired-judge-model` |
+| `scope_kind` | string | `project`, `task`, or `daemon` |
+| `scope` | string | Project name, task id, or empty |
+| `source` | string | Template name, or `config.toml` |
+| `payload_json` | text | The original values, verbatim |
+| `recorded_at` | string | ISO-8601 |
+
+It is read to show the operator what used to be configured and to notice a
+changed retired setting. It is never read to execute anything: there is no CRUD,
+no launch selector, and no path from a row here to a running agent. That is why
+it can be kept indefinitely without becoming a second source of launch policy.
+
+## `launch_reconciliations`
+
+Operator decisions that closed out a reconciliation.
+
+| Column | Type | Notes |
+|---|---|---|
+| `scope_kind`, `scope`, `kind` | string | Composite primary key |
+| `acknowledged_value` | text, nullable | The exact value acknowledged, where one applies |
+| `decided_at` | string | ISO-8601 |
+
+`acknowledged_value` is what lets an *unchanged* retired `judge_model` stay
+quiet across restarts while a *changed* one reopens as new evidence.
 
 ## `tasks`
 
@@ -96,7 +130,7 @@ legacy inconsistencies.
 |---|---|---|
 | `id` | integer | Primary key, autoincrement |
 | `project_name` | string | FK to `projects.name` |
-| `template_name` | string, nullable | The template used, if any |
+| `execution_inputs_json` | text, nullable | The launch decision this task was accepted under, as one version-tagged JSON document. NULL for a task created before pinned inputs |
 | `slug` | string | |
 | `branch` | string | |
 | `clone_path` | string | |
@@ -111,9 +145,26 @@ legacy inconsistencies.
 | `spawn_completed_at` | string, nullable | |
 | `created_at`, `updated_at` | string | ISO-8601 |
 
-Task rows denormalize the project, template, and workflow identity resolved at
-spawn time. Editing a template later does not change tasks already spawned
-from it — a run's configuration is fixed when it starts.
+`execution_inputs_json` carries the four role bindings, each agent step's
+abstract role, the judge binding, the effective workspace values with their
+inheritance attribution, the rendered branch, and the project-derived checkout
+path, fetch remote, and upstream/fork routing. Everything downstream reads it;
+nothing re-resolves. Editing a project or a profile — or deleting a profile
+nothing references — changes the next launch and not this task
+([ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)).
+
+It follows the registry's existing JSON-text convention rather than a dozen
+columns: nothing queries a task by a nested binding, and a partial update would
+be a different decision, so there is no field-level write API. The source
+profile name inside it is provenance, not a live foreign key.
+
+NULL is a real state, not a value to fill in. A task written before migration
+`0013` has no recoverable model, thinking level, preamble, or overrides — the
+original spawn's overrides were never persisted — so it keeps its records, is
+marked as needing confirmation, and everything that would need those values
+refuses until the operator confirms a continuation configuration. The
+confirmation writes the same document with `legacy-confirmed` provenance,
+once.
 
 ## `sessions`
 

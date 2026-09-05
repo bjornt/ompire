@@ -7,9 +7,10 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from ompire_daemon.config import Config
 from ompire_daemon.registry.tasks import create_task, mark_archived
 
-from .conftest import make_adoptable_checkout
+from .conftest import make_adoptable_checkout, make_execution_inputs
 
 
 @pytest.fixture(autouse=True)
@@ -146,6 +147,11 @@ def _reference_task(app, tmp_path: Path, name: str, slug: str, archived: bool = 
         branch=f"ompire/{slug}",
         clone_path=str(tmp_path / "tasks" / slug),
         prompt="fix it",
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(tmp_path / "checkout"),
+            project_name=name,
+            branch=f"ompire/{slug}",
+        ),
     )
     if archived:
         task = mark_archived(app.state.engine, task.id)
@@ -260,97 +266,89 @@ def test_rename_to_invalid_slug_rejected(client: TestClient, auth_headers: dict[
     assert fetched.status_code == 200
 
 
-# --- Template guards (templates capability; SPEC Decision 6) -----------------
+# --- Workspace defaults and launch guards (ADR-0026) -------------------------
 
 
-def _create_template(client: TestClient, auth_headers: dict[str, str], project: str) -> dict:
-    response = client.post(
-        "/api/templates",
-        headers=auth_headers,
-        json={"name": f"{project}-tpl", "project_name": project},
-    )
-    assert response.status_code == 201, response.text
-    return response.json()
-
-
-def test_project_payloads_carry_no_spawn_defaults(
+def test_project_carries_its_workspace_defaults(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
+    """The values that used to live on a template are project defaults now:
+    a launch inherits them, and a task pins its own effective copy."""
     project = _create(client, auth_headers)
-    assert "base_branch" not in project
-    assert "branch_pattern" not in project
+    assert project["base_branch"] == "main"
+    assert project["branch_pattern"] == "ompire/<slug>"
+    assert project["workshop_additions"] == "project"
+    assert project["preamble"] == ""
+    assert project["launch_config_state"] == "reconciled"
 
-    # The PUT payload needs no spawn defaults either.
-    updated = client.put(
+
+def test_workspace_defaults_are_preserved_by_an_update_that_omits_them(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """A client written before these fields existed cannot blank them."""
+    project = _create(client, auth_headers)
+    client.put(
+        "/api/projects/ompire",
+        headers=auth_headers,
+        json={**_put_payload(project), "preamble": "house style", "base_branch": "trunk"},
+    )
+    untouched = client.put(
         "/api/projects/ompire",
         headers=auth_headers,
         json=_put_payload(project, title="New Title"),
     )
-    assert updated.status_code == 200
-    assert "base_branch" not in updated.json()
-    assert "branch_pattern" not in updated.json()
+    assert untouched.status_code == 200
+    assert untouched.json()["preamble"] == "house style"
+    assert untouched.json()["base_branch"] == "trunk"
 
 
-def test_delete_blocked_by_referencing_template(
-    client: TestClient, auth_headers: dict[str, str]
-) -> None:
-    _create(client, auth_headers)
-    _create_template(client, auth_headers, "ompire")
-
-    response = client.delete("/api/projects/ompire", headers=auth_headers)
-    assert response.status_code == 409
-    assert "ompire-tpl" in response.json()["detail"]
-
-    # Deleting the template unblocks removal.
-    client.delete("/api/templates/ompire-tpl", headers=auth_headers)
-    deleted = client.delete("/api/projects/ompire", headers=auth_headers)
-    assert deleted.status_code == 200
-
-
-def test_rename_blocked_by_referencing_template(
+def test_an_empty_preamble_is_a_value_not_a_clear(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
     project = _create(client, auth_headers)
-    _create_template(client, auth_headers, "ompire")
+    client.put(
+        "/api/projects/ompire",
+        headers=auth_headers,
+        json={**_put_payload(project), "preamble": "house style"},
+    )
+    cleared = client.put(
+        "/api/projects/ompire",
+        headers=auth_headers,
+        json={**_put_payload(project), "preamble": ""},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["preamble"] == ""
 
+
+def test_an_invalid_branch_pattern_is_refused(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    project = _create(client, auth_headers)
     response = client.put(
         "/api/projects/ompire",
         headers=auth_headers,
-        json=_put_payload(project, new_name="ompire-ng"),
+        json={**_put_payload(project), "branch_pattern": "no-placeholder"},
     )
-    assert response.status_code == 409
-    assert "ompire-tpl" in response.json()["detail"]
-
-    fetched = client.get("/api/projects/ompire", headers=auth_headers)
-    assert fetched.status_code == 200
+    assert response.status_code == 422
+    assert "<slug>" in response.json()["detail"]
 
 
-def test_repointing_template_unblocks_project_delete(
-    client: TestClient, auth_headers: dict[str, str]
+def test_branch_pattern_is_seeded_from_the_daemon_setting(
+    daemon_config: Config, tmp_path: Path
 ) -> None:
-    _create(client, auth_headers)
-    _create(client, auth_headers, name="other")
-    template = _create_template(client, auth_headers, "ompire")
+    """A seed at registration, never a value read later: the project owns its
+    own pattern from the moment it exists."""
+    from dataclasses import replace
 
-    # Repoint the template at the other project.
-    repointed = client.put(
-        "/api/templates/ompire-tpl",
-        headers=auth_headers,
-        json={
-            "project_name": "other",
-            "base_branch": template["base_branch"],
-            "branch_pattern": template["branch_pattern"],
-            "workflow": template["workflow"],
-            "workshop_additions": template["workshop_additions"],
-            "model": template["model"],
-            "thinking": template["thinking"],
-            "preamble": template["preamble"],
-        },
-    )
-    assert repointed.status_code == 200
+    from ompire_daemon.app import create_app
 
-    deleted = client.delete("/api/projects/ompire", headers=auth_headers)
-    assert deleted.status_code == 200
+    config = replace(daemon_config, default_branch_pattern="wip/<slug>")
+    make_adoptable_checkout(config.checkout_root, "seeded")
+    app = create_app(config, frontend_dist=tmp_path / "no-dist")
+    with TestClient(app) as client:
+        headers = {"Authorization": f"Bearer {app.state.auth_token}"}
+        project = _create(client, headers, name="seeded")
+    assert project["branch_pattern"] == "wip/<slug>"
 
 
 # --- file search (add-spawn-file-mentions) ----------------------------------
@@ -683,9 +681,11 @@ def test_delete_is_refused_while_a_clone_is_running(
     assert "still being set up" in response.json()["detail"]
 
 
-def test_template_cannot_point_at_an_unready_project(
+def test_launch_refused_against_an_unready_project(
     client: TestClient, auth_headers: dict[str, str], app
 ) -> None:
+    """A checkout still being created has no usable clone source; refusing at
+    resolution beats discovering it at the pipeline's first git command."""
     from ompire_daemon.registry.projects import create_project
 
     create_project(
@@ -699,9 +699,14 @@ def test_template_cannot_point_at_an_unready_project(
     )
 
     response = client.post(
-        "/api/templates",
+        "/api/tasks/preview",
         headers=auth_headers,
-        json={"name": "t", "project_name": "cloning-now"},
+        json={
+            "project_name": "cloning-now",
+            "workflow_name": "single-step",
+            "slug": "t",
+            "prompt": "p",
+        },
     )
 
     assert response.status_code == 409

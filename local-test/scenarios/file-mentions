@@ -12,7 +12,7 @@
 # The fake omp records every prompt message it is served, which is what makes
 # the delivered text assertable without a model.
 #
-# Preconditions: `local-test/env up` (daemon + project + template).
+# Preconditions: `local-test/env up` (daemon + project + model profile).
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -45,8 +45,18 @@ jq -e '[.paths[] | select(startswith("/"))] | length == 0' <<<"$files" >/dev/nul
 # --- refusal: a mention that does not exist ----------------------------------
 
 before=$(api_json GET /api/tasks | jq 'length')
-body=$(jq -n --arg t "$PROJECT" --arg s "$slug-missing" \
-	'{template_name: $t, slug: $s, prompt: "read @no-such-file.md"}')
+# Mentions are validated at acceptance, against the accepted base branch and
+# checkout — so the refusal has to come from the real preview-then-accept
+# path, not from a shortcut POST (ADR-0026).
+body=$(jq -n --arg pr "$PROJECT" --arg s "$slug-missing" \
+	'{project_name: $pr, workflow_name: "single-step", slug: $s,
+	  prompt: "read @no-such-file.md"}')
+_api_run POST /api/tasks/preview "$body"
+[ "$API_CODE" = 200 ] || fail "preview of a mention-bearing draft" "got $API_CODE: $API_BODY"
+body=$(jq -n --arg pr "$PROJECT" --arg s "$slug-missing" \
+	--arg tok "$(jq -r .preview_token <<<"$API_BODY")" \
+	'{project_name: $pr, workflow_name: "single-step", slug: $s,
+	  prompt: "read @no-such-file.md", preview_token: $tok}')
 api_json POST /api/tasks "$body" >"$REFUSAL"
 [ "$API_CODE" = 422 ] || fail "missing-file mention refused" "got $API_CODE: $(cat "$REFUSAL")"
 grep -q 'no such file' "$REFUSAL" &&
@@ -65,8 +75,14 @@ jq -e --arg p "$uncommitted" '.paths | index($p)' <<<"$files" >/dev/null &&
 	ok "search offers the uncommitted file (working-tree scope)" ||
 	fail "uncommitted file not listed" "$files"
 
-body=$(jq -n --arg t "$PROJECT" --arg s "$slug-uncommitted" --arg p "read @$uncommitted" \
-	'{template_name: $t, slug: $s, prompt: $p}')
+body=$(jq -n --arg pr "$PROJECT" --arg s "$slug-uncommitted" --arg p "read @$uncommitted" \
+	'{project_name: $pr, workflow_name: "single-step", slug: $s, prompt: $p}')
+_api_run POST /api/tasks/preview "$body"
+[ "$API_CODE" = 200 ] || fail "preview of an uncommitted mention" "got $API_CODE: $API_BODY"
+body=$(jq -n --arg pr "$PROJECT" --arg s "$slug-uncommitted" --arg p "read @$uncommitted" \
+	--arg tok "$(jq -r .preview_token <<<"$API_BODY")" \
+	'{project_name: $pr, workflow_name: "single-step", slug: $s, prompt: $p,
+	  preview_token: $tok}')
 api_json POST /api/tasks "$body" >"$REFUSAL"
 [ "$API_CODE" = 422 ] || fail "uncommitted mention refused" "got $API_CODE: $(cat "$REFUSAL")"
 grep -q 'base branch' "$REFUSAL" &&
