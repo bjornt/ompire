@@ -16,7 +16,7 @@ from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.sessions import SessionTracker
-from tests.test_rpc import fake_omp_argv
+from tests.conftest import fake_argv_builder, make_test_policy
 
 THROTTLE = 0.15
 
@@ -238,7 +238,7 @@ def tracked(monkeypatch: pytest.MonkeyPatch):
     confirming the tracker hooks actually fire (not just the sampler's public
     methods in isolation)."""
     monkeypatch.setattr(
-        agent_module, "build_agent_argv", lambda clone, resume=None, model=None, thinking=None: fake_omp_argv("happy")
+        agent_module, "build_agent_argv", fake_argv_builder("happy")
     )
 
     async def no_preflight(clone_path: str) -> None:
@@ -257,7 +257,7 @@ def tracked(monkeypatch: pytest.MonkeyPatch):
 async def test_turn_end_hook_fires_through_real_tracker(tracked) -> None:
     supervisor, _tracker, hub, _sampler = tracked
     queue = hub.subscribe()
-    handle = await supervisor.start(1, "main", "/clone")
+    handle = await supervisor.start(1, "main", "/clone", policy=make_test_policy())
     await handle.prompt("hi")
 
     async with asyncio.timeout(5):

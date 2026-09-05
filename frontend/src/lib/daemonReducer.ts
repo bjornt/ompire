@@ -27,13 +27,14 @@ import type {
   ShipFinishedPayload,
   ShipState,
   ShipStepPayload,
+  SessionModelPayload,
   SnapshotPayload,
   SpawnStepPayload,
   StatsPayload,
   StatusChangedPayload,
   StepRecord,
   Task,
-  Template,
+  WorkflowDescriptor,
   WorkflowState,
   WorkflowStepPayload,
 } from "../types";
@@ -45,10 +46,12 @@ export interface DaemonState {
    * alone is insufficient: it precedes that first message. */
   snapshotReady: boolean;
   projects: Project[];
-  /** Template registry (templates capability), keyed by name like projects:
-   * loaded from the snapshot, upserted by `template_created`/
-   * `template_updated`, dropped by `template_deleted`. */
-  templates: Template[];
+  /** Every registered built-in workflow (ADR-0026). Snapshot-only, with no
+   * change event: definitions ship with the daemon (ADR-0018), so the
+   * catalog is constant for the life of the process. An older snapshot
+   * without the field normalizes to empty — which routes must not read as
+   * "no workflows exist" before `snapshotReady`. */
+  workflowCatalog: WorkflowDescriptor[];
   /** Global model profiles (ADR-0025), keyed by name like projects: replaced
    * wholesale by the snapshot, upserted by `model_profile_created`/
    * `model_profile_updated`, dropped by `model_profile_deleted`. An older
@@ -105,7 +108,7 @@ export const initialDaemonState: DaemonState = {
   connectionState: "connecting",
   snapshotReady: false,
   projects: [],
-  templates: [],
+  workflowCatalog: [],
   modelProfiles: [],
   tasks: [],
   spawnProgress: {},
@@ -213,7 +216,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         ...state,
         snapshotReady: true,
         projects: payload.projects,
-        templates: payload.templates ?? [],
+        workflowCatalog: payload.workflow_catalog ?? [],
         modelProfiles: payload.model_profiles ?? [],
         tasks: payload.tasks,
         spawnProgress: {},
@@ -255,21 +258,6 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         projects: state.projects.filter((p) => p.name !== name),
         projectSetupProgress,
       };
-    }
-    case "template_created": {
-      const template = envelope.payload as Template;
-      return { ...state, templates: [...state.templates, template] };
-    }
-    case "template_updated": {
-      const template = envelope.payload as Template;
-      return {
-        ...state,
-        templates: state.templates.map((t) => (t.name === template.name ? template : t)),
-      };
-    }
-    case "template_deleted": {
-      const { name } = envelope.payload as { name: string };
-      return { ...state, templates: state.templates.filter((t) => t.name !== name) };
     }
     case "model_profile_created":
     case "model_profile_updated": {
@@ -346,7 +334,38 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
           ...state.sessions,
           [task_id]: {
             ...perSession,
-            [session]: { status: to, reason, since: envelope.ts },
+            // The observed native model survives a status change: it is a
+            // fact about the running child, not about what it is doing.
+            [session]: {
+              status: to,
+              reason,
+              since: envelope.ts,
+              model: perSession[session]?.model,
+            },
+          },
+        },
+      };
+    }
+    case "session_model": {
+      // What the session's omp child reports it is actually running, next to
+      // the policy it was started with (ADR-0026). Observational only.
+      const { task_id, session, model, thinking, resolved_thinking } =
+        envelope.payload as SessionModelPayload;
+      const perSession = state.sessions[task_id] ?? {};
+      const existing = perSession[session];
+      return {
+        ...state,
+        sessions: {
+          ...state.sessions,
+          [task_id]: {
+            ...perSession,
+            [session]: {
+              status: existing?.status ?? "starting",
+              reason: existing?.reason ?? "agent spawned",
+              since: existing?.since ?? envelope.ts,
+              question: existing?.question,
+              model: { model, thinking, resolved_thinking },
+            },
           },
         },
       };

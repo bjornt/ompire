@@ -10,7 +10,7 @@
 # and the daemon's own states agree (review approved, ship shipped, task
 # never failed).
 #
-# Preconditions: `local-test/env up` (daemon + project + template).
+# Preconditions: `local-test/env up` (daemon + project + model profile).
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"

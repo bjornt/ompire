@@ -23,16 +23,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import asdict
 
 from sqlalchemy import Engine
 
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
+from ompire_daemon.execution_inputs import ModelPolicy
 from ompire_daemon.registry.sessions import list_resumable_sessions
-from ompire_daemon.registry.tasks import Task, mark_failed, reconcile_startup
-from ompire_daemon.registry.templates import TemplateNotFoundError, get_template
+from ompire_daemon.registry.tasks import (
+    Task,
+    mark_failed,
+    reconcile_startup,
+    task_payload,
+)
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.workflows import WorkflowRunner
 from ompire_daemon.workshop import workshop_status
@@ -51,7 +55,7 @@ async def classify_startup_tasks(
     """
     failed, candidates = reconcile_startup(engine)
     for task in failed:
-        events.publish("task_updated", asdict(task))
+        events.publish("task_updated", task_payload(task))
 
     recoverable: list[Task] = []
     for task in candidates:
@@ -64,7 +68,7 @@ async def classify_startup_tasks(
             failed_task = mark_failed(
                 engine, task.id, f"workshop container gone (status: {status!r}); cannot resume"
             )
-            events.publish("task_updated", asdict(failed_task))
+            events.publish("task_updated", task_payload(failed_task))
     return recoverable
 
 
@@ -76,10 +80,22 @@ async def _resume_session(
     task: Task,
     session_name: str,
     omp_session_id: str,
+    policy: ModelPolicy,
 ) -> bool:
+    """Resume one recorded session under the task's *accepted* policy.
+
+    A resumed omp restores its own model settings from the session file, so
+    the supervisor re-asserts the accepted active pair over the acknowledged
+    native controls and verifies the result before anything is prompted. A
+    profile edited or deleted since acceptance changes nothing here — the
+    policy comes off the task."""
     try:
         await supervisor.start(
-            task.id, session_name, task.clone_path, resume=omp_session_id
+            task.id,
+            session_name,
+            task.clone_path,
+            policy=policy,
+            resume=omp_session_id,
         )
     except Exception as exc:  # noqa: BLE001 — any resume failure lands the session `failed`
         reason = f"resume failed: {exc}"
@@ -92,6 +108,32 @@ async def _resume_session(
     return True
 
 
+async def recover_task(
+    engine: Engine,
+    events: EventHub,
+    config: Config,
+    supervisor: AgentSupervisor,
+    tracker: SessionTracker,
+    runner: WorkflowRunner,
+    task: Task,
+) -> None:
+    """Recover one task on its own, unbounded by the startup fan-out.
+
+    This is what the operator's explicit Continue calls after confirming a
+    legacy task's configuration, so a resumed-after-confirmation task follows
+    exactly the same path as a resumed-after-restart one."""
+    await _recover_one(
+        engine,
+        events,
+        config,
+        supervisor,
+        tracker,
+        runner,
+        asyncio.Semaphore(1),
+        task,
+    )
+
+
 async def _recover_one(
     engine: Engine,
     events: EventHub,
@@ -102,13 +144,27 @@ async def _recover_one(
     semaphore: asyncio.Semaphore,
     task: Task,
 ) -> None:
+    if task.execution_inputs is None:
+        # A task from before pinned inputs (ADR-0026). Resuming would need a
+        # model policy nobody recorded, and today's project/profile settings
+        # are not evidence of what it ran under. Leave it exactly as it is:
+        # the run keeps its position, its sessions and workspace are
+        # untouched, and task detail offers the operator a confirmation.
+        logger.info(
+            "task %d has no confirmed launch configuration; skipping recovery",
+            task.id,
+        )
+        return
+    inputs = task.execution_inputs
+    policy = ModelPolicy.from_roles(inputs.roles)
+
     # 1. Resume every recorded session (bounded concurrency across tasks).
     sessions = list_resumable_sessions(engine, task.id)
 
     async def bound(name: str, omp_session_id: str) -> bool:
         async with semaphore:
             return await _resume_session(
-                engine, events, supervisor, tracker, task, name, omp_session_id
+                engine, events, supervisor, tracker, task, name, omp_session_id, policy
             )
 
     results = await asyncio.gather(
@@ -122,25 +178,13 @@ async def _recover_one(
         # fails the task.
         if not all_resumed and sessions:
             failed_task = mark_failed(engine, task.id, "session resume failed")
-            events.publish("task_updated", asdict(failed_task))
+            events.publish("task_updated", task_payload(failed_task))
         return
 
     # 2. Re-drive the interrupted run from persisted state (design D-6). A
     # session that failed to resume is lazily re-spawned fresh by the engine
     # on first use (its old context is lost; the run's step records persist).
-    if task.template_name is None:
-        logger.warning(
-            "task %d has a %s workflow run but no template; cannot re-drive",
-            task.id,
-            task.workflow_status,
-        )
-        return
-    try:
-        template = get_template(engine, task.template_name)
-    except TemplateNotFoundError as exc:
-        logger.warning("recovery cannot re-drive task %d: %s", task.id, exc)
-        return
-    runner.recover_run(task, template, model=template.model, thinking=template.thinking)
+    runner.recover_run(task)
 
 
 async def run_recovery(

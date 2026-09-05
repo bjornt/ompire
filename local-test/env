@@ -76,6 +76,9 @@ DAEMON_URL=http://127.0.0.1:$DAEMON_PORT
 SLUG=local-test/sandbox
 NAME=sandbox
 BASE_BRANCH=main
+# The harness's own model profile. Its bindings name the offline fake omp, so
+# nothing here can reach a provider (ADR-0026).
+PROFILE=sandbox
 SSH_URL=git@github.com:$SLUG.git
 CHECKOUT=$HOME_DIR/proj/$NAME
 
@@ -337,13 +340,35 @@ EOF
 	[ "$ready" -eq 1 ] || die "daemon did not become ready — see $DAEMON_LOG"
 	DAEMON_TOKEN=$(cat "$DATA/token")
 
-	# ---- 8. register project + template --------------------------------------
+	# ---- 8. register a model profile + project -------------------------------
 	local payload
+	# A launch needs a complete model profile (ADR-0026). This one is harness
+	# data pointing at the offline fake omp — it exists so the harness can
+	# launch at all, and is never a production fallback: the daemon has no
+	# default profile of its own and refuses a launch without one.
+	payload=$(jq -n --arg n "$PROFILE" \
+		'{name: $n, roles: {
+		    default: {model: "local/fake-omp", thinking: "medium"},
+		    smol:    {model: "local/fake-omp-smol", thinking: "low"},
+		    slow:    {model: "local/fake-omp-slow", thinking: "high"},
+		    plan:    {model: "local/fake-omp-plan", thinking: "xhigh"}}}')
+	if ! api_daemon POST /api/model-profiles "$payload" >/dev/null 2>&1; then
+		local existing_profile
+		existing_profile=$(api_daemon GET "/api/model-profiles/$PROFILE" 2>/dev/null || true)
+		[ -n "$existing_profile" ] ||
+			die "could not create or read the '$PROFILE' model profile"
+		log "profile: '$PROFILE' already registered"
+	else
+		log "profile: registered '$PROFILE' (offline fake models)"
+	fi
 	# Explicit adopt mode: registration validates the checkout it is given
-	# (ADR-0022), and the harness just created a real one.
+	# (ADR-0022), and the harness just created a real one. The project's own
+	# workspace defaults and default profile are what a launch inherits.
 	payload=$(jq -n --arg n "$NAME" --arg t "$SLUG" --arg u "$SSH_URL" --arg c "$CHECKOUT" \
+		--arg b "$BASE_BRANCH" --arg p "$PROFILE" \
 		'{name: $n, title: $t, upstream_url: $u, checkout_path: $c,
-		  checkout_mode: "adopt", fetch_remote: "origin"}')
+		  checkout_mode: "adopt", fetch_remote: "origin",
+		  base_branch: $b, default_model_profile: $p}')
 	if ! api_daemon POST /api/projects "$payload" >/dev/null 2>&1; then
 		local existing got
 		existing=$(api_daemon GET "/api/projects/$NAME" 2>/dev/null || true)
@@ -354,18 +379,7 @@ EOF
 	else
 		log "project: registered '$NAME' ($SSH_URL)"
 	fi
-	payload=$(jq -n --arg n "$NAME" --arg b "$BASE_BRANCH" \
-		'{name: $n, project_name: $n, base_branch: $b}')
-	if ! api_daemon POST /api/templates "$payload" >/dev/null 2>&1; then
-		local existing_tpl got_tpl
-		existing_tpl=$(api_daemon GET "/api/templates/$NAME" 2>/dev/null || true)
-		got_tpl=$(jq -r '.project_name // empty' <<<"$existing_tpl" 2>/dev/null)
-		[ "$got_tpl" = "$NAME" ] ||
-			die "template '$NAME' already exists for a different project ($got_tpl)"
-		log "template: '$NAME' already registered"
-	else
-		log "template: registered '$NAME' (base $BASE_BRANCH)"
-	fi
+
 
 	# ---- 9. smoke -------------------------------------------------------------
 	local rc=0

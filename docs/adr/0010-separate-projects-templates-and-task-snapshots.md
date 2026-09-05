@@ -1,7 +1,16 @@
 # ADR 0010: Separate projects, templates, and task snapshots
 
-- Status: Proposed
+- Status: Superseded by ADR-0026
 - Date: 2026-08-22
+
+> Superseded by
+> [ADR-0026](0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md).
+> Templates are retired: a launch selects a workflow, a project, and a model
+> profile directly, and the reusable workspace defaults this record assigned
+> to templates belong to the project. The task-snapshot invariant below is
+> not withdrawn — ADR-0026 implements it, which is what this record was
+> waiting for to move past `Proposed`. Everything from here on is retained as
+> the original reasoning, including its description of templates.
 
 ## Context
 

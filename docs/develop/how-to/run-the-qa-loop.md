@@ -127,8 +127,14 @@ It verifies the identity directory, adds `.qa-agent/` to `.gitignore`, installs
 `gh`, the Node/pnpm/uv toolchain, and the Workshop/LXD stack, provisions a
 headless browser, builds the frontend, writes `~/.config/ompire/config.toml`
 with the bot's signing key, clones the sandbox repository to `~/proj/<name>`,
-registers it as a project with a matching template, starts the daemon, and runs
-smoke checks. `--check` additionally runs both test suites.
+registers it as a project, starts the daemon, and runs smoke checks. `--check`
+additionally runs both test suites.
+
+A launch needs a complete model profile, and the QA loop runs the real stack
+against real providers, so the script will not invent one. Either create a
+profile first and pass its name as `OMPIRE_QA_MODEL_PROFILE`, or set
+`OMPIRE_QA_MODEL` to a provider-qualified model id and let the script bind all
+four roles to it. Nothing is inherited from your own `omp` configuration.
 
 It is idempotent — re-run it freely. Useful options: `--repo <owner>/<sandbox>`
 when the PAT can see more than one repository, `--skip-workshop` and
@@ -229,7 +235,7 @@ an action that ran is not evidence that it worked.
 | # | Step | Proof |
 |---|---|---|
 | 1 | The sandbox project is registered | It appears in Projects with its checkout path and upstream |
-| 2 | Spawn a task from the sandbox template | The task reaches its own Workshop container and the transcript streams |
+| 2 | Spawn a task: pick a workflow, the sandbox project, and a profile | The preview lists every step with its model; the task reaches its own Workshop container and the transcript streams |
 | 3 | Answer the agent, if it asks | The session leaves `needs you` and resumes working |
 | 4 | Approve the gate, if the workflow has one | The workflow advances past the gate. `single-step` has no gate; the bugfix workflow does |
 | 5 | Start Review | llmvet opens; the review URL is reachable from the task detail page |

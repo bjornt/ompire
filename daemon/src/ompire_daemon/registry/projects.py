@@ -1,4 +1,10 @@
-"""Project registry: CRUD against the `projects` table. No ORM — Core queries only."""
+"""Project registry: CRUD against the `projects` table. No ORM — Core queries only.
+
+Since the template retirement (ADR-0026) a project also owns the workspace and
+prompt *defaults* a launch inherits: base branch, branch pattern, Workshop
+additions source, and standing preamble. They are defaults, not policy — a
+task pins its own effective values at acceptance and stops reading these.
+"""
 
 from __future__ import annotations
 
@@ -9,13 +15,60 @@ from pathlib import Path
 
 from sqlalchemy import Engine
 
-from ompire_daemon.db import projects, tasks, templates
+from ompire_daemon.db import projects, tasks
 from ompire_daemon.registry.model_profiles import (
     require_profile_exists,
     reserved_write,
 )
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+# Everything but the <slug> placeholder must be safe in a git ref name.
+_BRANCH_PATTERN_SAFE_RE = re.compile(r"^[A-Za-z0-9._/-]*$")
+
+# Which Workshop additions file a task's clone gets. The choice is exclusive:
+# `project` uses the repository's own additions, `global` uses the operator's,
+# and neither silently falls back to the other (ADR-0026).
+WORKSHOP_ADDITIONS_SOURCES = ("project", "global")
+
+DEFAULT_BASE_BRANCH = "main"
+DEFAULT_WORKSHOP_ADDITIONS = "project"
+# Only a dataclass field default. Real project registration seeds the branch
+# pattern from the daemon's `default_branch_pattern` setting; nothing reads
+# this constant to run a task.
+DEFAULT_BRANCH_PATTERN_PLACEHOLDER = "ompire/<slug>"
+
+LAUNCH_CONFIG_STATES = ("reconciled", "needs-reconciliation")
+
+
+class InvalidBranchPatternError(ValueError):
+    def __init__(self, pattern: str) -> None:
+        super().__init__(
+            f"invalid branch pattern {pattern!r}: must contain exactly one <slug> "
+            "placeholder and otherwise only git-ref-safe characters (A-Za-z0-9._/-)"
+        )
+        self.pattern = pattern
+
+
+class InvalidWorkshopAdditionsError(ValueError):
+    def __init__(self, workshop_additions: str) -> None:
+        super().__init__(
+            f"invalid workshop additions source {workshop_additions!r}: "
+            f"must be one of {', '.join(WORKSHOP_ADDITIONS_SOURCES)}"
+        )
+        self.workshop_additions = workshop_additions
+
+
+def validate_branch_pattern(pattern: str) -> None:
+    if pattern.count("<slug>") != 1:
+        raise InvalidBranchPatternError(pattern)
+    if not _BRANCH_PATTERN_SAFE_RE.match(pattern.replace("<slug>", "")):
+        raise InvalidBranchPatternError(pattern)
+
+
+def validate_workshop_additions(workshop_additions: str) -> None:
+    if workshop_additions not in WORKSHOP_ADDITIONS_SOURCES:
+        raise InvalidWorkshopAdditionsError(workshop_additions)
 
 
 class InvalidSlugError(ValueError):
@@ -37,27 +90,16 @@ class ProjectNotFoundError(Exception):
 
 
 class ProjectHasReferencingTasksError(Exception):
-    """409 detail for delete/rename guards: names referencing task rows
-    (any state) and referencing templates (SPEC Decision 6 — no cascade)."""
+    """409 detail for delete/rename guards: task rows in any state still name
+    this project. No cascade — purging the archived tasks is what unblocks it.
+    Templates are gone (ADR-0026); task history is the only remaining guard."""
 
-    def __init__(
-        self,
-        name: str,
-        task_labels: list[str] | None = None,
-        template_names: list[str] | None = None,
-    ) -> None:
+    def __init__(self, name: str, task_labels: list[str] | None = None) -> None:
         task_labels = task_labels or []
-        template_names = template_names or []
-        parts: list[str] = []
-        if task_labels:
-            parts.append(f"tasks: {', '.join(task_labels)}")
-        if template_names:
-            parts.append(f"templates: {', '.join(template_names)}")
-        detail = f" ({'; '.join(parts)})" if parts else ""
-        super().__init__(f"project {name!r} has tasks or templates referencing it{detail}")
+        detail = f" ({', '.join(task_labels)})" if task_labels else ""
+        super().__init__(f"project {name!r} has tasks referencing it{detail}")
         self.name = name
         self.task_labels = task_labels
-        self.template_names = template_names
 
 
 CHECKOUT_MODES = ("adopted", "cloned")
@@ -87,7 +129,7 @@ class ProjectSetupBusyError(Exception):
 
 
 class ProjectNotReadyError(Exception):
-    """409 detail for spawn/template guards: the checkout is not usable yet."""
+    """409 detail for the spawn guard: the checkout is not usable yet."""
 
     def __init__(self, name: str, setup_state: str) -> None:
         super().__init__(
@@ -112,9 +154,21 @@ class Project:
     setup_state: str = "ready"
     setup_error: str | None = None
     # The global model profile this project selects as its default, or None
-    # (ADR-0025). A reference to policy, not a copy of it — and, in this
-    # change, not yet consumed by task execution.
+    # (ADR-0025). A reference to policy, not a copy of it: a launch inherits
+    # it unless the operator selects a task profile, and what the task then
+    # runs is the snapshot pinned at acceptance, not this pointer.
     default_model_profile: str | None = None
+    # Workspace and prompt defaults for a launch (ADR-0026). A task inherits
+    # each independently and may override each independently.
+    base_branch: str = DEFAULT_BASE_BRANCH
+    branch_pattern: str = DEFAULT_BRANCH_PATTERN_PLACEHOLDER
+    workshop_additions: str = DEFAULT_WORKSHOP_ADDITIONS
+    preamble: str = ""
+    # `reconciled` or `needs-reconciliation` (ADR-0026): whether the operator
+    # still owes a decision about launch configuration carried over from
+    # templates. Independent of `setup_state` — a ready checkout can still be
+    # unlaunchable, and a cloning one can have perfectly clear defaults.
+    launch_config_state: str = "reconciled"
 
 
 def validate_slug(name: str) -> None:
@@ -134,6 +188,11 @@ def _row_to_project(row) -> Project:
         setup_state=row.setup_state,
         setup_error=row.setup_error,
         default_model_profile=row.default_model_profile,
+        base_branch=row.base_branch,
+        branch_pattern=row.branch_pattern,
+        workshop_additions=row.workshop_additions,
+        preamble=row.preamble,
+        launch_config_state=row.launch_config_state,
     )
 
 
@@ -164,8 +223,20 @@ def create_project(
     fetch_remote: str = DEFAULT_FETCH_REMOTE,
     setup_state: str = "ready",
     default_model_profile: str | None = None,
+    base_branch: str = DEFAULT_BASE_BRANCH,
+    branch_pattern: str = DEFAULT_BRANCH_PATTERN_PLACEHOLDER,
+    workshop_additions: str = DEFAULT_WORKSHOP_ADDITIONS,
+    preamble: str = "",
 ) -> Project:
+    """Register a project with its launch defaults.
+
+    `branch_pattern`'s default here is only a last resort for direct registry
+    callers; real registration passes the daemon's `default_branch_pattern`
+    setting, which is a seed at this moment and never re-read afterwards.
+    """
     validate_slug(name)
+    validate_branch_pattern(branch_pattern)
+    validate_workshop_additions(workshop_additions)
     resolved_checkout_path = checkout_path or str(default_checkout_root / name)
     # The duplicate check, the profile reference check, and the insert share
     # one write reservation, so a profile cannot be deleted between being
@@ -192,6 +263,11 @@ def create_project(
                 setup_state=setup_state,
                 setup_error=None,
                 default_model_profile=default_model_profile,
+                base_branch=base_branch,
+                branch_pattern=branch_pattern,
+                workshop_additions=workshop_additions,
+                preamble=preamble,
+                launch_config_state="reconciled",
             )
         )
         # Read the committed row back inside the reservation: the caller's
@@ -212,6 +288,10 @@ def update_project(
     fetch_remote: str = DEFAULT_FETCH_REMOTE,
     new_name: str | None = None,
     default_model_profile: str | None | _Unsupplied = UNSUPPLIED,
+    base_branch: str | _Unsupplied = UNSUPPLIED,
+    branch_pattern: str | _Unsupplied = UNSUPPLIED,
+    workshop_additions: str | _Unsupplied = UNSUPPLIED,
+    preamble: str | _Unsupplied = UNSUPPLIED,
 ) -> Project:
     """Update a project's editable fields.
 
@@ -219,7 +299,14 @@ def update_project(
     reference, `None` clears it, and a name selects that profile. The stored
     value is read inside the write reservation rather than from any earlier
     read, so an omission preserves what is actually committed.
+
+    The workspace defaults follow the same omission rule but are never null:
+    an empty `preamble` string is a value ("no preamble"), not a clear.
     """
+    if not isinstance(branch_pattern, _Unsupplied):
+        validate_branch_pattern(branch_pattern)
+    if not isinstance(workshop_additions, _Unsupplied):
+        validate_workshop_additions(workshop_additions)
     rename = new_name is not None and new_name != name
     if rename:
         assert new_name is not None  # rename implies it differs from name
@@ -255,6 +342,24 @@ def update_project(
             if default_model_profile is not None:
                 require_profile_exists(conn, default_model_profile)
             values["default_model_profile"] = default_model_profile
+        values["base_branch"] = (
+            current.base_branch
+            if isinstance(base_branch, _Unsupplied)
+            else base_branch
+        )
+        values["branch_pattern"] = (
+            current.branch_pattern
+            if isinstance(branch_pattern, _Unsupplied)
+            else branch_pattern
+        )
+        values["workshop_additions"] = (
+            current.workshop_additions
+            if isinstance(workshop_additions, _Unsupplied)
+            else workshop_additions
+        )
+        values["preamble"] = (
+            current.preamble if isinstance(preamble, _Unsupplied) else preamble
+        )
         conn.execute(projects.update().where(projects.c.name == name).values(**values))
         row = conn.execute(
             projects.select().where(
@@ -277,24 +382,10 @@ def _referencing_task_labels(engine: Engine, name: str) -> list[str]:
     return [f"{name}/{row.slug} ({row.state})" for row in rows]
 
 
-def _referencing_template_names(engine: Engine, name: str) -> list[str]:
-    # Templates referencing this project block delete/rename too (SPEC
-    # Decision 6); deleting or repointing them unblocks. No cascade.
-    with engine.connect() as conn:
-        rows = conn.execute(
-            templates.select()
-            .with_only_columns(templates.c.name)
-            .where(templates.c.project_name == name)
-            .order_by(templates.c.name)
-        ).all()
-    return [row.name for row in rows]
-
-
 def _raise_if_referenced(engine: Engine, name: str) -> None:
     labels = _referencing_task_labels(engine, name)
-    template_names = _referencing_template_names(engine, name)
-    if labels or template_names:
-        raise ProjectHasReferencingTasksError(name, labels, template_names)
+    if labels:
+        raise ProjectHasReferencingTasksError(name, labels)
 
 
 def list_setup_pending(engine: Engine) -> list[Project]:
@@ -346,3 +437,30 @@ def delete_project(engine: Engine, name: str) -> None:
         result = conn.execute(projects.delete().where(projects.c.name == name))
         if result.rowcount == 0:
             raise ProjectNotFoundError(name)
+
+
+def set_launch_config_state(engine: Engine, name: str, state: str) -> Project:
+    """Mark whether this project's launch configuration still needs the
+    operator's decision (ADR-0026). Separate from `setup_state` on purpose."""
+    assert state in LAUNCH_CONFIG_STATES
+    with engine.begin() as conn:
+        result = conn.execute(
+            projects.update()
+            .where(projects.c.name == name)
+            .values(launch_config_state=state)
+        )
+        if result.rowcount == 0:
+            raise ProjectNotFoundError(name)
+    return get_project(engine, name)
+
+
+class ProjectLaunchConfigUnreconciledError(Exception):
+    """409 detail for the launch guard: the operator has not yet decided what
+    this project's carried-over template configuration should become."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"project {name!r} still needs launch-configuration reconciliation; "
+            "resolve it in the project editor before launching a task"
+        )
+        self.name = name

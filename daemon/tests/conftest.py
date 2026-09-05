@@ -6,19 +6,26 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+# Captured before any test can monkeypatch the module attribute, so a fake
+# argv builder always composes the *real* native flags.
+from ompire_daemon.agent import build_agent_argv as REAL_BUILD_AGENT_ARGV
 from ompire_daemon.app import create_app
 from ompire_daemon.config import Config
-from ompire_daemon.registry.templates import create_template
+from ompire_daemon.registry.model_profiles import create_model_profile
 
 FAKE_OMP = Path(__file__).parent / "fake_omp.py"
 
 # Answers the daemon's two in-container invocations so REST-spawned pipelines
 # run end-to-end against the fake omp: the ask-timeout preflight gets `0`,
 # the rpc-ui spawn execs fake_omp, anything else (info/remove) succeeds.
+# The whole argv is forwarded so fake omp parses the real native model flags
+# and reports them back through `get_state` — the daemon verifies the child's
+# active model before prompting, so a fake that ignored the flags would make
+# every spawn fail.
 FAKE_WORKSHOP_SCRIPT = f"""#!/bin/sh
 case "$*" in
   *"config get ask.timeout"*) echo 0 ;;
-  *"--mode rpc-ui"*) exec {sys.executable} -u {FAKE_OMP} happy ;;
+  *"--mode rpc-ui"*) exec {sys.executable} -u {FAKE_OMP} happy "$@" ;;
   *) exit 0 ;;
 esac
 """
@@ -167,12 +174,33 @@ def git_checkout(tmp_path: Path) -> Path:
     return checkout
 
 
+# The four-role map every test profile uses. Concrete, provider-qualified,
+# and structurally valid; no test ever reaches a provider with it.
+TEST_ROLES = {
+    "default": {"model": "testing/main-model", "thinking": "medium"},
+    "smol": {"model": "testing/smol-model", "thinking": "low"},
+    "slow": {"model": "testing/slow-model", "thinking": "high"},
+    "plan": {"model": "testing/plan-model", "thinking": "xhigh"},
+}
+
+
 @pytest.fixture
-def demo_template(
-    client: TestClient, auth_headers: dict[str, str], git_checkout: Path
+def demo_profile(client: TestClient) -> dict:
+    """A complete global model profile named `demo` (ADR-0025)."""
+    return asdict(
+        create_model_profile(client.app.state.engine, name="demo", roles=TEST_ROLES)
+    )
+
+
+@pytest.fixture
+def demo_project(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    git_checkout: Path,
+    demo_profile: dict,
 ) -> dict:
-    """Project `demo` on the git checkout plus a same-named template — the
-    minimum a REST spawn needs (mirrors git_checkout's fixture style)."""
+    """Project `demo` on the git checkout, defaulting to the `demo` profile —
+    the minimum a launch needs now that templates are gone (ADR-0026)."""
     response = client.post(
         "/api/projects",
         headers=auth_headers,
@@ -181,13 +209,133 @@ def demo_template(
             "title": "Demo",
             "upstream_url": "https://example.com/demo.git",
             "checkout_path": str(git_checkout),
+            "default_model_profile": "demo",
         },
     )
     assert response.status_code == 201
-    template = create_template(
-        client.app.state.engine,
-        name="demo",
-        project_name="demo",
-        branch_pattern="ompire/<slug>",
+    return response.json()
+
+
+def launch_body(
+    slug: str = "fix-bug",
+    prompt: str = "do the thing",
+    *,
+    project_name: str = "demo",
+    workflow_name: str = "single-step",
+    **extra,
+) -> dict:
+    body = {
+        "project_name": project_name,
+        "workflow_name": workflow_name,
+        "slug": slug,
+        "prompt": prompt,
+    }
+    body.update(extra)
+    return body
+
+
+def spawn_task(
+    client: TestClient, auth_headers: dict[str, str], **kwargs
+) -> "object":
+    """Preview then accept, the way the UI does. Returns the POST response so
+    a test can assert on status and body."""
+    body = launch_body(**kwargs)
+    preview = client.post("/api/tasks/preview", headers=auth_headers, json=body)
+    assert preview.status_code == 200, preview.text
+    return client.post(
+        "/api/tasks",
+        headers=auth_headers,
+        json={**body, "preview_token": preview.json()["preview_token"]},
     )
-    return asdict(template)
+
+
+def make_execution_inputs(
+    *,
+    checkout_path: str,
+    project_name: str = "demo",
+    workflow_name: str = "single-step",
+    model_profile: str | None = "demo",
+    roles: dict | None = None,
+    base_branch: str = "main",
+    branch_pattern: str = "ompire/<slug>",
+    workshop_additions: str = "project",
+    preamble: str = "",
+    branch: str = "ompire/fix-bug",
+    fetch_remote: str = "origin",
+    upstream_url: str = "https://example.com/demo.git",
+    fork_url: str | None = None,
+):
+    """A complete accepted-input document for tests that build a task row
+    directly instead of going through preview/accept."""
+    from ompire_daemon.execution_inputs import (
+        PROFILE_SOURCE_PROJECT,
+        PROVENANCE_ACCEPTED,
+        TaskExecutionInputs,
+        WorkspaceInputs,
+    )
+    from ompire_daemon.model_config import JUDGE_ROLE
+    from ompire_daemon.registry.model_profiles import RoleBinding
+    from ompire_daemon.workflows import agent_step_roles, get_workflow
+
+    source = roles or TEST_ROLES
+    return TaskExecutionInputs(
+        provenance=PROVENANCE_ACCEPTED,
+        accepted_at="2026-09-05T00:00:00+00:00",
+        project_name=project_name,
+        workflow_name=workflow_name,
+        model_profile_name=model_profile,
+        model_profile_source=PROFILE_SOURCE_PROJECT,
+        roles={
+            role: RoleBinding(model=binding["model"], thinking=binding["thinking"])
+            for role, binding in source.items()
+        },
+        step_roles=agent_step_roles(get_workflow(workflow_name)),
+        judge_role=JUDGE_ROLE,
+        workspace=WorkspaceInputs(
+            base_branch=base_branch,
+            branch_pattern=branch_pattern,
+            workshop_additions=workshop_additions,
+            preamble=preamble,
+        ),
+        workspace_overrides=(),
+        branch=branch,
+        checkout_path=checkout_path,
+        fetch_remote=fetch_remote,
+        upstream_url=upstream_url,
+        fork_url=fork_url,
+    )
+
+
+def make_test_policy(**overrides):
+    """The native model policy tests start agents with. Explicit everywhere:
+    a supervisor start has no "no policy" case any more (ADR-0026)."""
+    from ompire_daemon.execution_inputs import ModelPolicy
+    from ompire_daemon.registry.model_profiles import RoleBinding
+
+    roles = {**TEST_ROLES, **overrides}
+    return ModelPolicy.from_roles(
+        {
+            role: RoleBinding(model=binding["model"], thinking=binding["thinking"])
+            for role, binding in roles.items()
+        }
+    )
+
+
+
+def fake_argv_builder(scenario: dict | str = "happy"):
+    """A `build_agent_argv` replacement that runs fake omp *with the real
+    native model flags*.
+
+    The supervisor reads the child's active model back and refuses to prompt
+    unless it matches the accepted policy (ADR-0026), so a fake argv that
+    dropped the flags would fail every session start for reasons that have
+    nothing to do with what the test is about.
+    """
+    from tests.test_rpc import fake_omp_argv
+
+    def build(clone, *, policy, resume=None):
+        name = scenario["name"] if isinstance(scenario, dict) else scenario
+        real = REAL_BUILD_AGENT_ARGV(clone, policy=policy, resume=resume)
+        return fake_omp_argv(name, *real[real.index("--no-title") + 1 :])
+
+    return build

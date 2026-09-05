@@ -52,10 +52,14 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0012"
+    assert version == "0013"
     assert "projects" in tables
     assert "tasks" in tables
-    assert "templates" in tables
+    # Templates are retired (ADR-0026): the live table is gone and only inert
+    # upgrade evidence remains.
+    assert "templates" not in tables
+    assert "launch_migration_evidence" in tables
+    assert "launch_reconciliations" in tables
     assert "task_sessions" in tables
     assert "workflow_step_records" in tables
     assert "settings" in tables
@@ -63,16 +67,22 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
     assert "reviews" in tables
     assert "review_iterations" in tables
     assert "pr_url" in task_columns
-    assert "template_name" in task_columns
+    assert "template_name" not in task_columns
+    # The launch decision a task was accepted under (ADR-0026).
+    assert "execution_inputs_json" in task_columns
     # Workflow run state lives on the task row (workflow-engine capability).
     assert "workflow_name" in task_columns
     assert "workflow_status" in task_columns
     assert "workflow_step" in task_columns
     # Session identity moved to task_sessions (per-session rows).
     assert "session_id" not in task_columns
-    # The per-project spawn defaults moved to templates (SPEC Decision 6).
-    assert "base_branch" not in project_columns
-    assert "branch_pattern" not in project_columns
+    # Workspace and prompt defaults live on the project again (ADR-0026) —
+    # as defaults a launch inherits, not as a saved launch preset.
+    assert "base_branch" in project_columns
+    assert "branch_pattern" in project_columns
+    assert "workshop_additions" in project_columns
+    assert "preamble" in project_columns
+    assert "launch_config_state" in project_columns
     # Checkout onboarding facts (ADR-0022).
     assert "checkout_mode" in project_columns
     assert "fetch_remote" in project_columns
@@ -144,7 +154,7 @@ def test_0012_preserves_data_and_backfills_no_default(tmp_path: Path) -> None:
             )
         )
 
-    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    command.upgrade(_alembic_cfg(db_path), "0012")
 
     with engine.connect() as conn:
         assert conn.execute(text("SELECT COUNT(*) FROM tasks")).scalar_one() == 4
@@ -188,7 +198,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0012"
+    assert version == "0013"
     assert row == "demo"
 
 
@@ -235,16 +245,21 @@ def _seed_0006_rows(db_path: Path) -> None:
 
 
 def test_0007_seeds_templates_and_drops_project_columns(tmp_path: Path) -> None:
+    """Historical behavior of 0007, checked at 0007. Templates are retired at
+    0013, but the revision that created them is unchanged and still has to
+    work on the way through."""
+    from alembic import command
+
     db_path = tmp_path / "ompire.db"
     _land_at_0006(db_path)
     _seed_0006_rows(db_path)
 
-    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    command.upgrade(_alembic_cfg(db_path), "0007")
 
     engine = make_engine(db_path)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "0012"
+        assert version == "0007"
 
         templates = conn.execute(
             text(
@@ -312,15 +327,17 @@ def test_0008_backfills_sessions_and_legacy_workflow_runs(tmp_path: Path) -> Non
     """Design D-5: live tasks' session ids become session `main` rows; legacy
     live (spawn-completed, created) tasks become `single-step`/`complete` with
     one ok `work` record so the engine never re-drives them."""
+    from alembic import command
+
     db_path = tmp_path / "ompire.db"
     _land_at_0007_with_tasks(db_path)
 
-    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    command.upgrade(_alembic_cfg(db_path), "0008")
 
     engine = make_engine(db_path)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "0012"
+        assert version == "0008"
 
         sessions = conn.execute(
             text("SELECT task_id, name, omp_session_id FROM task_sessions ORDER BY task_id")
@@ -397,12 +414,12 @@ def test_0008_downgrade_restores_session_id(tmp_path: Path) -> None:
 
 
 def test_0007_downgrade_restores_project_columns(tmp_path: Path) -> None:
+    from alembic import command
+
     db_path = tmp_path / "ompire.db"
     _land_at_0006(db_path)
     _seed_0006_rows(db_path)
-    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
-
-    from alembic import command
+    command.upgrade(_alembic_cfg(db_path), "0007")
 
     command.downgrade(_alembic_cfg(db_path), "0006")
 
@@ -421,9 +438,9 @@ def test_0007_downgrade_restores_project_columns(tmp_path: Path) -> None:
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         assert "template_name" not in task_columns
 
-    # And back to head again: the seed re-derives templates from the restored
+    # And back to 0007 again: the seed re-derives templates from the restored
     # defaults.
-    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    command.upgrade(_alembic_cfg(db_path), "0007")
     with engine.connect() as conn:
         templates = conn.execute(
             text("SELECT name, base_branch, branch_pattern FROM templates")
@@ -669,3 +686,311 @@ def test_0010_review_tables_roundtrip(tmp_path: Path) -> None:
     with engine.connect() as conn:
         assert conn.execute(text("SELECT COUNT(*) FROM tasks")).scalar_one() == 4
         assert conn.execute(text("SELECT COUNT(*) FROM reviews")).scalar_one() == 0
+
+
+# --- 0013: template retirement (ADR-0026) ------------------------------------
+
+
+def _land_at_0012(db_path: Path) -> None:
+    from alembic import command
+
+    command.upgrade(_alembic_cfg(db_path), "0012")
+
+
+def _insert_project(conn, name: str, **overrides) -> None:
+    values = {
+        "name": name,
+        "title": name.title(),
+        "upstream_url": f"https://example.com/{name}.git",
+        "checkout_path": f"/tmp/{name}",
+    }
+    values.update(overrides)
+    columns = ", ".join(values)
+    binds = ", ".join(f":{key}" for key in values)
+    conn.execute(text(f"INSERT INTO projects ({columns}) VALUES ({binds})"), values)
+
+
+def _insert_template(conn, name: str, project: str, **overrides) -> None:
+    values = {
+        "name": name,
+        "project_name": project,
+        "base_branch": "main",
+        "branch_pattern": "ompire/<slug>",
+        "workflow": "single-step",
+        "workshop_additions": "project",
+        "model": None,
+        "thinking": None,
+        "preamble": "",
+        "created_at": "2026-08-01T00:00:00+00:00",
+        "updated_at": "2026-08-01T00:00:00+00:00",
+    }
+    values.update(overrides)
+    columns = ", ".join(values)
+    binds = ", ".join(f":{key}" for key in values)
+    conn.execute(text(f"INSERT INTO templates ({columns}) VALUES ({binds})"), values)
+
+
+def _insert_task(conn, project: str, slug: str, template: str | None, state: str = "created") -> None:
+    conn.execute(
+        text(
+            "INSERT INTO tasks (project_name, template_name, slug, branch, clone_path, "
+            "state, prompt, workflow_name, created_at, updated_at) VALUES "
+            "(:project, :template, :slug, :branch, :clone, :state, 'p', 'single-step', "
+            "'2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00')"
+        ),
+        {
+            "project": project,
+            "template": template,
+            "slug": slug,
+            "branch": f"ompire/{slug}",
+            "clone": f"/tmp/tasks/{project}/{slug}",
+            "state": state,
+        },
+    )
+
+
+def _evidence(conn, kind: str) -> list:
+    import json as _json
+
+    rows = conn.execute(
+        text(
+            "SELECT scope_kind, scope, source, payload_json FROM "
+            "launch_migration_evidence WHERE kind = :kind ORDER BY id"
+        ),
+        {"kind": kind},
+    ).all()
+    return [(r.scope_kind, r.scope, r.source, _json.loads(r.payload_json)) for r in rows]
+
+
+def test_0013_one_template_moves_its_defaults_onto_the_project(tmp_path: Path) -> None:
+    """The unambiguous case: one template, so every field it held becomes the
+    project's default and nothing needs deciding."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0012(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "solo")
+        _insert_template(
+            conn,
+            "solo-tpl",
+            "solo",
+            base_branch="trunk",
+            branch_pattern="feat/<slug>",
+            workshop_additions="global",
+            preamble="house style",
+        )
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT base_branch, branch_pattern, workshop_additions, preamble, "
+                "launch_config_state FROM projects WHERE name = 'solo'"
+            )
+        ).one()
+    assert row.base_branch == "trunk"
+    assert row.branch_pattern == "feat/<slug>"
+    assert row.workshop_additions == "global"
+    assert row.preamble == "house style"
+    # No model was ever configured, so there is nothing to reconcile.
+    assert row.launch_config_state == "reconciled"
+
+
+def test_0013_conflicting_templates_leave_the_project_unreconciled(tmp_path: Path) -> None:
+    """Two templates disagreeing about a field is not resolved by picking the
+    first one: every distinct candidate is preserved and the project is
+    blocked until the operator chooses."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0012(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "multi")
+        _insert_template(conn, "a", "multi", base_branch="main", preamble="")
+        _insert_template(conn, "b", "multi", base_branch="release", preamble="be careful")
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT base_branch, branch_pattern, preamble, launch_config_state "
+                "FROM projects WHERE name = 'multi'"
+            )
+        ).one()
+        conflicts = _evidence(conn, "workspace-conflict")
+        templates = _evidence(conn, "template")
+    assert row.launch_config_state == "needs-reconciliation"
+    # The field they agree on is still copied across.
+    assert row.branch_pattern == "ompire/<slug>"
+    # The ones they disagree about keep their column defaults and are listed
+    # as candidates — including the empty preamble, which is a real value.
+    assert conflicts[0][3]["base_branch"] == ["main", "release"]
+    assert conflicts[0][3]["preamble"] == ["", "be careful"]
+    # Both template rows survive verbatim as inert evidence, with their source.
+    assert {source for _, _, source, _ in templates} == {"a", "b"}
+
+
+def test_0013_legacy_model_choices_become_candidates_never_a_profile(
+    tmp_path: Path,
+) -> None:
+    """One old concrete model/thinking pair cannot answer for four roles, and
+    an omp fuzzy name is not a provider-qualified identifier. It is recorded
+    as a candidate and the project is blocked until a real profile is chosen."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0012(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "modelled")
+        _insert_template(conn, "m", "modelled", model="sonnet", thinking="high")
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        state = conn.execute(
+            text("SELECT launch_config_state, default_model_profile FROM projects")
+        ).one()
+        profiles = conn.execute(text("SELECT COUNT(*) FROM model_profiles")).scalar_one()
+        candidates = _evidence(conn, "model-candidates")
+    assert state.launch_config_state == "needs-reconciliation"
+    assert state.default_model_profile is None
+    assert profiles == 0
+    assert candidates[0][3] == [{"source": "m", "model": "sonnet", "thinking": "high"}]
+
+
+def test_0013_a_null_model_is_not_a_model_choice(tmp_path: Path) -> None:
+    """A template that never set a model recorded no choice at all, so there
+    is nothing to reconcile — the operator picks a profile at launch."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0012(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "unset")
+        _insert_template(conn, "u", "unset", model=None, thinking=None)
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        state = conn.execute(
+            text("SELECT launch_config_state FROM projects WHERE name = 'unset'")
+        ).scalar_one()
+        assert _evidence(conn, "model-candidates") == []
+    assert state == "reconciled"
+
+
+def test_0013_an_already_assigned_profile_is_not_overwritten(tmp_path: Path) -> None:
+    db_path = tmp_path / "ompire.db"
+    _land_at_0012(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO model_profiles (name, roles_json, created_at, updated_at) "
+                "VALUES ('chosen', '{}', '2026-08-01', '2026-08-01')"
+            )
+        )
+        _insert_project(conn, "assigned", default_model_profile="chosen")
+        _insert_template(conn, "t", "assigned", model="sonnet")
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        assert (
+            conn.execute(
+                text("SELECT default_model_profile FROM projects WHERE name = 'assigned'")
+            ).scalar_one()
+            == "chosen"
+        )
+
+
+def test_0013_zero_template_projects_get_new_defaults_marked_as_new(
+    tmp_path: Path,
+) -> None:
+    """Nothing to recover, so ordinary defaults apply — recorded as *new*
+    values rather than restored history."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0012(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "bare")
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        state = conn.execute(
+            text("SELECT launch_config_state FROM projects WHERE name = 'bare'")
+        ).scalar_one()
+        new_defaults = _evidence(conn, "new-defaults")
+    assert state == "reconciled"
+    assert new_defaults[0][1] == "bare"
+
+
+def test_0013_tasks_keep_their_history_and_gain_no_invented_inputs(
+    tmp_path: Path,
+) -> None:
+    """A task created before pinned inputs has none; its template attribution
+    survives as evidence, and archived rows stay archived and readable."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0012(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "hist")
+        _insert_template(conn, "h", "hist", base_branch="trunk")
+        _insert_task(conn, "hist", "live", "h")
+        _insert_task(conn, "hist", "old", None, state="archived")
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        rows = {
+            row.slug: row
+            for row in conn.execute(
+                text("SELECT slug, state, branch, execution_inputs_json FROM tasks")
+            )
+        }
+        attribution = {scope: payload for _, scope, _, payload in _evidence(conn, "task-template")}
+    # Neither task was given the template's current contents as history.
+    assert rows["live"].execution_inputs_json is None
+    assert rows["old"].execution_inputs_json is None
+    assert rows["old"].state == "archived"
+    assert rows["live"].branch == "ompire/live"
+    # The attribution is preserved, including its absence for the older row.
+    assert sorted(
+        (v["template_name"] or "") for v in attribution.values()
+    ) == ["", "h"]
+
+
+def test_0013_is_reentrant_across_a_restart_during_reconciliation(
+    tmp_path: Path,
+) -> None:
+    """Re-running the whole upgrade path must not re-block a project the
+    operator has already reconciled, nor duplicate its evidence."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0012(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "twice")
+        _insert_template(conn, "a", "twice", base_branch="main")
+        _insert_template(conn, "b", "twice", base_branch="release")
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    with engine.begin() as conn:
+        # The operator decides.
+        conn.execute(
+            text(
+                "UPDATE projects SET base_branch = 'release', "
+                "launch_config_state = 'reconciled' WHERE name = 'twice'"
+            )
+        )
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT base_branch, launch_config_state FROM projects WHERE name = 'twice'"
+            )
+        ).one()
+        assert len(_evidence(conn, "template")) == 2
+    assert row.base_branch == "release"
+    assert row.launch_config_state == "reconciled"

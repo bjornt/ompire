@@ -25,22 +25,26 @@ All paths are under `daemon/src/ompire_daemon/`.
 | Module | Responsibility |
 |---|---|
 | `db.py` | Engine, schema definition, WAL configuration. Note it does *not* enable `PRAGMA foreign_keys` — see [Database schema](database-schema.md#reference-safety-without-global-fk-enforcement). |
-| `model_config.py` | The thinking-level vocabulary and validator shared by templates, spawn overrides, and profile bindings. Model identifiers are not validated here: templates accept omp's fuzzy names, and the stricter profile grammar lives with profile value validation. |
+| `model_config.py` | The vocabularies every model consumer agrees on: thinking levels, the four abstract roles, and the role the conditional judge binds. Model identifiers are not validated here — the provider-qualified grammar lives with profile value validation. |
+| `execution_inputs.py` | The typed launch decision pinned to a task, its JSON codec, and `ModelPolicy` — the complete native role map one omp process runs under. |
 | `migrate.py` | Runs Alembic migrations at startup. |
 | `registry/projects.py` | Projects, including the guarded default-model-profile reference |
-| `registry/templates.py` | Templates |
 | `registry/model_profiles.py` | Model profiles: the four-role contract, provider-qualified identifier grammar, reference-guarded deletion, and the `reserved_write` SQLite write reservation both reference checks share |
 | `registry/tasks.py` | Tasks and their publishing state |
 | `registry/sessions.py` | Session identity, `(task_id, name)` |
 | `registry/workflows.py` | Workflow runs and step records |
 | `registry/reviews.py` | Review status and ordered iteration history |
 | `registry/settings.py` | Layered settings: override, then TOML, then default |
+| `registry/launch.py` | Inert upgrade evidence and the operator decisions that close out a reconciliation. Nothing here is read to execute anything. |
 
 ## Task lifecycle
 
 | Module | Responsibility |
 |---|---|
-| `spawn.py` | The four-step spawn pipeline: fetch, clone, branch, workshop. |
+| `launch.py` | Launch resolution: one set of rules shared by preview, acceptance, and legacy confirmation. Pure with respect to the world outside the database, so it can run inside a write reservation. |
+| `launchconfig.py` | Startup initialization for the template retirement, plus the project and legacy-task reconciliation flows. |
+| `spawn.py` | The four-step spawn pipeline: fetch, clone, branch, workshop. Resolves nothing — every value comes off the task's accepted inputs. |
+| `workshopadditions.py` | The bounded staging that makes the accepted Workshop additions source the one the launcher actually applies, with restoration and crash recovery. |
 | `projectcheckout.py` | Read-only inspection of a base checkout, plus the URL and remote-name validators that guard `git clone` argv. Never writes to a checkout. |
 | `projectsetup.py` | `ProjectSetupManager`: the supervised clone-mode setup job, its step events, retry, and startup reconciliation of interrupted clones. |
 | `projectfiles.py` | Project file search, and the `@file` mention rule: validated at submit against the checkout, resolved again against the clone before delivery. |

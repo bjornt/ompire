@@ -20,6 +20,7 @@ from typing import Any
 from fastapi import FastAPI
 from sqlalchemy import Engine
 
+from ompire_daemon import launchconfig, workshopadditions
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.api.rest import router as api_router
@@ -127,8 +128,22 @@ async def _prepare_startup(
     sessions: SessionTracker,
     project_setup: ProjectSetupManager,
 ) -> list[Any]:
-    """Resolve interrupted project clones, close out interrupted reviews,
-    restore any clone parked mid-review, then classify startup tasks."""
+    """Finish the upgrade, resolve interrupted project clones and reviews,
+    restore any parked clone or Workshop staging, then classify startup tasks.
+
+    Order matters here. Launch-configuration initialization runs *first*: a
+    project or task the upgrade left blocked has to be blocked before the
+    classifier hands it to recovery, or the daemon would try to resume a run
+    whose model policy nobody has confirmed.
+    """
+    # Finish what migration 0013 could not: seed ordinary defaults for
+    # projects that never had a template, and record any retired `judge_model`
+    # as evidence to acknowledge (ADR-0026). Idempotent across restarts.
+    launchconfig.initialize(engine, config)
+    # A crash mid-launch can leave a clone carrying staged Workshop additions
+    # that are not the ones its repository owns. Undo that before any agent
+    # can start in it.
+    workshopadditions.recover_pending(config.data_dir)
     # A project left `cloning` by a stopped daemon is resolved from the
     # filesystem before any client can see the project list, so a card can
     # never sit pending forever (ADR-0022).
@@ -161,6 +176,24 @@ async def _prepare_startup(
         if restored_review or restored_ship:
             logger.info("restored task %d clone from parked ref", task.id)
     return await classify_startup_tasks(engine, events, sessions)
+
+
+async def _continue_task(app: FastAPI, task: Any) -> None:
+    """Resume one confirmed-but-interrupted task, using the same per-task
+    routine startup recovery uses (and therefore the same run guard, so a
+    Continue that races an already-running run is a no-op rather than a
+    second run)."""
+    from ompire_daemon.recovery import recover_task
+
+    await recover_task(
+        app.state.engine,
+        app.state.events,
+        app.state.config,
+        app.state.agents,
+        app.state.sessions,
+        app.state.workflow_runner,
+        task,
+    )
 
 
 def create_app(
@@ -237,6 +270,9 @@ def create_app(
         config, app.state.engine, app.state.events, app.state.gh
     )
     app.state.advisories.register(app.state.sessions)
+    # Bound to the app so the REST route does not have to reach into recovery
+    # internals; the guard on eligibility lives in the route.
+    app.state.continue_task = lambda task: _continue_task(app, task)
 
     # Before any snapshot is served: close out reviews interrupted by the
     # restart and restore any clone left parked by a mid-review crash (review

@@ -379,3 +379,7 @@
   font-size: 11.5px;
   color: var(--faint);
 }
+
+/* Launch-configuration reconciliation after the template retirement
+   (ADR-0026): legacy candidates the operator still has to decide between. */
+

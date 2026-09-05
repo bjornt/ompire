@@ -16,14 +16,11 @@ from ompire_daemon.registry.tasks import (
     create_task,
     get_task,
 )
+from tests.conftest import launch_body, make_execution_inputs, spawn_task
 
 
-def _spawn(client: TestClient, auth_headers: dict, slug: str = "fix-bug") -> dict:
-    response = client.post(
-        "/api/tasks",
-        headers=auth_headers,
-        json={"template_name": "demo", "slug": slug, "prompt": "fix it"},
-    )
+def _spawn(client: TestClient, auth_headers: dict, slug: str = "fix-bug", **kwargs) -> dict:
+    response = spawn_task(client, auth_headers, slug=slug, prompt="fix it", **kwargs)
     assert response.status_code == 202, response.text
     return response.json()
 
@@ -39,7 +36,7 @@ def _wait_settled(client: TestClient, auth_headers: dict, task_id: int, timeout:
 
 
 def test_spawn_creates_clone_and_branch(
-    client: TestClient, auth_headers: dict, demo_template: dict
+    client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
     task = _spawn(client, auth_headers)
     assert task["state"] == "created"
@@ -50,87 +47,308 @@ def test_spawn_creates_clone_and_branch(
     assert (Path(settled["clone_path"]) / ".git").is_dir()
 
 
-def test_invalid_slug_rejected(client: TestClient, auth_headers: dict, demo_template: dict) -> None:
+def test_invalid_slug_rejected(client: TestClient, auth_headers: dict, demo_project: dict) -> None:
     for bad in ["Fix-Bug", "../escape", "a/b", "dots.are.bad", "-leading", "x" * 65]:
         response = client.post(
-            "/api/tasks",
-            headers=auth_headers,
-            json={"template_name": "demo", "slug": bad, "prompt": "p"},
+            "/api/tasks/preview", headers=auth_headers, json=launch_body(slug=bad)
         )
         assert response.status_code == 422, bad
     assert client.get("/api/tasks", headers=auth_headers).json() == []
 
 
-def test_unknown_template_404(client: TestClient, auth_headers: dict) -> None:
-    response = client.post(
-        "/api/tasks",
-        headers=auth_headers,
-        json={"template_name": "nope", "slug": "s", "prompt": "p"},
+def test_unknown_project_refused_and_creates_nothing(
+    client: TestClient, auth_headers: dict
+) -> None:
+    body = launch_body(project_name="nope", slug="s", prompt="p")
+    preview = client.post("/api/tasks/preview", headers=auth_headers, json=body)
+    assert preview.status_code == 422
+    assert "project_name" in preview.json()["detail"]
+    created = client.post(
+        "/api/tasks", headers=auth_headers, json={**body, "preview_token": "whatever"}
     )
-    assert response.status_code == 404
-    # No task row is created for an unknown template.
+    assert created.status_code == 422
     assert client.get("/api/tasks", headers=auth_headers).json() == []
 
 
-def test_spawn_records_template_name_and_derives_branch(
-    client: TestClient, auth_headers: dict, demo_template: dict
+def test_unknown_workflow_refused(
+    client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
+    response = client.post(
+        "/api/tasks/preview",
+        headers=auth_headers,
+        json=launch_body(workflow_name="no-such-workflow"),
+    )
+    assert response.status_code == 422
+    assert "workflow_name" in response.json()["detail"]
+
+
+def test_accepted_task_pins_the_reviewed_inputs(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    """The task carries the decision, not a pointer to today's settings."""
     task = _spawn(client, auth_headers)
-    assert task["template_name"] == "demo"
     assert task["project_name"] == "demo"
     assert task["branch"] == "ompire/fix-bug"
+    assert task["needs_configuration"] is False
+    inputs = task["execution_inputs"]
+    assert inputs["model_profile_name"] == "demo"
+    assert inputs["model_profile_source"] == "project"
+    assert inputs["roles"]["default"] == {
+        "model": "testing/main-model",
+        "thinking": "medium",
+    }
+    assert inputs["roles"]["slow"]["model"] == "testing/slow-model"
+    assert inputs["judge_role"] == "slow"
+    assert inputs["step_roles"] == {"work": "default"}
+    assert inputs["workspace"]["base_branch"] == "main"
+    assert inputs["checkout_path"] == demo_project["checkout_path"]
     _wait_settled(client, auth_headers, task["id"])
 
 
-def test_invalid_thinking_override_rejected(
-    client: TestClient, auth_headers: dict, demo_template: dict
+@pytest.mark.parametrize(
+    "stale_field",
+    [
+        {"template_name": "demo"},
+        {"model": "fable-5"},
+        {"thinking": "high"},
+        {"step_overrides": {"work": "other"}},
+    ],
+)
+def test_retired_and_future_fields_are_refused_not_ignored(
+    client: TestClient, auth_headers: dict, demo_project: dict, stale_field: dict
 ) -> None:
+    """Silently dropping an unknown field would give a caller a launch it did
+    not ask for — the old template name and scalar model overrides most of
+    all (ADR-0026)."""
     response = client.post(
-        "/api/tasks",
-        headers=auth_headers,
-        json={"template_name": "demo", "slug": "s", "prompt": "p", "thinking": "galaxy"},
+        "/api/tasks/preview", headers=auth_headers, json={**launch_body(), **stale_field}
     )
     assert response.status_code == 422
+    assert "extra_forbidden" in response.text
     assert client.get("/api/tasks", headers=auth_headers).json() == []
 
 
-def test_overrides_accepted_but_not_persisted(
-    client: TestClient, auth_headers: dict, demo_template: dict
+def test_preview_and_acceptance_resolve_identically(
+    client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
+    body = launch_body()
+    preview = client.post("/api/tasks/preview", headers=auth_headers, json=body).json()
+    accepted = client.post(
+        "/api/tasks",
+        headers=auth_headers,
+        json={**body, "preview_token": preview["preview_token"]},
+    ).json()
+    inputs = accepted["execution_inputs"]
+    assert preview["roles"] == inputs["roles"]
+    assert preview["branch"] == inputs["branch"]
+    assert preview["workspace"] == inputs["workspace"]
+    # Every declared step is described, plus the conditional judge row.
+    assert [row["step"] for row in preview["steps"]] == ["work", "judge"]
+    assert preview["steps"][0]["model"] == "testing/main-model"
+    assert preview["steps"][-1]["kind"] == "judge"
+    assert preview["steps"][-1]["conditional"] is True
+    _wait_settled(client, auth_headers, accepted["id"])
+
+
+def test_stale_preview_refuses_creation_and_returns_the_new_resolution(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    """A configuration change between review and submission is not retried
+    under the new settings; the operator reviews again."""
+    body = launch_body()
+    preview = client.post("/api/tasks/preview", headers=auth_headers, json=body).json()
+
+    changed = client.put(
+        "/api/projects/demo",
+        headers=auth_headers,
+        json={
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+            "checkout_path": demo_project["checkout_path"],
+            "base_branch": "release",
+        },
+    )
+    assert changed.status_code == 200, changed.text
+
     response = client.post(
         "/api/tasks",
         headers=auth_headers,
+        json={**body, "preview_token": preview["preview_token"]},
+    )
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["reason"] == "preview_changed"
+    assert detail["preview"]["workspace"]["base_branch"] == "release"
+    # Nothing was created under either resolution.
+    assert client.get("/api/tasks", headers=auth_headers).json() == []
+
+
+def test_a_project_without_a_default_profile_needs_a_task_profile(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    cleared = client.put(
+        "/api/projects/demo",
+        headers=auth_headers,
         json={
-            "template_name": "demo",
-            "slug": "fix-bug",
-            "prompt": "fix it",
-            "model": "fable-5",
-            "thinking": "high",
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+            "checkout_path": demo_project["checkout_path"],
+            "default_model_profile": None,
         },
     )
-    assert response.status_code == 202, response.text
-    body = response.json()
-    assert "model" not in body
-    assert "thinking" not in body
-    _wait_settled(client, auth_headers, body["id"])
+    assert cleared.status_code == 200, cleared.text
+
+    refused = client.post("/api/tasks/preview", headers=auth_headers, json=launch_body())
+    assert refused.status_code == 422
+    assert "model_profile" in refused.json()["detail"]
+
+    # An explicit task profile satisfies it; nothing is inferred.
+    resolved = client.post(
+        "/api/tasks/preview", headers=auth_headers, json=launch_body(model_profile="demo")
+    )
+    assert resolved.status_code == 200
+    assert resolved.json()["model_profile_source"] == "task"
+
+
+def test_task_profile_replaces_project_inheritance(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    client.post(
+        "/api/model-profiles",
+        headers=auth_headers,
+        json={
+            "name": "other",
+            "roles": {
+                "default": {"model": "testing/other-model", "thinking": "low"},
+                "smol": {"model": "testing/smol-model", "thinking": "low"},
+                "slow": {"model": "testing/slow-model", "thinking": "high"},
+                "plan": {"model": "testing/plan-model", "thinking": "xhigh"},
+            },
+        },
+    )
+    preview = client.post(
+        "/api/tasks/preview", headers=auth_headers, json=launch_body(model_profile="other")
+    ).json()
+    assert preview["model_profile"] == "other"
+    assert preview["model_profile_source"] == "task"
+    assert preview["project_default_model_profile"] == "demo"
+    assert preview["roles"]["default"]["model"] == "testing/other-model"
+
+
+def test_accepted_inputs_survive_project_and_profile_edits(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    """Editing reusable defaults changes the next launch, never this task."""
+    task = _spawn(client, auth_headers)
+    _wait_settled(client, auth_headers, task["id"])
+
+    client.put(
+        "/api/model-profiles/demo",
+        headers=auth_headers,
+        json={
+            "roles": {
+                "default": {"model": "testing/changed", "thinking": "off"},
+                "smol": {"model": "testing/changed", "thinking": "off"},
+                "slow": {"model": "testing/changed", "thinking": "off"},
+                "plan": {"model": "testing/changed", "thinking": "off"},
+            }
+        },
+    )
+    client.put(
+        "/api/projects/demo",
+        headers=auth_headers,
+        json={
+            "title": "Demo",
+            "upstream_url": "https://example.com/demo.git",
+            "checkout_path": demo_project["checkout_path"],
+            "base_branch": "release",
+            "preamble": "new preamble",
+        },
+    )
+
+    after = client.get(f"/api/tasks/{task['id']}", headers=auth_headers).json()
+    inputs = after["execution_inputs"]
+    assert inputs["roles"]["default"]["model"] == "testing/main-model"
+    assert inputs["workspace"]["base_branch"] == "main"
+    assert inputs["workspace"]["preamble"] == ""
+
+
+def test_workspace_overrides_are_task_local_and_reset_by_omission(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    preview = client.post(
+        "/api/tasks/preview",
+        headers=auth_headers,
+        json=launch_body(
+            workspace_overrides={"branch_pattern": "wip/<slug>", "preamble": ""}
+        ),
+    ).json()
+    assert preview["branch"] == "wip/fix-bug"
+    assert sorted(preview["workspace_overrides"]) == ["branch_pattern", "preamble"]
+    # The project's own defaults are reported beside them, so the form can
+    # show what "reset" would restore.
+    assert preview["inherited_workspace"]["branch_pattern"] == "ompire/<slug>"
+
+    inherited = client.post(
+        "/api/tasks/preview", headers=auth_headers, json=launch_body()
+    ).json()
+    assert inherited["branch"] == "ompire/fix-bug"
+    assert inherited["workspace_overrides"] == []
+
+
+def test_null_is_not_a_reset_for_a_workspace_override(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    response = client.post(
+        "/api/tasks/preview",
+        headers=auth_headers,
+        json=launch_body(workspace_overrides={"base_branch": None}),
+    )
+    assert response.status_code == 422
+    assert "null is not a reset" in response.json()["detail"]
+
+
+def test_workflow_catalog_describes_every_declared_step(
+    client: TestClient, auth_headers: dict
+) -> None:
+    catalog = {w["name"]: w for w in client.get("/api/workflows", headers=auth_headers).json()}
+    assert set(catalog) == {"bugfix", "single-step"}
+    bugfix = catalog["bugfix"]
+    assert [step["name"] for step in bugfix["steps"]] == [
+        "reproduce",
+        "triage",
+        "fix",
+        "route-validate",
+        "validate-script",
+        "validate-agent",
+        "check",
+        "escalate",
+    ]
+    # Only agent steps name a role; a command or gate has no model.
+    roles = {step["name"]: step["role"] for step in bugfix["steps"]}
+    assert roles["reproduce"] == "default"
+    assert roles["triage"] is None
+    assert roles["validate-script"] is None
+    # Everything after the first decision may be routed past.
+    conditional = {step["name"]: step["conditional"] for step in bugfix["steps"]}
+    assert conditional["reproduce"] is False
+    assert conditional["fix"] is True
+    assert bugfix["judge_session"] == "judge"
+    assert bugfix["judge_role"] == "slow"
 
 
 def test_duplicate_live_slug_rejected(
-    client: TestClient, auth_headers: dict, demo_template: dict
+    client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
     first = _spawn(client, auth_headers)
     _wait_settled(client, auth_headers, first["id"])
 
-    duplicate = client.post(
-        "/api/tasks",
-        headers=auth_headers,
-        json={"template_name": "demo", "slug": "fix-bug", "prompt": "again"},
-    )
+    duplicate = spawn_task(client, auth_headers, slug="fix-bug", prompt="again")
     assert duplicate.status_code == 409
 
 
 def test_slug_reusable_after_archive(
-    client: TestClient, auth_headers: dict, demo_template: dict
+    client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
     first = _spawn(client, auth_headers)
     _wait_settled(client, auth_headers, first["id"])
@@ -144,7 +362,7 @@ def test_slug_reusable_after_archive(
 
 
 def test_cleanup_deletes_clone_and_is_idempotent(
-    client: TestClient, auth_headers: dict, demo_template: dict
+    client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
     task = _spawn(client, auth_headers)
     settled = _wait_settled(client, auth_headers, task["id"])
@@ -161,7 +379,7 @@ def test_cleanup_deletes_clone_and_is_idempotent(
 
 
 def test_spawn_records_workshop_id(
-    client: TestClient, auth_headers: dict, demo_template: dict
+    client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
     task = _spawn(client, auth_headers)
     settled = _wait_settled(client, auth_headers, task["id"])
@@ -169,7 +387,7 @@ def test_spawn_records_workshop_id(
 
 
 def test_detail_reports_workshop_status(
-    client: TestClient, auth_headers: dict, demo_template: dict
+    client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
     task = _spawn(client, auth_headers)
     _wait_settled(client, auth_headers, task["id"])
@@ -180,7 +398,7 @@ def test_detail_reports_workshop_status(
 
 
 def test_cleanup_aborts_when_workshop_remove_fails(
-    client: TestClient, auth_headers: dict, demo_template: dict, fake_workshop_cli: Path
+    client: TestClient, auth_headers: dict, demo_project: dict, fake_workshop_cli: Path
 ) -> None:
     task = _spawn(client, auth_headers)
     settled = _wait_settled(client, auth_headers, task["id"])
@@ -203,7 +421,7 @@ def test_cleanup_aborts_when_workshop_remove_fails(
 
 
 def test_cleanup_refuses_path_outside_task_root(
-    app, client: TestClient, auth_headers: dict, demo_template: dict, tmp_path: Path
+    app, client: TestClient, auth_headers: dict, demo_project: dict, tmp_path: Path
 ) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -214,6 +432,9 @@ def test_cleanup_refuses_path_outside_task_root(
         branch="ompire/escapee",
         clone_path=str(outside),
         prompt="p",
+        execution_inputs=make_execution_inputs(
+            checkout_path=demo_project["checkout_path"], branch="ompire/escapee"
+        ),
     )
     response = client.post(f"/api/tasks/{task.id}/cleanup", headers=auth_headers)
     assert response.status_code == 409
@@ -221,7 +442,7 @@ def test_cleanup_refuses_path_outside_task_root(
 
 
 def test_purge_requires_archived(
-    app, client: TestClient, auth_headers: dict, demo_template: dict
+    app, client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
     task = _spawn(client, auth_headers)
     _wait_settled(client, auth_headers, task["id"])
@@ -236,7 +457,7 @@ def test_purge_requires_archived(
 
 
 def test_purge_reaches_a_connected_client(
-    client: TestClient, auth_token: str, auth_headers: dict, demo_template: dict
+    client: TestClient, auth_token: str, auth_headers: dict, demo_project: dict
 ) -> None:
     """`purge_task_route` is a synchronous route, so its `task_deleted` goes
     through the hub's cross-thread hand-off like the project mutations do."""
@@ -258,7 +479,7 @@ def test_purge_reaches_a_connected_client(
 
 
 def test_project_delete_blocked_until_tasks_purged(
-    client: TestClient, auth_headers: dict, demo_template: dict
+    client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
     task = _spawn(client, auth_headers)
     _wait_settled(client, auth_headers, task["id"])
@@ -268,14 +489,11 @@ def test_project_delete_blocked_until_tasks_purged(
     assert blocked.status_code == 409
     assert "fix-bug" in blocked.json()["detail"]
 
+    # Purging the archived task is the only thing that unblocks it now:
+    # templates are gone, so task history is the sole remaining reference.
     client.delete(f"/api/tasks/{task['id']}", headers=auth_headers)
-    # The seeded template still references the project: delete it to unblock.
-    still_blocked = client.delete("/api/projects/demo", headers=auth_headers)
-    assert still_blocked.status_code == 409
-    assert "demo" in still_blocked.json()["detail"]
-    client.delete("/api/templates/demo", headers=auth_headers)
     unblocked = client.delete("/api/projects/demo", headers=auth_headers)
-    assert unblocked.status_code == 200
+    assert unblocked.status_code == 200, unblocked.text
 
 
 def test_clone_path_confinement_unit() -> None:
@@ -310,6 +528,9 @@ def test_reconciliation_on_restart(tmp_path: Path, git_checkout: Path) -> None:
             branch="ompire/interrupted",
             clone_path=str(tmp_path / "tasks" / "demo" / "interrupted"),
             prompt="p",
+            execution_inputs=make_execution_inputs(
+                checkout_path=str(git_checkout), branch="ompire/interrupted"
+            ),
         )
     app.state.engine.dispose()
 
@@ -320,7 +541,7 @@ def test_reconciliation_on_restart(tmp_path: Path, git_checkout: Path) -> None:
 
 
 def test_cleanup_clears_attention_entry(
-    client: TestClient, auth_headers: dict, demo_template: dict, app
+    client: TestClient, auth_headers: dict, demo_project: dict, app
 ) -> None:
     """Regression (merge-poll dogfood): the agent exit during workshop removal
     lands `failed` (interrupt tier); cleanup must not leave that attention
@@ -354,15 +575,20 @@ def test_cleanup_clears_attention_entry(
 
 
 def _spawn_with_prompt(client: TestClient, auth_headers: dict, prompt: str):
+    """Mentions are validated at acceptance, so this goes through the whole
+    preview-then-accept path rather than short-circuiting it."""
+    body = launch_body(prompt=prompt)
+    preview = client.post("/api/tasks/preview", headers=auth_headers, json=body)
+    assert preview.status_code == 200, preview.text
     return client.post(
         "/api/tasks",
         headers=auth_headers,
-        json={"template_name": "demo", "slug": "fix-bug", "prompt": prompt},
+        json={**body, "preview_token": preview.json()["preview_token"]},
     )
 
 
 def test_mention_of_a_committed_file_is_accepted(
-    client: TestClient, auth_headers: dict, demo_template: dict
+    client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
     response = _spawn_with_prompt(client, auth_headers, "look at @README.md please")
 
@@ -384,7 +610,7 @@ def test_mention_of_a_committed_file_is_accepted(
 def test_bad_mention_rejected_before_anything_is_created(
     client: TestClient,
     auth_headers: dict,
-    demo_template: dict,
+    demo_project: dict,
     git_checkout: Path,
     mention: str,
     fragment: str,
@@ -398,7 +624,7 @@ def test_bad_mention_rejected_before_anything_is_created(
 
 
 def test_uncommitted_file_mention_is_refused_with_the_base_branch_reason(
-    client: TestClient, auth_headers: dict, demo_template: dict, git_checkout: Path
+    client: TestClient, auth_headers: dict, demo_project: dict, git_checkout: Path
 ) -> None:
     (git_checkout / "scratch.md").write_text("not committed\n")
 
@@ -412,7 +638,7 @@ def test_uncommitted_file_mention_is_refused_with_the_base_branch_reason(
 
 
 def test_email_address_in_a_prompt_is_not_a_mention(
-    client: TestClient, auth_headers: dict, demo_template: dict
+    client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
     response = _spawn_with_prompt(client, auth_headers, "ask someone@example.com about it")
 
@@ -421,7 +647,7 @@ def test_email_address_in_a_prompt_is_not_a_mention(
 
 
 def test_every_bad_mention_is_named_in_one_refusal(
-    client: TestClient, auth_headers: dict, demo_template: dict
+    client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
     response = _spawn_with_prompt(client, auth_headers, "see @gone-a.md and @gone-b.md")
 

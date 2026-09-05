@@ -73,7 +73,7 @@ export function gpgPresentation(gpg: GpgStatus | null): GpgPresentation {
         label: "gpg unselected",
         description: gpg?.detail ?? "Several usable GPG signing keys",
         recovery:
-          "Choose which key signs, under Templates & settings → Daemon.",
+          "Choose which key signs, under Settings → Daemon.",
         command: null,
       };
     case "no_key":

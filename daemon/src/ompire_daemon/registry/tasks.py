@@ -7,11 +7,11 @@ state machine arrives with add-session-states.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import Engine
+from sqlalchemy import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 
 from ompire_daemon.db import (
@@ -20,6 +20,12 @@ from ompire_daemon.db import (
     task_sessions,
     tasks,
     workflow_step_records,
+)
+from ompire_daemon.execution_inputs import (
+    TaskExecutionInputs,
+    decode_execution_inputs,
+    encode_execution_inputs,
+    execution_inputs_payload,
 )
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
@@ -64,11 +70,25 @@ class ClonePathOutsideRootError(ValueError):
         self.root = root
 
 
+class TaskInputsAlreadyPinnedError(Exception):
+    """Refusal for a second write of the accepted inputs. They are decided
+    once: a task that already has them is never re-resolved, and a legacy
+    confirmation cannot edit a task that was accepted normally."""
+
+    def __init__(self, task_id: int) -> None:
+        super().__init__(f"task {task_id} already has pinned execution inputs")
+        self.task_id = task_id
+
+
 @dataclass(frozen=True)
 class Task:
     id: int
     project_name: str
-    template_name: str | None
+    # The launch decision this task runs under, or None for a task created
+    # before pinned inputs existed (ADR-0026). None is a real state, not a
+    # missing value to fill in: it blocks model- and branch-dependent work
+    # until the operator confirms a continuation configuration.
+    execution_inputs: TaskExecutionInputs | None
     slug: str
     branch: str
     clone_path: str
@@ -85,6 +105,52 @@ class Task:
     spawn_completed_at: str | None
     created_at: str
     updated_at: str
+
+
+class TaskConfigurationRequiredError(Exception):
+    """The single readiness guard for everything that needs a task's launch
+    inputs (ADR-0026).
+
+    A task created before pinned inputs existed has no accepted model, base
+    branch, or preamble, and today's project and profile settings are not
+    evidence of what it used. Rather than guess — or fall back to `main` and
+    the host's model — every path that would need those values refuses here,
+    and the operator confirms a continuation configuration once. Reading,
+    inspecting, stopping, and cleaning up such a task stay available.
+    """
+
+    def __init__(self, task_id: int) -> None:
+        super().__init__(
+            f"task {task_id} has no confirmed launch configuration; confirm one "
+            "on the task before continuing, reviewing, or shipping it"
+        )
+        self.task_id = task_id
+
+
+def task_payload(task: Task) -> dict:
+    """The one wire shape of a task row, used by both REST responses and
+    `task_updated` events so a client cannot see two different shapes for the
+    same row.
+
+    `execution_inputs` is the accepted decision itself — the same document
+    execution reads — and `null` means the task predates pinned inputs, which
+    `needs_configuration` states outright so a client does not have to infer
+    a blocker from an absent field.
+    """
+    payload = asdict(task)
+    payload["execution_inputs"] = (
+        execution_inputs_payload(task.execution_inputs)
+        if task.execution_inputs is not None
+        else None
+    )
+    payload["needs_configuration"] = task.execution_inputs is None
+    return payload
+
+
+def require_task_inputs(task: Task) -> TaskExecutionInputs:
+    if task.execution_inputs is None:
+        raise TaskConfigurationRequiredError(task.id)
+    return task.execution_inputs
 
 
 def validate_task_slug(slug: str) -> None:
@@ -114,7 +180,11 @@ def _row_to_task(row) -> Task:
     return Task(
         id=row.id,
         project_name=row.project_name,
-        template_name=row.template_name,
+        execution_inputs=(
+            decode_execution_inputs(row.execution_inputs_json)
+            if row.execution_inputs_json is not None
+            else None
+        ),
         slug=row.slug,
         branch=row.branch,
         clone_path=row.clone_path,
@@ -142,33 +212,50 @@ def create_task(
     branch: str,
     clone_path: str,
     prompt: str,
-    template_name: str | None = None,
+    execution_inputs: TaskExecutionInputs,
     workflow_name: str = "single-step",
+    conn: Connection | None = None,
 ) -> Task:
+    """Insert one accepted task together with the inputs it was accepted
+    under (ADR-0026).
+
+    `conn` lets the caller run this inside an already-open write reservation,
+    so the re-resolution the acceptance checked and this insert cannot be
+    separated by another writer. Without it the function opens its own
+    transaction, which is what the simpler callers want.
+    """
     validate_task_slug(slug)
     now = _now_iso()
+    values = {
+        "project_name": project_name,
+        "execution_inputs_json": encode_execution_inputs(execution_inputs),
+        "slug": slug,
+        "branch": branch,
+        "clone_path": clone_path,
+        "state": "created",
+        "prompt": prompt,
+        "error": None,
+        "workshop_id": None,
+        "workflow_name": workflow_name,
+        "workflow_status": None,
+        "workflow_step": None,
+        "pr_url": None,
+        "spawn_completed_at": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if conn is not None:
+        try:
+            result = conn.execute(tasks.insert().values(**values))
+        except IntegrityError as exc:
+            raise DuplicateTaskError(project_name, slug) from exc
+        inserted = result.inserted_primary_key
+        assert inserted is not None
+        row = conn.execute(tasks.select().where(tasks.c.id == inserted[0])).one()
+        return _row_to_task(row)
     try:
-        with engine.begin() as conn:
-            result = conn.execute(
-                tasks.insert().values(
-                    project_name=project_name,
-                    template_name=template_name,
-                    slug=slug,
-                    branch=branch,
-                    clone_path=clone_path,
-                    state="created",
-                    prompt=prompt,
-                    error=None,
-                    workshop_id=None,
-                    workflow_name=workflow_name,
-                    workflow_status=None,
-                    workflow_step=None,
-                    pr_url=None,
-                    spawn_completed_at=None,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
+        with engine.begin() as own_conn:
+            result = own_conn.execute(tasks.insert().values(**values))
             inserted = result.inserted_primary_key
             assert inserted is not None
             task_id = inserted[0]
@@ -234,6 +321,51 @@ def mark_pr_state(
 
 def mark_failed(engine: Engine, task_id: int, error: str) -> Task:
     return _update(engine, task_id, state="failed", error=error, spawn_completed_at=_now_iso())
+
+
+def pin_execution_inputs(engine: Engine, task_id: int, inputs: TaskExecutionInputs) -> Task:
+    """Write a legacy task's confirmed continuation configuration, once.
+
+    Only a task without pinned inputs can be written: a normally accepted
+    task's decision is not editable through this path, and a second
+    confirmation of the same task is refused rather than silently applied.
+    The read and the write share one reservation so two confirmations racing
+    cannot both believe they were first.
+    """
+    from ompire_daemon.registry.model_profiles import reserved_write
+
+    with reserved_write(engine) as conn:
+        row = conn.execute(
+            tasks.select()
+            .with_only_columns(tasks.c.id, tasks.c.execution_inputs_json)
+            .where(tasks.c.id == task_id)
+        ).first()
+        if row is None:
+            raise TaskNotFoundError(task_id)
+        if row.execution_inputs_json is not None:
+            raise TaskInputsAlreadyPinnedError(task_id)
+        conn.execute(
+            tasks.update()
+            .where(tasks.c.id == task_id)
+            .values(
+                execution_inputs_json=encode_execution_inputs(inputs),
+                updated_at=_now_iso(),
+            )
+        )
+    return get_task(engine, task_id)
+
+
+def list_unconfigured_tasks(engine: Engine) -> list[Task]:
+    """Live tasks that predate pinned inputs. Archived rows are excluded:
+    they are readable history and are never asked to be confirmed."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            tasks.select()
+            .where(tasks.c.execution_inputs_json.is_(None))
+            .where(tasks.c.state != "archived")
+            .order_by(tasks.c.id)
+        ).all()
+    return [_row_to_task(row) for row in rows]
 
 
 def mark_archived(engine: Engine, task_id: int) -> Task:

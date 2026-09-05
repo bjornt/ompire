@@ -57,11 +57,11 @@ describe("App", () => {
     const user = userEvent.setup();
 
     const header = screen.getByTestId("chrome-header");
-    await user.click(within(header).getByRole("link", { name: "Templates & settings" }));
-    expect(await screen.findByTestId("templates-empty-state")).toBeInTheDocument();
+    await user.click(within(header).getByRole("link", { name: "Settings" }));
+    expect(await screen.findByTestId("model-profiles-panel")).toBeInTheDocument();
     expect(screen.queryByTestId("stub-page")).not.toBeInTheDocument();
     expect(screen.getByTestId("chrome-header")).toBeInTheDocument();
-    const navLink = screen.getByRole("link", { name: "Templates & settings" });
+    const navLink = screen.getByRole("link", { name: "Settings" });
     expect(navLink.className).toContain("navLinkActive");
   });
 

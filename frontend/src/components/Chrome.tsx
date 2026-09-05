@@ -13,7 +13,7 @@ const NAV_ITEMS = [
   { to: "/projects", label: "Projects" },
   { to: "/spawn", label: "Spawn task" },
   { to: "/ship", label: "Ship flow" },
-  { to: "/settings", label: "Templates & settings" },
+  { to: "/settings", label: "Settings" },
 ] as const;
 
 const DAEMON_CHIP_BY_STATE: Record<ConnectionState, { dot: string; title: string }> = {

@@ -29,6 +29,7 @@ from ompire_daemon.registry.tasks import (
     mark_pr_url,
     mark_spawn_completed,
 )
+from tests.conftest import make_execution_inputs
 
 
 @pytest.fixture
@@ -55,6 +56,9 @@ def task(engine: Engine, tmp_path: Path) -> Task:
         branch="ompire/fix-thing",
         clone_path=str(tmp_path / "tasks" / "demo" / "fix-thing"),
         prompt="fix it",
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(tmp_path / "checkout")
+        ),
     )
     return mark_pr_url(engine, created.id, "https://github.com/upowner/uprepo/pull/7")
 
@@ -244,6 +248,9 @@ async def test_spawn_completed_unshipped_tasks_are_not_polled(
         branch="ompire/other",
         clone_path=str(tmp_path / "tasks" / "demo" / "other"),
         prompt="x",
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(tmp_path / "checkout")
+        ),
     )
     mark_spawn_completed(engine, unshipped.id)
     # And the shipped task from the fixture is archived: nothing pollable.
@@ -301,6 +308,9 @@ def test_watcher_runs_under_the_app_lifecycle(tmp_path: Path) -> None:
         branch="ompire/fix-thing",
         clone_path=str(tmp_path / "tasks" / "demo" / "fix-thing"),
         prompt="fix it",
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(tmp_path / "checkout")
+        ),
     )
     mark_pr_url(app.state.engine, seeded.id, "https://github.com/upowner/uprepo/pull/7")
 

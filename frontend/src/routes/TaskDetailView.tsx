@@ -17,6 +17,7 @@ import { useDaemonState } from "../lib/useDaemonState";
 import type { ReviewState, SessionInfo, StepRecord, TaskDetail, WorkflowState, WorkshopStatus } from "../types";
 import { formatElapsed } from "../lib/formatElapsed";
 import { QuestionCard } from "./QuestionCard";
+import { TaskConfigurationPanel } from "./TaskConfigurationPanel";
 import { TaskComposer } from "./TaskComposer";
 import { TaskStatusStrip } from "./TaskStatusStrip";
 import { TaskTranscript } from "./TaskTranscript";
@@ -406,8 +407,6 @@ export function TaskDetailView() {
             <dt>spawned</dt>
             <dd>
               {new Date(detail.created_at).toLocaleString()} · {formatElapsed(detail.created_at)} ago
-              {/* Tasks that predate templates have a null template_name — no annotation. */}
-              {detail.template_name !== null && ` · template ${detail.template_name}`}
             </dd>
             {detail.error && (
               <>
@@ -419,6 +418,8 @@ export function TaskDetailView() {
             )}
           </dl>
         </div>
+
+        <TaskConfigurationPanel detail={detail} sessions={taskSessions ?? {}} />
 
         <div className="panel" data-testid="escape-hatch">
           <h2 className="panelTitle">Escape hatch</h2>

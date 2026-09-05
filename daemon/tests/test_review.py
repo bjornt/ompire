@@ -12,7 +12,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ompire_daemon.config import Config
+from ompire_daemon.execution_inputs import encode_execution_inputs
 from ompire_daemon.review import REVIEW_GIT_REF, ReviewManager
+from tests.conftest import TEST_ROLES, make_execution_inputs, spawn_task
+
+
+def _create_demo_profile(client: TestClient) -> None:
+    """The `demo` global model profile a launch inherits from the project."""
+    from ompire_daemon.registry.model_profiles import create_model_profile
+
+    create_model_profile(client.app.state.engine, name="demo", roles=TEST_ROLES)
 
 
 def _now_iso() -> str:
@@ -73,6 +82,7 @@ def review_client(review_app) -> TestClient:
 def demo_project_and_task(review_client: TestClient, auth_headers: dict[str, str], git_checkout: Path):
     """Create a project and a spawned-to-idle task via REST; return task id."""
     client = review_client
+    _create_demo_profile(client)
     r = client.post(
         "/api/projects",
         headers=auth_headers,
@@ -81,20 +91,11 @@ def demo_project_and_task(review_client: TestClient, auth_headers: dict[str, str
             "title": "Demo",
             "upstream_url": "https://example.com/demo.git",
             "checkout_path": str(git_checkout),
+            "default_model_profile": "demo",
         },
     )
     assert r.status_code == 201, r.text
-    r = client.post(
-        "/api/templates",
-        headers=auth_headers,
-        json={"name": "demo", "project_name": "demo"},
-    )
-    assert r.status_code == 201, r.text
-    r = client.post(
-        "/api/tasks",
-        headers=auth_headers,
-        json={"template_name": "demo", "slug": "task1", "prompt": "hello"},
-    )
+    r = spawn_task(client, auth_headers, slug="task1", prompt="hello")
     assert r.status_code == 202, r.text
     task_id = r.json()["id"]
 
@@ -227,6 +228,7 @@ class TestReviewRestGuards:
         self, review_client: TestClient, auth_headers: dict[str, str], git_checkout: Path
     ) -> None:
         client = review_client
+        _create_demo_profile(client)
         client.post(
             "/api/projects",
             headers=auth_headers,
@@ -235,18 +237,10 @@ class TestReviewRestGuards:
                 "title": "Demo",
                 "upstream_url": "https://example.com/demo.git",
                 "checkout_path": str(git_checkout),
+                "default_model_profile": "demo",
             },
         )
-        client.post(
-            "/api/templates",
-            headers=auth_headers,
-            json={"name": "demo", "project_name": "demo"},
-        )
-        r = client.post(
-            "/api/tasks",
-            headers=auth_headers,
-            json={"template_name": "demo", "slug": "task1", "prompt": "hello"},
-        )
+        r = spawn_task(client, auth_headers, slug="task1", prompt="hello")
         task_id = r.json()["id"]
         # Task is created but not yet idle.
         r = client.post(f"/api/tasks/{task_id}/review", headers=auth_headers)
@@ -256,6 +250,7 @@ class TestReviewRestGuards:
         self, review_client: TestClient, auth_headers: dict[str, str], git_checkout: Path
     ) -> None:
         client = review_client
+        _create_demo_profile(client)
         client.post(
             "/api/projects",
             headers=auth_headers,
@@ -264,18 +259,10 @@ class TestReviewRestGuards:
                 "title": "Demo",
                 "upstream_url": "https://example.com/demo.git",
                 "checkout_path": str(git_checkout),
+                "default_model_profile": "demo",
             },
         )
-        client.post(
-            "/api/templates",
-            headers=auth_headers,
-            json={"name": "demo", "project_name": "demo"},
-        )
-        r = client.post(
-            "/api/tasks",
-            headers=auth_headers,
-            json={"template_name": "demo", "slug": "task1", "prompt": "hello"},
-        )
+        r = spawn_task(client, auth_headers, slug="task1", prompt="hello")
         task_id = r.json()["id"]
         # Manually seed an idle session without a live agent.
         sessions = client.app.state.sessions
@@ -335,7 +322,7 @@ class TestReviewManagerLifecycle:
         engine = app.state.engine
         # Seed project/task directly; review manager only needs the task row.
         with engine.begin() as conn:
-            from ompire_daemon.db import projects, tasks, templates
+            from ompire_daemon.db import projects, tasks
 
             conn.execute(
                 projects.insert().values(
@@ -344,29 +331,18 @@ class TestReviewManagerLifecycle:
                     upstream_url="https://example.com/demo.git",
                     fork_url=None,
                     checkout_path=str(git_checkout),
-                )
-            )
-            now0 = _now_iso()
-            conn.execute(
-                templates.insert().values(
-                    name="demo",
-                    project_name="demo",
-                    base_branch="main",
                     branch_pattern="ompire/<slug>",
-                    workflow="single-step",
-                    workshop_additions="project",
-                    model=None,
-                    thinking=None,
-                    preamble="",
-                    created_at=now0,
-                    updated_at=now0,
                 )
             )
             now = _now_iso()
             result = conn.execute(
                 tasks.insert().values(
                     project_name="demo",
-                    template_name="demo",
+                    execution_inputs_json=encode_execution_inputs(
+                        make_execution_inputs(
+                            checkout_path=str(git_checkout), branch="ompire/task1"
+                        )
+                    ),
                     slug="task1",
                     branch="ompire/task1",
                     clone_path=str(git_checkout),
@@ -418,7 +394,7 @@ class TestReviewManagerLifecycle:
         reviews._config = app.state.config
         reviews.start()
 
-        from ompire_daemon.db import projects, tasks, templates
+        from ompire_daemon.db import projects, tasks
         from ompire_daemon.registry.tasks import get_task
 
         engine = app.state.engine
@@ -430,29 +406,18 @@ class TestReviewManagerLifecycle:
                     upstream_url="https://example.com/demo.git",
                     fork_url=None,
                     checkout_path=str(git_checkout),
-                )
-            )
-            now0 = _now_iso()
-            conn.execute(
-                templates.insert().values(
-                    name="demo",
-                    project_name="demo",
-                    base_branch="main",
                     branch_pattern="ompire/<slug>",
-                    workflow="single-step",
-                    workshop_additions="project",
-                    model=None,
-                    thinking=None,
-                    preamble="",
-                    created_at=now0,
-                    updated_at=now0,
                 )
             )
             now = _now_iso()
             result = conn.execute(
                 tasks.insert().values(
                     project_name="demo",
-                    template_name="demo",
+                    execution_inputs_json=encode_execution_inputs(
+                        make_execution_inputs(
+                            checkout_path=str(git_checkout), branch="ompire/task1"
+                        )
+                    ),
                     slug="task1",
                     branch="ompire/task1",
                     clone_path=str(git_checkout),
@@ -503,7 +468,7 @@ class TestReviewManagerLifecycle:
         reviews._config = app.state.config
         reviews.start()
 
-        from ompire_daemon.db import projects, tasks, templates
+        from ompire_daemon.db import projects, tasks
         from ompire_daemon.registry.tasks import get_task
 
         engine = app.state.engine
@@ -515,29 +480,18 @@ class TestReviewManagerLifecycle:
                     upstream_url="https://example.com/demo.git",
                     fork_url=None,
                     checkout_path=str(git_checkout),
-                )
-            )
-            now0 = _now_iso()
-            conn.execute(
-                templates.insert().values(
-                    name="demo",
-                    project_name="demo",
-                    base_branch="main",
                     branch_pattern="ompire/<slug>",
-                    workflow="single-step",
-                    workshop_additions="project",
-                    model=None,
-                    thinking=None,
-                    preamble="",
-                    created_at=now0,
-                    updated_at=now0,
                 )
             )
             now = _now_iso()
             result = conn.execute(
                 tasks.insert().values(
                     project_name="demo",
-                    template_name="demo",
+                    execution_inputs_json=encode_execution_inputs(
+                        make_execution_inputs(
+                            checkout_path=str(git_checkout), branch="ompire/task1"
+                        )
+                    ),
                     slug="task1",
                     branch="ompire/task1",
                     clone_path=str(git_checkout),
@@ -576,9 +530,10 @@ class TestReviewManagerLifecycle:
 
 
 def _seed_project_and_task(engine, git_checkout: Path, slug: str = "task1") -> int:
-    """Seed project/template/task rows directly — the same shape the
-    lifecycle tests build inline. Returns the task id."""
-    from ompire_daemon.db import projects, tasks, templates
+    """Seed project/task rows directly — the same shape the lifecycle tests
+    build inline, with the task carrying its accepted inputs. Returns the
+    task id."""
+    from ompire_daemon.db import projects, tasks
 
     with engine.begin() as conn:
         if conn.execute(projects.select().where(projects.c.name == "demo")).first() is None:
@@ -589,29 +544,18 @@ def _seed_project_and_task(engine, git_checkout: Path, slug: str = "task1") -> i
                     upstream_url="https://example.com/demo.git",
                     fork_url=None,
                     checkout_path=str(git_checkout),
-                )
-            )
-            now0 = _now_iso()
-            conn.execute(
-                templates.insert().values(
-                    name="demo",
-                    project_name="demo",
-                    base_branch="main",
                     branch_pattern="ompire/<slug>",
-                    workflow="single-step",
-                    workshop_additions="project",
-                    model=None,
-                    thinking=None,
-                    preamble="",
-                    created_at=now0,
-                    updated_at=now0,
                 )
             )
         now = _now_iso()
         result = conn.execute(
             tasks.insert().values(
                 project_name="demo",
-                template_name="demo",
+                execution_inputs_json=encode_execution_inputs(
+                    make_execution_inputs(
+                        checkout_path=str(git_checkout), branch=f"ompire/{slug}"
+                    )
+                ),
                 slug=slug,
                 branch=f"ompire/{slug}",
                 clone_path=str(git_checkout),

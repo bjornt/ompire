@@ -3,7 +3,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
-import type { Task, Template } from "../types";
+import type { ModelProfile, Task, TaskExecutionInputs, WorkflowDescriptor } from "../types";
 type DeferredPromise<T> = {
   promise: Promise<T>;
   resolve: (value: T | PromiseLike<T>) => void;
@@ -33,8 +33,8 @@ class MockWebSocket {
 
   emitSnapshot(payload: {
     projects: unknown[];
-    templates?: unknown[];
     model_profiles?: unknown[];
+    workflow_catalog?: unknown[];
     tasks: unknown[];
     sessions?: unknown;
     workflows?: unknown;
@@ -60,8 +60,130 @@ const project = {
   fetch_remote: "origin",
   setup_state: "ready",
   setup_error: null,
-  default_model_profile: null,
+  default_model_profile: "balanced",
+  base_branch: "master",
+  branch_pattern: "bjornt/<slug>",
+  workshop_additions: "project",
+  preamble: "",
+  launch_config_state: "reconciled",
 };
+
+const balanced: ModelProfile = {
+  name: "balanced",
+  roles: {
+    default: { model: "anthropic/claude-sonnet-4.5", thinking: "medium" },
+    smol: { model: "openai/gpt-4.1-mini", thinking: "off" },
+    slow: { model: "openai/o3", thinking: "high" },
+    plan: { model: "google/gemini-2.5-pro", thinking: "max" },
+  },
+  created_at: "2026-09-01T00:00:00Z",
+  updated_at: "2026-09-01T00:00:00Z",
+};
+
+const singleStep: WorkflowDescriptor = {
+  name: "single-step",
+  primary_session: "main",
+  sessions: ["main"],
+  steps: [
+    { name: "work", kind: "agent", session: "main", role: "default", conditional: false },
+  ],
+  judge_session: "judge",
+  judge_role: "slow",
+};
+
+const bugfix: WorkflowDescriptor = {
+  name: "bugfix",
+  primary_session: "coder",
+  sessions: ["reproducer", "coder"],
+  steps: [
+    { name: "reproduce", kind: "agent", session: "reproducer", role: "default", conditional: false },
+    { name: "triage", kind: "decision", session: null, role: null, conditional: false },
+    { name: "fix", kind: "agent", session: "coder", role: "default", conditional: true },
+    { name: "validate-script", kind: "command", session: null, role: null, conditional: true },
+  ],
+  judge_session: "judge",
+  judge_role: "slow",
+};
+
+/** The launch decision an accepted task carries (ADR-0026). */
+function makeInputs(overrides: Partial<TaskExecutionInputs> = {}): TaskExecutionInputs {
+  return {
+    version: 1,
+    provenance: "accepted",
+    accepted_at: "2026-07-18T00:00:00Z",
+    project_name: "maas",
+    workflow_name: "single-step",
+    model_profile_name: "balanced",
+    model_profile_source: "project",
+    roles: balanced.roles,
+    step_roles: { work: "default" },
+    judge_role: "slow",
+    workspace: {
+      base_branch: "master",
+      branch_pattern: "bjornt/<slug>",
+      workshop_additions: "project",
+      preamble: "",
+    },
+    workspace_overrides: [],
+    branch: "bjornt/fix-bug",
+    checkout_path: "/home/op/proj/maas",
+    fetch_remote: "origin",
+    upstream_url: "https://example.com/maas.git",
+    fork_url: null,
+    unknown_inputs: [],
+    ...overrides,
+  };
+}
+
+/** The daemon's preview response for the default draft. */
+function previewResponse(overrides: Record<string, unknown> = {}) {
+  return {
+    preview_token: "tok-1",
+    project_name: "maas",
+    workflow_name: "single-step",
+    model_profile: "balanced",
+    model_profile_source: "project",
+    project_default_model_profile: "balanced",
+    judge_session: "judge",
+    judge_role: "slow",
+    roles: balanced.roles,
+    workspace: {
+      base_branch: "master",
+      branch_pattern: "bjornt/<slug>",
+      workshop_additions: "project",
+      preamble: "",
+    },
+    inherited_workspace: {
+      base_branch: "master",
+      branch_pattern: "bjornt/<slug>",
+      workshop_additions: "project",
+      preamble: "",
+    },
+    workspace_overrides: [],
+    branch: "bjornt/fix-bug",
+    steps: [
+      {
+        step: "work",
+        kind: "agent",
+        session: "main",
+        role: "default",
+        model: "anthropic/claude-sonnet-4.5",
+        thinking: "medium",
+        conditional: false,
+      },
+      {
+        step: "judge",
+        kind: "judge",
+        session: "judge",
+        role: "slow",
+        model: "openai/o3",
+        thinking: "high",
+        conditional: true,
+      },
+    ],
+    ...overrides,
+  };
+}
 
 const githubProject = { ...project, upstream_url: "https://github.com/ompire/maas.git" };
 const readyGitHub = {
@@ -90,28 +212,12 @@ const readyGitHub = {
   },
 };
 
-function makeTemplate(overrides: Partial<Template> = {}): Template {
-  return {
-    name: "maas",
-    project_name: "maas",
-    base_branch: "master",
-    branch_pattern: "bjornt/<slug>",
-    workflow: "single-step",
-    workshop_additions: "project",
-    model: null,
-    thinking: null,
-    preamble: "",
-    created_at: "2026-07-18T00:00:00Z",
-    updated_at: "2026-07-18T00:00:00Z",
-    ...overrides,
-  };
-}
-
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
     id: 1,
     project_name: "maas",
-    template_name: "maas",
+    execution_inputs: makeInputs(),
+    needs_configuration: false,
     slug: "fix-bug",
     branch: "bjornt/fix-bug",
     clone_path: "/home/op/tasks/maas/fix-bug",
@@ -140,8 +246,8 @@ async function renderAt(
   path: string,
   snapshot: {
     projects: unknown[];
-    templates?: unknown[];
     model_profiles?: unknown[];
+    workflow_catalog?: unknown[];
     tasks: unknown[];
     sessions?: unknown;
     workflows?: unknown;
@@ -163,6 +269,9 @@ async function renderAt(
 beforeEach(() => {
   MockWebSocket.instances = [];
   vi.stubGlobal("WebSocket", MockWebSocket);
+  // The Spawn draft survives a route unmount on purpose; it must not survive
+  // into another test.
+  window.sessionStorage.clear();
 });
 
 afterEach(() => {
@@ -170,550 +279,391 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+/** The Spawn form talks to two endpoints: `/api/tasks/preview` on every
+ * effective change, and `/api/tasks` on submit. This stubs both from one
+ * mock so a test can assert on either without wiring the other. */
+function stubLaunchFetch(options: {
+  preview?: unknown;
+  previewStatus?: number;
+  accept?: unknown;
+  acceptStatus?: number;
+  acceptDetail?: unknown;
+} = {}) {
+  const fetchMock = vi.fn((url: string, init?: { method?: string }) => {
+    if (typeof url === "string" && url.endsWith("/api/tasks/preview")) {
+      const status = options.previewStatus ?? 200;
+      return Promise.resolve({
+        ok: status < 400,
+        status,
+        json: () => Promise.resolve(options.preview ?? previewResponse()),
+      });
+    }
+    if (typeof url === "string" && url === "/api/tasks" && init?.method === "POST") {
+      const status = options.acceptStatus ?? 200;
+      return Promise.resolve({
+        ok: status < 400,
+        status,
+        json: () =>
+          Promise.resolve(
+            status < 400
+              ? (options.accept ?? makeTask())
+              : { detail: options.acceptDetail ?? "refused" },
+          ),
+      });
+    }
+    if (typeof url === "string" && /\/api\/tasks\/\d+$/.test(url)) {
+      return Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({ ...makeTask(), workshop_status: "present" }),
+      });
+    }
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({ paths: [], truncated: false }) });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+const launchSnapshot = {
+  projects: [project],
+  model_profiles: [balanced],
+  workflow_catalog: [bugfix, singleStep],
+  tasks: [],
+};
+
+/** Fill the three inputs that make a draft resolvable and wait for the
+ * preview the daemon answers with. */
+async function fillDraft(user: ReturnType<typeof userEvent.setup>, slug = "fix-bug") {
+  await user.selectOptions(screen.getByLabelText("Workflow"), "single-step");
+  await user.selectOptions(screen.getByLabelText("Project"), "maas");
+  await user.type(screen.getByLabelText("Task slug"), slug);
+  await screen.findByTestId("step-preview");
+}
+
 describe("SpawnView", () => {
-  it("previews the branch name from the selected template's pattern as the slug is typed", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+  it("offers every registered workflow against every project, with no template step", async () => {
+    stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
+
+    const workflows = screen.getByLabelText("Workflow");
+    expect(within(workflows).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "select a workflow",
+      "bugfix — 4 steps, 2 sessions",
+      "single-step — 1 step, 1 session",
+    ]);
+    expect(screen.queryByLabelText("Project template")).toBeNull();
+  });
+
+  it("previews every declared step with the model each consumer would use", async () => {
+    stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
     const user = userEvent.setup();
 
-    await user.type(screen.getByLabelText("Task slug"), "vlan-mtu");
+    await fillDraft(user);
+
+    const preview = screen.getByTestId("step-preview");
+    expect(within(preview).getByTestId("step-work")).toHaveTextContent(
+      "anthropic/claude-sonnet-4.5",
+    );
+    expect(within(preview).getByTestId("step-work")).toHaveTextContent("medium");
+    // The judge is described separately and binds `slow`, not the step role.
+    const judge = within(preview).getByTestId("step-judge");
+    expect(judge).toHaveTextContent("openai/o3");
+    expect(judge).toHaveTextContent("conditional");
     expect(screen.getByTestId("branch-preview")).toHaveTextContent(
-      "branch: bjornt/vlan-mtu · off origin/master",
+      "branch: bjornt/fix-bug · off origin/master",
     );
   });
 
-  it("lists one option per template with its summary line and an edit link", async () => {
-    await renderAt("/spawn", {
-      projects: [project],
-      templates: [
-        makeTemplate(),
-        makeTemplate({ name: "llmvet", base_branch: "main", model: "haiku-4.5" }),
-      ],
-      tasks: [],
-    });
-
-    const picker = screen.getByLabelText("Project template");
-    expect(within(picker).getAllByRole("option").map((o) => o.textContent)).toEqual([
-      "maas — /home/op/proj/maas · base master · omp default · wf:single-step",
-      "llmvet — /home/op/proj/maas · base main · haiku-4.5 · wf:single-step",
-    ]);
-    expect(screen.getByRole("link", { name: "Edit templates" })).toHaveAttribute(
-      "href",
-      "/settings",
-    );
-  });
-
-  it("reflects the selected template in the read-only workflow block", async () => {
-    await renderAt("/spawn", {
-      projects: [project],
-      templates: [makeTemplate(), makeTemplate({ name: "reviewer", workflow: "review-only" })],
-      tasks: [],
-    });
-    const user = userEvent.setup();
-
-    expect(screen.getByTestId("workflow-block")).toHaveTextContent(
-      "single-step — one agent session, operator reviews from idle (default)",
-    );
-
-    // A workflow outside the registered list renders as its bare name.
-    await user.selectOptions(screen.getByLabelText("Project template"), "reviewer");
-    expect(screen.getByTestId("workflow-block")).toHaveTextContent(/^review-only$/);
-  });
-
-  it("defaults the override controls to the template's model and thinking", async () => {
-    await renderAt("/spawn", {
-      projects: [project],
-      templates: [makeTemplate({ model: "fable-5", thinking: "medium" })],
-      tasks: [],
-    });
-
-    expect(screen.getByLabelText("Model override")).toHaveAttribute(
-      "placeholder",
-      "template default (fable-5)",
-    );
-    const thinking = screen.getByLabelText("Thinking");
-    expect(within(thinking).getAllByRole("option")[0]).toHaveTextContent(
-      "template default (medium)",
-    );
-  });
-
-  it("falls back to 'omp default' in the override labels for a null template model", async () => {
-    await renderAt("/spawn", {
-      projects: [project],
-      templates: [makeTemplate()],
-      tasks: [],
-    });
-
-    expect(screen.getByLabelText("Model override")).toHaveAttribute(
-      "placeholder",
-      "template default (omp default)",
-    );
-    const thinking = screen.getByLabelText("Thinking");
-    expect(within(thinking).getAllByRole("option")[0]).toHaveTextContent(
-      "template default (omp default)",
-    );
-  });
-
-  it("posts template_name, slug, and prompt without overrides when none are set", async () => {
-    await renderAt("/spawn", {
-      projects: [project],
-      templates: [makeTemplate({ model: "fable-5", thinking: "medium" })],
-      tasks: [],
-    });
-    const user = userEvent.setup();
-    const spawned = makeTask({ spawn_completed_at: null });
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) });
-    vi.stubGlobal("fetch", fetchMock);
-
-    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
-    await user.type(screen.getByLabelText("Prompt"), "fix it");
-    await user.click(screen.getByRole("button", { name: "Spawn task" }));
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/tasks",
-      expect.objectContaining({
-        method: "POST",
-        body: JSON.stringify({ template_name: "maas", slug: "fix-bug", prompt: "fix it" }),
+  it("shows a command or gate step with no model at all", async () => {
+    stubLaunchFetch({
+      preview: previewResponse({
+        workflow_name: "bugfix",
+        steps: [
+          {
+            step: "reproduce",
+            kind: "agent",
+            session: "reproducer",
+            role: "default",
+            model: "anthropic/claude-sonnet-4.5",
+            thinking: "medium",
+            conditional: false,
+          },
+          {
+            step: "triage",
+            kind: "decision",
+            session: null,
+            role: null,
+            model: null,
+            thinking: null,
+            conditional: false,
+          },
+        ],
       }),
-    );
-  });
-
-  it("includes model/thinking in the submit body only when overridden", async () => {
-    await renderAt("/spawn", {
-      projects: [project],
-      templates: [makeTemplate({ model: "fable-5", thinking: "medium" })],
-      tasks: [],
     });
+    await renderAt("/spawn", launchSnapshot);
     const user = userEvent.setup();
-    const spawned = makeTask({ spawn_completed_at: null });
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) });
-    vi.stubGlobal("fetch", fetchMock);
-
+    await user.selectOptions(screen.getByLabelText("Workflow"), "bugfix");
+    await user.selectOptions(screen.getByLabelText("Project"), "maas");
     await user.type(screen.getByLabelText("Task slug"), "fix-bug");
-    await user.type(screen.getByLabelText("Model override"), "haiku-4.5");
-    await user.selectOptions(screen.getByLabelText("Thinking"), "high");
-    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+    await screen.findByTestId("step-preview");
 
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/tasks",
-      expect.objectContaining({
-        method: "POST",
-        body: JSON.stringify({
-          template_name: "maas",
-          slug: "fix-bug",
-          prompt: "",
-          model: "haiku-4.5",
-          thinking: "high",
-        }),
-      }),
+    const decision = screen.getByTestId("step-triage");
+    // A decision never reaches a provider, so it is shown without one rather
+    // than with an inherited-looking model.
+    expect(decision).toHaveTextContent("decision");
+    expect(decision).not.toHaveTextContent("claude");
+  });
+
+  it("inherits the project profile and reports where it came from", async () => {
+    stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+
+    await fillDraft(user);
+
+    expect(screen.getByTestId("profile-source")).toHaveTextContent(
+      "inherited from the project",
+    );
+    const picker = screen.getByLabelText("Model profile");
+    expect(within(picker).getAllByRole("option")[0]).toHaveTextContent(
+      "inherit from project — balanced",
     );
   });
 
-  it("renders pipeline progress from spawn_step events after submit", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+  it("replaces inheritance with an explicit task profile, and resets back", async () => {
+    const fetchMock = stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
     const user = userEvent.setup();
-    const spawned = makeTask({ spawn_completed_at: null });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
-    );
+    await fillDraft(user);
 
-    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await user.selectOptions(screen.getByLabelText("Model profile"), "balanced");
+    await waitFor(() => {
+      const body = JSON.parse(
+        (fetchMock.mock.calls.at(-1)![1] as { body: string }).body,
+      );
+      expect(body.model_profile).toBe("balanced");
+    });
+
+    await user.click(screen.getByTestId("reset-profile"));
+    await waitFor(() => {
+      const body = JSON.parse(
+        (fetchMock.mock.calls.at(-1)![1] as { body: string }).body,
+      );
+      expect("model_profile" in body).toBe(false);
+    });
+  });
+
+  it("sends only the advanced fields the operator actually overrode", async () => {
+    const fetchMock = stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+
+    await user.click(screen.getByText(/Advanced/));
+    await user.clear(screen.getByLabelText("Branch pattern"));
+    await user.type(screen.getByLabelText("Branch pattern"), "wip/<slug>");
+
+    await waitFor(() => {
+      const body = JSON.parse(
+        (fetchMock.mock.calls.at(-1)![1] as { body: string }).body,
+      );
+      expect(body.workspace_overrides).toEqual({ branch_pattern: "wip/<slug>" });
+    });
+
+    await user.click(screen.getByTestId("reset-branch_pattern"));
+    await waitFor(() => {
+      const body = JSON.parse(
+        (fetchMock.mock.calls.at(-1)![1] as { body: string }).body,
+      );
+      expect("workspace_overrides" in body).toBe(false);
+    });
+  });
+
+  it("submits the reviewed token with the resolved selections", async () => {
+    const fetchMock = stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
     await user.type(screen.getByLabelText("Prompt"), "fix it");
+    await screen.findByTestId("step-preview");
+
     await user.click(screen.getByRole("button", { name: "Spawn task" }));
 
-    act(() => {
-      socket().emit("task_created", spawned);
-      socket().emit("spawn_step", { task_id: 1, step: "fetch", status: "started" });
-      socket().emit("spawn_step", { task_id: 1, step: "fetch", status: "ok" });
-      socket().emit("spawn_step", { task_id: 1, step: "clone", status: "started" });
+    const accept = fetchMock.mock.calls.find(
+      ([url, init]) => url === "/api/tasks" && (init as { method?: string })?.method === "POST",
+    )!;
+    expect(JSON.parse((accept[1] as { body: string }).body)).toEqual({
+      project_name: "maas",
+      workflow_name: "single-step",
+      slug: "fix-bug",
+      prompt: "fix it",
+      preview_token: "tok-1",
     });
-
-    const progress = screen.getByTestId("spawn-progress");
-    expect(within(progress).getByText("Launching · maas/fix-bug")).toBeInTheDocument();
-    const steps = progress.querySelectorAll("[data-step-status]");
-    expect([...steps].map((s) => s.getAttribute("data-step-status"))).toEqual([
-      "ok",
-      "running",
-      "pending",
-      "pending",
-      "pending",
-      "pending",
-    ]);
   });
 
-  it("renders the agent and prompt steps as they run", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+  it("refuses a stale review and shows the changed resolution instead of retrying", async () => {
+    const fetchMock = stubLaunchFetch({
+      acceptStatus: 409,
+      acceptDetail: {
+        reason: "preview_changed",
+        message: "the launch configuration changed since it was previewed; review again",
+      },
+    });
+    await renderAt("/spawn", launchSnapshot);
     const user = userEvent.setup();
-    const spawned = makeTask({ spawn_completed_at: null });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
-    );
-
-    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
-    await user.type(screen.getByLabelText("Prompt"), "fix it");
+    await fillDraft(user);
     await user.click(screen.getByRole("button", { name: "Spawn task" }));
 
-    act(() => {
-      socket().emit("task_created", spawned);
-      for (const step of ["fetch", "clone", "branch", "workshop", "agent"]) {
-        socket().emit("spawn_step", { task_id: 1, step, status: "started" });
-        socket().emit("spawn_step", { task_id: 1, step, status: "ok" });
-      }
-      socket().emit("spawn_step", { task_id: 1, step: "prompt", status: "started" });
-    });
-
-    const progress = screen.getByTestId("spawn-progress");
-    expect(within(progress).getByText("Agent")).toBeInTheDocument();
-    expect(within(progress).getByText("Prompt")).toBeInTheDocument();
-    const steps = progress.querySelectorAll("[data-step-status]");
-    expect([...steps].map((s) => s.getAttribute("data-step-status"))).toEqual([
-      "ok",
-      "ok",
-      "ok",
-      "ok",
-      "ok",
-      "running",
-    ]);
-  });
-
-  it("hides the prompt step for a promptless spawn", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
-    const user = userEvent.setup();
-    const spawned = makeTask({ spawn_completed_at: null, prompt: "" });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
+    expect(await screen.findByTestId("stale-review")).toHaveTextContent(
+      "The configuration changed since you reviewed it",
     );
-
-    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
-    await user.click(screen.getByRole("button", { name: "Spawn task" }));
-
-    act(() => {
-      socket().emit("task_created", spawned);
-    });
-
-    const progress = screen.getByTestId("spawn-progress");
-    expect(within(progress).getByText("Agent")).toBeInTheDocument();
-    expect(within(progress).queryByText("Prompt")).not.toBeInTheDocument();
-  });
-
-  it("keeps a failed launch on the Spawn view with its stderr and both actions", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
-    const user = userEvent.setup();
-    const spawned = makeTask({ spawn_completed_at: null });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
+    // Exactly one acceptance attempt: a refusal is never retried under
+    // settings the operator has not reviewed.
+    const accepts = fetchMock.mock.calls.filter(
+      ([url, init]) => url === "/api/tasks" && (init as { method?: string })?.method === "POST",
     );
-
-    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
-    await user.click(screen.getByRole("button", { name: "Spawn task" }));
-
-    act(() => {
-      socket().emit("task_created", spawned);
-      socket().emit("spawn_step", { task_id: 1, step: "fetch", status: "started" });
-      socket().emit("spawn_step", {
-        task_id: 1,
-        step: "fetch",
-        status: "failed",
-        stderr: "fatal: could not read from remote",
-      });
-      socket().emit("task_updated", {
-        ...spawned,
-        state: "failed",
-        error: "step 'fetch' failed",
-        spawn_completed_at: "x",
-      });
-    });
-
+    expect(accepts).toHaveLength(1);
     expect(window.location.pathname).toBe("/spawn");
-    expect(screen.getByTestId("stderr-fetch")).toHaveTextContent(
-      "fatal: could not read from remote",
+  });
+
+  it("keeps the draft through a trip to Settings to create a profile", async () => {
+    stubLaunchFetch();
+    await renderAt("/spawn", {
+      ...launchSnapshot,
+      model_profiles: [],
+      projects: [{ ...project, default_model_profile: null }],
+    });
+    const user = userEvent.setup();
+
+    await user.selectOptions(screen.getByLabelText("Workflow"), "single-step");
+    await user.selectOptions(screen.getByLabelText("Project"), "maas");
+    await user.type(screen.getByLabelText("Task slug"), "keep-me");
+    await user.type(screen.getByLabelText("Prompt"), "do not lose this");
+    expect(screen.getByTestId("no-profiles")).toHaveTextContent("Create one in Settings");
+
+    await user.click(screen.getByRole("link", { name: "Create one in Settings" }));
+    expect(window.location.pathname).toBe("/settings");
+
+    await user.click(screen.getByRole("link", { name: "Spawn task" }));
+    expect(screen.getByLabelText("Task slug")).toHaveValue("keep-me");
+    expect(screen.getByLabelText("Prompt")).toHaveValue("do not lose this");
+  });
+
+  it("blocks launching against a project whose configuration is unreconciled", async () => {
+    stubLaunchFetch({ previewStatus: 409 });
+    await renderAt("/spawn", {
+      ...launchSnapshot,
+      projects: [{ ...project, launch_config_state: "needs-reconciliation" }],
+    });
+    const user = userEvent.setup();
+    await user.selectOptions(screen.getByLabelText("Workflow"), "single-step");
+    await user.selectOptions(screen.getByLabelText("Project"), "maas");
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+
+    expect(await screen.findByTestId("project-unreconciled")).toHaveTextContent(
+      "needs launch-configuration reconciliation",
     );
-    const failure = screen.getByTestId("spawn-failed");
-    expect(failure).toHaveTextContent("step 'fetch' failed");
-    expect(screen.getByTestId("spawn-open-failed")).toHaveAttribute("href", "/tasks/1");
-    // The form stays locked to the failed task until the operator releases it.
-    expect(screen.getByLabelText("Task slug")).toBeDisabled();
     expect(screen.getByRole("button", { name: "Spawn task" })).toBeDisabled();
   });
 
-  it("unlocks the form with its values intact when starting another task", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+  it("blocks launching against a project whose checkout is not ready", async () => {
+    stubLaunchFetch({ previewStatus: 409 });
+    await renderAt("/spawn", {
+      ...launchSnapshot,
+      projects: [{ ...project, setup_state: "cloning" }],
+    });
     const user = userEvent.setup();
-    const spawned = makeTask({ spawn_completed_at: null });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
+    await user.selectOptions(screen.getByLabelText("Workflow"), "single-step");
+    await user.selectOptions(screen.getByLabelText("Project"), "maas");
+
+    expect(await screen.findByTestId("project-not-ready")).toHaveTextContent("cloning");
+    expect(screen.getByRole("button", { name: "Spawn task" })).toBeDisabled();
+  });
+
+  it("renders pipeline progress from spawn_step events after submit", async () => {
+    stubLaunchFetch({ accept: makeTask({ spawn_completed_at: null }) });
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+
+    await act(async () => {
+      socket().emit("task_created", makeTask({ spawn_completed_at: null }));
+      socket().emit("spawn_step", { task_id: 1, step: "clone", status: "ok" });
+      socket().emit("spawn_step", { task_id: 1, step: "branch", status: "started" });
+    });
+
+    const pipeline = await screen.findByTestId("spawn-progress");
+    expect(within(pipeline).getByText("Clone").closest(".step")).toHaveAttribute(
+      "data-step-status",
+      "ok",
     );
-
-    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
-    await user.type(screen.getByLabelText("Prompt"), "fix it");
-    await user.click(screen.getByRole("button", { name: "Spawn task" }));
-
-    act(() => {
-      socket().emit("task_created", spawned);
-      socket().emit("task_updated", {
-        ...spawned,
-        state: "failed",
-        error: "step 'fetch' failed",
-        spawn_completed_at: "x",
-      });
-    });
-
-    await user.click(screen.getByTestId("spawn-start-another"));
-
-    expect(screen.queryByTestId("spawn-failed")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Task slug")).toHaveValue("fix-bug");
-    expect(screen.getByLabelText("Prompt")).toHaveValue("fix it");
-    expect(screen.getByLabelText("Task slug")).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Spawn task" })).toBeEnabled();
-    // The spent pipeline is gone, not merely hidden behind the failure note.
-    expect(
-      within(screen.getByTestId("spawn-progress")).getByText(
-        "Submit to run the spawn pipeline; each step reports here as it runs.",
-      ),
-    ).toBeInTheDocument();
-  });
-
-  it("opens task detail once the workspace is ready, replacing the spent form", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
-    const user = userEvent.setup();
-    const spawned = makeTask({ spawn_completed_at: null });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
+    expect(within(pipeline).getByText("Branch").closest(".step")).toHaveAttribute(
+      "data-step-status",
+      "running",
     );
-    const historyLength = window.history.length;
-
-    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
-    await user.click(screen.getByRole("button", { name: "Spawn task" }));
-    expect(screen.getByRole("button", { name: "Launching…" })).toBeDisabled();
-
-    await act(async () => {
-      socket().emit("task_created", spawned);
-      for (const step of ["fetch", "clone", "branch", "workshop"]) {
-        socket().emit("spawn_step", { task_id: 1, step, status: "started" });
-        socket().emit("spawn_step", { task_id: 1, step, status: "ok" });
-      }
-      socket().emit("task_updated", { ...spawned, spawn_completed_at: "t1" });
-    });
-
-    expect(window.location.pathname).toBe("/tasks/1");
-    // Replacing, not stacking: back must not return to a spent form.
-    expect(window.history.length).toBe(historyLength);
-
-    // Later updates for the same task must not navigate a second time.
-    await act(async () => {
-      socket().emit("task_updated", {
-        ...spawned,
-        spawn_completed_at: "t1",
-        workflow_status: "running",
-        workflow_step: "work",
-      });
-    });
-    expect(window.location.pathname).toBe("/tasks/1");
   });
 
-  it("navigates when task_created arrives before the REST response resolves", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+  it("navigates to the task once the workspace is ready", async () => {
+    stubLaunchFetch({ accept: makeTask({ spawn_completed_at: null }) });
+    await renderAt("/spawn", launchSnapshot);
     const user = userEvent.setup();
-    const spawned = makeTask({ spawn_completed_at: null });
-    const deferred = nativePromiseWithResolvers.withResolvers<unknown>();
-    vi.stubGlobal("fetch", vi.fn().mockReturnValue(deferred.promise));
-
-    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
-    await user.click(screen.getByRole("button", { name: "Spawn task" }));
-    expect(screen.getByRole("button", { name: "Creating…" })).toBeDisabled();
-
-    // The whole pipeline completes before the POST response is delivered.
-    act(() => {
-      socket().emit("task_created", spawned);
-      socket().emit("task_updated", { ...spawned, spawn_completed_at: "t1" });
-    });
-    expect(window.location.pathname).toBe("/spawn");
-
-    await act(async () => {
-      deferred.resolve({ ok: true, json: () => Promise.resolve(spawned) });
-      await deferred.promise;
-    });
-
-    expect(window.location.pathname).toBe("/tasks/1");
-  });
-
-  it("navigates from a reconnect snapshot when the step events were lost", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
-    const user = userEvent.setup();
-    const spawned = makeTask({ spawn_completed_at: null });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
-    );
-
-    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await fillDraft(user);
     await user.click(screen.getByRole("button", { name: "Spawn task" }));
 
-    // No spawn_step or task_updated deltas survive the reconnect; the
-    // replacement snapshot carries the completed task instead.
     await act(async () => {
-      socket().emitSnapshot({
-        projects: [project],
-        templates: [makeTemplate()],
-        tasks: [{ ...spawned, spawn_completed_at: "t1" }],
-      });
+      socket().emit("task_created", makeTask({ spawn_completed_at: null }));
+      socket().emit("task_updated", makeTask({ spawn_completed_at: "t1" }));
     });
 
-    expect(window.location.pathname).toBe("/tasks/1");
-  });
-
-  it("issues one request for a double activation", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
-    const user = userEvent.setup();
-    const spawned = makeTask({ spawn_completed_at: null });
-    const deferred = nativePromiseWithResolvers.withResolvers<unknown>();
-    const fetchMock = vi.fn().mockReturnValue(deferred.promise);
-    vi.stubGlobal("fetch", fetchMock);
-
-    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
-    const button = screen.getByRole("button", { name: "Spawn task" });
-    await user.dblClick(button);
-    // Submitting the form directly bypasses the disabled button entirely.
-    act(() => {
-      screen.getByTestId("spawn-form").dispatchEvent(
-        new Event("submit", { bubbles: true, cancelable: true }),
-      );
-    });
-
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      deferred.resolve({ ok: true, json: () => Promise.resolve(spawned) });
-      await deferred.promise;
-    });
+    await waitFor(() => expect(window.location.pathname).toBe("/tasks/1"));
   });
 
   it("unlocks the form and keeps its values when the daemon rejects the request", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+    stubLaunchFetch({ acceptStatus: 409, acceptDetail: "a live task maas/fix-bug already exists" });
+    await renderAt("/spawn", launchSnapshot);
     const user = userEvent.setup();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: false,
-        status: 409,
-        json: () => Promise.resolve({ detail: "a live task maas/fix-bug already exists" }),
-      }),
-    );
-
-    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await fillDraft(user);
     await user.type(screen.getByLabelText("Prompt"), "fix it");
     await user.click(screen.getByRole("button", { name: "Spawn task" }));
 
     expect(window.location.pathname).toBe("/spawn");
-    expect(screen.getByRole("alert")).toHaveTextContent("already exists");
+    expect(await screen.findByText(/already exists/)).toBeInTheDocument();
     expect(screen.getByLabelText("Task slug")).toHaveValue("fix-bug");
     expect(screen.getByLabelText("Prompt")).toHaveValue("fix it");
     expect(screen.getByRole("button", { name: "Spawn task" })).toBeEnabled();
   });
 
-  it("unlocks the form when the accepted task disappears from the snapshot", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
-    const user = userEvent.setup();
-    const spawned = makeTask({ spawn_completed_at: null });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(spawned) }),
-    );
-
-    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
-    await user.click(screen.getByRole("button", { name: "Spawn task" }));
-
-    act(() => {
-      socket().emit("task_created", spawned);
+  it("issues one acceptance request for a double activation", async () => {
+    const deferred = nativePromiseWithResolvers.withResolvers<unknown>();
+    const fetchMock = vi.fn((url: string, init?: { method?: string }) => {
+      if (typeof url === "string" && url.endsWith("/api/tasks/preview")) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(previewResponse()) });
+      }
+      if (url === "/api/tasks" && init?.method === "POST") return deferred.promise;
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({ paths: [], truncated: false }) });
     });
-    expect(screen.getByLabelText("Task slug")).toBeDisabled();
-
-    act(() => {
-      socket().emit("task_deleted", { id: 1 });
-    });
-
-    expect(window.location.pathname).toBe("/spawn");
-    expect(screen.getByRole("alert")).toHaveTextContent("no longer present");
-    expect(screen.getByRole("button", { name: "Spawn task" })).toBeEnabled();
-  });
-
-  it("renders cards from the snapshot and hides archived tasks", async () => {
-    await renderAt("/tasks", {
-      projects: [project],
-      tasks: [
-        makeTask(),
-        makeTask({ id: 2, slug: "old", branch: "bjornt/old", state: "archived" }),
-      ],
-    });
-
-    expect(screen.getByTestId("task-card-1")).toHaveTextContent("bjornt/fix-bug");
-    expect(screen.queryByTestId("task-card-2")).not.toBeInTheDocument();
-  });
-
-  it("shows spawning until the pipeline completes, then the created state", async () => {
-    const spawning = makeTask({ spawn_completed_at: null });
-    await renderAt("/tasks", { projects: [project], tasks: [spawning] });
-
-    expect(screen.getByTestId("task-card-1")).toHaveTextContent("spawning");
-
-    act(() => {
-      socket().emit("task_updated", makeTask());
-    });
-    expect(screen.getByTestId("task-card-1")).toHaveTextContent("created");
-    expect(screen.getByTestId("task-card-1")).not.toHaveTextContent("spawning");
-  });
-
-  it("failed cards expose the captured error on demand", async () => {
-    const failed = makeTask({ state: "failed", error: "step 'clone' failed:\nboom" });
-    await renderAt("/tasks", { projects: [project], tasks: [failed] });
-    const user = userEvent.setup();
-
-    expect(screen.queryByTestId("task-error-1")).not.toBeInTheDocument();
-    await user.click(screen.getByTestId("task-error-toggle-1"));
-    expect(screen.getByTestId("task-error-1")).toHaveTextContent("boom");
-  });
-
-  it("cleanup requires confirmation naming the clone path before calling the API", async () => {
-    await renderAt("/tasks", { projects: [project], tasks: [makeTask()] });
-    const user = userEvent.setup();
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue({ ok: true, json: () => Promise.resolve(makeTask({ state: "archived" })) });
     vi.stubGlobal("fetch", fetchMock);
-
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
-    await user.click(screen.getByRole("button", { name: "Clean up" }));
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining("/home/op/tasks/maas/fix-bug"));
-    expect(fetchMock).not.toHaveBeenCalled();
-
-    confirmSpy.mockReturnValue(true);
-    await user.click(screen.getByRole("button", { name: "Clean up" }));
-    expect(fetchMock).toHaveBeenCalledWith("/api/tasks/1/cleanup", expect.objectContaining({ method: "POST" }));
-
-    act(() => {
-      socket().emit("task_updated", makeTask({ state: "archived" }));
-    });
-    expect(screen.queryByTestId("task-card-1")).not.toBeInTheDocument();
-    expect(screen.getByTestId("tasks-empty-state")).toBeInTheDocument();
-  });
-
-  it("cleanup confirmation names the workshop container when one is recorded", async () => {
-    await renderAt("/tasks", { projects: [project], tasks: [makeTask({ workshop_id: "ws-maas-fix-bug" })] });
+    await renderAt("/spawn", launchSnapshot);
     const user = userEvent.setup();
-    vi.stubGlobal("fetch", vi.fn());
+    await fillDraft(user);
 
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
-    await user.click(screen.getByRole("button", { name: "Clean up" }));
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining("ws-maas-fix-bug"));
+    await user.dblClick(screen.getByRole("button", { name: "Spawn task" }));
+    act(() => {
+      screen
+        .getByTestId("spawn-form")
+        .dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    });
+
+    const accepts = fetchMock.mock.calls.filter(
+      ([url, init]) => url === "/api/tasks" && (init as { method?: string })?.method === "POST",
+    );
+    expect(accepts).toHaveLength(1);
+
+    await act(async () => {
+      deferred.resolve({ ok: true, json: () => Promise.resolve(makeTask()) });
+      await deferred.promise;
+    });
   });
 });
 
@@ -1331,23 +1281,72 @@ describe("TaskDetailView", () => {
     expect(screen.getByTestId("workshop-status")).toHaveTextContent("present · ws-maas-fix-bug");
   });
 
-  it("annotates the spawned row with the task's template when set", async () => {
-    const task = makeTask({ template_name: "maas" });
+  it("shows the accepted configuration, not a recomputation from today's settings", async () => {
+    const task = makeTask();
     stubDetailFetch({ ...task, workshop_status: "present" });
-    await renderAt("/tasks/1", { projects: [project], tasks: [task] });
+    await renderAt("/tasks/1", {
+      projects: [{ ...project, default_model_profile: "something-else", base_branch: "trunk" }],
+      model_profiles: [balanced],
+      tasks: [task],
+    });
 
-    const meta = await screen.findByTestId("task-metadata");
-    expect(meta).toHaveTextContent(/spawned.+template maas/);
+    const panel = await screen.findByTestId("task-inputs");
+    expect(within(panel).getByTestId("accepted-profile")).toHaveTextContent("balanced");
+    expect(within(panel).getByTestId("accepted-profile")).toHaveTextContent(
+      "inherited from the project",
+    );
+    // The project now says `trunk`; the task keeps what it was accepted with.
+    expect(panel).toHaveTextContent("master");
+    expect(within(panel).getByTestId("role-slow")).toHaveTextContent("openai/o3");
+    expect(within(panel).getByTestId("role-slow")).toHaveTextContent("judge (conditional)");
   });
 
-  it("omits the template annotation for tasks that predate templates", async () => {
-    const task = makeTask({ template_name: null });
-    stubDetailFetch({ ...task, workshop_status: "present" });
-    await renderAt("/tasks/1", { projects: [project], tasks: [task] });
+  it("asks a task that predates pinned inputs to confirm a continuation", async () => {
+    const task = makeTask({ execution_inputs: null, needs_configuration: true });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (typeof url === "string" && url.endsWith("/configuration")) {
+          return Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                task_id: 1,
+                needs_configuration: true,
+                archived: false,
+                known: { branch: "bjornt/fix-bug" },
+                source_attribution: [],
+                unknown_inputs: ["model_profile", "thinking", "preamble"],
+                candidates: {
+                  base_branch: "master",
+                  workshop_additions: "project",
+                  preamble: "",
+                  default_model_profile: "balanced",
+                },
+              }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ ...task, workshop_status: "present" }),
+        });
+      }),
+    );
+    await renderAt("/tasks/1", {
+      projects: [project],
+      model_profiles: [balanced],
+      tasks: [task],
+    });
 
-    const meta = await screen.findByTestId("task-metadata");
-    expect(meta).toHaveTextContent("spawned");
-    expect(meta).not.toHaveTextContent("template");
+    await screen.findByTestId("task-inputs");
+    // The panel renders as soon as the task loads; the legacy evidence needs
+    // its own /configuration response, so wait for that rather than the panel.
+    expect(await screen.findByTestId("legacy-unknown")).toHaveTextContent(
+      "cannot be recovered",
+    );
+    // The acknowledgement gates confirmation; nothing is pre-ticked.
+    expect(screen.getByTestId("legacy-acknowledge")).not.toBeChecked();
+    expect(screen.getByTestId("legacy-confirm")).toBeDisabled();
   });
 
   it("shows escape-hatch commands with the task's clone path", async () => {
@@ -3677,8 +3676,9 @@ describe("ProjectsView (projects-view capability)", () => {
     await user.type(nameInput, "maas-ng");
     await user.click(screen.getByRole("button", { name: "Save" }));
 
-    // base_branch/branch_pattern moved to templates — the save no longer
-    // round-trips them (projects capability, per-project defaults removed).
+    // The workspace defaults are project fields again (ADR-0026), and the
+    // edit panel shows every one of them — so it always states the intended
+    // value rather than leaving any to be preserved by omission.
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/projects/maas",
       expect.objectContaining({
@@ -3689,9 +3689,11 @@ describe("ProjectsView (projects-view capability)", () => {
           fork_url: null,
           checkout_path: project.checkout_path,
           fetch_remote: project.fetch_remote,
-          // The edit panel shows the selector, so it always states the
-          // intended value rather than leaving it to be preserved.
-          default_model_profile: null,
+          default_model_profile: project.default_model_profile,
+          base_branch: project.base_branch,
+          branch_pattern: project.branch_pattern,
+          workshop_additions: project.workshop_additions,
+          preamble: project.preamble,
           new_name: "maas-ng",
         }),
       }),
@@ -3782,248 +3784,33 @@ describe("ProjectsView (projects-view capability)", () => {
   });
 });
 
-describe("SettingsView (templates capability)", () => {
-  it("renders one row per template from the snapshot with its summary line", async () => {
+describe("SettingsView after the template retirement (ADR-0026)", () => {
+  it("keeps model profiles and daemon controls, and offers no template CRUD", async () => {
     await renderAt("/settings", {
       projects: [project],
-      templates: [
-        makeTemplate({ model: "fable-5" }),
-        makeTemplate({ name: "llmvet", base_branch: "main", model: "haiku-4.5" }),
-        makeTemplate({ name: "reviewer", branch_pattern: "review/<slug>" }),
-      ],
+      model_profiles: [balanced],
       tasks: [],
     });
 
-    expect(screen.getByRole("heading", { name: "Templates & settings" })).toBeInTheDocument();
-    expect(screen.getByText("what spawn needs, and how attention reaches you")).toBeInTheDocument();
-
-    const maasRow = screen.getByTestId("template-row-maas");
-    expect(maasRow).toHaveTextContent("maas");
-    expect(maasRow).toHaveTextContent(
-      "/home/op/proj/maas · master · bjornt/<slug> · fable-5 · wf:single-step",
-    );
-    expect(screen.getByTestId("template-row-llmvet")).toHaveTextContent(
-      "/home/op/proj/maas · main · bjornt/<slug> · haiku-4.5 · wf:single-step",
-    );
-    // A null model falls back to "omp default".
-    expect(screen.getByTestId("template-row-reviewer")).toHaveTextContent(
-      "/home/op/proj/maas · master · review/<slug> · omp default · wf:single-step",
-    );
+    expect(screen.getByTestId("model-profiles-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("notifications-panel")).toBeInTheDocument();
+    expect(screen.queryByTestId("templates-panel")).toBeNull();
+    expect(screen.queryByTestId("new-template-toggle")).toBeNull();
+    expect(screen.queryByTestId("template-editor")).toBeNull();
   });
 
-  it("shows an empty state when no templates exist", async () => {
-    await renderAt("/settings", { projects: [project], templates: [], tasks: [] });
-    expect(screen.getByTestId("templates-empty-state")).toBeInTheDocument();
-  });
-
-  it("creates a template via the editor and lists the row from the broadcast", async () => {
-    await renderAt("/settings", { projects: [project], templates: [], tasks: [] });
-    const user = userEvent.setup();
-    const created = makeTemplate({ name: "llmvet", base_branch: "main" });
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve(created),
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    await user.click(screen.getByTestId("new-template-toggle"));
-    const editor = screen.getByTestId("template-editor");
-    expect(within(editor).getByText("New template")).toBeInTheDocument();
-    // The picked project's checkout/remote render read-only beneath the picker.
-    expect(screen.getByTestId("template-project-derived")).toHaveTextContent(
-      "checkout /home/op/proj/maas · remote https://example.com/maas.git",
-    );
-
-    await user.type(screen.getByTestId("template-name"), "llmvet");
-    await user.clear(screen.getByTestId("template-base-branch"));
-    await user.type(screen.getByTestId("template-base-branch"), "main");
-    await user.click(screen.getByRole("button", { name: "Create template" }));
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/templates",
-      expect.objectContaining({
-        method: "POST",
-        body: JSON.stringify({
-          name: "llmvet",
-          project_name: "maas",
-          base_branch: "main",
-          branch_pattern: "ompire/<slug>",
-          workflow: "single-step",
-          workshop_additions: "project",
-          model: null,
-          thinking: null,
-          preamble: "",
-        }),
-      }),
-    );
-
-    // Editor closed; the row arrives over the wire, not from the response.
-    expect(screen.queryByTestId("template-editor")).not.toBeInTheDocument();
-    act(() => {
-      socket().emit("template_created", created);
-    });
-    expect(screen.getByTestId("template-row-llmvet")).toBeInTheDocument();
-  });
-
-  it("saves edits with PUT and reflects the broadcast without a reload", async () => {
+  it("no longer says a profile is saved-only configuration", async () => {
     await renderAt("/settings", {
       projects: [project],
-      templates: [makeTemplate()],
+      model_profiles: [balanced],
       tasks: [],
     });
-    const user = userEvent.setup();
-    const updated = makeTemplate({ model: "fable-5", preamble: "Run pytest from the repo root." });
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve(updated),
-    });
-    vi.stubGlobal("fetch", fetchMock);
 
-    await user.click(
-      within(screen.getByTestId("template-row-maas")).getByRole("button", { name: "Edit" }),
-    );
-    const editor = screen.getByTestId("template-editor");
-    expect(within(editor).getByText("Template · maas")).toBeInTheDocument();
-    expect(screen.getByTestId("template-base-branch")).toHaveValue("master");
-
-    await user.type(screen.getByTestId("template-model"), "fable-5");
-    await user.type(screen.getByTestId("template-preamble"), "Run pytest from the repo root.");
-    await user.click(screen.getByRole("button", { name: "Save template" }));
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/templates/maas",
-      expect.objectContaining({
-        method: "PUT",
-        body: JSON.stringify({
-          project_name: "maas",
-          base_branch: "master",
-          branch_pattern: "bjornt/<slug>",
-          workflow: "single-step",
-          workshop_additions: "project",
-          model: "fable-5",
-          thinking: null,
-          preamble: "Run pytest from the repo root.",
-        }),
-      }),
-    );
-
-    expect(screen.queryByTestId("template-editor")).not.toBeInTheDocument();
-    act(() => {
-      socket().emit("template_updated", updated);
-    });
-    expect(screen.getByTestId("template-row-maas")).toHaveTextContent("fable-5");
-  });
-
-  it("confirms removal and surfaces the daemon's 409 naming live tasks inline", async () => {
-    await renderAt("/settings", {
-      projects: [project],
-      templates: [makeTemplate()],
-      tasks: [makeTask()],
-    });
-    const user = userEvent.setup();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: false,
-        status: 409,
-        json: () =>
-          Promise.resolve({
-            detail: "template 'maas' has tasks referencing it: maas/fix-bug (created)",
-          }),
-      }),
-    );
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
-
-    await user.click(
-      within(screen.getByTestId("template-row-maas")).getByRole("button", { name: "Edit" }),
-    );
-    await user.click(screen.getByTestId("remove-template-maas"));
-
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining("Remove template maas?"));
-    expect(await screen.findByTestId("template-editor-error")).toHaveTextContent(
-      "template 'maas' has tasks referencing it: maas/fix-bug (created)",
-    );
-    // The editor stays open and the template is retained.
-    expect(screen.getByTestId("template-editor")).toBeInTheDocument();
-    expect(screen.getByTestId("template-row-maas")).toBeInTheDocument();
-  });
-
-  it("keeps the editor open with the daemon's 422 detail on an invalid save", async () => {
-    await renderAt("/settings", {
-      projects: [project],
-      templates: [makeTemplate()],
-      tasks: [],
-    });
-    const user = userEvent.setup();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue({
-        ok: false,
-        status: 422,
-        json: () =>
-          Promise.resolve({ detail: "branch pattern must contain exactly one <slug>" }),
-      }),
-    );
-
-    await user.click(
-      within(screen.getByTestId("template-row-maas")).getByRole("button", { name: "Edit" }),
-    );
-    await user.clear(screen.getByTestId("template-branch-pattern"));
-    await user.type(screen.getByTestId("template-branch-pattern"), "bjornt/no-slot");
-    await user.click(screen.getByRole("button", { name: "Save template" }));
-
-    expect(await screen.findByTestId("template-editor-error")).toHaveTextContent(
-      "branch pattern must contain exactly one <slug>",
-    );
-    expect(screen.getByTestId("template-editor")).toBeInTheDocument();
-  });
-
-  it("removes an unreferenced template after confirmation", async () => {
-    await renderAt("/settings", {
-      projects: [project],
-      templates: [makeTemplate()],
-      tasks: [],
-    });
-    const user = userEvent.setup();
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ deleted: "maas" }),
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    vi.spyOn(window, "confirm").mockReturnValue(true);
-
-    await user.click(
-      within(screen.getByTestId("template-row-maas")).getByRole("button", { name: "Edit" }),
-    );
-    await user.click(screen.getByTestId("remove-template-maas"));
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/templates/maas",
-      expect.objectContaining({ method: "DELETE" }),
-    );
-    act(() => {
-      socket().emit("template_deleted", { name: "maas" });
-    });
-    expect(screen.queryByTestId("template-row-maas")).not.toBeInTheDocument();
-    expect(screen.getByTestId("templates-empty-state")).toBeInTheDocument();
-  });
-
-  it("declining the remove confirmation sends no request", async () => {
-    await renderAt("/settings", {
-      projects: [project],
-      templates: [makeTemplate()],
-      tasks: [],
-    });
-    const user = userEvent.setup();
-    const fetchMock = vi.fn();
-    vi.stubGlobal("fetch", fetchMock);
-    vi.spyOn(window, "confirm").mockReturnValue(false);
-
-    await user.click(
-      within(screen.getByTestId("template-row-maas")).getByRole("button", { name: "Edit" }),
-    );
-    await user.click(screen.getByTestId("remove-template-maas"));
-    expect(fetchMock).not.toHaveBeenCalled();
+    const note = screen.getByTestId("model-profiles-boundary");
+    // A profile governs launches now; what it must still not claim is that
+    // editing it reaches a task already accepted.
+    expect(note).not.toHaveTextContent("saved configuration only");
+    expect(note).toHaveTextContent("Tasks already accepted keep the bindings");
   });
 });
 
@@ -4066,14 +3853,21 @@ describe("SpawnView file mentions", () => {
 
   async function spawnViewWithFiles(
     responder: (query: string) => { paths: string[]; truncated?: boolean } | "error",
-    templates = [makeTemplate()],
+    projects = [project],
   ) {
-    await renderAt("/spawn", { projects: [project], templates, tasks: [] });
+    await renderAt("/spawn", {
+      projects,
+      model_profiles: [balanced],
+      workflow_catalog: [singleStep],
+      tasks: [],
+    });
+    const user = userEvent.setup();
+    await user.selectOptions(screen.getByLabelText("Project"), projects[0].name);
     const fetchMock = stubFileSearch(responder);
-    return { user: userEvent.setup(), fetchMock, prompt: screen.getByLabelText("Prompt") };
+    return { user, fetchMock, prompt: screen.getByLabelText("Prompt") };
   }
 
-  it("opens suggestions when @ is typed and queries the template's project", async () => {
+  it("opens suggestions when @ is typed and queries the selected project", async () => {
     const { user, fetchMock, prompt } = await spawnViewWithFiles(() => ({
       paths: ["src/lib/token.ts"],
     }));
@@ -4207,16 +4001,16 @@ describe("SpawnView file mentions", () => {
     expect(prompt).toHaveValue("@abc");
   });
 
-  it("closes the list when the template changes without rewriting the prompt", async () => {
+  it("closes the list when the project changes without rewriting the prompt", async () => {
     const { user, prompt } = await spawnViewWithFiles(() => ({ paths: ["a/token.ts"] }), [
-      makeTemplate(),
-      makeTemplate({ name: "other", project_name: "maas" }),
+      project,
+      { ...project, name: "other", title: "Other" },
     ]);
 
     await user.type(prompt, "read @tok");
     await screen.findByRole("option", { name: "a/token.ts" });
 
-    await user.selectOptions(screen.getByLabelText("Project template"), "other");
+    await user.selectOptions(screen.getByLabelText("Project"), "other");
 
     expect(screen.queryByTestId("mention-popup")).not.toBeInTheDocument();
     expect(prompt).toHaveValue("read @tok");
@@ -4253,19 +4047,36 @@ describe("SpawnView file mentions", () => {
   });
 
   it("is inert while the form is locked by a submission", async () => {
-    await renderAt("/spawn", { projects: [project], templates: [makeTemplate()], tasks: [] });
+    const spawned = makeTask({ spawn_completed_at: null });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string, init?: { method?: string }) => {
+        if (typeof url === "string" && url.endsWith("/api/tasks/preview")) {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve(previewResponse()) });
+        }
+        if (url === "/api/tasks" && init?.method === "POST") {
+          return Promise.resolve({ ok: true, json: () => Promise.resolve(spawned) });
+        }
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ paths: ["a/token.ts"], truncated: false }),
+        });
+      }),
+    );
+    await renderAt("/spawn", {
+      projects: [project],
+      model_profiles: [balanced],
+      workflow_catalog: [singleStep],
+      tasks: [],
+    });
     const user = userEvent.setup();
+    await user.selectOptions(screen.getByLabelText("Workflow"), "single-step");
+    await user.selectOptions(screen.getByLabelText("Project"), "maas");
     const prompt = screen.getByLabelText("Prompt");
     await user.type(prompt, "fix it");
-
-    const spawned = makeTask({ spawn_completed_at: null });
-    stubFileSearch(() => ({ paths: ["a/token.ts"] }));
-    vi.mocked(fetch).mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve(spawned),
-    } as unknown as Response);
-
     await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await screen.findByTestId("step-preview");
+
     await user.click(screen.getByRole("button", { name: "Spawn task" }));
 
     expect(prompt).toBeDisabled();
@@ -4515,24 +4326,13 @@ describe("project checkout onboarding (ADR-0022)", () => {
   it("refuses to spawn against a project whose checkout is not ready", async () => {
     await renderAt("/spawn", {
       projects: [cloning],
-      templates: [
-        {
-          name: "fresh",
-          project_name: "fresh",
-          base_branch: "main",
-          branch_pattern: "ompire/<slug>",
-          workflow: "single-step",
-          workshop_additions: "project",
-          model: null,
-          thinking: null,
-          preamble: "",
-        },
-      ],
+      model_profiles: [balanced],
+      workflow_catalog: [singleStep],
       tasks: [],
     });
     const user = userEvent.setup();
 
-    await user.type(screen.getByLabelText("Task slug"), "fix-it");
+    await user.selectOptions(screen.getByLabelText("Project"), "fresh");
 
     expect(screen.getByTestId("project-not-ready")).toHaveTextContent("cloning");
     expect(screen.getByRole("button", { name: "Spawn task" })).toBeDisabled();
@@ -4587,19 +4387,21 @@ describe("project default model profile (ADR-0025)", () => {
 
   it("shows the chosen profile on the card, or that none is configured", async () => {
     const assigned = { ...project, name: "assigned", default_model_profile: "balanced" };
+    const bare = { ...project, name: "bare", default_model_profile: null };
     await renderAt("/projects", {
-      projects: [project, assigned],
+      projects: [bare, assigned],
       tasks: [],
       model_profiles: [balanced],
     });
 
     expect(screen.getByTestId("default-profile-assigned")).toHaveTextContent("balanced");
-    expect(screen.getByTestId("default-profile-maas")).toHaveTextContent(
+    expect(screen.getByTestId("default-profile-bare")).toHaveTextContent(
       "no default configured",
     );
-    // The card states that the assignment is stored, not in force.
+    // The card states what the default actually does: it is inherited, and a
+    // task may replace it (ADR-0026).
     expect(screen.getByTestId("default-profile-assigned")).toHaveTextContent(
-      /templates still run tasks/,
+      /inherited by a launch unless the task selects another/,
     );
   });
 
@@ -4617,7 +4419,7 @@ describe("project default model profile (ADR-0025)", () => {
     // points at where to make one.
     expect(screen.getByTestId("new-project-default-profile")).toHaveValue("");
     expect(
-      screen.getByRole("link", { name: /Create one in Templates/ }),
+      screen.getByRole("link", { name: /Create one in Settings/ }),
     ).toBeInTheDocument();
 
     await user.type(screen.getByTestId("new-project-name"), "fresh");

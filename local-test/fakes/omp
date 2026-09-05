@@ -7,9 +7,11 @@ so this process's cwd is the task clone and stdio carries the rpc-ui NDJSON.
 Consumed contracts (daemon call sites):
   agent.py:verify_ask_timeout   omp config get ask.timeout       -> "0", rc 0
   agent.py:build_agent_argv     omp --mode rpc-ui --no-title
-                                [--model M] [--thinking T] [--resume <id>]
+                                [--model M] [--thinking T]
+                                [--smol/--slow/--plan P:L] [--resume <id>]
   agent.py AgentHandle          ready handshake; prompt bursts;
-                                get_state / get_session_stats / steer /
+                                get_state / set_model / set_thinking_level /
+                                get_session_stats / steer /
                                 follow_up / abort_and_prompt
   ship.py ShipManager.draft     get_last_assistant_text -> {"data":{"text":…}}
   workflows.py                  .ompire/outcome.json written by the "agent"
@@ -34,6 +36,7 @@ State layout (under $LOCAL_TEST_STATE, else local-test/.state):
 
 Usage: omp config get ask.timeout | omp --version
        omp [--mode rpc-ui --no-title] [--model M] [--thinking T]
+           [--smol P:L] [--slow P:L] [--plan P:L]
            [--resume <id>]
        omp selfcheck
 """
@@ -276,6 +279,32 @@ class Engine:
         self.resume_id = resume_id
         self.session_id = resume_id
         self.transcript: Transcript | None = None
+        # The native model policy this process was started with, parsed from
+        # its own argv so `get_state` can report it back the way real omp
+        # does. Recording the auxiliary role flags is what makes a scenario
+        # able to assert that all four roles actually reached the child.
+        self.model_state: dict[str, str] | None = None
+        self.thinking_level: str | None = None
+        self.role_flags: dict[str, str] = {}
+        self._parse_model_flags(argv)
+
+    def _parse_model_flags(self, argv: list[str]) -> None:
+        index = 0
+        while index < len(argv):
+            flag = argv[index]
+            value = argv[index + 1] if index + 1 < len(argv) else ""
+            if flag == "--model":
+                provider, _, model_id = value.partition("/")
+                self.model_state = {"provider": provider, "id": model_id}
+                index += 2
+            elif flag == "--thinking":
+                self.thinking_level = value
+                index += 2
+            elif flag in ("--smol", "--slow", "--plan"):
+                self.role_flags[flag.lstrip("-")] = value
+                index += 2
+            else:
+                index += 1
 
     # -- launch ---------------------------------------------------------------
 
@@ -390,6 +419,26 @@ class Engine:
     def _handle_generic(self, request: dict) -> None:
         request_id = request.get("id", "")
         rtype = request.get("type")
+        if rtype == "set_model":
+            # Real omp refuses an unknown model and leaves the active one in
+            # place; `unknown-model` reproduces that here.
+            if request.get("modelId") == "unknown-model":
+                emit({"id": request_id, "type": "response", "command": "set_model",
+                      "success": False,
+                      "error": f"Model not found: {request.get('provider')}/unknown-model"})
+                return
+            self.model_state = {
+                "provider": request.get("provider"),
+                "id": request.get("modelId"),
+            }
+            emit({"id": request_id, "type": "response", "command": "set_model",
+                  "success": True})
+            return
+        if rtype == "set_thinking_level":
+            self.thinking_level = request.get("level")
+            emit({"id": request_id, "type": "response",
+                  "command": "set_thinking_level", "success": True})
+            return
         if rtype == "get_state":
             if self.startup_scenario == "get-state-fails":
                 emit({"id": request_id, "type": "response",
@@ -406,6 +455,15 @@ class Engine:
                         "messageCount": self.message_count,
                         "sessionId": self.session_id,
                         "contextPercent": 95 if self.last_scenario == "big" else 10,
+                        # The native model policy this process was started
+                        # with, reported the way real omp does (v18.1.10:
+                        # `data.model.{provider,id}` and `thinkingLevel`).
+                        # The daemon reads it back and refuses to prompt
+                        # unless it matches the accepted policy, so a fake
+                        # that ignored the flags would fail every start.
+                        "model": self.model_state,
+                        "thinkingLevel": self.thinking_level,
+                        "roleFlags": self.role_flags,
                     },
                 })
             return
@@ -746,7 +804,7 @@ def main() -> None:
             flag = argv[i]
             if flag == "--no-title":
                 i += 1
-            elif flag in ("--model", "--thinking") and i + 1 < len(argv):
+            elif flag in ("--model", "--thinking", "--smol", "--slow", "--plan") and i + 1 < len(argv):
                 i += 2
             elif flag == "--resume" and i + 1 < len(argv):
                 resume = argv[i + 1]

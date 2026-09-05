@@ -4,7 +4,7 @@
 # (docs/adr/0014-test-end-to-end-behavior-at-external-process-boundaries.md)
 # End-to-end runbook driver.
 #
-#   run <name>    preflight (daemon reachable, project + template
+#   run <name>    preflight (daemon reachable, project + model profile
 #                 registered) then execute one runbook
 #   run --all     throwaway state root on a free port: env up, every
 #                 runbook in matrix order, env down --wipe; the persistent
@@ -20,7 +20,7 @@ DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$DIR/../.." && pwd)
 ENV_TOOL=$REPO_ROOT/local-test/env
 
-# matrix order: happy-path first (it is the template the others assume);
+# matrix order: happy-path first (it is the pattern the others assume);
 # crash-recovery last-but-one (it kills the daemon); cleanup last.
 MATRIX=(
 	happy-path
@@ -54,10 +54,12 @@ preflight() {
 		die "daemon not reachable on port $port — run 'local-test/env up' first"
 	jq -e 'map(select(.name == "sandbox")) | length == 1' >/dev/null <<<"$body" ||
 		die "project 'sandbox' not registered — run 'local-test/env up'"
+	# A launch needs a complete model profile, and the project must inherit
+	# one or the scenario has to select it explicitly (ADR-0026).
 	body=$(curl -sS -H "Authorization: Bearer $(cat "$token_file")" \
-		"http://127.0.0.1:$port/api/templates")
+		"http://127.0.0.1:$port/api/model-profiles")
 	jq -e 'map(select(.name == "sandbox")) | length == 1' >/dev/null <<<"$body" ||
-		die "template 'sandbox' not registered — run 'local-test/env up'"
+		die "model profile 'sandbox' not registered — run 'local-test/env up'"
 }
 
 tree_checksum() { # tree_checksum ROOT — names, modes, links, and file bytes

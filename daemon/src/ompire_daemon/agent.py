@@ -15,11 +15,14 @@ import asyncio
 import contextlib
 import logging
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ompire_daemon import rpc
 from ompire_daemon.config import Config
 from ompire_daemon.events import Event, EventHub
+from ompire_daemon.execution_inputs import ModelPolicy, split_model_identifier
+from ompire_daemon.registry.model_profiles import RoleBinding
 
 if TYPE_CHECKING:
     from ompire_daemon.sessions import SessionTracker
@@ -55,29 +58,68 @@ class NoLiveAgentError(Exception):
         self.session = session
 
 
+class ModelConfigurationError(Exception):
+    """The child did not end up running the accepted model policy.
+
+    Raised instead of prompting: a turn sent under a substituted model or a
+    dropped thinking policy is not the run the operator reviewed, and omp
+    resolves `--model` fuzzily, so "it started" is not proof it obeyed
+    (native probe, v18.1.10). The caller kills the child and fails the step.
+    """
+
+
+@dataclass(frozen=True)
+class NativeModelState:
+    """What the child reports it is actually running.
+
+    `thinking_level` is omp's *resolved* level, which legitimately differs
+    from the accepted policy: `max` resolves per model (observed `xhigh` on
+    `anthropic/claude-sonnet-4-5`) and `auto` resolves to a concrete level
+    (observed `high`). Keeping both means the UI can show the policy the
+    operator chose next to the level the model is using, instead of
+    presenting normalization as a lost override.
+    """
+
+    model: str  # provider-qualified, as the child reports it
+    thinking_level: str | None
+
+
+def role_flag_value(binding: RoleBinding) -> str:
+    """`provider/model-id:LEVEL` — the native encoding the auxiliary role
+    flags take (one argument each, verified against omp v18.1.10)."""
+    return f"{binding.model}:{binding.thinking}"
+
+
 def build_agent_argv(
     clone_path: str,
     *,
+    policy: ModelPolicy,
     resume: str | None = None,
-    model: str | None = None,
-    thinking: str | None = None,
 ) -> list[str]:
     """The spike's spawn recipe (design D-2): sessions ON (no `--no-session`),
     no `-s` flag (nonexistent), and no environment-injection prefix
     (ADR-0015). `resume` appends `--resume <session-id>`
     (crash-recovery capability, design D-1/D-3) — a bare session id, not a
     file path, confirmed against the omp source (see the
-    `omp-rpc-field-assumptions` memory note). `model`/`thinking` append
-    `--model`/`--thinking` only when set (templates capability; both flags
-    verified against omp v17.2.12); unset means omp's defaults."""
+    `omp-rpc-field-assumptions` memory note).
+
+    The model policy is not optional (ADR-0026). Every process — a fresh
+    session, a lazily spawned one, the judge, a resumed one — carries the
+    task's accepted active pair *and* all three auxiliary role pairs, each
+    with its own thinking level. There is no "unset means omp's default"
+    any more: inheriting the host's model settings is exactly what a global
+    profile exists to prevent. Flags and their one-argument
+    `provider/model-id:LEVEL` encoding verified against omp v18.1.10.
+    """
     argv = [
         "workshop", "exec", "-p", clone_path, "--",
         "omp", "--mode", "rpc-ui", "--no-title",
+        "--model", policy.active.model,
+        "--thinking", policy.active.thinking,
+        "--smol", role_flag_value(policy.smol),
+        "--slow", role_flag_value(policy.slow),
+        "--plan", role_flag_value(policy.plan),
     ]
-    if model is not None:
-        argv += ["--model", model]
-    if thinking is not None:
-        argv += ["--thinking", thinking]
     if resume is not None:
         argv += ["--resume", resume]
     return argv
@@ -128,6 +170,11 @@ class AgentHandle:
 
     def __init__(self, process: asyncio.subprocess.Process, ring_buffer_size: int) -> None:
         self._process = process
+        # The accepted policy this child was started and verified under, set
+        # by the supervisor once the model handshake succeeds. Lives on the
+        # handle rather than in the engine so it survives a restart that
+        # rebuilds the runner over already-resumed sessions.
+        self.policy: ModelPolicy | None = None
         self.events: deque[Event] = deque(maxlen=ring_buffer_size)
         self._subscribers: set[asyncio.Queue] = set()
         self._stderr_capture: deque[str] = deque(maxlen=_STDERR_CAPTURE_LIMIT)
@@ -193,6 +240,76 @@ class AgentHandle:
             logger.warning("session id capture failed: no sessionId in get_state response")
             return None
         return session_id
+
+    async def read_native_model_state(self) -> NativeModelState | None:
+        """The child's actual model and resolved thinking level via
+        `get_state`. `data.model.{provider,id}` and `data.thinkingLevel`
+        verified against omp v18.1.10 in an isolated rpc-ui process; returns
+        None only when the response has no model at all."""
+        response = await self.request("get_state")
+        data = response.get("data")
+        data = data if isinstance(data, dict) else {}
+        model = data.get("model")
+        model = model if isinstance(model, dict) else {}
+        provider = model.get("provider")
+        model_id = model.get("id")
+        if not isinstance(provider, str) or not isinstance(model_id, str):
+            return None
+        level = data.get("thinkingLevel")
+        return NativeModelState(
+            model=f"{provider}/{model_id}",
+            thinking_level=level if isinstance(level, str) else None,
+        )
+
+    async def set_active_model(self, provider: str, model_id: str) -> None:
+        """`set_model` with the split identifier. omp answers `success: false`
+        with "Model not found: …" and leaves the previous model in place when
+        the id is unknown (v18.1.10 probe), so a failure here must never be
+        swallowed: it means the next prompt would run on the wrong model."""
+        try:
+            await self.request("set_model", provider=provider, modelId=model_id)
+        except rpc.RequestFailedError as exc:
+            raise ModelConfigurationError(
+                f"omp refused model {provider}/{model_id}: {exc}"
+            ) from exc
+
+    async def set_thinking_level(self, level: str) -> None:
+        try:
+            await self.request("set_thinking_level", level=level)
+        except rpc.RequestFailedError as exc:
+            raise ModelConfigurationError(
+                f"omp refused thinking level {level!r}: {exc}"
+            ) from exc
+
+    async def apply_model_policy(
+        self, policy: ModelPolicy, *, reassert: bool
+    ) -> NativeModelState:
+        """Make sure this child is running the accepted active pair, and
+        report what it resolved to.
+
+        A resumed process is restored from its session file, so `--model` on
+        the argv is not by itself proof (crash-recovery). `reassert` sends the
+        acknowledged `set_model`/`set_thinking_level` controls before any
+        prompt or resume nudge goes out. Either way the active model identity
+        is then read back and compared exactly: omp fuzzy-matches `--model`,
+        so a typo or a retired id would otherwise silently run a neighbour.
+        """
+        provider, model_id = split_model_identifier(policy.active.model)
+        if reassert:
+            await self.set_active_model(provider, model_id)
+            await self.set_thinking_level(policy.active.thinking)
+        state = await self.read_native_model_state()
+        if state is None:
+            raise ModelConfigurationError(
+                "omp did not report an active model; refusing to prompt under "
+                "unknown model settings"
+            )
+        if state.model != policy.active.model:
+            raise ModelConfigurationError(
+                f"omp resolved model {policy.active.model!r} to {state.model!r}; "
+                "refusing to prompt under a substituted model"
+            )
+        return state
 
     async def respond_ui_request(self, request_id: str, payload: dict[str, Any]) -> None:
         """Reply to an agent-raised `extension_ui_request` (design D-5): this
@@ -346,9 +463,8 @@ class AgentSupervisor:
         session: str,
         clone_path: str,
         *,
+        policy: ModelPolicy,
         resume: str | None = None,
-        model: str | None = None,
-        thinking: str | None = None,
     ) -> AgentHandle:
         key = (task_id, session)
         if key in self._handles:
@@ -356,9 +472,7 @@ class AgentSupervisor:
         if task_id not in self._ask_timeout_verified:
             await verify_ask_timeout(clone_path)
             self._ask_timeout_verified.add(task_id)
-        argv = build_agent_argv(
-            clone_path, resume=resume, model=model, thinking=thinking
-        )
+        argv = build_agent_argv(clone_path, policy=policy, resume=resume)
         if self._tracker is not None and resume is None:
             # `starting` covers the spawn and ready handshake (design D-2). A
             # resumed start is already seeded `starting` with a recovery
@@ -370,6 +484,33 @@ class AgentSupervisor:
             ready_timeout=self._config.agent_ready_timeout,
             ring_buffer_size=self._config.agent_ring_buffer_size,
         )
+        # Between ready and the first prompt: assert the accepted policy and
+        # read back what the child actually runs (ADR-0026). A child that
+        # cannot be put on the accepted model is killed here rather than
+        # prompted under substituted settings.
+        try:
+            native = await handle.apply_model_policy(policy, reassert=resume is not None)
+        except (ModelConfigurationError, rpc.RequestFailedError, rpc.AgentGoneError) as exc:
+            await handle.kill()
+            if self._tracker is not None:
+                self._tracker.session_start_failed(
+                    task_id, session, f"model configuration failed: {exc}"
+                )
+            raise ModelConfigurationError(str(exc)) from exc
+        except TimeoutError as exc:
+            await handle.kill()
+            raise ModelConfigurationError(
+                "omp did not answer the model configuration handshake"
+            ) from exc
+        handle.policy = policy
+        if self._tracker is not None:
+            self._tracker.record_native_model(
+                task_id,
+                session,
+                model=native.model,
+                thinking_level=native.thinking_level,
+                accepted_thinking=policy.active.thinking,
+            )
         if key in self._handles:
             # A concurrent start won the race while this one awaited spawn.
             await handle.kill()

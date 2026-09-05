@@ -61,6 +61,10 @@ def _make_task(engine: Engine, project, tmp_path: Path, slug: str) -> Task:
         branch=f"ompire/{slug}",
         clone_path=str(tmp_path / "tasks" / slug),
         prompt="fix it",
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(tmp_path / "checkout"),
+            project_name=project.name,
+        ),
     )
 
 
@@ -74,6 +78,7 @@ def test_task_carries_workflow_fields(engine: Engine, project, tmp_path: Path) -
     assert updated.workflow_status == "running"
     assert updated.workflow_step == "work"
     assert get_task(engine, task.id).workflow_status == "running"
+from tests.conftest import make_execution_inputs
 
 
 def test_session_rows_round_trip(engine: Engine, project, tmp_path: Path) -> None:

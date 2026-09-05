@@ -111,9 +111,9 @@ This is not a prerequisite. Register without one — the field can be set later
 from the project's Edit panel, and a project can be registered before any
 profile exists. Several projects may share the same profile.
 
-The assignment is stored for workflow-first task launching. It does **not**
-change how tasks run today: those still take their model and thinking level
-from their [template](../reference/templates.md) or a per-spawn override.
+A launch against this project inherits the profile unless you select another
+for that task. What the task runs is fixed when you accept it, so changing the
+default later affects your next launch and nothing already under way.
 
 ## When the checkout uses a different remote name
 
@@ -124,7 +124,7 @@ a task's clone, `origin` always points back at that checkout.
 
 ## Renaming and deleting
 
-A project cannot be renamed or deleted while tasks or templates still
+A project cannot be renamed or deleted while tasks still
 reference it. The request fails with `409` and names what is holding it. Clean
 up or archive those tasks first. A project whose clone is still running cannot
 be removed either.
@@ -135,6 +135,6 @@ gone.
 
 ## Next
 
-Tasks spawned against a project use a template for their spawn configuration —
-workflow, base branch, branch pattern, model, and prompt preamble. See [Spawn a
+A launch against this project picks a workflow and a model profile and
+inherits the project's workspace defaults. See [Spawn a
 task](spawn-a-task.md).

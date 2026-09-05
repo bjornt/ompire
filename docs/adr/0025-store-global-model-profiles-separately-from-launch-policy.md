@@ -3,6 +3,11 @@
 - Status: Accepted
 - Date: 2026-09-05
 
+> Execution handoff: [ADR-0026](0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)
+> is where a profile starts governing what runs. This record's registry
+> decision — a global, reusable, four-role profile carrying no repository
+> or credential policy — is unchanged by it.
+
 ## Context
 
 Model settings in Ompire are per-template. A template carries a `model` and a

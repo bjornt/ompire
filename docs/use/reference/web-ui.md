@@ -14,7 +14,7 @@ Everything it changes goes through REST.
 ### Global chrome
 
 Every route renders a sticky header: the logo, nav links for Tasks, Projects,
-Spawn task, Ship flow, and Templates & settings, and a right-side chip group.
+Spawn task, Ship flow, and Settings, and a right-side chip group.
 
 Task detail is deliberately absent from the nav — it is reached from a task,
 not from a menu.
@@ -32,7 +32,7 @@ remaining cache lifetime only when the agent reports one), `gpg locked`,
 `gpg —` — sourced from the snapshot's `gpg` entry and `gpg_status` events,
 never a static placeholder. Its accessible description names the condition.
 
-**Templates & settings → Daemon → Commit signing** shows the same state with
+**Settings → Daemon → Commit signing** shows the same state with
 the selected key's fingerprint and user ID, how it was chosen, the last-check
 time, the recovery action and terminal helper for the current state, and a
 **Re-check key** control disabled while a request is in flight. When the host
@@ -41,7 +41,7 @@ persists it and re-probes. No secret key material or passphrase appears there.
 
 The GitHub chip renders `gh @login`, `gh missing`, `gh auth`, `gh error`, or
 `gh —` from snapshot `gh` state and `gh_status` events. Its accessible
-description is safe status text only. **Templates & settings** shows the same
+description is safe status text only. **Settings** shows the same
 state with the login, host, credential-source label, executable path, version,
 last-check time, and sanitized failure detail. Its **Re-check GitHub** action
 is disabled while a request is in flight.
@@ -69,14 +69,14 @@ HTTPS `git push` authentication. The daemon repeats every preflight; browser
 state only controls presentation.
 ### Model profiles and project defaults
 
-**Templates & settings** carries a **Model profiles** section beside — not in
-place of — the template and daemon panels, which are unchanged. It lists each
-saved profile with all four role bindings, model and thinking level together,
-and opens an editor with four fixed rows and no implicit defaults.
+**Settings** carries a **Model profiles** section beside the daemon panels. It
+lists each saved profile with all four role bindings, model and thinking level
+together, and opens an editor with four fixed rows and no implicit defaults.
+There is no template panel: launch configuration is chosen per task, and the
+project owns the workspace defaults it inherits.
 
-Both surfaces state the transitional boundary: profiles are saved
-configuration, and tasks still run with their template's model and thinking
-settings.
+Both surfaces state what a profile governs: launches that select it from now
+on, never a task already accepted.
 
 The panel is snapshot-gated in the same sense as the routes below: before the
 current connection's first full snapshot it renders a loading state rather
@@ -94,8 +94,53 @@ Project registration and the project Edit panel offer an optional **Default
 model profile** selector that always includes **No default** and never
 auto-selects. A selection whose profile has since been deleted is kept and
 marked unavailable rather than silently changed. Each project card shows the
-chosen profile or that none is configured, with the same transitional note.
-See [Model profiles](model-profiles.md).
+chosen profile or that none is configured, noting that a launch inherits it
+unless the task selects another. See [Model profiles](model-profiles.md).
+
+A project's Edit panel also carries its workspace defaults — base branch,
+branch pattern, Workshop additions source, and standing preamble. A project
+whose configuration was carried over from templates and still needs a decision
+shows a **Launch configuration needs a decision** panel listing every distinct
+old value with the template it came from, nothing pre-selected, and requiring
+an explicit acknowledgement of any old model choice or retired judge model it
+supersedes. See [Projects](projects.md#launch-configuration-state).
+
+### The Spawn view
+
+The form is three selectors — workflow, project, model profile — plus a slug,
+a prompt, and an **Advanced** section holding the four workspace overrides.
+Each override shows the project's value until it is changed and then offers its
+own reset; only changed fields are sent.
+
+Beside it, the daemon's resolution of the current draft: every declared step of
+the chosen workflow with its kind, session, abstract role, model, and thinking
+policy. Command, decision, and gate rows carry no model. A step a decision can
+route past is marked conditional, and the engine's judge is a separate
+conditional row on the profile's `slow` binding.
+
+The resolution is re-fetched on every change to an effective choice, and a
+slow response for an older draft is discarded rather than shown. Submitting
+carries the token identifying what was reviewed; a resolution that changed in
+between is refused, and the changed choices are shown to review and submit
+again rather than launched automatically.
+
+The draft survives leaving the view — going to Settings to create a profile and
+coming back restores everything typed.
+
+### Task detail configuration
+
+Task detail shows the configuration the task was **accepted** with, not a
+recomputation from today's settings: its profile and where that profile came
+from, the effective workspace values with any task-local overrides marked, and
+all four role bindings with which steps consume each. A live session also
+shows the model omp reports it is running and the thinking level omp resolved,
+beside the policy the profile states.
+
+A task created before Ompire recorded launch inputs shows what is known, names
+what is unknown and unrecoverable, and offers a confirmation for what should
+happen from here on. The acknowledgement is explicit and unticked; confirming
+pins future behavior and changes no recorded history. See
+[Tasks](tasks.md#tasks-without-recorded-launch-inputs).
 
 ### Snapshot-gated routes
 

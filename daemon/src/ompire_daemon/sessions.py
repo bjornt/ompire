@@ -116,6 +116,23 @@ class SessionInfo:
 
 
 @dataclass
+class NativeModelInfo:
+    """What one session's omp child reports it is running, beside the policy
+    that was accepted for it (ADR-0026).
+
+    `thinking` is the accepted policy — the operator's choice, spelled as
+    they chose it. `resolved_thinking` is what omp says the model actually
+    uses: `max` and `auto` resolve per model (observed `xhigh` and `high` on
+    `anthropic/claude-sonnet-4-5`, omp v18.1.10). Showing both keeps native
+    normalization from reading as a dropped override.
+    """
+
+    model: str
+    thinking: str
+    resolved_thinking: str | None
+
+
+@dataclass
 class PendingOption:
     value: str
     label: str
@@ -221,6 +238,10 @@ class SessionTracker:
         # Everything is keyed (task_id, session) — a task runs one omp child
         # per named session (workflow-engine design D-1).
         self._sessions: dict[tuple[int, str], SessionInfo] = {}
+        # Observed native model state per session, recorded once the child's
+        # model handshake succeeds. Purely observational: it never feeds back
+        # into what the next process is started with.
+        self._native_models: dict[tuple[int, str], NativeModelInfo] = {}
         self._watchers: dict[tuple[int, str], asyncio.Task] = {}
         self._debounces: dict[tuple[int, str], asyncio.Task] = {}
         self._watchdogs: dict[tuple[int, str], asyncio.Task] = {}
@@ -291,6 +312,9 @@ class SessionTracker:
             pending = self._pending.get((task_id, session))
             if pending is not None:
                 entry["question"] = asdict(pending)
+            native = self._native_models.get((task_id, session))
+            if native is not None:
+                entry["model"] = asdict(native)
             result.setdefault(task_id, {})[session] = entry
         return result
 
@@ -299,6 +323,26 @@ class SessionTracker:
     def agent_spawning(self, task_id: int, session: str) -> None:
         """The agent child is being spawned; covers the ready handshake too."""
         self._transition(task_id, session, "starting", "agent spawned")
+
+    def record_native_model(
+        self,
+        task_id: int,
+        session: str,
+        *,
+        model: str,
+        thinking_level: str | None,
+        accepted_thinking: str,
+    ) -> None:
+        """Record and broadcast what the session's child actually runs, next
+        to the policy it was started with (ADR-0026)."""
+        info = NativeModelInfo(
+            model=model, thinking=accepted_thinking, resolved_thinking=thinking_level
+        )
+        self._native_models[(task_id, session)] = info
+        self._hub.publish(
+            "session_model",
+            {"task_id": task_id, "session": session, **asdict(info)},
+        )
 
     def watch(self, task_id: int, session: str, handle: AgentHandle) -> None:
         """Subscribe to the agent's fan-out and drive frame transitions."""
@@ -386,6 +430,7 @@ class SessionTracker:
             self.unwatch(*key)
             self._operator_stops.discard(key)
             self._sessions.pop(key, None)
+            self._native_models.pop(key, None)
             self._pending.pop(key, None)
             self._inflight_tools.pop(key, None)
             self._inflight_asks.pop(key, None)

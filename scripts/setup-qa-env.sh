@@ -347,8 +347,36 @@ api_daemon() { # api_daemon METHOD PATH [JSON]
 	curl "${args[@]}" "$DAEMON_URL$path"
 }
 
+# A launch needs a complete model profile (ADR-0026) and the QA loop runs the
+# real stack, so this one must name real, provider-qualified models. It is not
+# invented here: set OMPIRE_QA_MODEL_PROFILE to reuse a profile you already
+# created, or OMPIRE_QA_MODEL to say which model the four roles should bind.
+# There is no host-model fallback to inherit.
+PROFILE=${OMPIRE_QA_MODEL_PROFILE:-qa}
+QA_MODEL=${OMPIRE_QA_MODEL:-}
+if api_daemon GET "/api/model-profiles/$PROFILE" >/dev/null 2>&1; then
+	log "profile: '$PROFILE' already registered"
+elif [ -n "$QA_MODEL" ]; then
+	profile_payload=$(jq -n --arg n "$PROFILE" --arg m "$QA_MODEL" \
+		'{name: $n, roles: {
+		    default: {model: $m, thinking: "medium"},
+		    smol:    {model: $m, thinking: "low"},
+		    slow:    {model: $m, thinking: "high"},
+		    plan:    {model: $m, thinking: "high"}}}')
+	api_daemon POST /api/model-profiles "$profile_payload" >/dev/null ||
+		die "could not create the '$PROFILE' model profile"
+	log "profile: registered '$PROFILE' (all roles on $QA_MODEL)"
+else
+	die "no model profile '$PROFILE' exists. Create one under Settings → Model
+profiles, or set OMPIRE_QA_MODEL to a provider-qualified model id (for example
+anthropic/claude-sonnet-4-5) and re-run. Nothing is inferred from your omp
+configuration."
+fi
+
 payload=$(jq -n --arg n "$NAME" --arg t "$REPO" --arg u "$SSH_URL" --arg c "$CHECKOUT" \
-	'{name: $n, title: $t, upstream_url: $u, checkout_path: $c}')
+	--arg b "$BASE_BRANCH" --arg p "$PROFILE" \
+	'{name: $n, title: $t, upstream_url: $u, checkout_path: $c,
+	  base_branch: $b, default_model_profile: $p}')
 if ! api_daemon POST /api/projects "$payload" >/dev/null 2>&1; then
 	# most likely a duplicate — verify the existing registration matches
 	existing=$(api_daemon GET "/api/projects/$NAME" 2>/dev/null || true)
@@ -357,19 +385,6 @@ if ! api_daemon POST /api/projects "$payload" >/dev/null 2>&1; then
 	log "project: '$NAME' already registered"
 else
 	log "project: registered '$NAME' ($SSH_URL)"
-fi
-
-# Spawn is template-driven (templates capability): ensure a default template
-# carrying the repo's real default branch exists alongside the project.
-tpl_payload=$(jq -n --arg n "$NAME" --arg b "$BASE_BRANCH" \
-	'{name: $n, project_name: $n, base_branch: $b}')
-if ! api_daemon POST /api/templates "$tpl_payload" >/dev/null 2>&1; then
-	existing_tpl=$(api_daemon GET "/api/templates/$NAME" 2>/dev/null || true)
-	got_tpl=$(jq -r '.project_name // empty' <<<"$existing_tpl" 2>/dev/null)
-	[ "$got_tpl" = "$NAME" ] || die "template '$NAME' already exists for a different project ($got_tpl)"
-	log "template: '$NAME' already registered"
-else
-	log "template: registered '$NAME' (base $BASE_BRANCH)"
 fi
 
 # ---- 10. smoke ------------------------------------------------------------

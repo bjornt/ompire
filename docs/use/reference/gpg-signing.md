@@ -3,7 +3,7 @@
 ## Overview
 
 Ompire reports whether the operator's signing key is usable, as one shared
-condition consumed by the UI chip, the Templates & settings panel, and the ship
+condition consumed by the UI chip, the Settings panel, and the ship
 commit gate.
 
 The design constraint that shapes everything here: **the probe must never
@@ -120,7 +120,7 @@ pinentry. Unlocking is the operator's action, in a terminal.
 
 | Key | Effect |
 |---|---|
-| `gpg_signing_key` | The signing key. Selectable in Templates & settings, which takes precedence over this file. |
+| `gpg_signing_key` | The signing key. Selectable in Settings, which takes precedence over this file. |
 
 GPG agent cache lifetime is a GPG setting, not an Ompire one —
 `default-cache-ttl` and `max-cache-ttl` in `~/.gnupg/gpg-agent.conf`.

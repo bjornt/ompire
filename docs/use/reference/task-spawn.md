@@ -6,37 +6,75 @@ Spawning builds a task's workspace: a fetched checkout, an isolated clone, a
 branch, and a running container. It is the boundary between "a task record
 exists" and "an agent can work".
 
-Spawning is template-driven. `POST /api/tasks` takes a `template_name`, not a
-project — the project, checkout, remotes, base branch, branch pattern, and
-workflow all come from the template.
+A launch is three choices: a workflow, a project, and a model profile. Every
+registered workflow is available to every ready project, and there is no saved
+preset in between — see [Model profiles](model-profiles.md) for what a profile
+binds and [Projects](projects.md) for the workspace defaults a launch
+inherits.
+
+Launching is two calls. `POST /api/tasks/preview` resolves the selections and
+returns what would run; `POST /api/tasks` submits the same selections plus the
+token identifying the resolution that was reviewed. Both use the same rules, so
+what you approve is what is stored.
 
 ## Using spawn
 
-`POST /api/tasks` accepts:
+Both calls accept:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `template_name` | yes | Resolves the project and all spawn configuration |
+| `project_name` | yes | The project to work against |
+| `workflow_name` | yes | Any registered built-in workflow |
 | `slug` | yes | Task slug; the branch is derived from it |
 | `prompt` | yes | The operator's instruction, including any `@file` mentions |
-| `model` | no | Per-spawn override of the template's model |
-| `thinking` | no | Per-spawn override of the template's thinking level |
+| `model_profile` | no | Omitted means "inherit the project default"; a name replaces that inheritance for this task |
+| `workspace_overrides` | no | Task-local overrides of the project's workspace defaults |
+| `preview_token` | on `POST /api/tasks` | The token from the preview that was reviewed |
 
-The call returns `202` with the new task id and the pipeline runs
-asynchronously. An unknown `template_name` returns `404` and creates nothing.
-A prompt whose `@file` mention cannot become file context returns `422` and
-also creates nothing — see [File mentions](#file-mentions).
+`workspace_overrides` may carry `base_branch`, `branch_pattern`,
+`workshop_additions`, and `preamble`. Leaving a key out inherits the project
+value. An explicit empty `preamble` is an override to "no preamble"; an
+explicit null for any of the other three is refused, because none of them has
+a meaningful empty value. Any other field — including the retired
+`template_name` and the old scalar `model` and `thinking` overrides — is
+refused rather than ignored.
+
+The preview returns the resolved role bindings, the effective workspace values
+with the project's own values beside them, the rendered branch, every declared
+step of the workflow, and a `preview_token`.
+
+`POST /api/tasks` returns `202` with the new task and its pinned
+`execution_inputs`, and the pipeline runs asynchronously. If the resolution
+changed since the preview, it returns `409` with a `preview_changed` reason and
+the current resolution; nothing is created and nothing is retried under the new
+settings. A prompt whose `@file` mention cannot become file context returns
+`422` and also creates nothing — see [File mentions](#file-mentions).
 
 ### The Spawn view
 
-A template picker labeled "Project template", with option lines reading
-`name — checkout · base <branch> · <model> · wf:<workflow>` and an "Edit
-templates" link to `/settings`.
+Workflow, project, and model-profile selectors; a slug field with a live
+branch-name preview; and a prompt editor that offers repository paths when `@`
+is typed.
 
-Below it, a read-only "Workflow — from template" block describing the selected
-template's workflow, model and thinking override controls each defaulting to
-"template default (…)", a slug field with a live branch-name preview, and a
-prompt editor that offers repository paths when `@` is typed.
+The profile selector's first option is "inherit from project — <name>", or
+"inherit from project — none set" for a project with no default. Choosing a
+profile replaces that inheritance and offers a **Reset to project default**
+control; the explicit choice survives changing the project.
+
+An **Advanced** section holds the four workspace defaults. Each shows the
+project's value until you change it, and then offers its own **Reset to project
+default**. Only the fields you actually changed are sent.
+
+Beside the form, the preview lists every step the workflow declares, in order,
+with its kind, session, abstract role, concrete model, and thinking policy. A
+command, decision, or gate step is shown with no model, because it never
+reaches one. A step a decision can route past is marked *conditional*, and the
+engine's judge appears as a conditional row on the profile's `slow` binding.
+The list is what the run *may* execute, not a prediction that it will.
+
+Thinking is shown as the policy the profile states. omp resolves `auto` and
+`max` to a model-specific level at run time; [task detail](task-detail.md)
+shows that resolved level beside the accepted policy for a running session.
 
 Submitting locks the form. Every input and the submit button are disabled
 from the moment the button is activated, so one activation creates at most one
@@ -67,13 +105,18 @@ A failed pipeline keeps the operator on the Spawn view with the form still
 locked to that task, the failing step and its captured text visible, and two
 actions: **Open failed task**, which opens `/tasks/<task-id>`, and **Start
 another task**, which clears the pipeline and unlocks the form while keeping
-the entered template, slug, prompt, and overrides.
+the selections, slug, prompt, and overrides.
 
-A request the daemon refuses — an unknown template, a duplicate or invalid
-slug, a clone path outside the task root, or a transport failure — creates
-nothing. The form unlocks immediately, keeps everything that was typed, and
-shows the daemon's message. If the accepted task is deleted or purged while the
-form is locked, the form unlocks and says so.
+A request the daemon refuses — a duplicate or invalid slug, a project that is
+not ready or not reconciled, a clone path outside the task root, or a transport
+failure — creates nothing. The form unlocks immediately, keeps everything that
+was typed, and shows the daemon's message. A stale review is shown as a changed
+resolution to look at and submit again, never as an automatic retry. If the
+accepted task is deleted or purged while the form is locked, the form unlocks
+and says so.
+
+Leaving the form to create a model profile in Settings keeps the draft: coming
+back restores the workflow, project, slug, prompt, and every override.
 
 ## File mentions
 
@@ -84,7 +127,7 @@ searching for it.
 ### Writing one
 
 Typing `@` at the start of the prompt or after whitespace opens a suggestion
-list of repository-relative paths from the template's project; the characters
+list of repository-relative paths from the selected project; the characters
 typed after it narrow the list. `@` inside a word — an email address, a
 decorator — opens nothing.
 
@@ -99,9 +142,8 @@ and starting another `@` opens suggestions again.
 
 Selecting inserts `@` plus the path at the caret, replacing the partial token
 wherever it sits in the prompt, followed by a separating space. A prompt may
-carry several mentions. Choosing a different template closes the list and
-points later lookups at the new template's project without touching text
-already written.
+carry several mentions. Choosing a different project closes the list and points
+later lookups at that project without touching text already written.
 
 The list offers what the repository tracks plus files present but not yet
 committed, and never offers anything the repository ignores. It never shows
@@ -113,7 +155,7 @@ request stays readable:
 
 ### Which files can be attached
 
-The task's clone is made from the template's base branch, so only what that
+The task's clone is made from the effective base branch, so only what that
 branch carries reaches the agent. A file that exists in your checkout but is
 not on the base branch — one you just created, or one committed to another
 branch — is offered by the search but refused at submit, because it would not
@@ -138,7 +180,7 @@ delivered as a reference omp would silently drop.
 |---|---|
 | `fetch` | `git fetch <project fetch remote>` in the project's checkout |
 | `clone` | Local hardlink clone of the checkout to `<task_root>/<project>/<slug>` |
-| `branch` | New branch from the template's pattern, off `origin/<base_branch>` |
+| `branch` | New branch from the accepted pattern, off `origin/<base_branch>` |
 | `workshop` | Launch the task's container in the clone |
 
 Git runs as subprocesses with argument lists, never through a shell. Each git
@@ -157,19 +199,36 @@ of the tree.
 
 Spawn completion is recorded only after the last workspace step succeeds.
 
-### Template resolution
+### Where the pipeline's values come from
 
-The template is resolved once, at pipeline start. A template deleted between
-task creation and pipeline start fails the task with a clear error **before
-any git command runs**.
+The pipeline resolves nothing. Acceptance already reviewed and pinned every
+value it needs — the checkout path, the fetch remote, the base branch, the
+rendered branch, and the Workshop additions source — in the same transaction
+that created the task row. Editing the project between the `202` and the
+pipeline cannot repoint the fetch or move the branch point.
 
-Effective model and thinking resolve as: the spawn-time override if given,
-else the template's value, else omitted. Omitted means the agent's own
-default. The resolved values are carried to the workflow engine, which passes
-them to every session it spawns for the task.
+The same is true of model policy: the four role bindings are on the task, and
+the workflow engine passes them to every session it spawns, including the
+judge. There is no fallback to the agent's own default.
 
-The template's `preamble` is *not* applied by the pipeline. Prompt
-construction belongs to the workflow.
+The preamble is *not* applied by the pipeline. Prompt construction belongs to
+the workflow.
+
+### Workshop additions
+
+The accepted additions source is applied around the launcher. my-workshop
+resolves additions local-first with no way to select a source, so the daemon
+stages the selected source at the clone's `workshop.my.yaml` before the
+launcher runs and restores the clone — including restoring the file's absence —
+afterwards, whether the launcher succeeded or failed.
+
+A selected source that does not exist is staged as an explicitly empty
+additions file and disclosed as "no additions". That is what stops the launcher
+falling back to the source you did not choose. A selected source that exists
+but cannot be read fails workspace setup rather than launching with nothing
+applied. The staged file is gone before any agent starts in the clone, the
+registered checkout is never touched, and a crash mid-staging is undone at the
+next startup before recovery resumes anything.
 
 ### After the pipeline
 
@@ -193,10 +252,13 @@ manage it later.
 |---|---|
 | Prompt mention is absolute, contains `..`, or resolves outside the checkout | `422`, nothing created |
 | Prompt mention names a missing path or something that is not a regular file | `422`, nothing created |
-| Prompt mention is not on the template's base branch | `422`, nothing created — the clone would not contain it |
+| Prompt mention is not on the effective base branch | `422`, nothing created — the clone would not contain it |
 | Prompt mention stops resolving in the clone before delivery | Step fails with the path named; no prompt is sent |
 | Project's checkout setup is not `ready` | `409`, nothing created — finish or retry it on the Projects view |
-| Template missing at pipeline start | Task `failed` before any git command |
+| Project's launch configuration is not reconciled | `409`, nothing created — resolve it on the Projects view |
+| Project has no default profile and none was selected | `422`, nothing created — nothing is inferred |
+| The resolution changed since the preview | `409` with `preview_changed` and the current resolution; nothing created |
+| The selected Workshop additions source is unreadable | Workspace setup fails before any agent starts |
 | Any step exits non-zero or times out | Pipeline stops, task `failed`, stderr stored on the task |
 | Resolved clone path falls outside the task root | Spawn rejected before any git command |
 | Target clone directory already exists | Clone step fails; the directory is never reused |
@@ -220,7 +282,8 @@ reachable from its card.
 
 Each step broadcasts `spawn_step` carrying the task id, the step name
 (`fetch`, `clone`, `branch`, `workshop`), and a status of started, ok, or
-failed with stderr.
+failed with stderr. The workshop step is preceded by a `workshop_additions`
+event naming the source that applied and whether it was absent.
 
 A successful run produces started/ok pairs for all four steps in order,
 followed by `workflow_step` events as the run executes.

@@ -220,7 +220,7 @@ links to both Ship flow and Tasks, rather than a transient false 404.
 
 | Key | Effect |
 |---|---|
-| `gpg_signing_key` | The signing key. Selectable in Templates & settings, which takes precedence over this file; auto-detected when the host holds exactly one. |
+| `gpg_signing_key` | The signing key. Selectable in Settings, which takes precedence over this file; auto-detected when the host holds exactly one. |
 | `gh_command` | Non-empty GitHub CLI prefix used for bounded, non-interactive version, API, PR-create, and PR-watch calls. |
 
 ## Interfaces

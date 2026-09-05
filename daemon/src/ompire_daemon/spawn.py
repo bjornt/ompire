@@ -15,25 +15,24 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import Engine
 
+from ompire_daemon import workshopadditions
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.registry.projects import Project, get_project
+from ompire_daemon.execution_inputs import TaskExecutionInputs
 from ompire_daemon.registry.tasks import (
     Task,
+    TaskConfigurationRequiredError,
     get_task,
     mark_failed,
     mark_spawn_completed,
     mark_workshop_launched,
-)
-from ompire_daemon.registry.templates import (
-    Template,
-    TemplateNotFoundError,
-    get_template,
+    require_task_inputs,
+    task_payload,
 )
 from ompire_daemon.workflows import UnknownWorkflowNameError, WorkflowRunner
 
@@ -118,7 +117,13 @@ async def _run_step(step: Step) -> str:
     return stderr
 
 
-def _git_steps(config: Config, project: Project, template: Template, task: Task) -> list[Step]:
+def _git_steps(config: Config, inputs: TaskExecutionInputs, task: Task) -> list[Step]:
+    """The workspace steps, entirely from the task's accepted inputs.
+
+    Checkout path, fetch remote, and base branch were copied onto the task at
+    acceptance, so a project edited between the 202 and this pipeline cannot
+    repoint the fetch or move the branch point of a task already under way.
+    """
     clone_path = task.clone_path
     git_timeout = config.spawn_step_timeout
     return [
@@ -127,14 +132,17 @@ def _git_steps(config: Config, project: Project, template: Template, task: Task)
         # an `origin` pointing at this checkout; that one is fixed.
         Step(
             "fetch",
-            ["git", "-C", project.checkout_path, "fetch", project.fetch_remote],
+            ["git", "-C", inputs.checkout_path, "fetch", inputs.fetch_remote],
             git_timeout,
         ),
         # Local source path => hardlink clone, near-instant.
-        Step("clone", ["git", "clone", project.checkout_path, clone_path], git_timeout),
+        Step("clone", ["git", "clone", inputs.checkout_path, clone_path], git_timeout),
         Step(
             "branch",
-            ["git", "-C", clone_path, "checkout", "-b", task.branch, f"origin/{template.base_branch}"],
+            [
+                "git", "-C", clone_path, "checkout", "-b", task.branch,
+                f"origin/{inputs.workspace.base_branch}",
+            ],
             git_timeout,
         ),
     ]
@@ -189,32 +197,24 @@ async def run_spawn_pipeline(
     config: Config,
     task_id: int,
     runner: WorkflowRunner,
-    *,
-    model_override: str | None = None,
-    thinking_override: str | None = None,
 ) -> None:
-    task = get_task(engine, task_id)
+    """Build the task's workspace from the inputs it was accepted under.
 
-    # Resolve the template ONCE at pipeline start (design D-3): base branch,
-    # branch pattern, and the project (hence checkout and remotes) all come
-    # from it. A template deleted between the 202 and this point fails the
-    # task with a clear error, before any git command runs.
-    assert task.template_name is not None  # guaranteed by the spawn route
+    The pipeline resolves nothing: `POST /api/tasks` already reviewed and
+    pinned every value this needs, in the same transaction that created the
+    row (ADR-0026). There is no second, later reading of a project, profile,
+    or request override that could disagree with what the operator approved.
+    """
+    task = get_task(engine, task_id)
     try:
-        template = get_template(engine, task.template_name)
-    except TemplateNotFoundError:
-        stderr = f"template {task.template_name!r} no longer exists; cannot spawn"
-        failed = mark_failed(engine, task_id, stderr)
-        events.publish("task_updated", asdict(failed))
+        inputs = require_task_inputs(task)
+    except TaskConfigurationRequiredError as exc:
+        # Unreachable through acceptance, which writes the inputs in the same
+        # transaction as the row. Kept as a hard stop rather than an assert:
+        # if it ever happens, no git command must run against guessed values.
+        failed = mark_failed(engine, task_id, str(exc))
+        events.publish("task_updated", task_payload(failed))
         return
-    project = get_project(engine, template.project_name)
-    # Effective omp settings: spawn-time override ?? template value ?? omitted
-    # (omp default). Overrides are spawn-time only — never persisted; the
-    # workflow engine carries them to every lazy session spawn of the run.
-    effective_model = model_override if model_override is not None else template.model
-    effective_thinking = (
-        thinking_override if thinking_override is not None else template.thinking
-    )
 
     if Path(task.clone_path).exists():
         # Crash residue from an earlier spawn: fail loudly, never reuse.
@@ -224,7 +224,7 @@ async def run_spawn_pipeline(
             {"task_id": task_id, "step": "clone", "status": "failed", "stderr": stderr},
         )
         failed = mark_failed(engine, task_id, stderr)
-        events.publish("task_updated", asdict(failed))
+        events.publish("task_updated", task_payload(failed))
         return
 
     async def run_clone_step(step: Step) -> None:
@@ -236,14 +236,37 @@ async def run_spawn_pipeline(
         # my-workshop creates/augments workshop.yaml, hides it from git, and
         # launches the container. Its contract with the daemon is only
         # "exit 0 and leave a .workshop.lock" (design D-1).
-        await _run_step(
-            Step(
-                "workshop",
-                [*config.my_workshop_command],
-                config.workshop_step_timeout,
-                cwd=task.clone_path,
+        #
+        # The accepted additions source is staged around that call and undone
+        # afterwards either way, so the launcher applies the source the
+        # operator chose and the clone an agent later sees is unchanged.
+        try:
+            staged = workshopadditions.stage(
+                config.data_dir,
+                task_id,
+                task.clone_path,
+                inputs.workspace.workshop_additions,
             )
+        except workshopadditions.WorkshopAdditionsError as exc:
+            raise StepFailedError("workshop", str(exc)) from exc
+        # Its own event, not a second `spawn_step`: which additions source
+        # applied — and whether the selected one was simply absent — is a
+        # disclosure about the workspace, not a pipeline step outcome.
+        events.publish(
+            "workshop_additions",
+            {"task_id": task_id, "source": staged.source, "detail": staged.note},
         )
+        try:
+            await _run_step(
+                Step(
+                    "workshop",
+                    [*config.my_workshop_command],
+                    config.workshop_step_timeout,
+                    cwd=task.clone_path,
+                )
+            )
+        finally:
+            workshopadditions.restore(config.data_dir, staged)
         lock_id = _read_workshop_lock(task.clone_path)
         mark_workshop_launched(engine, task_id, lock_id)
 
@@ -255,7 +278,7 @@ async def run_spawn_pipeline(
 
     steps: list[tuple[str, Callable[[], Awaitable[None]]]] = [
         (step.name, subprocess_runner(step))
-        for step in _git_steps(config, project, template, task)
+        for step in _git_steps(config, inputs, task)
     ]
     steps.append(("workshop", run_workshop))
 
@@ -269,7 +292,7 @@ async def run_spawn_pipeline(
                 {"task_id": task_id, "step": name, "status": "failed", "stderr": exc.stderr},
             )
             failed = mark_failed(engine, task_id, f"step {name!r} failed:\n{exc.stderr}")
-            events.publish("task_updated", asdict(failed))
+            events.publish("task_updated", task_payload(failed))
             return
         events.publish("spawn_step", {"task_id": task_id, "step": name, "status": "ok"})
 
@@ -277,11 +300,9 @@ async def run_spawn_pipeline(
     # meaning is unchanged), then hand the task to the workflow engine —
     # session spawn and prompt delivery are workflow execution now.
     completed = mark_spawn_completed(engine, task_id)
-    events.publish("task_updated", asdict(completed))
+    events.publish("task_updated", task_payload(completed))
     try:
-        runner.start_run(
-            completed, template, model=effective_model, thinking=effective_thinking
-        )
+        runner.start_run(completed)
     except UnknownWorkflowNameError as exc:
         failed = mark_failed(engine, task_id, str(exc))
-        events.publish("task_updated", asdict(failed))
+        events.publish("task_updated", task_payload(failed))

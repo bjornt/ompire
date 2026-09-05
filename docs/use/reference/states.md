@@ -12,6 +12,20 @@ Every state Ompire reports, and what it means.
 
 Task state is durable and survives a daemon restart.
 
+A task also reports whether its launch configuration still needs confirming.
+Tasks accepted before launch inputs were pinned to the task carry no recorded
+model policy or workspace inputs, so they are shown as needing configuration
+until you confirm one. That is not a task state of its own and never becomes
+`failed`: the task keeps its position, sessions, workspace and history. While
+it is pending, automatic recovery skips the task and continuing, prompting,
+reviewing and shipping it are refused; reading, inspecting and cleaning it up
+are not. Archived tasks stay readable and need no confirmation. See
+[Task detail](task-detail.md) for the confirmation itself.
+
+Projects report launch-configuration reconciliation separately, and separately
+again from checkout setup — see [Projects](projects.md). A project awaiting
+reconciliation cannot start new tasks; other projects are unaffected.
+
 ## Session statuses
 
 A task runs one agent process per workflow-declared named session, addressed

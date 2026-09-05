@@ -27,16 +27,18 @@ from sqlalchemy import Connection, Engine
 
 from ompire_daemon.db import model_profiles, projects
 from ompire_daemon.model_config import (
+    MODEL_ROLES,
     THINKING_LEVELS,
     InvalidThinkingLevelError,
     validate_thinking,
 )
 
-# The four fixed roles, in presentation order. This tuple is the contract:
-# a profile has exactly these, no more and no fewer.
-MODEL_ROLES = ("default", "smol", "slow", "plan")
+# `MODEL_ROLES` — the four fixed roles, in presentation order — is imported
+# rather than defined here: workflow step declarations and the native argv
+# builder bind the same vocabulary, so `model_config` owns it. It stays
+# importable from here for the callers that already read it from this module.
 
-# Same lowercase alphanumeric-and-hyphen convention project and template names
+# Same lowercase alphanumeric-and-hyphen convention project names
 # use; profiles report their own error rather than borrowing the project one.
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
@@ -118,7 +120,7 @@ class UnknownModelProfileReferenceError(ValueError):
     def __init__(self, name: str) -> None:
         super().__init__(
             f"unknown model profile {name!r}: create it under "
-            "Templates & settings → Model profiles first"
+            "Settings → Model profiles first"
         )
         self.name = name
 

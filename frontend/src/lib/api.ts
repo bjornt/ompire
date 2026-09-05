@@ -11,12 +11,14 @@ import type {
   ModelRoleBinding,
   Project,
   ProjectFiles,
+  WorkflowDescriptor,
   ReviewState,
   ShipState,
   Task,
   TaskDetail,
-  Template,
+  TaskExecutionInputs,
   ThinkingLevel,
+  WorkshopAdditionsSource,
 } from "../types";
 import { getDaemonToken } from "./token";
 
@@ -59,18 +61,86 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   return (await response.json()) as T;
 }
 
-/** Spawn is template-driven (task-spawn capability): the daemon resolves the
- * template, denormalizes its project onto the task, and derives the branch
- * from the template's pattern. `model`/`thinking` are per-spawn overrides —
- * omitted entirely when unset so the template value (or omp default) wins. */
-export function spawnTask(input: {
-  template_name: string;
+/** Task-local overrides of the project's workspace defaults (ADR-0026).
+ * Leaving a key out inherits; an explicit empty `preamble` is an override to
+ * "no preamble". The other three have no meaningful empty value, so the
+ * daemon refuses an explicit null rather than reading it as a reset. */
+export interface WorkspaceOverridesInput {
+  base_branch?: string;
+  branch_pattern?: string;
+  workshop_additions?: WorkshopAdditionsSource;
+  preamble?: string;
+}
+
+/** What the operator selected. `model_profile` omitted means "inherit the
+ * project default"; a name replaces that inheritance for this task. */
+export interface LaunchInput {
+  project_name: string;
+  workflow_name: string;
   slug: string;
   prompt: string;
-  model?: string;
-  thinking?: ThinkingLevel;
-}): Promise<Task> {
+  model_profile?: string;
+  workspace_overrides?: WorkspaceOverridesInput;
+}
+
+/** One row of the launch preview. A command, decision, or gate carries no
+ * model — showing one would be a fiction, since those steps never reach a
+ * provider. `thinking` is the accepted *policy*, which omp may resolve to a
+ * model-specific level at run time. */
+export interface LaunchPreviewStep {
+  step: string;
+  kind: "agent" | "command" | "decision" | "gate" | "judge";
+  session: string | null;
+  role: ModelRole | null;
+  model: string | null;
+  thinking: ThinkingLevel | null;
+  conditional: boolean;
+}
+
+/** The daemon's resolution of one launch. `preview_token` names exactly what
+ * was reviewed: it authorizes nothing, and creation compares it so a
+ * configuration change between review and submission is refused rather than
+ * retried under settings nobody looked at. */
+export interface LaunchPreview {
+  preview_token: string;
+  project_name: string;
+  workflow_name: string;
+  model_profile: string | null;
+  model_profile_source: "task" | "project" | "legacy-confirmed";
+  project_default_model_profile: string | null;
+  judge_session: string;
+  judge_role: ModelRole;
+  roles: Record<ModelRole, ModelRoleBinding>;
+  workspace: {
+    base_branch: string;
+    branch_pattern: string;
+    workshop_additions: WorkshopAdditionsSource;
+    preamble: string;
+  };
+  /** What the project would supply, so the form can show what "reset" gives
+   * back without guessing. */
+  inherited_workspace: LaunchPreview["workspace"];
+  workspace_overrides: string[];
+  branch: string;
+  steps: LaunchPreviewStep[];
+}
+
+/** Resolve the operator's selections without creating anything. Same rules,
+ * same daemon module, same output as acceptance (ADR-0026). */
+export function previewTask(input: LaunchInput): Promise<LaunchPreview> {
+  return request<LaunchPreview>("POST", "/api/tasks/preview", input);
+}
+
+/** Accept the reviewed resolution. A stale token comes back as a 409 whose
+ * detail carries the current preview, so the form can show what changed. */
+export function spawnTask(input: LaunchInput & { preview_token: string }): Promise<Task> {
   return request<Task>("POST", "/api/tasks", input);
+}
+
+/** Registered built-in workflows. Also present in the WebSocket snapshot;
+ * this is the reload path for a view mounted before the socket connects. */
+export function listWorkflows(): Promise<WorkflowDescriptor[]> {
+  return request<WorkflowDescriptor[]>("GET", "/api/workflows");
 }
 
 export function cleanupTask(id: number): Promise<Task> {
@@ -191,6 +261,12 @@ export function createProject(input: {
   /** Optional global model profile (ADR-0025); omitted or null means no
    * default. Nothing is auto-selected. */
   default_model_profile?: string | null;
+  /** Workspace and prompt defaults (ADR-0026); the branch pattern defaults
+   * to the daemon's configured seed when omitted. */
+  base_branch?: string;
+  branch_pattern?: string;
+  workshop_additions?: WorkshopAdditionsSource;
+  preamble?: string;
 }): Promise<Project> {
   return request<Project>("POST", "/api/projects", input);
 }
@@ -207,6 +283,13 @@ export function updateProject(
     /** Three-valued: leave the key out to preserve the stored reference, pass
      * null to clear it, pass a name to select that profile. */
     default_model_profile?: string | null;
+    /** Workspace and prompt defaults (ADR-0026). Omitting a key preserves
+     * the stored value, so a caller written before these existed cannot
+     * blank them; an empty `preamble` is the value "no preamble". */
+    base_branch?: string;
+    branch_pattern?: string;
+    workshop_additions?: WorkshopAdditionsSource;
+    preamble?: string;
   },
 ): Promise<Project> {
   return request<Project>("PUT", `/api/projects/${encodeURIComponent(name)}`, input);
@@ -250,31 +333,105 @@ export function deleteProject(name: string): Promise<{ deleted: string }> {
   return request("DELETE", `/api/projects/${encodeURIComponent(name)}`);
 }
 
-/** Template CRUD (templates capability). The list itself arrives via the
- * WebSocket snapshot — these are commands only; render results from daemon
- * state, not from these return values. Templates have no view that reconciles
- * responses, so they rely on the event alone. */
-export interface TemplateInput {
+/** Upgrade reconciliation (ADR-0026): what a project still owes a decision
+ * about after the template retirement, and the decision itself. Candidates
+ * are shown with their source and never pre-selected — the operator supplies
+ * the final value. */
+export interface ProjectReconciliation {
   project_name: string;
+  state: "reconciled" | "needs-reconciliation";
+  needs_reconciliation: boolean;
+  evidence_fingerprint: string;
+  current: {
+    base_branch: string;
+    branch_pattern: string;
+    workshop_additions: WorkshopAdditionsSource;
+    preamble: string;
+    default_model_profile: string | null;
+  };
+  /** Distinct old values per field, in the order the migration found them. */
+  workspace_conflicts: Record<string, (string | null)[]>;
+  /** Old concrete model/thinking pairs. Candidates for at most one binding;
+   * never turned into a profile. */
+  model_candidates: { source: string; model: string | null; thinking: string | null }[];
+  retired_judge_model: string | null;
+  judge_role: ModelRole;
+  /** Inert history, kept after reconciliation so an unselected preamble or
+   * candidate is not lost. */
+  source_templates: { source: string; values: Record<string, unknown> }[];
+}
+
+export function getProjectReconciliation(name: string): Promise<ProjectReconciliation> {
+  return request<ProjectReconciliation>(
+    "GET",
+    `/api/projects/${encodeURIComponent(name)}/launch-reconciliation`,
+  );
+}
+
+export function confirmProjectReconciliation(
+  name: string,
+  input: {
+    evidence_fingerprint: string;
+    base_branch: string;
+    branch_pattern: string;
+    workshop_additions: WorkshopAdditionsSource;
+    preamble: string;
+    default_model_profile: string | null;
+    acknowledge_model_candidates?: boolean;
+    acknowledge_judge_model?: boolean;
+  },
+): Promise<Project> {
+  return request<Project>(
+    "POST",
+    `/api/projects/${encodeURIComponent(name)}/launch-reconciliation`,
+    input,
+  );
+}
+
+/** What a legacy task's records hold, what was reconstructed as a candidate,
+ * and what is simply unknown and cannot be recovered. */
+export interface TaskConfiguration {
+  task_id: number;
+  needs_configuration: boolean;
+  archived: boolean;
+  known: Record<string, unknown>;
+  source_attribution: { source: string; values: Record<string, unknown> }[];
+  unknown_inputs: string[];
+  candidates: Record<string, string | null>;
+  accepted?: TaskExecutionInputs;
+}
+
+export interface TaskContinuationInput {
+  model_profile: string;
   base_branch: string;
-  branch_pattern: string;
-  workflow: string;
-  workshop_additions: "project" | "global";
-  model: string | null;
-  thinking: ThinkingLevel | null;
+  workshop_additions: WorkshopAdditionsSource;
   preamble: string;
 }
 
-export function createTemplate(input: TemplateInput & { name: string }): Promise<Template> {
-  return request<Template>("POST", "/api/templates", input);
+export function getTaskConfiguration(id: number): Promise<TaskConfiguration> {
+  return request<TaskConfiguration>("GET", `/api/tasks/${id}/configuration`);
 }
 
-export function updateTemplate(name: string, input: TemplateInput): Promise<Template> {
-  return request<Template>("PUT", `/api/templates/${encodeURIComponent(name)}`, input);
+export function previewTaskConfiguration(
+  id: number,
+  input: TaskContinuationInput,
+): Promise<{ task_id: number; preview_token: string; inputs: TaskExecutionInputs; unknown_inputs: string[] }> {
+  return request("POST", `/api/tasks/${id}/configuration/preview`, input);
 }
 
-export function deleteTemplate(name: string): Promise<{ deleted: string }> {
-  return request("DELETE", `/api/templates/${encodeURIComponent(name)}`);
+/** Pins what happens next. It does not claim the turns already taken used
+ * these values, and it recreates no workspace, branch, or session identity. */
+export function confirmTaskConfiguration(
+  id: number,
+  input: TaskContinuationInput & { preview_token: string; acknowledge_unknown: boolean },
+): Promise<Task> {
+  return request<Task>("POST", `/api/tasks/${id}/configuration/confirm`, input);
+}
+
+/** Resume a confirmed task whose run was left in place while it was
+ * unconfigured. Only a previously running or waiting run is eligible. */
+export function continueTask(id: number): Promise<Task> {
+  return request<Task>("POST", `/api/tasks/${id}/continue`);
 }
 
 /** Model-profile CRUD (ADR-0025). Commands only: the list itself arrives in

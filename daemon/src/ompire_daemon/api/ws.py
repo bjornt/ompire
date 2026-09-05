@@ -23,9 +23,9 @@ from ompire_daemon.events import EventHub
 from ompire_daemon.registry.model_profiles import list_model_profiles
 from ompire_daemon.registry.projects import list_projects
 from ompire_daemon.registry.settings import SettingsStore
-from ompire_daemon.registry.tasks import list_tasks
-from ompire_daemon.registry.templates import list_templates
+from ompire_daemon.registry.tasks import list_tasks, task_payload
 from ompire_daemon.registry.workflows import list_step_records
+from ompire_daemon.workflows import describe_workflows
 
 router = APIRouter()
 
@@ -67,11 +67,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
     seq = itertools.count()
     projects_payload = [asdict(p) for p in list_projects(engine)]
-    templates_payload = [asdict(t) for t in list_templates(engine)]
     # Global model profiles (ADR-0025), sorted by name: the same authoritative
-    # replacement the projects and templates registries get.
+    # replacement the projects registry gets.
     model_profiles_payload = [asdict(p) for p in list_model_profiles(engine)]
-    tasks_payload = [asdict(t) for t in list_tasks(engine)]
+    # The workflow catalog (ADR-0026). Definitions ship with the daemon
+    # (ADR-0018), so it rides in the snapshot and has no change event: it
+    # cannot change while the process runs.
+    workflow_catalog_payload = [asdict(d) for d in describe_workflows()]
+    tasks_payload = [task_payload(t) for t in list_tasks(engine)]
     # Session statuses ride separately from task rows (design D-4), nested
     # task → session (workflow-engine design D-7); JSON object keys are
     # strings, so task ids are stringified here.
@@ -117,8 +120,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         "snapshot",
         {
             "projects": projects_payload,
-            "templates": templates_payload,
             "model_profiles": model_profiles_payload,
+            "workflow_catalog": workflow_catalog_payload,
             "tasks": tasks_payload,
             "sessions": sessions_payload,
             "workflows": workflows_payload,

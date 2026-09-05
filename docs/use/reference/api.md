@@ -33,9 +33,11 @@ bodies; the tables below are a map, not a schema.
 | `POST` | `/api/projects/checkout-inspect` | Look at an unregistered path read-only; returns its remotes and, on refusal, why |
 | `GET` | `/api/projects/{name}` | Fetch |
 | `PUT` | `/api/projects/{name}` | Update. `409` while setup is running or when repointing a cloned checkout. `422` for an unknown `default_model_profile` |
-| `DELETE` | `/api/projects/{name}` | Delete. `409` if tasks or templates reference it, or while setup is running |
+| `DELETE` | `/api/projects/{name}` | Delete. `409` if any task references it, or while setup is running |
 | `POST` | `/api/projects/{name}/setup/retry` | Re-arm a failed clone. `202`, or `409` for an adopted project |
 | `GET` | `/api/projects/{name}/files` | Repository paths for prompt `@` mentions. `409` if the checkout is missing or not a git repository |
+| `GET` | `/api/projects/{name}/launch-reconciliation` | Configuration carried over from templates that still needs a decision, with every candidate and its source |
+| `POST` | `/api/projects/{name}/launch-reconciliation` | Record the decision. `409` for a stale evidence fingerprint, `422` for a missing acknowledgement |
 
 Create accepts `checkout_mode` (`adopt`, the default, or `clone`) and
 `fetch_remote`. Clone mode derives its destination and refuses a supplied
@@ -46,6 +48,12 @@ Both create and update accept an optional `default_model_profile` naming a
 omitted preserves the stored reference, `null` clears it, a name selects that
 profile. See [Default model
 profile](projects.md#default-model-profile).
+
+Both also accept `base_branch`, `branch_pattern`, `workshop_additions`, and
+`preamble`. On update these follow the same omission rule — a body that leaves
+one out preserves it — but are never null: an empty `preamble` is a value, and
+an explicit null for any of the others is `422`. See [Workspace and prompt
+defaults](projects.md#workspace-and-prompt-defaults).
 
 ## Model profiles
 
@@ -64,15 +72,17 @@ neither field null. Unknown fields anywhere in the body are errors. The full
 contract, including the identifier grammar and what validation does *not*
 check, is in [Model profiles](model-profiles.md).
 
-## Templates
+## Workflows
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/templates` | List |
-| `POST` | `/api/templates` | Create |
-| `GET` | `/api/templates/{name}` | Fetch |
-| `PUT` | `/api/templates/{name}` | Update |
-| `DELETE` | `/api/templates/{name}` | Delete |
+| `GET` | `/api/workflows` | Read-only catalog of every registered built-in workflow |
+
+Each entry carries the workflow's sessions, its primary session, every declared
+step with its kind, session, abstract role (agent steps only) and whether a
+decision can route past it, and the engine-reserved judge with the role it
+binds. Definitions ship with the daemon, so there is no CRUD and no change
+event; the same catalog rides in the WebSocket snapshot.
 
 ## Tasks
 
@@ -80,9 +90,22 @@ check, is in [Model profiles](model-profiles.md).
 |---|---|---|
 | `GET` | `/api/tasks` | List |
 | `GET` | `/api/tasks/{id}` | Detail, including sessions and step records |
-| `POST` | `/api/tasks` | Spawn. Returns `202`; spawning continues in the background, or `422` for an unusable prompt mention |
+| `POST` | `/api/tasks/preview` | Resolve the selections without creating anything; returns the resolved bindings, every declared step, the rendered branch, and a `preview_token` |
+| `POST` | `/api/tasks` | Accept the reviewed resolution. `202`; spawning continues in the background. `409` with a `preview_changed` reason and the current resolution when it moved, `422` for an unusable prompt mention or an unknown field |
+| `GET` | `/api/tasks/{id}/configuration` | Known facts, candidates, and unknown inputs for a task created before launch inputs were recorded |
+| `POST` | `/api/tasks/{id}/configuration/preview` | Resolve a proposed continuation configuration |
+| `POST` | `/api/tasks/{id}/configuration/confirm` | Pin it, once. `409` if already pinned or the token is stale |
+| `POST` | `/api/tasks/{id}/continue` | Resume a confirmed task whose run was left interrupted. `409` unless it is `running` or `waiting` |
 | `POST` | `/api/tasks/{id}/cleanup` | Remove workshop, delete clone, archive |
 | `DELETE` | `/api/tasks/{id}` | Purge the record |
+
+Both launch calls take `project_name`, `workflow_name`, `slug`, `prompt`, an
+optional `model_profile` (omitted inherits the project default), and an
+optional `workspace_overrides` object limited to `base_branch`,
+`branch_pattern`, `workshop_additions`, and `preamble`. Acceptance adds the
+`preview_token`. Unknown fields — including the retired `template_name` and the
+old scalar `model`/`thinking` overrides — are refused, not ignored. See
+[Task spawn](task-spawn.md).
 
 ## Sessions
 

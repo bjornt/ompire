@@ -19,9 +19,9 @@ A workflow declares:
 
 | Part | Meaning |
 |---|---|
-| `name` | Unique registry name; templates reference it |
+| `name` | Unique registry name; a launch selects it |
 | `sessions` | Slug-format session names, declared up front, unique per task |
-| steps | Ordered, uniquely named, of four kinds |
+| steps | Ordered, uniquely named, of four kinds. An `agent` step also declares the abstract model role it consumes. |
 | `primary` | Session targeted by task-scoped operations. Defaults to the first declared. |
 
 Steps fall through to the next declared step on success. A `decision` step
@@ -38,8 +38,8 @@ Two workflows are registered: [`single-step`](#the-single-step-workflow) and
 
 ### Run execution
 
-After the spawn pipeline completes the workspace, the workflow named by the
-task's template executes as a single sequential run — one step at a time, in
+After the spawn pipeline completes the workspace, the workflow the task was
+accepted with executes as a single sequential run — one step at a time, in
 declaration order, with `decision` routes as the only jumps. At most one step
 runs at a time per task.
 
@@ -70,8 +70,8 @@ A workflow with no `agent` steps starts no agent at all.
 
 ### Agent steps
 
-An agent step builds its prompt from the run context — the task, the resolved
-template, and prior step records — so prompts can incorporate earlier
+An agent step builds its prompt from the run context — the task, its accepted
+launch inputs, and prior step records — so prompts can incorporate earlier
 outcomes. An empty built prompt sends nothing and the step completes when the
 session is ready.
 
@@ -155,9 +155,13 @@ and a decision step whose route cannot resolve.
 
 It runs as an engine-reserved session named `judge` in the task's container
 and clone, spawned lazily through the normal supervised-start path and
-surfaced in the session tracker, snapshot, and UI like any other session. Its
-model comes from the optional `judge_model` config key, independent of the
-task's template.
+surfaced in the session tracker, snapshot, and UI like any other session.
+
+It has no model setting of its own. Its active pair is the task profile's
+`slow` binding, disclosed in the launch preview beside every declared step, and
+it carries the same full auxiliary role map as any other session. The retired
+`judge_model` config key configures nothing; see
+[Configuration](configuration.md#retired-keys).
 
 Each judgment is self-contained: the prompt names the step and its purpose,
 references a daemon-written transcript tail at
@@ -182,9 +186,9 @@ outcomes. Arbitrary undeclared session names still return `404`.
 
 ### The single-step workflow
 
-Sessions `('main',)`, primary `main`. One agent step named `work`, not
-outcome-bearing, whose prompt is the template's preamble prepended to the
-task's stored prompt separated by a blank line.
+Sessions `('main',)`, primary `main`. One agent step named `work` on role
+`default`, not outcome-bearing, whose prompt is the accepted preamble prepended
+to the task's stored prompt separated by a blank line.
 
 The preamble alone is never sent for an empty prompt; the step completes once
 the session is ready and the session lands `idle`.
@@ -237,5 +241,27 @@ step name, kind, and status, with error text on failure.
 The snapshot carries each task's workflow state, so reconnecting clients see
 current runs without replaying events.
 
-Templates validate their `workflow` value against this registry; unregistered
-names are rejected with `422`.
+`GET /api/workflows` returns the registry as a read-only catalog — each
+workflow's sessions, every declared step with its kind, session, abstract role,
+and whether a decision can route past it, plus the conditional judge and the
+role it binds. The same catalog rides in the WebSocket snapshot. There is no
+CRUD and no change event: definitions ship with the daemon (ADR-0018), so the
+catalog cannot change while the process runs.
+
+A launch validates its `workflow_name` against this registry; an unregistered
+name is rejected with `422`.
+
+### Model policy
+
+A step declares an abstract role, never a model. Which model answers to that
+role is the launch's choice, pinned onto the task at acceptance and read from
+there — including after a restart, and including when the profile is edited or
+deleted afterwards.
+
+Every omp process the engine starts receives the task's full role map: the
+step's active pair as `--model`/`--thinking`, and all three auxiliary roles as
+`--smol`, `--slow`, and `--plan`, each with its own thinking level. A resumed
+session has its accepted active pair re-asserted before any prompt, because a
+resumed omp restores its own settings from its session file. The child's active
+model is then read back and compared; a mismatch fails the step rather than
+prompting under a substituted model.

@@ -22,8 +22,9 @@ It also denormalizes configuration and outcome:
 
 | Field | Source |
 |---|---|
-| `template_name` | The template used at spawn; null for tasks predating templates |
-| `workflow_name` | Copied from the template at creation |
+| `execution_inputs` | The launch decision the task was accepted under; null for a task created before those were recorded |
+| `needs_configuration` | True exactly when `execution_inputs` is null |
+| `workflow_name` | The workflow chosen at creation |
 | `workflow_status` | `running`, `waiting`, `complete`, or `failed`; null before the workspace is ready |
 | `workflow_step` | Current step name; null when no run is in flight |
 | `pr_url` | Set when the task ships a pull request |
@@ -33,6 +34,58 @@ It also denormalizes configuration and outcome:
 Session identity is not a task field. Each spawned session records its own
 identity on a per-session row, because sessions are spawned lazily by the
 workflow.
+
+### Accepted execution inputs
+
+`execution_inputs` is the decision the task was accepted under, stored once and
+never recomputed (ADR-0026). It carries:
+
+| Field | Meaning |
+|---|---|
+| `provenance` | `accepted`, or `legacy-confirmed` for a pre-upgrade task the operator confirmed |
+| `model_profile_name` / `model_profile_source` | Which profile, and whether it was inherited from the project or selected for this task |
+| `roles` | All four role bindings, model and thinking level together |
+| `step_roles` | Which abstract role each agent step of the workflow consumes |
+| `judge_role` | The role the conditional judge uses — `slow` |
+| `workspace` | The effective base branch, branch pattern, Workshop additions source, and preamble |
+| `workspace_overrides` | Which of those four the task overrode rather than inherited |
+| `branch` | The rendered branch name |
+| `checkout_path`, `fetch_remote`, `upstream_url`, `fork_url` | The project-derived checkout and publishing routing this task uses |
+| `unknown_inputs` | Historical inputs a legacy task could not recover; empty for a normally accepted task |
+
+The profile name is provenance, not a live reference. Editing the profile,
+renaming the project, or deleting a profile nothing references does not change
+this document — or what the task runs. No credential material is copied here;
+signing keys and forge credentials are read live at the moment they are used.
+
+### Tasks without recorded launch inputs
+
+A task created before this existed has `execution_inputs: null`. Its
+workspace, branch, sessions, workflow history, review history, and pull-request
+facts are all intact and are never recreated or discarded. What is missing is
+the model, thinking level, preamble, and any spawn-time overrides — those were
+never persisted, and today's project or profile settings are not evidence of
+what the task used.
+
+Such a task stays readable, inspectable, stoppable, and cleanable. What is
+refused until the operator confirms a continuation configuration is anything
+that would need the missing values: automatic resume after a restart, manual
+prompts and follow-ups, review, and every ship entry point. There is no
+fallback to `main`.
+
+`GET /api/tasks/{id}/configuration` returns the known facts, the current
+project's routing as candidates, and the list of unknown inputs.
+`POST .../configuration/preview` resolves a proposed continuation, and
+`POST .../configuration/confirm` records it — once, with its preview token and
+an explicit acknowledgement that the original values are unrecoverable.
+
+Confirmation pins what happens from then on. It does not claim the turns
+already taken used those values, does not respawn the workspace, and does not
+alter the recorded branch or session identities. Afterwards, an explicitly
+requested `POST /api/tasks/{id}/continue` resumes a run that was left
+interrupted; a failed or completed task is never silently restarted, and review
+and ship remain their own actions. An archived task needs no confirmation at
+all.
 
 ### Slugs
 

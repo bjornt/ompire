@@ -93,7 +93,7 @@ describe("ModelProfilesPanel", () => {
     expect(screen.queryByTestId("model-profiles-loading")).not.toBeInTheDocument();
   });
 
-  it("lists every role with its thinking level and says profiles do not run tasks yet", () => {
+  it("lists every role with its thinking level and says what a profile governs", () => {
     renderPanel([makeProfile("balanced")]);
 
     expect(screen.getByTestId("model-profile-balanced-default")).toHaveTextContent(
@@ -108,8 +108,10 @@ describe("ModelProfilesPanel", () => {
     expect(screen.getByTestId("model-profile-balanced-plan")).toHaveTextContent(
       "google/gemini-2.5-pro · max",
     );
+    // The note must not claim a profile is inert, and must not claim it
+    // reaches a task that was already accepted (ADR-0026).
     expect(screen.getByTestId("model-profiles-boundary")).toHaveTextContent(
-      /template's model and thinking/,
+      /Tasks already accepted keep the bindings/,
     );
   });
 

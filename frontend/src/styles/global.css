@@ -78,3 +78,70 @@ a:hover {
 .contextRingFill {
   stroke: var(--amber);
 }
+
+/* Shared launch/configuration surfaces (ADR-0026): the spawn step preview,
+ * the pinned task inputs, and the project/task reconciliation panels all
+ * present the same table and acknowledgement shapes. */
+
+.stepTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+  margin-top: 6px;
+}
+
+.stepTable th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--faint);
+  border-bottom: 1px solid var(--line);
+  padding: 4px 8px 4px 0;
+}
+
+.stepTable td {
+  border-bottom: 1px solid var(--line);
+  padding: 5px 8px 5px 0;
+  color: var(--text);
+  vertical-align: top;
+}
+
+.stepTable tr:last-child td {
+  border-bottom: none;
+}
+
+.stepTable .mono {
+  font-family: var(--mono);
+}
+
+/* The preview sits in a side panel narrower than the page: a long
+   provider-qualified model id must wrap rather than push the table past the
+   panel edge. `break-word` is a last resort — it splits a token only when the
+   token cannot fit on its own line, so step and role names stay whole. */
+
+.stepTable th,
+.stepTable td {
+  overflow-wrap: break-word;
+}
+
+.unknownList {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.checkboxField {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-top: 8px;
+  cursor: pointer;
+}
+
+.checkboxField input[type="checkbox"] {
+  accent-color: var(--accent);
+  margin: 2px 0 0;
+  cursor: pointer;
+}
