@@ -26,6 +26,7 @@ from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.events import EventHub
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.registry.projects import create_project
+from ompire_daemon.registry.sessions import get_session
 from ompire_daemon.registry.tasks import Task, create_task, get_task
 from ompire_daemon.registry.workflows import list_step_records
 from ompire_daemon.sessions import SessionTracker
@@ -44,7 +45,12 @@ from ompire_daemon.workflows import (
     registered_workflows,
     unregister_workflow,
 )
-from tests.conftest import fake_argv_builder, make_execution_inputs, make_test_policy
+from tests.conftest import (
+    TEST_ROLES,
+    fake_argv_builder,
+    make_execution_inputs,
+    make_test_policy,
+)
 
 DEBOUNCE = 0.1
 
@@ -79,16 +85,19 @@ def _make_task(
     *,
     preamble: str = "",
     roles: dict | None = None,
+    slug: str | None = None,
+    **bindings,
 ) -> Task:
     """A task carrying the launch inputs it was accepted under (ADR-0026).
     The engine reads preamble and role bindings off the task; there is no
     second object to hand it."""
-    clone_path = tmp_path / "tasks" / f"task-{workflow}"
+    name = slug or f"task-{workflow}"
+    clone_path = tmp_path / "tasks" / name
     clone_path.mkdir(parents=True, exist_ok=True)
     return create_task(
         engine,
         project_name="demo",
-        slug=f"task-{workflow}",
+        slug=name,
         branch="ompire/task",
         clone_path=str(clone_path),
         prompt=prompt,
@@ -99,6 +108,7 @@ def _make_task(
             preamble=preamble,
             roles=roles,
             branch="ompire/task",
+            **bindings,
         ),
     )
 
@@ -1557,3 +1567,222 @@ async def test_a_preamble_at_sign_is_prose_and_never_fails_the_step(
 
     assert final.workflow_status == "complete"
     assert user_prompts(supervisor, task.id, "main") == ["ping @nobody about this\n\ndo it"]
+
+
+# --- per-consumer policy through the engine (ADR-0027) -----------------------
+
+#: A second profile's four-role map, differing from `TEST_ROLES` in every
+#: role, so a step bound to it needs a real process replacement rather than an
+#: active-pair swap.
+OTHER_ROLES = {
+    "default": {"model": "testing/other-model", "thinking": "high"},
+    "smol": {"model": "testing/other-smol", "thinking": "off"},
+    "slow": {"model": "testing/other-slow", "thinking": "xhigh"},
+    "plan": {"model": "testing/other-plan", "thinking": "low"},
+}
+
+
+@pytest.fixture
+def shared_session_workflow():
+    """Two agent steps in one named session — the `reproduce`/`validate-agent`
+    shape, reduced to what a policy handoff needs."""
+    workflow = Workflow(
+        name="shared-policy",
+        sessions=("shared",),
+        steps=(
+            AgentStep(name="first", session="shared", prompt=lambda ctx: "first turn"),
+            AgentStep(name="second", session="shared", prompt=lambda ctx: "second turn"),
+        ),
+    )
+    register_workflow(workflow)
+    try:
+        yield workflow
+    finally:
+        unregister_workflow("shared-policy")
+
+
+async def test_two_steps_share_a_session_under_different_policies(
+    engine: Engine, project, tmp_path: Path, rig, shared_session_workflow
+) -> None:
+    """Both steps keep the one logical session and its conversation while
+    running under genuinely different bindings."""
+    runner, supervisor, _, _, _ = rig
+    task = _make_task(
+        engine,
+        tmp_path,
+        workflow="shared-policy",
+        step_profile_names={"second": "other"},
+        step_profiles={"other": _role_bindings(OTHER_ROLES)},
+    )
+
+    runner.start_run(task)
+    await wait_for_run(engine, task.id, {"complete", "failed"})
+    assert get_task(engine, task.id).workflow_status == "complete"
+
+    # One session, both turns: the second step continued the conversation the
+    # first one started rather than opening a new one.
+    prompts = user_prompts(supervisor, task.id, "shared")
+    assert "first turn" in prompts
+    assert "second turn" in prompts
+
+    session = get_session(engine, task.id, "shared")
+    # The session records the policy it *last* ran under, attributed to the
+    # step that applied it.
+    assert session.applied_policy is not None
+    assert session.applied_policy.consumer_name == "second"
+    assert session.applied_policy.policy.active.model == "testing/other-model"
+    assert session.applied_policy.policy.slow.model == "testing/other-slow"
+    assert session.applied_policy.verified
+    # Native identity is preserved across the replacement.
+    assert session.omp_session_id == "fake-session-id"
+
+
+async def test_a_repeated_step_reuses_its_own_accepted_binding(
+    engine: Engine, project, tmp_path: Path, rig
+) -> None:
+    """A loop revisit is the same accepted decision again, not whatever the
+    session was last put on by the step in between."""
+    visits = {"n": 0}
+
+    def route(ctx):
+        visits["n"] += 1
+        return "fix" if visits["n"] == 1 else COMPLETE
+
+    workflow = Workflow(
+        name="loop-policy",
+        sessions=("coder", "checker"),
+        steps=(
+            AgentStep(name="fix", session="coder", prompt=lambda ctx: f"fix {visits['n']}"),
+            AgentStep(name="check", session="checker", prompt=lambda ctx: "check"),
+            DecisionStep(name="again", route=route),
+        ),
+    )
+    register_workflow(workflow)
+    try:
+        runner, supervisor, _, _, _ = rig
+        task = _make_task(
+            engine,
+            tmp_path,
+            workflow="loop-policy",
+            step_roles={"fix": "plan"},
+        )
+        runner.start_run(task)
+        await wait_for_run(engine, task.id, {"complete", "failed"})
+        assert get_task(engine, task.id).workflow_status == "complete"
+
+        prompts = user_prompts(supervisor, task.id, "coder")
+        # Two visits to the same step, each prompted under its own binding.
+        assert "fix 0" in prompts and "fix 1" in prompts
+        applied = get_session(engine, task.id, "coder").applied_policy
+        assert applied.consumer_name == "fix"
+        assert applied.role == "plan"
+        assert applied.policy.active.model == TEST_ROLES["plan"]["model"]
+    finally:
+        unregister_workflow("loop-policy")
+
+
+async def test_a_failed_handoff_fails_the_step_and_keeps_the_previous_record(
+    engine: Engine, project, tmp_path: Path, rig, shared_session_workflow
+) -> None:
+    """A refused native configuration must not authorize the prompt, and must
+    not overwrite what the session is durably known to have run."""
+    runner, supervisor, _, _, _ = rig
+    task = _make_task(
+        engine,
+        tmp_path,
+        workflow="shared-policy",
+        step_profile_names={"second": "other"},
+        step_profiles={
+            "other": _role_bindings(
+                {**OTHER_ROLES, "default": {"model": "testing/unknown-model", "thinking": "low"}}
+            )
+        },
+    )
+
+    runner.start_run(task)
+    await wait_for_run(engine, task.id, {"complete", "failed"})
+    assert get_task(engine, task.id).workflow_status == "failed"
+
+    records = list_step_records(engine, task.id)
+    assert records[-1].step == "second"
+    assert records[-1].status == "failed"
+    # The durable record still describes the first step's verified policy: the
+    # second never successfully applied one.
+    applied = get_session(engine, task.id, "shared").applied_policy
+    assert applied.consumer_name == "first"
+    assert applied.policy.active.model == TEST_ROLES["default"]["model"]
+
+
+async def test_the_judge_runs_on_its_own_accepted_binding(
+    engine: Engine, project, tmp_path: Path, rig
+) -> None:
+    """The judge is an ordinary model consumer with an overridable binding,
+    not a hidden exception bound to the task profile's `slow`."""
+    workflow = Workflow(
+        name="judge-policy",
+        sessions=("main",),
+        steps=(
+            AgentStep(
+                name="work", session="main", prompt=lambda ctx: "do it", expects_outcome=True
+            ),
+        ),
+    )
+    register_workflow(workflow)
+    try:
+        runner, supervisor, _, _, _ = rig
+        task = _make_task(engine, tmp_path, workflow="judge-policy", judge_role="plan")
+        runner.start_run(task)
+        await wait_for_run(engine, task.id, {"complete", "failed"})
+
+        applied = get_session(engine, task.id, JUDGE_SESSION).applied_policy
+        assert applied is not None
+        assert applied.consumer_kind == "auxiliary"
+        assert applied.consumer_name == "judge"
+        assert applied.role == "plan"
+        assert applied.policy.active.model == TEST_ROLES["plan"]["model"]
+    finally:
+        unregister_workflow("judge-policy")
+
+
+async def test_recovery_restores_the_session_policy_that_actually_applied(
+    engine: Engine, project, tmp_path: Path, rig, shared_session_workflow
+) -> None:
+    """After a restart the session resumes on what it last ran, not on the
+    task's `default` role — the bug a single task-wide policy could not see."""
+    runner, supervisor, tracker, hub, _ = rig
+    task = _make_task(
+        engine,
+        tmp_path,
+        workflow="shared-policy",
+        step_profile_names={"second": "other"},
+        step_profiles={"other": _role_bindings(OTHER_ROLES)},
+    )
+    runner.start_run(task)
+    await wait_for_run(engine, task.id, {"complete", "failed"})
+
+    # A restart: the live children are gone, the registry is not.
+    await supervisor.shutdown()
+    for name in ("shared",):
+        assert supervisor.get(task.id, name) is None
+
+    resumed = _make_task_policy_for_recovery(engine, task.id, "shared")
+    assert resumed.policy.active.model == "testing/other-model"
+    assert resumed.policy.plan.model == "testing/other-plan"
+
+
+def _make_task_policy_for_recovery(engine: Engine, task_id: int, session: str):
+    """What `recovery._continuation_policy` will hand the resume."""
+    from ompire_daemon.recovery import _continuation_policy
+
+    applied = _continuation_policy(engine, get_task(engine, task_id), session)
+    assert applied is not None
+    return applied
+
+
+def _role_bindings(roles: dict) -> dict:
+    from ompire_daemon.registry.model_profiles import RoleBinding
+
+    return {
+        role: RoleBinding(model=pair["model"], thinking=pair["thinking"])
+        for role, pair in roles.items()
+    }

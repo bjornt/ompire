@@ -704,3 +704,271 @@ def test_every_bad_mention_is_named_in_one_refusal(
     detail = response.json()["detail"]
     assert "@gone-a.md" in detail
     assert "@gone-b.md" in detail
+
+
+# --- per-consumer overrides (ADR-0027) ---------------------------------------
+
+
+def _make_profile(client: TestClient, auth_headers: dict, name: str, model: str) -> None:
+    response = client.post(
+        "/api/model-profiles",
+        headers=auth_headers,
+        json={
+            "name": name,
+            "roles": {
+                "default": {"model": f"{model}/default", "thinking": "low"},
+                "smol": {"model": f"{model}/smol", "thinking": "off"},
+                "slow": {"model": f"{model}/slow", "thinking": "high"},
+                "plan": {"model": f"{model}/plan", "thinking": "xhigh"},
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+
+
+def _preview(client: TestClient, auth_headers: dict, **extra) -> dict:
+    response = client.post(
+        "/api/tasks/preview", headers=auth_headers, json=launch_body(**extra)
+    )
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _row(preview: dict, step: str) -> dict:
+    return next(row for row in preview["steps"] if row["step"] == step)
+
+
+def test_row_profile_and_role_resolve_independently(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    """The two dimensions are chosen separately and resolved together: the
+    role picks one complete pair out of whichever profile the row ends on."""
+    _make_profile(client, auth_headers, "thorough", "vendor")
+
+    preview = _preview(
+        client,
+        auth_headers,
+        workflow_name="bugfix",
+        step_overrides={
+            "reproduce": {"model_profile": "thorough"},
+            "fix": {"role": "plan"},
+            "validate-agent": {"model_profile": "thorough", "role": "slow"},
+        },
+    )
+
+    reproduce = _row(preview, "reproduce")["binding"]
+    assert reproduce["profile_name"] == "thorough"
+    assert reproduce["profile_source"] == "step"
+    # The role was not overridden, so it is still what the workflow declares.
+    assert (reproduce["role"], reproduce["role_source"]) == ("default", "workflow")
+    assert reproduce["roles"]["default"]["model"] == "vendor/default"
+
+    fix = _row(preview, "fix")["binding"]
+    # A role-only override resolves its model *and* thinking against the
+    # inherited profile — the pair moves together.
+    assert (fix["profile_name"], fix["profile_source"]) == ("demo", "project")
+    assert (fix["role"], fix["role_source"]) == ("plan", "step")
+    assert _row(preview, "fix")["model"] == fix["roles"]["plan"]["model"]
+    assert _row(preview, "fix")["thinking"] == fix["roles"]["plan"]["thinking"]
+
+    validate = _row(preview, "validate-agent")["binding"]
+    assert validate["profile_name"] == "thorough"
+    assert validate["role"] == "slow"
+    assert _row(preview, "validate-agent")["model"] == "vendor/slow"
+
+
+def test_an_untouched_row_follows_the_task_profile_and_an_explicit_one_does_not(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    _make_profile(client, auth_headers, "thorough", "vendor")
+    _make_profile(client, auth_headers, "economy", "cheap")
+
+    preview = _preview(
+        client,
+        auth_headers,
+        workflow_name="bugfix",
+        model_profile="economy",
+        step_overrides={"reproduce": {"model_profile": "thorough"}},
+    )
+
+    assert _row(preview, "reproduce")["binding"]["profile_name"] == "thorough"
+    assert _row(preview, "fix")["binding"]["profile_name"] == "economy"
+    # The judge inherits the task-wide decision like any other unoverridden
+    # consumer; it is not a hidden exception.
+    assert _row(preview, "judge")["binding"]["profile_name"] == "economy"
+    assert _row(preview, "judge")["binding"]["role"] == "slow"
+
+
+def test_an_explicit_choice_equal_to_the_inherited_one_is_still_explicit(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    """Choosing the value you would have inherited is a decision, and it must
+    survive a later task-profile change rather than following it."""
+    _make_profile(client, auth_headers, "economy", "cheap")
+
+    preview = _preview(
+        client,
+        auth_headers,
+        step_overrides={"work": {"model_profile": "demo"}},
+    )
+    assert _row(preview, "work")["binding"]["profile_source"] == "step"
+
+    moved = _preview(
+        client,
+        auth_headers,
+        model_profile="economy",
+        step_overrides={"work": {"model_profile": "demo"}},
+    )
+    assert _row(moved, "work")["binding"]["profile_name"] == "demo"
+    assert _row(moved, "judge")["binding"]["profile_name"] == "economy"
+
+
+def test_a_role_only_override_follows_a_task_profile_change(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    _make_profile(client, auth_headers, "economy", "cheap")
+
+    preview = _preview(
+        client,
+        auth_headers,
+        model_profile="economy",
+        step_overrides={"work": {"role": "plan"}},
+    )
+    work = _row(preview, "work")["binding"]
+    assert work["role"] == "plan"
+    assert work["profile_name"] == "economy"
+    assert _row(preview, "work")["model"] == "cheap/plan"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_field"),
+    [
+        ({"step_overrides": {"nope": {"role": "plan"}}}, "step_overrides.nope"),
+        ({"step_overrides": {"triage": {"role": "plan"}}}, "step_overrides.triage"),
+        ({"step_overrides": {"fix": {"role": "wizard"}}}, "step_overrides.fix.role"),
+        (
+            {"step_overrides": {"fix": {"model_profile": "ghost"}}},
+            "step_overrides.fix.model_profile",
+        ),
+        (
+            {"auxiliary_overrides": {"referee": {"role": "plan"}}},
+            "auxiliary_overrides.referee",
+        ),
+        (
+            {"auxiliary_overrides": {"judge": {"model_profile": "ghost"}}},
+            "auxiliary_overrides.judge.model_profile",
+        ),
+    ],
+)
+def test_bad_override_targets_are_refused_at_their_own_field(
+    client: TestClient,
+    auth_headers: dict,
+    demo_project: dict,
+    overrides: dict,
+    expected_field: str,
+) -> None:
+    """Unknown steps, non-agent steps, unknown auxiliary consumers, bad roles
+    and missing profiles are each reported at the input that needs fixing —
+    and none of them creates a task or a workspace."""
+    body = launch_body(workflow_name="bugfix", **overrides)
+    for route in ("/api/tasks/preview", "/api/tasks"):
+        payload = body if route.endswith("preview") else {**body, "preview_token": "x"}
+        response = client.post(route, headers=auth_headers, json=payload)
+        assert response.status_code == 422, response.text
+        assert expected_field in response.json()["detail"]
+    assert client.get("/api/tasks", headers=auth_headers).json() == []
+
+
+def test_an_empty_row_override_is_the_same_launch_as_no_override(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    """An opened-and-reset selector must not invalidate a reviewed preview
+    over a difference the operator cannot see."""
+    plain = _preview(client, auth_headers)
+    emptied = _preview(client, auth_headers, step_overrides={"work": {}})
+    nulled = _preview(
+        client, auth_headers, step_overrides={"work": {"model_profile": None, "role": None}}
+    )
+    assert plain["preview_token"] == emptied["preview_token"] == nulled["preview_token"]
+
+
+def test_an_auxiliary_only_binding_change_invalidates_the_review(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    """Editing a profile's `slow` pair changes no row's active model, but it
+    changes what a `/switch slow` in the container reaches — so the reviewed
+    resolution is no longer the one being submitted."""
+    body = launch_body()
+    preview = client.post("/api/tasks/preview", headers=auth_headers, json=body).json()
+
+    client.put(
+        "/api/model-profiles/demo",
+        headers=auth_headers,
+        json={
+            "roles": {
+                "default": {"model": "testing/main-model", "thinking": "medium"},
+                "smol": {"model": "testing/smol-model", "thinking": "low"},
+                "slow": {"model": "testing/other-slow", "thinking": "high"},
+                "plan": {"model": "testing/plan-model", "thinking": "xhigh"},
+            }
+        },
+    )
+
+    response = client.post(
+        "/api/tasks",
+        headers=auth_headers,
+        json={**body, "preview_token": preview["preview_token"]},
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["reason"] == "preview_changed"
+    assert client.get("/api/tasks", headers=auth_headers).json() == []
+
+
+def test_an_unrelated_profile_edit_leaves_the_review_valid(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    _make_profile(client, auth_headers, "unrelated", "elsewhere")
+    body = launch_body()
+    preview = client.post("/api/tasks/preview", headers=auth_headers, json=body).json()
+
+    client.put(
+        "/api/model-profiles/unrelated",
+        headers=auth_headers,
+        json={
+            "roles": {
+                "default": {"model": "elsewhere/changed", "thinking": "off"},
+                "smol": {"model": "elsewhere/changed", "thinking": "off"},
+                "slow": {"model": "elsewhere/changed", "thinking": "off"},
+                "plan": {"model": "elsewhere/changed", "thinking": "off"},
+            }
+        },
+    )
+
+    response = client.post(
+        "/api/tasks",
+        headers=auth_headers,
+        json={**body, "preview_token": preview["preview_token"]},
+    )
+    assert response.status_code == 202, response.text
+    _wait_settled(client, auth_headers, response.json()["id"])
+
+
+def test_deleting_an_overridden_profile_after_acceptance_changes_nothing(
+    client: TestClient, auth_headers: dict, demo_project: dict
+) -> None:
+    _make_profile(client, auth_headers, "thorough", "vendor")
+    task = _spawn(
+        client, auth_headers, step_overrides={"work": {"model_profile": "thorough"}}
+    )
+    _wait_settled(client, auth_headers, task["id"])
+
+    # Nothing references it as a *default*, so deletion is allowed: an
+    # accepted task holds a snapshot, not a live reference.
+    deleted = client.delete("/api/model-profiles/thorough", headers=auth_headers)
+    assert deleted.status_code == 200, deleted.text
+
+    after = client.get(f"/api/tasks/{task['id']}", headers=auth_headers).json()
+    work = after["execution_inputs"]["step_bindings"]["work"]
+    assert work["profile_name"] == "thorough"
+    assert work["profile_source"] == "step"
+    assert work["roles"]["default"]["model"] == "vendor/default"

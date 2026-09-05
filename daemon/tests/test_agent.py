@@ -13,13 +13,15 @@ from ompire_daemon.agent import (
     AgentHandle,
     AgentStartError,
     AgentSupervisor,
+    MissingResumeIdentityError,
     ModelConfigurationError,
     NoLiveAgentError,
+    SessionBusyError,
     build_agent_argv,
     role_flag_value,
 )
 from ompire_daemon.config import Config
-from ompire_daemon.events import EventHub
+from ompire_daemon.events import Event, EventHub
 from ompire_daemon.rpc import AgentGoneError
 from ompire_daemon.sessions import SessionTracker
 from tests.conftest import fake_argv_builder, make_test_policy
@@ -410,3 +412,251 @@ async def test_verify_ask_timeout_rejects_command_failure(fake_workshop_cli, tmp
     fake_workshop_cli.write_text('#!/bin/sh\necho "no such workshop" >&2\nexit 1\n')
     with pytest.raises(AgentStartError, match="cannot read ask.timeout"):
         await agent_module.verify_ask_timeout(str(tmp_path))
+
+
+# --- between-turn model policy handoff (ADR-0027) ----------------------------
+
+
+def _policy(**roles) -> object:
+    """A policy differing from `make_test_policy()` in exactly the named
+    roles, so a test says which dimension of the transition it is about."""
+    return make_test_policy(**roles)
+
+
+@pytest.fixture
+def handoff(monkeypatch: pytest.MonkeyPatch):
+    """A supervisor over the fake omp, plus the resume arguments its spawns
+    were built with — the only way to tell a replacement that resumed the
+    native session from one that started a fresh conversation."""
+    scenario = {"name": "happy"}
+    build = fake_argv_builder(scenario)
+    resumes: list[str | None] = []
+
+    def fake_build(clone, *, policy, resume=None):
+        resumes.append(resume)
+        return build(clone, policy=policy, resume=resume)
+
+    monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
+
+    async def no_preflight(clone_path: str) -> None:
+        return None
+
+    monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
+    hub = EventHub()
+    config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100, shutdown_grace=2)
+    return AgentSupervisor(config, hub), hub, scenario, resumes
+
+
+async def test_unchanged_policy_keeps_the_process_and_still_verifies_it(handoff) -> None:
+    """A cached handle is not evidence: the active pair is reasserted and read
+    back before the prompt, so an externally changed model cannot masquerade
+    as the accepted policy."""
+    sup, _, _, resumes = handoff
+    policy = make_test_policy()
+    commits: list[int] = []
+    first = await sup.start(1, "main", "/clone", policy=policy)
+
+    same = await sup.apply_session_policy(
+        1, "main", "/clone", policy=policy, commit=lambda: commits.append(1)
+    )
+
+    assert same is first
+    assert resumes == [None]  # nothing was replaced
+    assert commits == [1]
+    await sup.stop(1, "main")
+
+
+async def test_an_active_only_change_reconfigures_in_place(handoff) -> None:
+    """Only the active pair differs, and omp has acknowledged controls for
+    exactly that — so the conversation is kept without a restart."""
+    sup, hub, _, resumes = handoff
+    hub_queue = hub.subscribe()
+    first = await sup.start(1, "main", "/clone", policy=make_test_policy())
+
+    changed = _policy(default={"model": "testing/other-model", "thinking": "high"})
+    same = await sup.apply_session_policy(
+        1, "main", "/clone", policy=changed, commit=lambda: None
+    )
+
+    assert same is first
+    assert same.policy == changed
+    assert resumes == [None]
+    assert hub_queue.empty()  # no exit, no replacement
+    await sup.stop(1, "main")
+
+
+async def test_an_auxiliary_change_replaces_the_process_and_resumes_the_session(
+    handoff,
+) -> None:
+    """omp v18.1.10 has no auxiliary-role setter — `--smol`/`--slow`/`--plan`
+    are start-time flags — so the only honest way to change one is to replace
+    the child and resume its native session."""
+    sup, hub, _, resumes = handoff
+    hub_queue = hub.subscribe()
+    first = await sup.start(1, "main", "/clone", policy=make_test_policy())
+    first.events.append(Event(type="agent_end", payload={"marker": "before"}))
+
+    changed = _policy(slow={"model": "testing/other-slow", "thinking": "xhigh"})
+    replacement = await sup.apply_session_policy(
+        1, "main", "/clone", policy=changed, commit=lambda: None
+    )
+
+    assert replacement is not first
+    assert first.returncode is not None
+    assert sup.get(1, "main") is replacement
+    # The replacement resumed the recorded native session rather than opening
+    # a new conversation.
+    assert resumes == [None, "fake-session-id"]
+    # The transcript the session already showed is carried forward.
+    assert any(e.payload.get("marker") == "before" for e in replacement.snapshot())
+    # A handoff is not a crash: the retired child's exit publishes nothing.
+    await asyncio.sleep(0.1)
+    assert hub_queue.empty()
+    await sup.stop(1, "main")
+
+
+async def test_a_retired_child_cannot_unregister_its_replacement(handoff) -> None:
+    """The old exit watcher must not fire late and drop the handle the
+    session is now using."""
+    sup, hub, _, _ = handoff
+    await sup.start(1, "main", "/clone", policy=make_test_policy())
+    changed = _policy(plan={"model": "testing/other-plan", "thinking": "off"})
+    replacement = await sup.apply_session_policy(
+        1, "main", "/clone", policy=changed, commit=lambda: None
+    )
+
+    await asyncio.sleep(0.2)
+    assert sup.get(1, "main") is replacement
+    assert replacement.returncode is None
+    await sup.stop(1, "main")
+
+
+async def test_a_busy_session_refuses_the_transition_without_interrupting_it(
+    handoff,
+) -> None:
+    """Configuration never aborts work in flight: the transition is refused
+    and the caller fails through the ordinary infrastructure path."""
+    sup, _, scenario, _ = handoff
+    scenario["name"] = "busy"
+    handle = await sup.start(1, "main", "/clone", policy=make_test_policy())
+    committed: list[int] = []
+
+    changed = _policy(slow={"model": "testing/other-slow", "thinking": "off"})
+    with pytest.raises(SessionBusyError, match="not at a turn boundary"):
+        await sup.apply_session_policy(
+            1, "main", "/clone", policy=changed, commit=lambda: committed.append(1)
+        )
+
+    # The turn is untouched and nothing was recorded as applied.
+    assert sup.get(1, "main") is handle
+    assert handle.returncode is None
+    assert committed == []
+    await sup.stop(1, "main")
+
+
+async def test_a_refused_reconfiguration_leaves_no_promptable_handle(handoff) -> None:
+    """A child that answered part of the handshake is on an unknown active
+    pair. Keeping it would send the next turn under settings nobody verified."""
+    sup, _, _, _ = handoff
+    await sup.start(1, "main", "/clone", policy=make_test_policy())
+    committed: list[int] = []
+
+    # Real omp answers `success: false` and leaves the previous model in
+    # place when the id is unknown (v18.1.10 probe); the fake reproduces it.
+    changed = _policy(default={"model": "testing/unknown-model", "thinking": "low"})
+    with pytest.raises(ModelConfigurationError, match="refused model"):
+        await sup.apply_session_policy(
+            1, "main", "/clone", policy=changed, commit=lambda: committed.append(1)
+        )
+
+    assert sup.get(1, "main") is None
+    assert committed == []
+
+
+async def test_a_failed_applied_state_write_kills_the_candidate(handoff) -> None:
+    """The applied record is the thing a restart trusts. If it cannot be
+    written, the process it describes must not survive to be prompted."""
+    sup, _, _, _ = handoff
+    await sup.start(1, "main", "/clone", policy=make_test_policy())
+
+    def explode() -> None:
+        raise RuntimeError("disk is full")
+
+    changed = _policy(default={"model": "testing/other-model", "thinking": "low"})
+    with pytest.raises(ModelConfigurationError, match="could not be recorded"):
+        await sup.apply_session_policy(
+            1, "main", "/clone", policy=changed, commit=explode
+        )
+
+    assert sup.get(1, "main") is None
+
+
+async def test_a_replacement_that_resumes_a_different_session_is_refused(
+    handoff, monkeypatch
+) -> None:
+    """A reported session id is not proof the conversation came back: omp
+    starts a new session when the recorded one names nothing."""
+    sup, _, _, _ = handoff
+    await sup.start(1, "main", "/clone", policy=make_test_policy())
+
+    real_read = AgentHandle.read_session_id
+    calls = {"n": 0}
+
+    async def drifting(self):
+        calls["n"] += 1
+        # First call captures the identity to resume; the readback after the
+        # restart reports a different one.
+        return "fake-session-id" if calls["n"] == 1 else "some-other-session"
+
+    monkeypatch.setattr(AgentHandle, "read_session_id", drifting)
+    changed = _policy(smol={"model": "testing/other-smol", "thinking": "off"})
+    with pytest.raises(ModelConfigurationError, match="different conversation"):
+        await sup.apply_session_policy(
+            1, "main", "/clone", policy=changed, commit=lambda: None
+        )
+
+    assert sup.get(1, "main") is None
+    monkeypatch.setattr(AgentHandle, "read_session_id", real_read)
+
+
+async def test_a_replacement_without_a_resume_identity_is_refused(handoff, monkeypatch) -> None:
+    """Starting fresh would silently drop the transcript; failing keeps the
+    workspace and the history intact."""
+    sup, _, _, resumes = handoff
+    handle = await sup.start(1, "main", "/clone", policy=make_test_policy())
+
+    async def unnamed(self):
+        return None
+
+    monkeypatch.setattr(AgentHandle, "read_session_id", unnamed)
+    changed = _policy(smol={"model": "testing/other-smol", "thinking": "off"})
+    with pytest.raises(MissingResumeIdentityError):
+        await sup.apply_session_policy(
+            1, "main", "/clone", policy=changed, commit=lambda: None
+        )
+
+    # Nothing was stopped and nothing was started: the refusal comes before
+    # the live child is touched.
+    assert sup.get(1, "main") is handle
+    assert resumes == [None]
+
+
+async def test_a_prompting_caller_waits_for_a_handoff_rather_than_racing_it(
+    handoff,
+) -> None:
+    """`acquire` takes the same boundary, so a follow-up cannot be handed a
+    child that is already being retired."""
+    sup, _, _, _ = handoff
+    await sup.start(1, "main", "/clone", policy=make_test_policy())
+    changed = _policy(plan={"model": "testing/other-plan", "thinking": "off"})
+
+    handoff_task = asyncio.create_task(
+        sup.apply_session_policy(1, "main", "/clone", policy=changed, commit=lambda: None)
+    )
+    await asyncio.sleep(0)
+    acquired = await sup.acquire(1, "main")
+    replacement = await handoff_task
+
+    assert acquired is replacement
+    assert acquired.returncode is None
+    await sup.stop(1, "main")

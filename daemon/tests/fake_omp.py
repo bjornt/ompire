@@ -25,6 +25,10 @@ Scenarios:
   no-session-id     like happy, but get_state omits `sessionId` (the model
                     handshake still succeeds, so this isolates a session-id
                     capture miss from a model-verification failure)
+  busy              like happy, but every get_state after the start handshake
+                    reports isStreaming: true — a child mid-turn, which a
+                    policy handoff must refuse to reconfigure rather than
+                    interrupt (ADR-0027)
 
 `get_state` requests get the response shape verified against omp 16.5.2
 (see the add-session-states change's findings-omp-verification.md):
@@ -249,13 +253,18 @@ def parse_model_flags(argv: list[str]) -> None:
 
 
 def get_state_response(
-    request_id: str, queued: int, message_count: int, *, session_id: bool = True
+    request_id: str,
+    queued: int,
+    message_count: int,
+    *,
+    session_id: bool = True,
+    streaming: bool = False,
 ) -> dict:
     """The response shape verified against omp 16.5.2 (isStreaming and
     queuedMessageCount at the top level of `data`) plus the model block and
     `thinkingLevel` verified against omp 18.1.10."""
     data = {
-        "isStreaming": False,
+        "isStreaming": streaming,
         "isCompacting": False,
         "queuedMessageCount": queued,
         "messageCount": message_count,
@@ -302,6 +311,9 @@ def handle_generic_request(request: dict, scenario: str, queued: int, message_co
                     queued,
                     message_count,
                     session_id=scenario != "no-session-id",
+                    # The start handshake must still succeed, so only the
+                    # calls after it report a turn in flight.
+                    streaming=scenario == "busy" and STATE_CALLS[0] > 1,
                 )
             )
             if scenario == "exit-after-start":
