@@ -65,6 +65,7 @@ nav:
           - HTTP and WebSocket API: use/reference/api.md
           - Projects: use/reference/projects.md
           - Templates: use/reference/templates.md
+          - Model profiles: use/reference/model-profiles.md
           - Tasks: use/reference/tasks.md
           - Task spawn: use/reference/task-spawn.md
           - Task detail: use/reference/task-detail.md

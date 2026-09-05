@@ -21,12 +21,59 @@ The rationale is in
 | `fetch_remote` | string | Remote to fetch **in that checkout**; default `origin` |
 | `setup_state` | string | `ready`, `cloning`, or `failed` |
 | `setup_error` | text, nullable | Failing step and git stderr |
+| `default_model_profile` | string, nullable | FK to `model_profiles.name`, indexed. NULL means no default |
 
 The four onboarding columns arrived with migration `0011`
 ([ADR-0022](../../adr/0022-create-or-adopt-base-checkouts-without-mutating-them.md)).
 Rows written before it backfill to `adopted` / `origin` / `ready` / `NULL`;
 the migration reaches no filesystem to decide that, because a pre-`0011` row
 records only what the operator supplied.
+
+`default_model_profile` arrived with migration `0012`
+([ADR-0025](../../adr/0025-store-global-model-profiles-separately-from-launch-policy.md)).
+It is purely additive: existing rows backfill to `NULL`, and nothing is
+inferred from a template, a credential, omp's own settings, or the name.
+
+## `model_profiles`
+
+| Column | Type | Notes |
+|---|---|---|
+| `name` | string | Primary key. Slug, immutable — there is no rename path |
+| `roles_json` | text | JSON object: exactly `default`, `smol`, `slow`, `plan`, each `{model, thinking}` |
+| `created_at`, `updated_at` | string | ISO-8601 |
+
+The role map is stored as one JSON document rather than eight fixed columns.
+It is small, always written whole (there is no role-level update API), and
+nothing queries profiles by a nested model — so it follows the same JSON-text
+convention as `workflow_steps.outcome_json`. It is decoded into a typed
+`ModelProfile.roles` mapping at the registry boundary; JSON text never reaches
+an API caller.
+
+### Reference safety without global FK enforcement
+
+`projects.default_model_profile` declares a named, non-cascading foreign key,
+but the runtime connection hook enables WAL and **not** `PRAGMA foreign_keys`.
+The declaration is therefore schema metadata and defense for any connection
+that does enable it — it is not the runtime guarantee.
+
+The guarantee is a `BEGIN IMMEDIATE` write reservation
+(`registry.model_profiles.reserved_write`) shared by both sides of the race:
+project create/update takes it before checking that the referenced profile
+exists, and profile deletion takes it before scanning for referencing
+projects. Because `BEGIN IMMEDIATE` acquires SQLite's write lock up front, a
+read inside the reservation cannot go stale before the matching write commits,
+and competing writers serialize at the database rather than behind an
+in-process lock that other connections would miss. Each mutation also reads
+its committed row back inside the reservation, so a later unrelated write
+cannot change the response a caller already received.
+
+A plain `engine.begin()` is insufficient: pysqlite defers `BEGIN` until the
+first DML statement, so a preflight `SELECT` would run outside the
+reservation.
+
+Turning FK enforcement on globally was deliberately not done here — it would
+change enforcement for every existing table at once and can surface unrelated
+legacy inconsistencies.
 
 ## `templates`
 
@@ -141,6 +188,12 @@ same review. `interrupted` is iteration-only and always accompanies an
 |---|---|---|
 | `key` | string | Primary key |
 | `value` | text | |
+
+Scalar daemon settings only
+([ADR-0013](../../adr/0013-layer-daemon-writable-settings-over-operator-configuration.md)).
+Model profiles are deliberately *not* here: a named collection with its own
+lifecycle, sort order, references, and deletion guard is a registry entity,
+not a setting.
 
 Runtime overrides only, stored as JSON-encoded scalars. Fifteen keys are
 recognized: `renotify_interval`, `stall_threshold`,

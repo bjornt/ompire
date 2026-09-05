@@ -31,10 +31,26 @@ already spawned from it.
 Checkout path and remotes are not template fields. They come from the
 referenced [project](projects.md).
 
+### Model and thinking
+
+A template's `model` and `thinking` are what a spawned task actually uses,
+unless the spawn overrides them. `model` is passed to the agent as written and
+may be a fuzzy name such as `sonnet`; null on either field means the agent's
+own default.
+
+These are separate from [model profiles](model-profiles.md), which store
+global role bindings and are selected as a project's default. Profiles are
+saved configuration and do not affect task execution: a project may name a
+profile while its templates continue to determine every spawned task's model
+and thinking level. Template behavior is unchanged by profiles.
+
 ### Thinking levels
 
 `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto`. Anything
 else is rejected.
+
+A template may leave thinking null; a model profile binding may not. The
+vocabulary is the same, the permitted absence is not.
 
 ## Using templates
 

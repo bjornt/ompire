@@ -67,6 +67,36 @@ ready target result and a `ready` GPG key.
 The banner says explicitly that GitHub API eligibility does not prove SSH or
 HTTPS `git push` authentication. The daemon repeats every preflight; browser
 state only controls presentation.
+### Model profiles and project defaults
+
+**Templates & settings** carries a **Model profiles** section beside — not in
+place of — the template and daemon panels, which are unchanged. It lists each
+saved profile with all four role bindings, model and thinking level together,
+and opens an editor with four fixed rows and no implicit defaults.
+
+Both surfaces state the transitional boundary: profiles are saved
+configuration, and tasks still run with their template's model and thinking
+settings.
+
+The panel is snapshot-gated in the same sense as the routes below: before the
+current connection's first full snapshot it renders a loading state rather
+than an empty saved list, because "you have no profiles" is a claim about
+saved state it cannot yet make.
+
+An open editor is keyed by the profile's name and holds its own draft. A
+profile edited or deleted in another browser updates the saved list but leaves
+that draft untouched; for a deletion the editor stays on screen with a note
+that the original is gone. Save and remove lock their controls while a request
+is pending, and a refusal — including a deletion refused with the referencing
+project names — stays visible with the draft intact.
+
+Project registration and the project Edit panel offer an optional **Default
+model profile** selector that always includes **No default** and never
+auto-selects. A selection whose profile has since been deleted is kept and
+marked unavailable rather than silently changed. Each project card shows the
+chosen profile or that none is configured, with the same transitional note.
+See [Model profiles](model-profiles.md).
+
 ### Snapshot-gated routes
 
 A route that needs to decide whether a task exists waits for the current

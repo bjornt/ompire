@@ -1,18 +1,4 @@
-import type { Project, Template, ThinkingLevel } from "../types";
-
-/** Thinking levels omp accepts, in the order the selects offer them
- * (templates capability). Kept in sync with the `ThinkingLevel` union by the
- * `satisfies` check. */
-export const THINKING_LEVELS = [
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-  "auto",
-] as const satisfies readonly ThinkingLevel[];
+import type { Project, Template } from "../types";
 
 /** Workflows registered daemon-side. Exactly `single-step` exists until
  * ROADMAP chunk 17 lands real workflows — the Settings editor select and the

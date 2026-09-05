@@ -32,7 +32,7 @@ bodies; the tables below are a map, not a schema.
 | `POST` | `/api/projects` | Create. `201`, or `409` on duplicate name. `422` when an adopted checkout is unusable or a URL is not an accepted form |
 | `POST` | `/api/projects/checkout-inspect` | Look at an unregistered path read-only; returns its remotes and, on refusal, why |
 | `GET` | `/api/projects/{name}` | Fetch |
-| `PUT` | `/api/projects/{name}` | Update. `409` while setup is running or when repointing a cloned checkout |
+| `PUT` | `/api/projects/{name}` | Update. `409` while setup is running or when repointing a cloned checkout. `422` for an unknown `default_model_profile` |
 | `DELETE` | `/api/projects/{name}` | Delete. `409` if tasks or templates reference it, or while setup is running |
 | `POST` | `/api/projects/{name}/setup/retry` | Re-arm a failed clone. `202`, or `409` for an adopted project |
 | `GET` | `/api/projects/{name}/files` | Repository paths for prompt `@` mentions. `409` if the checkout is missing or not a git repository |
@@ -40,6 +40,29 @@ bodies; the tables below are a map, not a schema.
 Create accepts `checkout_mode` (`adopt`, the default, or `clone`) and
 `fetch_remote`. Clone mode derives its destination and refuses a supplied
 `checkout_path`. See [Projects](projects.md#checkout-modes).
+
+Both create and update accept an optional `default_model_profile` naming a
+[model profile](model-profiles.md). On update the field is three-valued:
+omitted preserves the stored reference, `null` clears it, a name selects that
+profile. See [Default model
+profile](projects.md#default-model-profile).
+
+## Model profiles
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/model-profiles` | List, sorted by name |
+| `POST` | `/api/model-profiles` | Create. `201`, `409` on duplicate name, `422` for an invalid name or binding |
+| `GET` | `/api/model-profiles/{name}` | Fetch |
+| `PUT` | `/api/model-profiles/{name}` | Replace all four bindings. The name is immutable |
+| `DELETE` | `/api/model-profiles/{name}` | Delete. `409` naming every project that still uses it as its default |
+
+`POST` takes `{"name": "<slug>", "roles": {...}}`; `PUT` takes only
+`{"roles": {...}}`. `roles` must be exactly `default`, `smol`, `slow`, and
+`plan`, each `{"model": "provider/model-id", "thinking": "<level>"}` with
+neither field null. Unknown fields anywhere in the body are errors. The full
+contract, including the identifier grammar and what validation does *not*
+check, is in [Model profiles](model-profiles.md).
 
 ## Templates
 
@@ -123,6 +146,11 @@ A reconnect produces a fresh snapshot, so a dropped connection loses nothing.
 Raw agent transcript events are not on this socket — they use separate,
 buffered per-session channels, so a dashboard client is not made to receive
 every frame of every agent.
+
+The snapshot's `model_profiles` key carries the complete sorted profile list.
+`model_profile_created` and `model_profile_updated` carry a full profile;
+`model_profile_deleted` carries `{"name": "<slug>"}`. Project payloads carry
+`default_model_profile`.
 
 The snapshot's optional `gh` key contains `{identity, targets}`. Every
 completed GitHub probe emits `gh_status` with the same full safe status object,

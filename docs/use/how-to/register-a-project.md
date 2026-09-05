@@ -15,6 +15,7 @@ the first thing to do after installing.
 | `checkout_mode` | `adopt` to use a checkout you already have, `clone` to have Ompire create one. |
 | `checkout_path` | Adopt mode only. Your local working checkout. |
 | `fetch_remote` | The remote Ompire fetches **in that checkout**. Defaults to `origin`. |
+| `default_model_profile` | Optional. Names a [model profile](../reference/model-profiles.md) as this project's default. |
 
 The checkout is the source Ompire clones every task workspace from. You either
 point Ompire at one you already have, or let it create one.
@@ -99,6 +100,20 @@ it unset when you have push access to upstream.
 
 In clone mode the fork is added to the new checkout as a second remote named
 `fork`.
+
+## Choosing a default model profile
+
+Registration offers an optional **Default model profile** selector in both
+modes, listing every saved [model profile](../reference/model-profiles.md)
+plus **No default**. Nothing is selected for you.
+
+This is not a prerequisite. Register without one — the field can be set later
+from the project's Edit panel, and a project can be registered before any
+profile exists. Several projects may share the same profile.
+
+The assignment is stored for workflow-first task launching. It does **not**
+change how tasks run today: those still take their model and thinking level
+from their [template](../reference/templates.md) or a per-spawn override.
 
 ## When the checkout uses a different remote name
 

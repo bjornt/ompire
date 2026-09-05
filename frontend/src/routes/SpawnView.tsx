@@ -3,7 +3,8 @@ import { Link, useNavigate } from "react-router-dom";
 import { spawnTask } from "../lib/api";
 import { PromptMentions } from "./PromptMentions";
 import { useDaemonState } from "../lib/useDaemonState";
-import { REGISTERED_WORKFLOWS, THINKING_LEVELS, templateCheckout } from "../lib/templates";
+import { THINKING_LEVELS } from "../lib/models";
+import { REGISTERED_WORKFLOWS, templateCheckout } from "../lib/templates";
 import type { SpawnStepName, SpawnStepPayload, Task, ThinkingLevel } from "../types";
 import "./SpawnView.css";
 

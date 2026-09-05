@@ -49,7 +49,8 @@ Cross-cutting:
 
 Projects and tasks:
 
-- [Projects](reference/projects.md) · [Templates](reference/templates.md)
+- [Projects](reference/projects.md) · [Templates](reference/templates.md) ·
+  [Model profiles](reference/model-profiles.md)
 - [Tasks](reference/tasks.md) · [Task spawn](reference/task-spawn.md) ·
   [Task detail](reference/task-detail.md) · [Web UI](reference/web-ui.md)
 

@@ -17,7 +17,24 @@ field-level detail and changes nothing.
 
 The full endpoint inventory is in the [API
 reference](../../use/reference/api.md); the generated OpenAPI schema at
-`/openapi.json` is authoritative for request and response bodies.
+`/openapi.json` is authoritative for request and response bodies. The model
+profile contract, including its identifier grammar and status codes, is in
+[Model profiles](../../use/reference/model-profiles.md).
+
+Two mutation boundaries are worth knowing before adding routes near them.
+
+Profile input schemas forbid unknown fields at every nesting level, so a
+misspelled role or binding key is a `422` rather than silently ignored
+configuration. A duplicate name is classified by a serialized existence check
+rather than by catching `IntegrityError`, so a failure on some other
+constraint can never be reported as a duplicate name.
+
+`PUT /api/projects/{name}` distinguishes an omitted `default_model_profile`
+from an explicit `null` using Pydantic's `model_fields_set`, and passes that
+distinction into the registry, which resolves an omission against the stored
+row inside its write transaction rather than against the route's earlier
+read. This is one optional field with that behavior — project `PUT` is
+otherwise still a full replacement, not a PATCH.
 
 ## Observation over WebSocket
 

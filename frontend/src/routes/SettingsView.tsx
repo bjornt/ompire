@@ -17,7 +17,9 @@ import { setDaemonToken } from "../lib/token";
 import { useDaemonState } from "../lib/useDaemonState";
 import { githubIdentityPresentation, safeGitHubDetail } from "../lib/githubPresentation";
 import { gpgPresentation, selectionSourceLabel } from "../lib/gpgPresentation";
-import { REGISTERED_WORKFLOWS, THINKING_LEVELS, templateCheckout } from "../lib/templates";
+import { THINKING_LEVELS } from "../lib/models";
+import { REGISTERED_WORKFLOWS, templateCheckout } from "../lib/templates";
+import { ModelProfilesPanel } from "./ModelProfilesPanel";
 import type {
   AttentionTier,
   DaemonInfo,
@@ -1005,6 +1007,10 @@ export function SettingsView() {
               onClose={() => setEditor(null)}
             />
           )}
+
+          {/* Global model policy, kept beside — not inside — templates:
+              templates still own what spawn actually uses (ADR-0025). */}
+          <ModelProfilesPanel />
         </div>
 
         <div className="settingsColumn">

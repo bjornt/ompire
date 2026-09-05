@@ -6,6 +6,9 @@ import type {
   GitHubStatus,
   CheckoutInspection,
   GpgStatus,
+  ModelProfile,
+  ModelRole,
+  ModelRoleBinding,
   Project,
   ProjectFiles,
   ReviewState,
@@ -185,6 +188,9 @@ export function createProject(input: {
   checkout_mode?: "adopt" | "clone";
   checkout_path?: string | null;
   fetch_remote?: string;
+  /** Optional global model profile (ADR-0025); omitted or null means no
+   * default. Nothing is auto-selected. */
+  default_model_profile?: string | null;
 }): Promise<Project> {
   return request<Project>("POST", "/api/projects", input);
 }
@@ -198,6 +204,9 @@ export function updateProject(
     checkout_path: string;
     fetch_remote?: string;
     new_name?: string;
+    /** Three-valued: leave the key out to preserve the stored reference, pass
+     * null to clear it, pass a name to select that profile. */
+    default_model_profile?: string | null;
   },
 ): Promise<Project> {
   return request<Project>("PUT", `/api/projects/${encodeURIComponent(name)}`, input);
@@ -266,6 +275,38 @@ export function updateTemplate(name: string, input: TemplateInput): Promise<Temp
 
 export function deleteTemplate(name: string): Promise<{ deleted: string }> {
   return request("DELETE", `/api/templates/${encodeURIComponent(name)}`);
+}
+
+/** Model-profile CRUD (ADR-0025). Commands only: the list itself arrives in
+ * the WebSocket snapshot, and a mutation's response is fed back through
+ * `useDaemonReconcile` so the panel need not wait for the matching event.
+ *
+ * The daemon owns binding validation — these helpers send what the operator
+ * typed and surface its refusal. */
+export type ModelProfileRoles = Record<ModelRole, ModelRoleBinding>;
+
+export function createModelProfile(input: {
+  name: string;
+  roles: ModelProfileRoles;
+}): Promise<ModelProfile> {
+  return request<ModelProfile>("POST", "/api/model-profiles", input);
+}
+
+/** Replaces all four bindings at once; the name is immutable. */
+export function updateModelProfile(
+  name: string,
+  roles: ModelProfileRoles,
+): Promise<ModelProfile> {
+  return request<ModelProfile>(
+    "PUT",
+    `/api/model-profiles/${encodeURIComponent(name)}`,
+    { roles },
+  );
+}
+
+/** 409 with the referencing project names while any project still selects it. */
+export function deleteModelProfile(name: string): Promise<{ deleted: string }> {
+  return request("DELETE", `/api/model-profiles/${encodeURIComponent(name)}`);
 }
 
 /** Settings CRUD (daemon-settings capability). The effective map and

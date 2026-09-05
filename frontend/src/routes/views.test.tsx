@@ -34,6 +34,7 @@ class MockWebSocket {
   emitSnapshot(payload: {
     projects: unknown[];
     templates?: unknown[];
+    model_profiles?: unknown[];
     tasks: unknown[];
     sessions?: unknown;
     workflows?: unknown;
@@ -59,6 +60,7 @@ const project = {
   fetch_remote: "origin",
   setup_state: "ready",
   setup_error: null,
+  default_model_profile: null,
 };
 
 const githubProject = { ...project, upstream_url: "https://github.com/ompire/maas.git" };
@@ -139,6 +141,7 @@ async function renderAt(
   snapshot: {
     projects: unknown[];
     templates?: unknown[];
+    model_profiles?: unknown[];
     tasks: unknown[];
     sessions?: unknown;
     workflows?: unknown;
@@ -3407,6 +3410,7 @@ describe("ProjectsView (projects-view capability)", () => {
     fetch_remote: "origin",
     setup_state: "ready",
     setup_error: null,
+    default_model_profile: null,
   };
 
   it("renders one card per project with fork-less annotation and active-task pills", async () => {
@@ -3468,6 +3472,8 @@ describe("ProjectsView (projects-view capability)", () => {
           // Adoption is the default mode; the empty path derives from the
           // effective checkout root (ADR-0022).
           checkout_mode: "adopt",
+          // No profile is auto-selected; "No default" sends an explicit null.
+          default_model_profile: null,
           checkout_path: null,
           fetch_remote: "origin",
         }),
@@ -3683,6 +3689,9 @@ describe("ProjectsView (projects-view capability)", () => {
           fork_url: null,
           checkout_path: project.checkout_path,
           fetch_remote: project.fetch_remote,
+          // The edit panel shows the selector, so it always states the
+          // intended value rather than leaving it to be preserved.
+          default_model_profile: null,
           new_name: "maas-ng",
         }),
       }),
@@ -4420,6 +4429,7 @@ describe("project checkout onboarding (ADR-0022)", () => {
           upstream_url: "https://example.com/fresh.git",
           fork_url: null,
           checkout_mode: "clone",
+          default_model_profile: null,
         }),
       }),
     );
@@ -4558,5 +4568,136 @@ describe("project create form mode switching (ADR-0022)", () => {
     await user.click(screen.getByTestId("new-project-mode-clone"));
 
     expect(screen.queryByTestId("new-project-inspection")).not.toBeInTheDocument();
+  });
+});
+
+describe("project default model profile (ADR-0025)", () => {
+  const balanced = {
+    name: "balanced",
+    roles: {
+      default: { model: "anthropic/claude-sonnet-4.5", thinking: "medium" },
+      smol: { model: "openai/gpt-4.1-mini", thinking: "off" },
+      slow: { model: "openai/o3", thinking: "high" },
+      plan: { model: "google/gemini-2.5-pro", thinking: "max" },
+    },
+    created_at: "2026-09-01T00:00:00Z",
+    updated_at: "2026-09-01T00:00:00Z",
+  };
+  const thorough = { ...balanced, name: "thorough" };
+
+  it("shows the chosen profile on the card, or that none is configured", async () => {
+    const assigned = { ...project, name: "assigned", default_model_profile: "balanced" };
+    await renderAt("/projects", {
+      projects: [project, assigned],
+      tasks: [],
+      model_profiles: [balanced],
+    });
+
+    expect(screen.getByTestId("default-profile-assigned")).toHaveTextContent("balanced");
+    expect(screen.getByTestId("default-profile-maas")).toHaveTextContent(
+      "no default configured",
+    );
+    // The card states that the assignment is stored, not in force.
+    expect(screen.getByTestId("default-profile-assigned")).toHaveTextContent(
+      /templates still run tasks/,
+    );
+  });
+
+  it("never auto-selects a profile, and registers fine when none exist", async () => {
+    await renderAt("/projects", { projects: [], tasks: [], model_profiles: [] });
+    const user = userEvent.setup();
+    const created = { ...project, name: "fresh" };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: true, json: () => Promise.resolve(created) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await user.click(screen.getByTestId("new-project-toggle"));
+    // No profiles saved: the selector still offers "No default" only, and
+    // points at where to make one.
+    expect(screen.getByTestId("new-project-default-profile")).toHaveValue("");
+    expect(
+      screen.getByRole("link", { name: /Create one in Templates/ }),
+    ).toBeInTheDocument();
+
+    await user.type(screen.getByTestId("new-project-name"), "fresh");
+    await user.type(screen.getByTestId("new-project-title"), "Fresh");
+    await user.type(screen.getByTestId("new-project-upstream"), "https://example.com/f.git");
+    await user.click(screen.getByTestId("new-project-submit"));
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).default_model_profile).toBeNull();
+  });
+
+  it("sends the selected profile on registration", async () => {
+    await renderAt("/projects", { projects: [], tasks: [], model_profiles: [balanced] });
+    const user = userEvent.setup();
+    const created = { ...project, name: "fresh", default_model_profile: "balanced" };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: true, json: () => Promise.resolve(created) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await user.click(screen.getByTestId("new-project-toggle"));
+    await user.type(screen.getByTestId("new-project-name"), "fresh");
+    await user.type(screen.getByTestId("new-project-title"), "Fresh");
+    await user.type(screen.getByTestId("new-project-upstream"), "https://example.com/f.git");
+    await user.selectOptions(screen.getByTestId("new-project-default-profile"), "balanced");
+    await user.click(screen.getByTestId("new-project-submit"));
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).default_model_profile).toBe("balanced");
+  });
+
+  it("reassigns and clears one project's default without touching another", async () => {
+    const alpha = { ...project, name: "alpha", default_model_profile: "balanced" };
+    const beta = { ...project, name: "beta", default_model_profile: "balanced" };
+    await renderAt("/projects", {
+      projects: [alpha, beta],
+      tasks: [],
+      model_profiles: [balanced, thorough],
+    });
+    const user = userEvent.setup();
+    const saved = { ...alpha, default_model_profile: "thorough" };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: true, json: () => Promise.resolve(saved) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await user.click(
+      within(screen.getByTestId("project-card-alpha")).getByRole("button", { name: "Edit" }),
+    );
+    const select = screen.getByTestId("edit-default-profile-alpha");
+    expect(select).toHaveValue("balanced");
+    await user.selectOptions(select, "thorough");
+    await user.click(screen.getByTestId("edit-save-alpha"));
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).default_model_profile).toBe("thorough");
+    await waitFor(() =>
+      expect(screen.getByTestId("default-profile-alpha")).toHaveTextContent("thorough"),
+    );
+    expect(screen.getByTestId("default-profile-beta")).toHaveTextContent("balanced");
+  });
+
+  it("keeps a profile deleted since selection visible as unavailable", async () => {
+    const alpha = { ...project, name: "alpha", default_model_profile: "balanced" };
+    await renderAt("/projects", {
+      projects: [alpha],
+      tasks: [],
+      model_profiles: [balanced, thorough],
+    });
+    const user = userEvent.setup();
+
+    await user.click(
+      within(screen.getByTestId("project-card-alpha")).getByRole("button", { name: "Edit" }),
+    );
+    act(() => {
+      socket().emit("model_profile_deleted", { name: "balanced" });
+    });
+
+    // The stale selection is not silently swapped for another profile or for
+    // "No default"; the operator has to correct it.
+    expect(screen.getByTestId("edit-default-profile-alpha")).toHaveValue("balanced");
+    expect(
+      screen.getByTestId("edit-default-profile-alpha-unavailable"),
+    ).toHaveTextContent("balanced has been removed");
   });
 });

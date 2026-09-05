@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { applyEnvelope, initialDaemonState } from "./daemonReducer";
-import type { Envelope, Project, Template } from "../types";
+import type { Envelope, ModelProfile, Project, Template } from "../types";
 
 const project: Project = {
   name: "maas",
@@ -12,6 +12,19 @@ const project: Project = {
   fetch_remote: "origin",
   setup_state: "ready",
   setup_error: null,
+  default_model_profile: null,
+};
+
+const modelProfile: ModelProfile = {
+  name: "balanced",
+  roles: {
+    default: { model: "anthropic/claude-sonnet-4.5", thinking: "medium" },
+    smol: { model: "openai/gpt-4.1-mini", thinking: "off" },
+    slow: { model: "openai/o3", thinking: "high" },
+    plan: { model: "google/gemini-2.5-pro", thinking: "max" },
+  },
+  created_at: "2026-09-01T00:00:00Z",
+  updated_at: "2026-09-01T00:00:00Z",
 };
 
 const template: Template = {
@@ -1396,5 +1409,76 @@ describe("project setup progress (ADR-0022)", () => {
     // The durable setup_state is what a reconnecting client renders.
     expect(state.projectSetupProgress).toEqual({});
     expect(state.projects[0].setup_state).toBe("cloning");
+  });
+});
+
+describe("model profiles (ADR-0025)", () => {
+  const snapshot = (model_profiles: ModelProfile[]): Envelope => ({
+    seq: 0,
+    ts: "",
+    type: "snapshot",
+    payload: { projects: [], templates: [], tasks: [], model_profiles },
+  });
+
+  it("normalizes an older snapshot without the field to an empty list", () => {
+    const next = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], templates: [], tasks: [] },
+    });
+    expect(next.modelProfiles).toEqual([]);
+    expect(next.snapshotReady).toBe(true);
+  });
+
+  it("upserts by name, so a response and its event leave one row", () => {
+    const start = applyEnvelope(initialDaemonState, snapshot([]));
+    const created = applyEnvelope(start, {
+      seq: 1,
+      ts: "",
+      type: "model_profile_created",
+      payload: modelProfile,
+    });
+    const echoed = applyEnvelope(created, {
+      seq: 2,
+      ts: "",
+      type: "model_profile_created",
+      payload: modelProfile,
+    });
+    expect(echoed.modelProfiles).toEqual([modelProfile]);
+  });
+
+  it("replaces a profile in place on update and keeps the list sorted on insert", () => {
+    const start = applyEnvelope(initialDaemonState, snapshot([modelProfile]));
+    const replaced = { ...modelProfile, updated_at: "2026-09-02T00:00:00Z" };
+    const updated = applyEnvelope(start, {
+      seq: 1,
+      ts: "",
+      type: "model_profile_updated",
+      payload: replaced,
+    });
+    expect(updated.modelProfiles).toEqual([replaced]);
+
+    const withEarlier = applyEnvelope(updated, {
+      seq: 2,
+      ts: "",
+      type: "model_profile_created",
+      payload: { ...modelProfile, name: "aggressive" },
+    });
+    expect(withEarlier.modelProfiles.map((p) => p.name)).toEqual(["aggressive", "balanced"]);
+  });
+
+  it("drops a profile by name and replaces the whole list on a new snapshot", () => {
+    const start = applyEnvelope(initialDaemonState, snapshot([modelProfile]));
+    const deleted = applyEnvelope(start, {
+      seq: 1,
+      ts: "",
+      type: "model_profile_deleted",
+      payload: { name: "balanced" },
+    });
+    expect(deleted.modelProfiles).toEqual([]);
+
+    const cheap = { ...modelProfile, name: "cheap" };
+    expect(applyEnvelope(deleted, snapshot([cheap])).modelProfiles).toEqual([cheap]);
   });
 });

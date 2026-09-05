@@ -12,6 +12,7 @@ import type {
   GpgStatusPayload,
   GitHubStatus,
   GitHubStatusPayload,
+  ModelProfile,
   Project,
   QuestionPostedPayload,
   QuestionResolvedPayload,
@@ -48,6 +49,12 @@ export interface DaemonState {
    * loaded from the snapshot, upserted by `template_created`/
    * `template_updated`, dropped by `template_deleted`. */
   templates: Template[];
+  /** Global model profiles (ADR-0025), keyed by name like projects: replaced
+   * wholesale by the snapshot, upserted by `model_profile_created`/
+   * `model_profile_updated`, dropped by `model_profile_deleted`. An older
+   * snapshot without the field normalizes to empty — which routes must not
+   * read as "no profiles saved" before `snapshotReady`. */
+  modelProfiles: ModelProfile[];
   tasks: Task[];
   /** Transient per-task spawn pipeline progress, keyed by task id. Fed by
    * `spawn_step` events, never part of the snapshot — a reconnect drops it,
@@ -99,6 +106,7 @@ export const initialDaemonState: DaemonState = {
   snapshotReady: false,
   projects: [],
   templates: [],
+  modelProfiles: [],
   tasks: [],
   spawnProgress: {},
   projectSetupProgress: {},
@@ -125,6 +133,22 @@ function upsertProject(projects: Project[], project: Project): Project[] {
   const next = [...projects];
   next[index] = project;
   return next;
+}
+
+/** Same name-keyed idempotence as projects, and for the same reason: a saved
+ * profile arrives twice — once as the mutation's own REST response, once as
+ * its WebSocket event — and either order must leave exactly one row.
+ * Insertion keeps the daemon's by-name sort. */
+function upsertModelProfile(profiles: ModelProfile[], profile: ModelProfile): ModelProfile[] {
+  const index = profiles.findIndex((p) => p.name === profile.name);
+  if (index !== -1) {
+    const next = [...profiles];
+    next[index] = profile;
+    return next;
+  }
+  const at = profiles.findIndex((p) => p.name.localeCompare(profile.name) > 0);
+  if (at === -1) return [...profiles, profile];
+  return [...profiles.slice(0, at), profile, ...profiles.slice(at)];
 }
 
 /** Do not retain a target result across a changed or unavailable ambient identity.
@@ -190,6 +214,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         snapshotReady: true,
         projects: payload.projects,
         templates: payload.templates ?? [],
+        modelProfiles: payload.model_profiles ?? [],
         tasks: payload.tasks,
         spawnProgress: {},
         projectSetupProgress: {},
@@ -245,6 +270,18 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
     case "template_deleted": {
       const { name } = envelope.payload as { name: string };
       return { ...state, templates: state.templates.filter((t) => t.name !== name) };
+    }
+    case "model_profile_created":
+    case "model_profile_updated": {
+      const profile = envelope.payload as ModelProfile;
+      return { ...state, modelProfiles: upsertModelProfile(state.modelProfiles, profile) };
+    }
+    case "model_profile_deleted": {
+      const { name } = envelope.payload as { name: string };
+      return {
+        ...state,
+        modelProfiles: state.modelProfiles.filter((p) => p.name !== name),
+      };
     }
     case "task_created": {
       const task = envelope.payload as Task;

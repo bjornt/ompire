@@ -374,3 +374,84 @@ def test_retry_endpoint_is_404_for_unknown_and_409_for_adopted(
     response = client.post("/api/projects/demo/setup/retry", headers=auth_headers)
     assert response.status_code == 409
     assert "nothing for Ompire to retry" in response.json()["detail"]
+
+
+def test_clone_mode_with_an_unknown_profile_starts_no_setup_job(
+    client: TestClient, auth_headers: dict[str, str], app
+) -> None:
+    """The profile reference is validated on the shared registration path,
+    before the row is committed and before `setup.start(project)` — so a bad
+    reference cannot leave a clone job running against a project that was
+    never registered."""
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "cloned",
+            "title": "Cloned",
+            "upstream_url": "https://example.com/repo.git",
+            "checkout_mode": "clone",
+            "default_model_profile": "ghost",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "unknown model profile" in response.json()["detail"]
+    assert app.state.project_setup._jobs == {}
+    assert not clone_target(app.state.config.checkout_root, "cloned").destination.exists()
+    assert client.get("/api/projects/cloned", headers=auth_headers).status_code == 404
+
+
+async def test_setup_completion_and_retry_preserve_the_default_profile(
+    app, setup_manager: ProjectSetupManager, tmp_path: Path
+) -> None:
+    """Setup only owns `setup_state`/`setup_error`. A clone that fails and is
+    then retried must still come back with the profile the operator chose at
+    registration."""
+    from ompire_daemon.registry.model_profiles import create_model_profile
+
+    create_model_profile(
+        app.state.engine,
+        name="balanced",
+        roles={
+            role: {"model": "openai/o3", "thinking": "high"}
+            for role in ("default", "smol", "slow", "plan")
+        },
+    )
+    root = app.state.config.checkout_root
+    project = create_project(
+        app.state.engine,
+        name="demo",
+        title="Demo",
+        upstream_url="https://example.invalid/nope.git",
+        checkout_path=str(clone_target(root, "demo").destination),
+        default_checkout_root=root,
+        checkout_mode="cloned",
+        setup_state="cloning",
+        default_model_profile="balanced",
+    )
+    assert project.default_model_profile == "balanced"
+
+    setup_manager.start(project)
+    await asyncio.gather(*setup_manager._jobs.values())
+    failed = get_project(app.state.engine, "demo")
+    assert failed.setup_state == "failed"
+    assert failed.default_model_profile == "balanced"
+
+    upstream = make_upstream(tmp_path)
+    from ompire_daemon.registry.projects import update_project
+
+    update_project(
+        app.state.engine,
+        "demo",
+        title="Demo",
+        upstream_url=str(upstream),
+        fork_url=None,
+        checkout_path=project.checkout_path,
+    )
+    setup_manager.retry("demo")
+    await asyncio.gather(*setup_manager._jobs.values())
+
+    ready = get_project(app.state.engine, "demo")
+    assert ready.setup_state == "ready"
+    assert ready.default_model_profile == "balanced"

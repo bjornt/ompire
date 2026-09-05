@@ -22,6 +22,7 @@ not own spawn configuration — that belongs to [templates](templates.md).
 | `fetch_remote` | no | The remote spawn fetches **in that checkout**. Defaults to `origin`. |
 | `setup_state` | read-only | `ready`, `cloning`, or `failed`. |
 | `setup_error` | read-only | Why setup failed, with the failing step's git stderr. |
+| `default_model_profile` | no | Name of a [model profile](model-profiles.md), or `null` for no default. |
 
 A slug is lowercase alphanumerics separated by single hyphens — `my-project`
 is valid, `My_Project` and `-leading` are not.
@@ -75,6 +76,43 @@ This is unrelated to the `origin` inside a task's own clone, which always
 points at the base checkout and is what branch creation, review, and shipping
 resolve against.
 
+## Default model profile
+
+A project may name one [model profile](model-profiles.md) as its default. The
+field is optional and defaults to `null`; several projects may name the same
+profile.
+
+**This is stored configuration, not execution.** Tasks are still created from
+[templates](templates.md) and still run with the template's `model` and
+`thinking` values or a per-spawn override. The assignment is recorded for
+workflow-first task launching; today it changes nothing about how a task runs.
+
+The field is three-valued on `PUT /api/projects/{name}`:
+
+| The request body | Effect |
+|---|---|
+| Omits `default_model_profile` | The stored reference is preserved |
+| Sets it to `null` | The default is cleared |
+| Sets it to a name | That profile becomes the default |
+
+Omission preserving the reference is what lets an API caller written before
+profiles existed update a project's title or URLs without silently clearing
+its default. The Projects view's Edit panel always sends the field, because
+the operator can see the selector — choosing **No default** there means clear
+it.
+
+A reference to a profile that does not exist is `422`, and the whole project
+create or update is unapplied: no field lands, and in clone mode no setup job
+starts. Deleting a profile a project still names is refused, naming the
+projects; see
+[Removing a profile](model-profiles.md#removing-a-profile). Removing a project
+releases its reference and never removes the profile.
+
+Existing projects have no default after upgrading. None is inferred from a
+template, from provider credentials, from omp's own settings, or from the
+project's name. Setup completion, setup retry, and a permitted rename all
+preserve an assigned reference.
+
 ## Fork routing
 
 A project with no `fork_url` means "the operator owns upstream — push straight
@@ -89,8 +127,9 @@ request is opened against `upstream_url`.
 Create, edit, and remove projects from the Projects view. Each project renders
 as a card showing name, title, setup state, upstream and fork rows, the
 checkout path with whether it was adopted or cloned and which remote it
-fetches, and a pill counting its non-archived tasks that links to the Tasks
-view filtered to that project.
+fetches, its default model profile or that none is configured, and a pill
+counting its non-archived tasks that links to the Tasks view filtered to that
+project.
 
 A project with no fork shows the upstream row annotated "you own upstream — no
 fork needed" and no fork row.
@@ -100,6 +139,14 @@ task changes are reflected without a reload. An empty list renders an empty
 state rather than example cards.
 
 ### Creating and editing
+
+Registration in both modes, and the Edit panel, offer an optional **Default
+model profile** selector listing every saved profile plus **No default**. No
+profile is auto-selected, and a project can be registered when none exist —
+the selector then links to where to create one. If the profile a draft
+selected has since been deleted, the selection stays visible and is marked
+unavailable rather than silently becoming another profile or **No default**;
+correct it before saving.
 
 While a create or edit request is in flight the form stays on screen with every
 field and button disabled, and the submit button reads `Creating…` or `Saving…`.
@@ -205,6 +252,7 @@ nothing under `.git`.
 | Delete or rename while tasks reference it | `409` naming the tasks |
 | Delete or rename while templates reference it | `409` naming the templates |
 | Rename to a name already in use | `409`, both projects unchanged |
+| `default_model_profile` names a profile that does not exist | `422`, the entire create or update unapplied |
 | File search for an unknown project | `404` |
 | File search when `checkout_path` is missing or is not a git repository | `409` naming the path |
 

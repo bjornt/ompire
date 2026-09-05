@@ -44,6 +44,30 @@ projects = Table(
     Column("fetch_remote", String, nullable=False, server_default="origin"),
     Column("setup_state", String, nullable=False, server_default="ready"),
     Column("setup_error", Text, nullable=True),
+    # Optional global model profile (ADR-0025). NULL means no default; the
+    # named, non-cascading FK is schema metadata — the runtime guarantee is the
+    # write reservation in `registry/model_profiles.reserved_write`, because
+    # this connection does not enable `PRAGMA foreign_keys`.
+    Column(
+        "default_model_profile",
+        String,
+        ForeignKey("model_profiles.name", name="fk_projects_default_model_profile"),
+        nullable=True,
+    ),
+    Index("ix_projects_default_model_profile", "default_model_profile"),
+)
+
+# Global model profiles (ADR-0025): a reusable name for the four model-role
+# bindings. The role map is one small complete document — there is no
+# role-level update API and nothing queries profiles by a nested model — so it
+# follows the existing JSON-text convention rather than eight fixed columns.
+model_profiles = Table(
+    "model_profiles",
+    metadata,
+    Column("name", String, primary_key=True),
+    Column("roles_json", Text, nullable=False),
+    Column("created_at", String, nullable=False),
+    Column("updated_at", String, nullable=False),
 )
 
 # SPEC Decision 6/9: spawn configuration lives on templates; checkout path and

@@ -8,11 +8,74 @@ import {
   updateProject,
 } from "../lib/api";
 import { useDaemonReconcile, useDaemonState } from "../lib/useDaemonState";
-import type { CheckoutInspection, Project, ProjectSetupStep, Task } from "../types";
+import type { CheckoutInspection, ModelProfile, Project, ProjectSetupStep, Task } from "../types";
+import { EXECUTION_BOUNDARY_NOTE } from "./ModelProfilesPanel";
 import "./ProjectsView.css";
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** The optional default-profile selector, shared by registration and editing.
+ *
+ * Always offers "No default" and never auto-selects: assigning a profile is a
+ * choice, and registering without one stays possible even with none saved. A
+ * name that has disappeared from saved state is kept as an explicitly
+ * unavailable option rather than silently becoming another profile or no
+ * default — the operator has to correct it before submitting. */
+function DefaultProfileField({
+  profiles,
+  value,
+  onChange,
+  disabled,
+  testId,
+}: {
+  profiles: ModelProfile[];
+  value: string;
+  onChange: (value: string) => void;
+  disabled: boolean;
+  testId: string;
+}) {
+  const unavailable = value !== "" && !profiles.some((p) => p.name === value);
+  return (
+    <label className="formField">
+      <span className="fieldLabel">
+        Default model profile <span className="fieldHint">— optional</span>
+      </span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        disabled={disabled}
+        data-testid={testId}
+      >
+        <option value="">No default</option>
+        {profiles.map((profile) => (
+          <option key={profile.name} value={profile.name}>
+            {profile.name}
+          </option>
+        ))}
+        {unavailable && (
+          <option value={value} disabled>
+            {value} — no longer available
+          </option>
+        )}
+      </select>
+      {unavailable && (
+        <span className="submitError" role="alert" data-testid={`${testId}-unavailable`}>
+          {value} has been removed. Pick another profile or No default before saving.
+        </span>
+      )}
+      <span className="fieldHint">
+        {EXECUTION_BOUNDARY_NOTE}
+        {profiles.length === 0 && (
+          <>
+            {" "}
+            <Link to="/settings">Create one in Templates &amp; settings</Link>.
+          </>
+        )}
+      </span>
+    </label>
+  );
 }
 
 /** A `201`/`200` body is authoritative only if it is actually a project. A
@@ -63,8 +126,9 @@ async function confirmAndRemove(
 }
 
 function NewProjectForm({ onClose }: { onClose: () => void }) {
-  const { projects, settings } = useDaemonState();
+  const { projects, settings, modelProfiles } = useDaemonState();
   const reconcile = useDaemonReconcile();
+  const [defaultProfile, setDefaultProfile] = useState("");
   const [name, setName] = useState("");
   const [title, setTitle] = useState("");
   const [upstream, setUpstream] = useState("");
@@ -134,6 +198,9 @@ function NewProjectForm({ onClose }: { onClose: () => void }) {
           upstream_url: upstream.trim(),
           fork_url: fork.trim() || null,
           checkout_mode: mode,
+          // Both modes carry the reference; the daemon validates it before
+          // committing the row or starting a clone.
+          default_model_profile: defaultProfile || null,
           ...(mode === "adopt"
             ? {
                 checkout_path: checkoutPath.trim() || null,
@@ -308,6 +375,13 @@ function NewProjectForm({ onClose }: { onClose: () => void }) {
             </span>
           </div>
         )}
+        <DefaultProfileField
+          profiles={modelProfiles}
+          value={defaultProfile}
+          onChange={setDefaultProfile}
+          disabled={busy}
+          testId="new-project-default-profile"
+        />
         {inspection && (
           <div
             className={inspection.ok ? "inspectOk" : "inspectProblem"}
@@ -374,6 +448,8 @@ function ProjectEditPanel({
   const [fork, setFork] = useState(project.fork_url ?? "");
   const [checkoutPath, setCheckoutPath] = useState(project.checkout_path);
   const [fetchRemote, setFetchRemote] = useState(project.fetch_remote);
+  const [defaultProfile, setDefaultProfile] = useState(project.default_model_profile ?? "");
+  const { modelProfiles } = useDaemonState();
   const reconcile = useDaemonReconcile();
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -401,6 +477,9 @@ function ProjectEditPanel({
           fork_url: fork.trim() || null,
           checkout_path: checkoutPath.trim(),
           fetch_remote: fetchRemote.trim() || "origin",
+          // Always sent from this form: the operator sees the selector, so an
+          // explicit "No default" here means clear it.
+          default_model_profile: defaultProfile || null,
           ...(renaming ? { new_name: newName } : {}),
         }),
       );
@@ -515,6 +594,13 @@ function ProjectEditPanel({
           />
         </label>
       </div>
+      <DefaultProfileField
+        profiles={modelProfiles}
+        value={defaultProfile}
+        onChange={setDefaultProfile}
+        disabled={submitting}
+        testId={`edit-default-profile-${project.name}`}
+      />
       <div className="formActions">
         <button
           type="submit"
@@ -693,6 +779,11 @@ function ProjectCard({
             {" · fetches "}
             {project.fetch_remote}
           </span>
+        </span>
+        <span className="metaLabel">model profile</span>
+        <span className="metaValue" data-testid={`default-profile-${project.name}`}>
+          {project.default_model_profile ?? "no default configured"}
+          <span className="noForkNote"> · saved for launching; templates still run tasks</span>
         </span>
       </div>
       <ProjectSetupPanel project={project} />

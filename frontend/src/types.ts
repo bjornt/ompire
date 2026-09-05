@@ -12,6 +12,10 @@ export interface Project {
   fetch_remote: string;
   setup_state: "ready" | "cloning" | "failed";
   setup_error: string | null;
+  /** The global model profile this project selects as its default, or null
+   * (ADR-0025). A stored reference for workflow-first launching — it does not
+   * govern today's template-driven tasks. */
+  default_model_profile: string | null;
 }
 
 /** Read-only look at a candidate checkout, used by the create form to
@@ -45,6 +49,28 @@ export interface ProjectFiles {
  * v17.2.12); null on a template or unset on a spawn override means the omp
  * default. */
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "auto";
+
+/** The four fixed roles a model profile binds (ADR-0025), in presentation
+ * order. A profile has exactly these — no more, no fewer, no custom aliases. */
+export type ModelRole = "default" | "smol" | "slow" | "plan";
+
+/** One role's concrete pair. Neither field is ever null: the model is a
+ * provider-qualified identifier and the thinking level is explicit, so a
+ * binding never falls back to omp's host configuration. */
+export interface ModelRoleBinding {
+  model: string;
+  thinking: ThinkingLevel;
+}
+
+/** A global, reusable name for the four role bindings (ADR-0025). Contains
+ * identifiers only — no repository, workflow, or credential policy. The name
+ * is the stable identifier and cannot be renamed. */
+export interface ModelProfile {
+  name: string;
+  roles: Record<ModelRole, ModelRoleBinding>;
+  created_at: string;
+  updated_at: string;
+}
 
 /** SPEC Decision 6 setup template: everything spawn needs. Checkout path and
  * remotes come from the referenced project (Decision 9), never stored here. */
@@ -506,6 +532,9 @@ export interface DaemonInfo {
 export interface SnapshotPayload {
   projects: Project[];
   templates: Template[];
+  /** The complete sorted model-profile registry (ADR-0025); absent from
+   * snapshots emitted before this capability. */
+  model_profiles?: ModelProfile[];
   tasks: Task[];
   /** Nested task id → session name → info (workflow-engine design D-7; JSON
    * object keys arrive as strings). */

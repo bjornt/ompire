@@ -731,3 +731,219 @@ def test_update_revalidates_a_changed_adopted_checkout(
     assert response.status_code == 422
     stored = client.get("/api/projects/demo", headers=auth_headers).json()
     assert stored["checkout_path"] == str(git_checkout)
+
+
+# --- Default model profile (ADR-0025) ---------------------------------------
+
+
+def _create_profile(client: TestClient, auth_headers: dict[str, str], name: str) -> None:
+    response = client.post(
+        "/api/model-profiles",
+        headers=auth_headers,
+        json={
+            "name": name,
+            "roles": {
+                role: {"model": "openai/o3", "thinking": "high"}
+                for role in ("default", "smol", "slow", "plan")
+            },
+        },
+    )
+    assert response.status_code == 201, response.text
+
+
+def test_registration_without_a_profile_has_no_default(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """Nothing is inferred: no first profile is auto-selected, and a project
+    can be registered before any profile exists."""
+    _create_profile(client, auth_headers, "balanced")
+
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "ompire",
+            "title": "Ompire",
+            "upstream_url": "https://example.com/ompire.git",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["default_model_profile"] is None
+
+
+def test_registration_can_select_a_profile(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    _create_profile(client, auth_headers, "balanced")
+
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "ompire",
+            "title": "Ompire",
+            "upstream_url": "https://example.com/ompire.git",
+            "default_model_profile": "balanced",
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["default_model_profile"] == "balanced"
+    stored = client.get("/api/projects/ompire", headers=auth_headers).json()
+    assert stored["default_model_profile"] == "balanced"
+
+
+def test_registration_with_an_unknown_profile_registers_nothing(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    response = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "ompire",
+            "title": "Ompire",
+            "upstream_url": "https://example.com/ompire.git",
+            "default_model_profile": "ghost",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "unknown model profile" in response.json()["detail"]
+    assert client.get("/api/projects/ompire", headers=auth_headers).status_code == 404
+
+
+def test_update_omitting_the_field_preserves_the_reference(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """`_put_payload` never mentions the field — exactly what an API caller
+    written before profiles existed sends. Editing other fields must not
+    silently clear the project's default."""
+    _create_profile(client, auth_headers, "balanced")
+    project = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "ompire",
+            "title": "Ompire",
+            "upstream_url": "https://example.com/ompire.git",
+            "default_model_profile": "balanced",
+        },
+    ).json()
+
+    response = client.put(
+        "/api/projects/ompire",
+        headers=auth_headers,
+        json=_put_payload(project, title="Renamed title"),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["title"] == "Renamed title"
+    assert response.json()["default_model_profile"] == "balanced"
+
+
+def test_update_with_explicit_null_clears_the_reference(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    _create_profile(client, auth_headers, "balanced")
+    project = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "ompire",
+            "title": "Ompire",
+            "upstream_url": "https://example.com/ompire.git",
+            "default_model_profile": "balanced",
+        },
+    ).json()
+
+    response = client.put(
+        "/api/projects/ompire",
+        headers=auth_headers,
+        json=_put_payload(project, default_model_profile=None),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["default_model_profile"] is None
+
+
+def test_update_can_reassign_and_leaves_other_projects_alone(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    _create_profile(client, auth_headers, "balanced")
+    _create_profile(client, auth_headers, "thorough")
+    for name in ("ompire", "other"):
+        client.post(
+            "/api/projects",
+            headers=auth_headers,
+            json={
+                "name": name,
+                "title": name.title(),
+                "upstream_url": f"https://example.com/{name}.git",
+                "default_model_profile": "balanced",
+            },
+        )
+    project = client.get("/api/projects/ompire", headers=auth_headers).json()
+
+    response = client.put(
+        "/api/projects/ompire",
+        headers=auth_headers,
+        json=_put_payload(project, default_model_profile="thorough"),
+    )
+
+    assert response.json()["default_model_profile"] == "thorough"
+    other = client.get("/api/projects/other", headers=auth_headers).json()
+    assert other["default_model_profile"] == "balanced"
+
+
+def test_update_with_an_unknown_profile_applies_no_part_of_the_mutation(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    _create_profile(client, auth_headers, "balanced")
+    project = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "ompire",
+            "title": "Ompire",
+            "upstream_url": "https://example.com/ompire.git",
+            "default_model_profile": "balanced",
+        },
+    ).json()
+
+    response = client.put(
+        "/api/projects/ompire",
+        headers=auth_headers,
+        json=_put_payload(project, title="Should not land", default_model_profile="ghost"),
+    )
+
+    assert response.status_code == 422
+    stored = client.get("/api/projects/ompire", headers=auth_headers).json()
+    assert stored["title"] == "Ompire"
+    assert stored["default_model_profile"] == "balanced"
+
+
+def test_rename_preserves_the_reference(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    _create_profile(client, auth_headers, "balanced")
+    project = client.post(
+        "/api/projects",
+        headers=auth_headers,
+        json={
+            "name": "ompire",
+            "title": "Ompire",
+            "upstream_url": "https://example.com/ompire.git",
+            "default_model_profile": "balanced",
+        },
+    ).json()
+
+    response = client.put(
+        "/api/projects/ompire",
+        headers=auth_headers,
+        json=_put_payload(project, new_name="ompire-ng"),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["name"] == "ompire-ng"
+    assert response.json()["default_model_profile"] == "balanced"

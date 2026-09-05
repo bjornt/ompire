@@ -14,6 +14,7 @@ from sqlalchemy import Engine
 from sqlalchemy.exc import IntegrityError
 
 from ompire_daemon.db import projects, tasks, templates
+from ompire_daemon.model_config import validate_thinking
 from ompire_daemon.registry.projects import validate_slug
 
 # The engine's registry is the source of truth for valid workflow names
@@ -25,9 +26,6 @@ from ompire_daemon.workflows import registered_workflows
 _BRANCH_PATTERN_SAFE_RE = re.compile(r"^[A-Za-z0-9._/-]*$")
 
 WORKSHOP_ADDITIONS_SOURCES = ("project", "global")
-
-# omp's `--thinking` vocabulary, verified against omp v17.2.12 (`omp --help`).
-THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto")
 
 
 class DuplicateTemplateError(Exception):
@@ -74,14 +72,6 @@ class UnknownWorkflowError(ValueError):
         self.workflow = workflow
 
 
-class InvalidThinkingLevelError(ValueError):
-    def __init__(self, thinking: str) -> None:
-        super().__init__(
-            f"invalid thinking level {thinking!r}: must be one of {', '.join(THINKING_LEVELS)}"
-        )
-        self.thinking = thinking
-
-
 class InvalidWorkshopAdditionsError(ValueError):
     def __init__(self, workshop_additions: str) -> None:
         super().__init__(
@@ -116,11 +106,6 @@ def validate_branch_pattern(pattern: str) -> None:
 def validate_workflow(workflow: str) -> None:
     if workflow not in registered_workflows():
         raise UnknownWorkflowError(workflow)
-
-
-def validate_thinking(thinking: str) -> None:
-    if thinking not in THINKING_LEVELS:
-        raise InvalidThinkingLevelError(thinking)
 
 
 def validate_workshop_additions(workshop_additions: str) -> None:

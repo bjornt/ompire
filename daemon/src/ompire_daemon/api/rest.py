@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import Engine
 
 from ompire_daemon import auth
@@ -32,6 +32,7 @@ from ompire_daemon.gpg import (
     GpgProbe,
     gpg_signing_refusal,
 )
+from ompire_daemon.model_config import InvalidThinkingLevelError, validate_thinking
 from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.projectcheckout import (
     InvalidRemoteNameError,
@@ -58,8 +59,25 @@ from ompire_daemon.projectsetup import (
     ProjectSetupManager,
     clone_target,
 )
+from ompire_daemon.registry.model_profiles import (
+    DuplicateModelProfileError,
+    InvalidModelProfileNameError,
+    InvalidRoleBindingError,
+    InvalidRoleSetError,
+    ModelProfile,
+    ModelProfileNotFoundError,
+    ModelProfileReferencedError,
+    UnknownModelProfileReferenceError,
+    create_model_profile,
+    delete_model_profile,
+    get_model_profile,
+    list_model_profiles,
+    update_model_profile,
+    validate_profile_name,
+)
 from ompire_daemon.registry.projects import (
     DEFAULT_FETCH_REMOTE,
+    UNSUPPLIED,
     DuplicateProjectError,
     Project,
     ProjectHasReferencingTasksError,
@@ -95,7 +113,6 @@ from ompire_daemon.registry.tasks import (
 from ompire_daemon.registry.templates import (
     DuplicateTemplateError,
     InvalidBranchPatternError,
-    InvalidThinkingLevelError,
     InvalidWorkshopAdditionsError,
     Template,
     TemplateHasReferencingTasksError,
@@ -107,7 +124,6 @@ from ompire_daemon.registry.templates import (
     get_template,
     list_templates,
     update_template,
-    validate_thinking,
 )
 from ompire_daemon.review import ReviewAlreadyOpenError, ReviewError, ReviewManager
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
@@ -142,6 +158,9 @@ class ProjectCreate(BaseModel):
     checkout_path: str | None = None
     checkout_mode: str = "adopt"
     fetch_remote: str = DEFAULT_FETCH_REMOTE
+    # Optional global model profile (ADR-0025). Omitted or null means no
+    # default; nothing is inferred from templates, credentials, or the name.
+    default_model_profile: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -164,6 +183,11 @@ class ProjectUpdate(BaseModel):
     checkout_path: str
     fetch_remote: str = DEFAULT_FETCH_REMOTE
     new_name: str | None = None
+    # Three-valued on update: absent from the body preserves the stored
+    # reference, explicit null clears it, a name selects that profile. The
+    # route reads `model_fields_set` to tell the first two apart, so a caller
+    # written before profiles existed cannot clear one by not mentioning it.
+    default_model_profile: str | None = None
 
     @field_validator("new_name")
     @classmethod
@@ -205,6 +229,7 @@ class ProjectOut(BaseModel):
     fetch_remote: str
     setup_state: str
     setup_error: str | None
+    default_model_profile: str | None
 
     model_config = {"from_attributes": True}
 
@@ -465,6 +490,8 @@ async def create_project_route(
         checkout_mode, setup_state = "adopted", "ready"
 
     try:
+        # Both modes converge here, so an unknown profile is refused before any
+        # row exists — and, in clone mode, before a clone job is scheduled.
         project = create_project(
             engine,
             name=body.name,
@@ -476,9 +503,14 @@ async def create_project_route(
             checkout_mode=checkout_mode,
             fetch_remote=fetch_remote,
             setup_state=setup_state,
+            default_model_profile=body.default_model_profile,
         )
     except DuplicateProjectError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except UnknownModelProfileReferenceError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)
+        ) from exc
     events.publish("project_created", asdict(project))
     if project.setup_state == "cloning":
         setup.start(project)
@@ -597,6 +629,14 @@ async def update_project_route(
             checkout_path=body.checkout_path,
             fetch_remote=fetch_remote,
             new_name=body.new_name,
+            # Absent from the body means "leave it alone"; the registry
+            # resolves that against the stored row inside its write
+            # transaction, not against the `current` read above.
+            default_model_profile=(
+                body.default_model_profile
+                if "default_model_profile" in body.model_fields_set
+                else UNSUPPLIED
+            ),
         )
     except ProjectNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
@@ -604,6 +644,10 @@ async def update_project_route(
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except ProjectHasReferencingTasksError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except UnknownModelProfileReferenceError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)
+        ) from exc
     renamed = body.new_name is not None and body.new_name != name
     if renamed:
         # Keyed-by-name consumers can't match a renamed payload via
@@ -629,6 +673,154 @@ def delete_project_route(
     except ProjectHasReferencingTasksError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     events.publish("project_deleted", {"name": name})
+    return {"deleted": name}
+
+
+# --- Model profiles ---------------------------------------------------------
+# ADR-0025: global named model-role bindings. Configuration only in this
+# change — nothing here reaches spawn, agent argv, or a running session.
+
+
+class RoleBindingIn(BaseModel):
+    """One role's pair. Both fields are required and neither may be null: a
+    binding that cannot say which model and how much reasoning is not one."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    thinking: str
+
+
+class ModelProfileCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    roles: dict[str, RoleBindingIn]
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        validate_profile_name(value)
+        return value
+
+
+class ModelProfileUpdate(BaseModel):
+    """The name is the stable identifier, so an update replaces only the
+    bindings — and replaces all four of them together."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    roles: dict[str, RoleBindingIn]
+
+
+class RoleBindingOut(BaseModel):
+    model: str
+    thinking: str
+
+    model_config = {"from_attributes": True}
+
+
+class ModelProfileOut(BaseModel):
+    name: str
+    roles: dict[str, RoleBindingOut]
+    created_at: str
+    updated_at: str
+
+    model_config = {"from_attributes": True}
+
+
+def _model_profile_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, ModelProfileNotFoundError):
+        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    if isinstance(exc, (DuplicateModelProfileError, ModelProfileReferencedError)):
+        return HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    # Invalid names ride FastAPI's request validation via the field validator;
+    # role-set and binding refusals are registry-level 422s that name the role
+    # and field the operator has to fix.
+    return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
+
+
+def _profile_roles_payload(body: ModelProfileCreate | ModelProfileUpdate) -> dict[str, Any]:
+    return {role: binding.model_dump() for role, binding in body.roles.items()}
+
+
+def _profile_payload(profile: ModelProfile) -> dict[str, Any]:
+    """Event/response shape: the same nested role map the REST body uses."""
+    return asdict(profile)
+
+
+@router.get("/model-profiles", response_model=list[ModelProfileOut])
+def list_model_profiles_route(
+    engine: Engine = Depends(_engine),
+) -> list[ModelProfile]:
+    return list_model_profiles(engine)
+
+
+@router.post(
+    "/model-profiles",
+    response_model=ModelProfileOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_model_profile_route(
+    body: ModelProfileCreate,
+    engine: Engine = Depends(_engine),
+    events: EventHub = Depends(_events),
+) -> ModelProfile:
+    try:
+        profile = create_model_profile(
+            engine, name=body.name, roles=_profile_roles_payload(body)
+        )
+    except (
+        DuplicateModelProfileError,
+        InvalidModelProfileNameError,
+        InvalidRoleBindingError,
+        InvalidRoleSetError,
+    ) as exc:
+        raise _model_profile_error(exc) from exc
+    events.publish("model_profile_created", _profile_payload(profile))
+    return profile
+
+
+@router.get("/model-profiles/{name}", response_model=ModelProfileOut)
+def get_model_profile_route(
+    name: str, engine: Engine = Depends(_engine)
+) -> ModelProfile:
+    try:
+        return get_model_profile(engine, name)
+    except ModelProfileNotFoundError as exc:
+        raise _model_profile_error(exc) from exc
+
+
+@router.put("/model-profiles/{name}", response_model=ModelProfileOut)
+def update_model_profile_route(
+    name: str,
+    body: ModelProfileUpdate,
+    engine: Engine = Depends(_engine),
+    events: EventHub = Depends(_events),
+) -> ModelProfile:
+    try:
+        profile = update_model_profile(
+            engine, name, roles=_profile_roles_payload(body)
+        )
+    except (
+        ModelProfileNotFoundError,
+        InvalidRoleBindingError,
+        InvalidRoleSetError,
+    ) as exc:
+        raise _model_profile_error(exc) from exc
+    events.publish("model_profile_updated", _profile_payload(profile))
+    return profile
+
+
+@router.delete("/model-profiles/{name}")
+def delete_model_profile_route(
+    name: str, engine: Engine = Depends(_engine), events: EventHub = Depends(_events)
+) -> dict[str, str]:
+    try:
+        delete_model_profile(engine, name)
+    except (ModelProfileNotFoundError, ModelProfileReferencedError) as exc:
+        raise _model_profile_error(exc) from exc
+    events.publish("model_profile_deleted", {"name": name})
     return {"deleted": name}
 
 

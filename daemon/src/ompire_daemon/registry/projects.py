@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from sqlalchemy import Engine
-from sqlalchemy.exc import IntegrityError
 
 from ompire_daemon.db import projects, tasks, templates
+from ompire_daemon.registry.model_profiles import (
+    require_profile_exists,
+    reserved_write,
+)
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
@@ -62,6 +66,18 @@ SETUP_STATES = ("ready", "cloning", "failed")
 DEFAULT_FETCH_REMOTE = "origin"
 
 
+class _Unsupplied(Enum):
+    """Distinguishes "the caller said nothing about this field" from an
+    explicit `None`. A project update that omits `default_model_profile` — as
+    every API caller written before profiles existed does — must preserve the
+    stored reference, while an explicit null clears it."""
+
+    token = 0
+
+
+UNSUPPLIED = _Unsupplied.token
+
+
 class ProjectSetupBusyError(Exception):
     """Refusal for an operation that cannot run while a clone is in flight."""
 
@@ -95,6 +111,10 @@ class Project:
     fetch_remote: str = DEFAULT_FETCH_REMOTE
     setup_state: str = "ready"
     setup_error: str | None = None
+    # The global model profile this project selects as its default, or None
+    # (ADR-0025). A reference to policy, not a copy of it — and, in this
+    # change, not yet consumed by task execution.
+    default_model_profile: str | None = None
 
 
 def validate_slug(name: str) -> None:
@@ -113,6 +133,7 @@ def _row_to_project(row) -> Project:
         fetch_remote=row.fetch_remote,
         setup_state=row.setup_state,
         setup_error=row.setup_error,
+        default_model_profile=row.default_model_profile,
     )
 
 
@@ -142,27 +163,42 @@ def create_project(
     checkout_mode: str = "adopted",
     fetch_remote: str = DEFAULT_FETCH_REMOTE,
     setup_state: str = "ready",
+    default_model_profile: str | None = None,
 ) -> Project:
     validate_slug(name)
     resolved_checkout_path = checkout_path or str(default_checkout_root / name)
-    try:
-        with engine.begin() as conn:
-            conn.execute(
-                projects.insert().values(
-                    name=name,
-                    title=title,
-                    upstream_url=upstream_url,
-                    fork_url=fork_url,
-                    checkout_path=resolved_checkout_path,
-                    checkout_mode=checkout_mode,
-                    fetch_remote=fetch_remote,
-                    setup_state=setup_state,
-                    setup_error=None,
-                )
+    # The duplicate check, the profile reference check, and the insert share
+    # one write reservation, so a profile cannot be deleted between being
+    # validated here and being pinned on the committed row.
+    with reserved_write(engine) as conn:
+        clash = conn.execute(
+            projects.select()
+            .with_only_columns(projects.c.name)
+            .where(projects.c.name == name)
+        ).first()
+        if clash is not None:
+            raise DuplicateProjectError(name)
+        if default_model_profile is not None:
+            require_profile_exists(conn, default_model_profile)
+        conn.execute(
+            projects.insert().values(
+                name=name,
+                title=title,
+                upstream_url=upstream_url,
+                fork_url=fork_url,
+                checkout_path=resolved_checkout_path,
+                checkout_mode=checkout_mode,
+                fetch_remote=fetch_remote,
+                setup_state=setup_state,
+                setup_error=None,
+                default_model_profile=default_model_profile,
             )
-    except IntegrityError as exc:
-        raise DuplicateProjectError(name) from exc
-    return get_project(engine, name)
+        )
+        # Read the committed row back inside the reservation: the caller's
+        # response is this mutation's own outcome, not whatever a later write
+        # leaves behind.
+        row = conn.execute(projects.select().where(projects.c.name == name)).one()
+    return _row_to_project(row)
 
 
 def update_project(
@@ -175,7 +211,15 @@ def update_project(
     checkout_path: str,
     fetch_remote: str = DEFAULT_FETCH_REMOTE,
     new_name: str | None = None,
+    default_model_profile: str | None | _Unsupplied = UNSUPPLIED,
 ) -> Project:
+    """Update a project's editable fields.
+
+    `default_model_profile` is three-valued: omitted preserves the stored
+    reference, `None` clears it, and a name selects that profile. The stored
+    value is read inside the write reservation rather than from any earlier
+    read, so an omission preserves what is actually committed.
+    """
     rename = new_name is not None and new_name != name
     if rename:
         assert new_name is not None  # rename implies it differs from name
@@ -183,10 +227,6 @@ def update_project(
         # Same guard as delete: renaming the PK under referencing rows would
         # orphan them — refused, no cascade.
         _raise_if_referenced(engine, name)
-        with engine.connect() as conn:
-            clash = conn.execute(projects.select().where(projects.c.name == new_name)).first()
-        if clash is not None:
-            raise DuplicateProjectError(new_name)
     values: dict[str, str | None] = {
         "title": title,
         "upstream_url": upstream_url,
@@ -196,14 +236,32 @@ def update_project(
     }
     if rename:
         values["name"] = new_name
-    with engine.begin() as conn:
-        result = conn.execute(projects.update().where(projects.c.name == name).values(**values))
-        if result.rowcount == 0:
+    with reserved_write(engine) as conn:
+        current = conn.execute(projects.select().where(projects.c.name == name)).first()
+        if current is None:
             raise ProjectNotFoundError(name)
-    if rename:
-        assert new_name is not None
-        return get_project(engine, new_name)
-    return get_project(engine, name)
+        if rename:
+            assert new_name is not None
+            clash = conn.execute(
+                projects.select()
+                .with_only_columns(projects.c.name)
+                .where(projects.c.name == new_name)
+            ).first()
+            if clash is not None:
+                raise DuplicateProjectError(new_name)
+        if isinstance(default_model_profile, _Unsupplied):
+            values["default_model_profile"] = current.default_model_profile
+        else:
+            if default_model_profile is not None:
+                require_profile_exists(conn, default_model_profile)
+            values["default_model_profile"] = default_model_profile
+        conn.execute(projects.update().where(projects.c.name == name).values(**values))
+        row = conn.execute(
+            projects.select().where(
+                projects.c.name == (new_name if rename else name)
+            )
+        ).one()
+    return _row_to_project(row)
 
 
 def _referencing_task_labels(engine: Engine, name: str) -> list[str]:

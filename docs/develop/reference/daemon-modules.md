@@ -24,10 +24,12 @@ All paths are under `daemon/src/ompire_daemon/`.
 
 | Module | Responsibility |
 |---|---|
-| `db.py` | Engine, schema definition, WAL configuration. |
+| `db.py` | Engine, schema definition, WAL configuration. Note it does *not* enable `PRAGMA foreign_keys` — see [Database schema](database-schema.md#reference-safety-without-global-fk-enforcement). |
+| `model_config.py` | The thinking-level vocabulary and validator shared by templates, spawn overrides, and profile bindings. Model identifiers are not validated here: templates accept omp's fuzzy names, and the stricter profile grammar lives with profile value validation. |
 | `migrate.py` | Runs Alembic migrations at startup. |
-| `registry/projects.py` | Projects |
+| `registry/projects.py` | Projects, including the guarded default-model-profile reference |
 | `registry/templates.py` | Templates |
+| `registry/model_profiles.py` | Model profiles: the four-role contract, provider-qualified identifier grammar, reference-guarded deletion, and the `reserved_write` SQLite write reservation both reference checks share |
 | `registry/tasks.py` | Tasks and their publishing state |
 | `registry/sessions.py` | Session identity, `(task_id, name)` |
 | `registry/workflows.py` | Workflow runs and step records |

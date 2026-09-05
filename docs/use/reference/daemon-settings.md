@@ -10,6 +10,11 @@ Ompire layers a small set of daemon-writable settings over the operator's
 configuration file, and never rewrites that file. The boundary is recorded in
 [ADR-0013](../../adr/0013-layer-daemon-writable-settings-over-operator-configuration.md).
 
+This page covers those layered scalar settings. Other things edited from the
+same Settings view are registry entities with their own lifecycle rather than
+settings — [templates](templates.md) and
+[model profiles](model-profiles.md) — and are documented on their own pages.
+
 ## States and behavior
 
 ### Resolution order

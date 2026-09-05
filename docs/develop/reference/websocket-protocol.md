@@ -60,6 +60,7 @@ full current registry state:
 |---|---|
 | `projects` | All projects |
 | `templates` | All templates |
+| `model_profiles` | All model profiles, sorted by name, each with its four role bindings |
 | `tasks` | All non-purged tasks, each carrying its workflow fields |
 | `sessions` | Per task, a per-session map of current status |
 | workflow state | Per-task run status, current step, and gate message |
@@ -109,6 +110,19 @@ two obligations:
 A client that applies no responses is still correct; it just learns the outcome
 one event later.
 
+Model profiles follow the same contract as projects: `model_profile_created`
+and `model_profile_updated` carry the full profile and are upserted by name,
+`model_profile_deleted` carries `{"name": "<slug>"}` and filters, and the
+snapshot's `model_profiles` replaces the collection. Applying a mutation's
+response and its matching event in either order leaves exactly one row.
+
+Only committed mutations are published. A refusal — an invalid profile
+replacement, a deletion blocked by a referencing project, a project update
+naming a profile that does not exist — broadcasts nothing, so no client can
+observe a successful-looking change that was not written. A project's payload
+carries `default_model_profile` on the events it already had; there is no
+separate assignment event.
+
 ## Event types
 
 Published on the dashboard channel:
@@ -117,6 +131,7 @@ Published on the dashboard channel:
 |---|---|
 | `project_created`, `project_updated`, `project_renamed`, `project_deleted` | Project mutations |
 | `template_created`, `template_updated`, `template_deleted` | Template mutations |
+| `model_profile_created`, `model_profile_updated`, `model_profile_deleted` | Model profile mutations |
 | `task_created`, `task_updated`, `task_deleted` | Task mutations |
 | `project_setup_step` | A clone-mode project setup step starts, succeeds, or fails |
 | `spawn_step` | A spawn step starts, succeeds, or fails |

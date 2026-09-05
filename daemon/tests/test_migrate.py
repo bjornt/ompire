@@ -52,7 +52,7 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0011"
+    assert version == "0012"
     assert "projects" in tables
     assert "tasks" in tables
     assert "templates" in tables
@@ -78,6 +78,9 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
     assert "fetch_remote" in project_columns
     assert "setup_state" in project_columns
     assert "setup_error" in project_columns
+    # Global model profiles and the optional project reference (ADR-0025).
+    assert "model_profiles" in tables
+    assert "default_model_profile" in project_columns
 
 
 def test_0011_backfills_existing_projects_as_adopted(tmp_path: Path) -> None:
@@ -117,6 +120,55 @@ def test_0011_backfills_existing_projects_as_adopted(tmp_path: Path) -> None:
     assert not Path("/nonexistent/legacy").exists()
 
 
+def test_0012_preserves_data_and_backfills_no_default(tmp_path: Path) -> None:
+    """0012 is purely additive: every existing project, template and task row
+    survives, and each project reads back with no model profile.
+
+    No default is invented from a template's model, a provider credential, or
+    the project's name — nothing before this revision recorded that choice.
+    """
+    from alembic import command
+
+    db_path = tmp_path / "ompire.db"
+    _land_at_0007_with_tasks(db_path)
+    command.upgrade(_alembic_cfg(db_path), "0011")
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO templates (name, project_name, base_branch, branch_pattern, "
+                "workflow, workshop_additions, model, thinking, preamble, created_at, "
+                "updated_at) VALUES ('demo', 'demo', 'main', 'ompire/<slug>', "
+                "'single-step', 'project', 'sonnet', 'high', '', "
+                "'2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00')"
+            )
+        )
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM tasks")).scalar_one() == 4
+        assert conn.execute(text("SELECT COUNT(*) FROM model_profiles")).scalar_one() == 0
+        assert conn.execute(
+            text("SELECT name, default_model_profile FROM projects")
+        ).all() == [("demo", None)]
+        # The template's own model/thinking are untouched by this revision.
+        assert conn.execute(
+            text("SELECT model, thinking FROM templates WHERE name = 'demo'")
+        ).one() == ("sonnet", "high")
+
+    command.downgrade(_alembic_cfg(db_path), "0011")
+    with engine.connect() as conn:
+        project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
+        tables = {
+            row[0]
+            for row in conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))
+        }
+        assert "default_model_profile" not in project_columns
+        assert "model_profiles" not in tables
+        assert conn.execute(text("SELECT COUNT(*) FROM tasks")).scalar_one() == 4
+
+
 def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     db_path = tmp_path / "ompire.db"
     upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
@@ -136,7 +188,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0011"
+    assert version == "0012"
     assert row == "demo"
 
 
@@ -192,7 +244,7 @@ def test_0007_seeds_templates_and_drops_project_columns(tmp_path: Path) -> None:
     engine = make_engine(db_path)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "0011"
+        assert version == "0012"
 
         templates = conn.execute(
             text(
@@ -268,7 +320,7 @@ def test_0008_backfills_sessions_and_legacy_workflow_runs(tmp_path: Path) -> Non
     engine = make_engine(db_path)
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "0011"
+        assert version == "0012"
 
         sessions = conn.execute(
             text("SELECT task_id, name, omp_session_id FROM task_sessions ORDER BY task_id")

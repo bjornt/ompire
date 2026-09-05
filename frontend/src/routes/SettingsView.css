@@ -368,3 +368,132 @@
   display: flex;
   gap: 8px;
 }
+
+/* Model profile list rows and the four-role editor grid (ADR-0025). Reuses
+ * the template panel's row/toggle/button primitives; only the per-role
+ * layout is new. */
+
+.profileList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.profileRow {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface2);
+  font-size: 12.5px;
+}
+
+.profileRow.editing {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface2));
+}
+
+.profileRowHead {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.profileName {
+  font-family: var(--mono);
+  font-weight: 700;
+  flex: 1;
+}
+
+.profileBindings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px 12px;
+  margin: 0;
+}
+
+@media (max-width: 700px) {
+  .profileBindings {
+    grid-template-columns: 1fr;
+  }
+}
+
+.profileBinding {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.profileBinding dt {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  min-width: 52px;
+}
+
+.profileBinding dd {
+  margin: 0;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.profileEditor form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.profileEditor .formField select,
+.profileEditor .formField input.mono {
+  font-size: 12.5px;
+}
+
+.roleGrid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.roleRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 140px;
+  grid-template-areas:
+    "name name"
+    "model thinking";
+  gap: 4px 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface2);
+}
+
+@media (max-width: 700px) {
+  .roleRow {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "name"
+      "model"
+      "thinking";
+  }
+}
+
+.roleName {
+  grid-area: name;
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 12px;
+}
+
+.roleRow .formField:nth-of-type(1) {
+  grid-area: model;
+}
+
+.roleRow .formField:nth-of-type(2) {
+  grid-area: thinking;
+}

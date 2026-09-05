@@ -20,6 +20,7 @@ from sqlalchemy import Engine
 from ompire_daemon.agent import EVENT_STREAM_END, AgentSupervisor
 from ompire_daemon.auth import check_ws_token
 from ompire_daemon.events import EventHub
+from ompire_daemon.registry.model_profiles import list_model_profiles
 from ompire_daemon.registry.projects import list_projects
 from ompire_daemon.registry.settings import SettingsStore
 from ompire_daemon.registry.tasks import list_tasks
@@ -67,6 +68,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     seq = itertools.count()
     projects_payload = [asdict(p) for p in list_projects(engine)]
     templates_payload = [asdict(t) for t in list_templates(engine)]
+    # Global model profiles (ADR-0025), sorted by name: the same authoritative
+    # replacement the projects and templates registries get.
+    model_profiles_payload = [asdict(p) for p in list_model_profiles(engine)]
     tasks_payload = [asdict(t) for t in list_tasks(engine)]
     # Session statuses ride separately from task rows (design D-4), nested
     # task → session (workflow-engine design D-7); JSON object keys are
@@ -114,6 +118,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         {
             "projects": projects_payload,
             "templates": templates_payload,
+            "model_profiles": model_profiles_payload,
             "tasks": tasks_payload,
             "sessions": sessions_payload,
             "workflows": workflows_payload,

@@ -29,6 +29,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         assert payload.keys() == {
             "projects",
             "templates",
+            "model_profiles",
             "tasks",
             "sessions",
             "workflows",
@@ -41,6 +42,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         }
         assert payload["projects"] == []
         assert payload["templates"] == []
+        assert payload["model_profiles"] == []
         assert payload["tasks"] == []
         assert payload["sessions"] == {}
         assert payload["workflows"] == {}
