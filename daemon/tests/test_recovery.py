@@ -24,12 +24,15 @@ from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.app import create_app
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
+from ompire_daemon.execution_inputs import ModelPolicy
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
 from ompire_daemon.registry.model_profiles import create_model_profile
 from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.sessions import (
+    build_applied_policy,
     get_session,
     mark_session_id,
+    record_applied_policy,
     record_session_spawned,
 )
 from ompire_daemon.registry.tasks import (
@@ -85,10 +88,34 @@ def _make_task(engine, project, tmp_path: Path, slug: str):
     )
 
 
-def _record_main_session(engine, task_id: int, omp_session_id: str = "sess-1") -> None:
-    """Seed the session rows a successful spawn would have written (lazy
-    spawn by the workflow engine records the row, then the omp identity)."""
+def _record_main_session(
+    engine,
+    task_id: int,
+    omp_session_id: str = "sess-1",
+    *,
+    applied: bool = True,
+    step: str = "work",
+) -> None:
+    """Seed the session rows a successful spawn would have written: the row,
+    the applied policy the step verified before prompting, then the omp
+    identity. `applied=False` reproduces a session whose policy was never
+    recorded, which recovery must refuse to guess at."""
     record_session_spawned(engine, task_id, "main")
+    if applied:
+        inputs = get_task(engine, task_id).execution_inputs
+        binding = inputs.binding_for_step(step)
+        record_applied_policy(
+            engine,
+            task_id,
+            "main",
+            build_applied_policy(
+                ModelPolicy.from_binding(binding),
+                profile_name=binding.profile_name,
+                role=binding.role,
+                consumer_kind="step",
+                consumer_name=step,
+            ),
+        )
     mark_session_id(engine, task_id, "main", omp_session_id)
 
 

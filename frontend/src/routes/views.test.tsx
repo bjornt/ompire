@@ -108,16 +108,31 @@ const bugfix: WorkflowDescriptor = {
 /** The launch decision an accepted task carries (ADR-0026). */
 function makeInputs(overrides: Partial<TaskExecutionInputs> = {}): TaskExecutionInputs {
   return {
-    version: 1,
+    version: 2,
     provenance: "accepted",
     accepted_at: "2026-07-18T00:00:00Z",
     project_name: "maas",
     workflow_name: "single-step",
     model_profile_name: "balanced",
     model_profile_source: "project",
-    roles: balanced.roles,
-    step_roles: { work: "default" },
-    judge_role: "slow",
+    step_bindings: {
+      work: {
+        profile_name: "balanced",
+        profile_source: "project",
+        role: "default",
+        role_source: "workflow",
+        roles: balanced.roles,
+      },
+    },
+    auxiliary_bindings: {
+      judge: {
+        profile_name: "balanced",
+        profile_source: "project",
+        role: "slow",
+        role_source: "workflow",
+        roles: balanced.roles,
+      },
+    },
     workspace: {
       base_branch: "master",
       branch_pattern: "bjornt/<slug>",
@@ -146,6 +161,7 @@ function previewResponse(overrides: Record<string, unknown> = {}) {
     project_default_model_profile: "balanced",
     judge_session: "judge",
     judge_role: "slow",
+    auxiliary_consumers: ["judge"],
     roles: balanced.roles,
     workspace: {
       base_branch: "master",
@@ -166,19 +182,35 @@ function previewResponse(overrides: Record<string, unknown> = {}) {
         step: "work",
         kind: "agent",
         session: "main",
+        conditional: false,
+        declared_role: "default",
+        binding: {
+          profile_name: "balanced",
+          profile_source: "project",
+          role: "default",
+          role_source: "workflow",
+          roles: balanced.roles,
+        },
         role: "default",
         model: "anthropic/claude-sonnet-4.5",
         thinking: "medium",
-        conditional: false,
       },
       {
         step: "judge",
         kind: "judge",
         session: "judge",
+        conditional: true,
+        declared_role: "slow",
+        binding: {
+          profile_name: "balanced",
+          profile_source: "project",
+          role: "slow",
+          role_source: "workflow",
+          roles: balanced.roles,
+        },
         role: "slow",
         model: "openai/o3",
         thinking: "high",
-        conditional: true,
       },
     ],
     ...overrides,
@@ -451,6 +483,112 @@ describe("SpawnView", () => {
       );
       expect("model_profile" in body).toBe(false);
     });
+  });
+
+  it("overrides one row's profile and another's role independently", async () => {
+    const fetchMock = stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+
+    await user.selectOptions(screen.getByTestId("row-profile-work"), "balanced");
+    await user.selectOptions(screen.getByTestId("row-role-judge"), "plan");
+
+    await waitFor(() => {
+      const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
+      // Two namespaces, and each row carries only the dimension that was
+      // actually chosen — the other stays inherited.
+      expect(body.step_overrides).toEqual({ work: { model_profile: "balanced" } });
+      expect(body.auxiliary_overrides).toEqual({ judge: { role: "plan" } });
+    });
+  });
+
+  it("resets one dimension of a row and leaves the other selected", async () => {
+    const fetchMock = stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+
+    await user.selectOptions(screen.getByTestId("row-profile-work"), "balanced");
+    await user.selectOptions(screen.getByTestId("row-role-work"), "plan");
+    await waitFor(() => {
+      const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
+      expect(body.step_overrides.work).toEqual({
+        model_profile: "balanced",
+        role: "plan",
+      });
+    });
+
+    await user.click(screen.getByTestId("reset-row-profile-work"));
+    await waitFor(() => {
+      const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
+      // Resetting the profile must not take the role choice with it.
+      expect(body.step_overrides).toEqual({ work: { role: "plan" } });
+    });
+
+    await user.click(screen.getByTestId("reset-row-role-work"));
+    await waitFor(() => {
+      const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
+      expect("step_overrides" in body).toBe(false);
+    });
+  });
+
+  it("clears row overrides on a workflow change and says so", async () => {
+    const fetchMock = stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+
+    await user.selectOptions(screen.getByTestId("row-profile-work"), "balanced");
+    await waitFor(() => {
+      const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
+      expect(body.step_overrides).toEqual({ work: { model_profile: "balanced" } });
+    });
+
+    await user.selectOptions(screen.getByLabelText("Workflow"), "bugfix");
+
+    // Nothing transfers by row position or a coincidentally matching name.
+    await waitFor(() => {
+      const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
+      expect(body.workflow_name).toBe("bugfix");
+      expect("step_overrides" in body).toBe(false);
+      expect("auxiliary_overrides" in body).toBe(false);
+    });
+    expect(screen.getByTestId("cleared-overrides")).toHaveTextContent("work");
+    // The rest of the draft is not workflow-scoped and survives.
+    expect(screen.getByLabelText("Task slug")).toHaveValue("fix-bug");
+  });
+
+  it("keeps a row correctable when its resolution fails", async () => {
+    stubLaunchFetch({ previewStatus: 422 });
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await user.selectOptions(screen.getByLabelText("Workflow"), "single-step");
+    await user.selectOptions(screen.getByLabelText("Project"), "maas");
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+
+    // Controls come from the daemon's workflow catalog, not from the failed
+    // resolution, so the row that needs correcting is still on screen.
+    const row = await screen.findByTestId("row-profile-work");
+    expect(row).toBeInTheDocument();
+    expect(screen.getByTestId("preview-error")).toBeInTheDocument();
+  });
+
+  it("keeps a selected profile visible after it is deleted, without re-picking one", async () => {
+    stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+    await user.selectOptions(screen.getByTestId("row-profile-work"), "balanced");
+
+    // The profile registry loses it while the draft is open.
+    act(() => {
+      socket().emit("snapshot", { ...launchSnapshot, model_profiles: [] });
+    });
+
+    const control = screen.getByTestId("row-profile-work");
+    expect(control).toHaveValue("balanced");
+    expect(within(control).getByRole("option", { name: /unavailable/ })).toBeInTheDocument();
   });
 
   it("sends only the advanced fields the operator actually overrode", async () => {
@@ -1297,8 +1435,48 @@ describe("TaskDetailView", () => {
     );
     // The project now says `trunk`; the task keeps what it was accepted with.
     expect(panel).toHaveTextContent("master");
-    expect(within(panel).getByTestId("role-slow")).toHaveTextContent("openai/o3");
-    expect(within(panel).getByTestId("role-slow")).toHaveTextContent("judge (conditional)");
+    // Per consumer, with its own attribution — the judge is an ordinary
+    // model consumer with an accepted binding, not a hidden exception.
+    const work = within(panel).getByTestId("consumer-work");
+    expect(work).toHaveTextContent("anthropic/claude-sonnet-4.5");
+    expect(work).toHaveTextContent("inherited from the project");
+    expect(work).toHaveTextContent("declared by the workflow");
+    const judge = within(panel).getByTestId("consumer-judge");
+    expect(judge).toHaveTextContent("openai/o3");
+    expect(judge).toHaveTextContent("auxiliary, conditional");
+  });
+
+  it("shows a per-step override as overridden and the rest as inherited", async () => {
+    const task = makeTask({
+      execution_inputs: makeInputs({
+        step_bindings: {
+          work: {
+            profile_name: "thorough",
+            profile_source: "step",
+            role: "plan",
+            role_source: "step",
+            roles: balanced.roles,
+          },
+        },
+      }),
+    });
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", {
+      projects: [project],
+      model_profiles: [balanced],
+      tasks: [task],
+    });
+
+    const panel = await screen.findByTestId("task-inputs");
+    const work = within(panel).getByTestId("consumer-work");
+    expect(work).toHaveTextContent("thorough");
+    expect(work).toHaveTextContent("overridden for this step");
+    // The task-wide decision is still shown: it is what the other rows
+    // inherited, and what the operator chose at the top of the form.
+    expect(within(panel).getByTestId("accepted-profile")).toHaveTextContent("balanced");
+    expect(within(panel).getByTestId("consumer-judge")).toHaveTextContent(
+      "inherited from the project",
+    );
   });
 
   it("asks a task that predates pinned inputs to confirm a continuation", async () => {

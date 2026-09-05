@@ -126,19 +126,42 @@ export interface WorkspaceInputs {
  * acceptance and never recomputed. `model_profile_name` is provenance, not a
  * live reference: the profile may be edited, renamed, or deleted and this
  * task keeps running exactly as accepted. */
+/** Where one consumer's effective model profile came from. `step` means the
+ * operator overrode this row; the rest are inherited (ADR-0027). */
+export type ProfileSource = "step" | "task" | "project" | "legacy-confirmed";
+
+/** Where one consumer's effective role came from: an explicit row override,
+ * or the role the workflow declares. */
+export type RoleSource = "step" | "workflow";
+
+/** One model consumer's pinned policy (ADR-0027).
+ *
+ * `roles` is the complete native map that consumer's process carries, not
+ * only its active pair: `smol`, `slow`, and `plan` reach the container too.
+ * The two `*_source` fields are separate because the operator can override
+ * one dimension and inherit the other. */
+export interface ConsumerBinding {
+  profile_name: string;
+  profile_source: ProfileSource;
+  role: ModelRole;
+  role_source: RoleSource;
+  roles: Record<ModelRole, ModelRoleBinding>;
+}
+
 export interface TaskExecutionInputs {
   version: number;
   provenance: "accepted" | "legacy-confirmed";
   accepted_at: string;
   project_name: string;
   workflow_name: string;
+  /** The task-wide decision an unoverridden consumer inherited. What runs is
+   * always a binding below. */
   model_profile_name: string | null;
   model_profile_source: "task" | "project" | "legacy-confirmed";
-  roles: Record<ModelRole, ModelRoleBinding>;
-  /** Agent step name to abstract role, pinned so a later workflow edit
-   * cannot silently rebind a step. */
-  step_roles: Record<string, ModelRole>;
-  judge_role: ModelRole;
+  /** Every declared agent step, keyed by step name. */
+  step_bindings: Record<string, ConsumerBinding>;
+  /** Engine-reserved model consumers, keyed by name (today: `judge`). */
+  auxiliary_bindings: Record<string, ConsumerBinding>;
   workspace: WorkspaceInputs;
   /** Which workspace fields this task overrode rather than inheriting. */
   workspace_overrides: string[];

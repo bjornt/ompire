@@ -170,6 +170,14 @@ tasks = Table(
 
 # Named omp sessions per task (workflow-engine capability): identity for
 # `omp --resume` is per (task, session), not per task.
+#
+# `applied_policy_json` is mutable *execution state*, not an input: the
+# complete model policy this session's child last verifiably ran under
+# (ADR-0027). It is what a restart resumes on and what a follow-up keeps
+# using, which is why it cannot be recomputed from the task document — two
+# steps sharing a session can pin different policies, and only the session
+# knows which one actually took effect. NULL until the first successful
+# application.
 task_sessions = Table(
     "task_sessions",
     metadata,
@@ -177,6 +185,7 @@ task_sessions = Table(
     Column("name", String, primary_key=True),
     Column("omp_session_id", String, nullable=True),
     Column("spawned_at", String, nullable=False),
+    Column("applied_policy_json", Text, nullable=True),
 )
 
 # One row per executed workflow step; identity is (task_id, seq) because loops

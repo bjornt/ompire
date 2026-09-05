@@ -507,9 +507,12 @@ class ReviewManager:
                 "review_iteration",
                 {"task_id": task_id, "iteration": self._iteration_payload(record)},
             )
-            # Comments loop back to the primary session (workflow-engine D-8).
-            handle = self._agents.get(task_id, self._primary_session(task))
-            if handle is None or handle.returncode is not None:
+            # Comments loop back to the primary session (workflow-engine D-8),
+            # on whatever model policy that session last applied (ADR-0027) —
+            # taken inside the session boundary so a concurrent policy handoff
+            # cannot hand back a child it is already retiring.
+            handle = await self._agents.acquire(task_id, self._primary_session(task))
+            if handle is None:
                 await self._finalize(
                     task_id,
                     task,

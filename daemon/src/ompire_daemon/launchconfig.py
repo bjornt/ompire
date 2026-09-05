@@ -39,8 +39,12 @@ from ompire_daemon.config import Config
 from ompire_daemon.db import launch_migration_evidence
 from ompire_daemon.db import projects as projects_table
 from ompire_daemon.execution_inputs import (
+    AUXILIARY_JUDGE,
     PROFILE_SOURCE_LEGACY,
     PROVENANCE_LEGACY_CONFIRMED,
+    ROLE_SOURCE_WORKFLOW,
+    ConsumerBinding,
+    ModelPolicy,
     TaskExecutionInputs,
     WorkspaceInputs,
     encode_execution_inputs,
@@ -76,6 +80,12 @@ from ompire_daemon.registry.projects import (
     validate_branch_pattern,
     validate_workshop_additions,
 )
+from ompire_daemon.registry.sessions import (
+    APPLIED_ORIGIN_MIGRATED,
+    build_applied_policy,
+    list_resumable_sessions,
+    record_applied_policy,
+)
 from ompire_daemon.registry.tasks import (
     Task,
     TaskNotFoundError,
@@ -83,7 +93,7 @@ from ompire_daemon.registry.tasks import (
     list_unconfigured_tasks,
     pin_execution_inputs,
 )
-from ompire_daemon.workflows import agent_step_roles, get_workflow
+from ompire_daemon.workflows import agent_steps, get_workflow
 
 logger = logging.getLogger(__name__)
 
@@ -457,6 +467,21 @@ def _legacy_inputs(
 ) -> TaskExecutionInputs:
     roles = _read_profile_roles(conn, continuation.model_profile, field="model_profile")
     workflow = get_workflow(task.workflow_name)
+
+    def binding(role: str) -> ConsumerBinding:
+        # Every consumer inherits the one confirmed profile and its declared
+        # role. The legacy confirmation UI does not offer row overrides: the
+        # operator is pinning what this task *continues* under, and inventing
+        # per-step choices for a run already in progress would be a claim
+        # about turns that already happened.
+        return ConsumerBinding(
+            profile_name=continuation.model_profile,
+            profile_source=PROFILE_SOURCE_LEGACY,
+            role=role,
+            role_source=ROLE_SOURCE_WORKFLOW,
+            roles=dict(roles),
+        )
+
     return TaskExecutionInputs(
         provenance=PROVENANCE_LEGACY_CONFIRMED,
         accepted_at=_now_iso(),
@@ -464,9 +489,10 @@ def _legacy_inputs(
         workflow_name=task.workflow_name,
         model_profile_name=continuation.model_profile,
         model_profile_source=PROFILE_SOURCE_LEGACY,
-        roles=roles,
-        step_roles=agent_step_roles(workflow),
-        judge_role=JUDGE_ROLE,
+        step_bindings={
+            step.name: binding(step.role) for step in agent_steps(workflow)
+        },
+        auxiliary_bindings={AUXILIARY_JUDGE: binding(JUDGE_ROLE)},
         workspace=WorkspaceInputs(
             base_branch=continuation.base_branch,
             # The branch already exists on this task; the pattern that made it
@@ -561,7 +587,59 @@ def confirm_task_configuration(
             "the continuation configuration changed since it was previewed; "
             "review it again before confirming"
         )
-    return pin_execution_inputs(engine, task_id, inputs)
+    pinned = pin_execution_inputs(engine, task_id, inputs)
+    _seed_session_continuation(engine, task_id, inputs)
+    return pinned
+
+
+def _seed_session_continuation(
+    engine: Engine, task_id: int, inputs: TaskExecutionInputs
+) -> None:
+    """Give this task's already-existing sessions a continuation policy.
+
+    Those sessions were spawned before anything was pinned, so nothing
+    records what they actually ran under, and a resume needs *some* complete
+    policy. The confirmed inputs are that policy — for the judge session its
+    own auxiliary binding, for every other session the primary agent
+    binding of the same session. It is stored as `migrated`, because it says
+    what these sessions continue under and makes no claim about the turns
+    they have already taken (ADR-0027).
+    """
+    for session in list_resumable_sessions(engine, task_id):
+        if session.name == AUXILIARY_JUDGE:
+            binding = inputs.auxiliary_bindings[AUXILIARY_JUDGE]
+            kind, name = "auxiliary", AUXILIARY_JUDGE
+        else:
+            named = [
+                (step, bound)
+                for step, bound in sorted(inputs.step_bindings.items())
+                if _step_session(inputs, step) == session.name
+            ]
+            if not named:
+                continue
+            name, binding = named[0]
+            kind = "step"
+        record_applied_policy(
+            engine,
+            task_id,
+            session.name,
+            build_applied_policy(
+                ModelPolicy.from_binding(binding),
+                profile_name=binding.profile_name,
+                role=binding.role,
+                consumer_kind=kind,
+                consumer_name=name,
+                origin=APPLIED_ORIGIN_MIGRATED,
+            ),
+        )
+
+
+def _step_session(inputs: TaskExecutionInputs, step_name: str) -> str | None:
+    workflow = get_workflow(inputs.workflow_name)
+    for step in agent_steps(workflow):
+        if step.name == step_name:
+            return step.session
+    return None
 
 
 def unconfigured_task_ids(engine: Engine) -> list[int]:

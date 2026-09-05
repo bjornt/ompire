@@ -31,6 +31,10 @@ router = APIRouter()
 
 # Custom close code for "no live agent behind this channel".
 NO_LIVE_AGENT_CLOSE_CODE = 4404
+# Custom close code for "this child was replaced to apply a new model policy"
+# (ADR-0027). Deliberately not 1000: the session is continuing, so the client
+# must reconnect to the replacement rather than end the transcript.
+AGENT_REPLACED_CLOSE_CODE = 4409
 
 
 def _now_iso() -> str:
@@ -210,8 +214,18 @@ async def agent_websocket_endpoint(
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         if forwarder in done and forwarder.exception() is None:
-            # Agent exited and the buffer is flushed: close the channel.
-            await websocket.close(code=1000, reason="agent exited")
+            if handle.retiring:
+                # A between-turn policy handoff (ADR-0027), not an exit: the
+                # same logical session continues on a replacement child that
+                # carries this one's history forward. A non-terminal code so
+                # the client reconnects and replays the carried-over buffer
+                # instead of treating the transcript as finished.
+                await websocket.close(
+                    code=AGENT_REPLACED_CLOSE_CODE, reason="agent replaced"
+                )
+            else:
+                # Agent exited and the buffer is flushed: close the channel.
+                await websocket.close(code=1000, reason="agent exited")
     except RuntimeError:
         # Client went away mid-send; nothing left to deliver.
         pass

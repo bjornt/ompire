@@ -5,6 +5,7 @@ import type {
   DaemonSettings,
   GitHubStatus,
   CheckoutInspection,
+  ConsumerBinding,
   GpgStatus,
   ModelProfile,
   ModelRole,
@@ -72,8 +73,22 @@ export interface WorkspaceOverridesInput {
   preamble?: string;
 }
 
+/** One model consumer's row-level selections (ADR-0027). Each dimension is
+ * independently optional: omitting a field inherits it. There is deliberately
+ * no concrete model or thinking field — those are profile settings, not a
+ * third override hierarchy. */
+export interface ConsumerOverrideInput {
+  model_profile?: string;
+  role?: ModelRole;
+}
+
 /** What the operator selected. `model_profile` omitted means "inherit the
- * project default"; a name replaces that inheritance for this task. */
+ * project default"; a name replaces that inheritance for this task.
+ *
+ * `step_overrides` is keyed by declared agent step name and
+ * `auxiliary_overrides` by engine-reserved consumer name (today: `judge`).
+ * Two namespaces, so a decision step can never become an agent binding by
+ * sharing a name with the judge. */
 export interface LaunchInput {
   project_name: string;
   workflow_name: string;
@@ -81,6 +96,8 @@ export interface LaunchInput {
   prompt: string;
   model_profile?: string;
   workspace_overrides?: WorkspaceOverridesInput;
+  step_overrides?: Record<string, ConsumerOverrideInput>;
+  auxiliary_overrides?: Record<string, ConsumerOverrideInput>;
 }
 
 /** One row of the launch preview. A command, decision, or gate carries no
@@ -91,10 +108,17 @@ export interface LaunchPreviewStep {
   step: string;
   kind: "agent" | "command" | "decision" | "gate" | "judge";
   session: string | null;
+  conditional: boolean;
+  /** The role the workflow declares, so the form can say what resetting the
+   * role override restores. Null for a model-free step. */
+  declared_role: ModelRole | null;
+  /** The resolved binding, byte-identical to what acceptance pins for this
+   * consumer. Null for a command, decision, or gate — those rows carry no
+   * model and get no override controls. */
+  binding: ConsumerBinding | null;
   role: ModelRole | null;
   model: string | null;
   thinking: ThinkingLevel | null;
-  conditional: boolean;
 }
 
 /** The daemon's resolution of one launch. `preview_token` names exactly what
@@ -110,6 +134,10 @@ export interface LaunchPreview {
   project_default_model_profile: string | null;
   judge_session: string;
   judge_role: ModelRole;
+  /** Engine-reserved consumer names an `auxiliary_overrides` map may key. */
+  auxiliary_consumers: string[];
+  /** The task-wide profile's own map: what a row inheriting both dimensions
+   * resolves against. */
   roles: Record<ModelRole, ModelRoleBinding>;
   workspace: {
     base_branch: string;

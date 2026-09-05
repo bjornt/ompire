@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import logging
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -68,6 +69,26 @@ class ModelConfigurationError(Exception):
     """
 
 
+class SessionBusyError(ModelConfigurationError):
+    """The session was not at a turn boundary when a policy change was due.
+
+    Configuration never interrupts work (ADR-0027): a streaming turn, a
+    compaction, queued messages, or an unanswered question mean the transition
+    is refused and the consumer fails through the ordinary infrastructure
+    path. Aborting the turn to change a model would destroy exactly the
+    context the named session exists to keep.
+    """
+
+
+class MissingResumeIdentityError(ModelConfigurationError):
+    """A process had to be replaced but its native session could not be
+    named, so `--resume` could not bring the conversation back.
+
+    Starting fresh instead would silently drop the transcript, which is a
+    worse outcome than failing the step with the workspace intact.
+    """
+
+
 @dataclass(frozen=True)
 class NativeModelState:
     """What the child reports it is actually running.
@@ -82,6 +103,29 @@ class NativeModelState:
 
     model: str  # provider-qualified, as the child reports it
     thinking_level: str | None
+
+
+@dataclass(frozen=True)
+class NativeActivity:
+    """What the child is doing, as far as a policy change is concerned."""
+
+    streaming: bool
+    compacting: bool
+    queued: int
+
+    @property
+    def busy(self) -> bool:
+        return self.streaming or self.compacting or self.queued > 0
+
+    def describe(self) -> str:
+        parts = []
+        if self.streaming:
+            parts.append("a turn is streaming")
+        if self.compacting:
+            parts.append("the context is compacting")
+        if self.queued:
+            parts.append(f"{self.queued} message(s) are queued")
+        return ", ".join(parts) or "the session is busy"
 
 
 def role_flag_value(binding: RoleBinding) -> str:
@@ -175,6 +219,11 @@ class AgentHandle:
         # handle rather than in the engine so it survives a restart that
         # rebuilds the runner over already-resumed sessions.
         self.policy: ModelPolicy | None = None
+        # Set when the supervisor is deliberately replacing this child to put
+        # its session on a new policy. Its exit is then part of a handoff, not
+        # a crash: the exit watcher must not fail the session or publish an
+        # `agent_exited` the replacement would have to undo.
+        self.retiring = False
         self.events: deque[Event] = deque(maxlen=ring_buffer_size)
         self._subscribers: set[asyncio.Queue] = set()
         self._stderr_capture: deque[str] = deque(maxlen=_STDERR_CAPTURE_LIMIT)
@@ -240,6 +289,38 @@ class AgentHandle:
             logger.warning("session id capture failed: no sessionId in get_state response")
             return None
         return session_id
+
+    async def read_activity(self) -> NativeActivity:
+        """Whether this child is at a turn boundary right now.
+
+        `isStreaming`, `isCompacting` and `queuedMessageCount` all sit at the
+        top level of `get_state`'s `data` (verified against omp 16.5.2 and
+        re-confirmed on 18.1.10). A missing field is read as "not busy": omp
+        omits nothing here, and inventing busyness would block every
+        transition on a response shape change.
+        """
+        response = await self.request("get_state")
+        data = response.get("data")
+        data = data if isinstance(data, dict) else {}
+        queued = data.get("queuedMessageCount")
+        return NativeActivity(
+            streaming=bool(data.get("isStreaming")),
+            compacting=bool(data.get("isCompacting")),
+            queued=int(queued) if isinstance(queued, int) else 0,
+        )
+
+    def seed_history(self, events: list[Event]) -> None:
+        """Prepend a retired child's events to this one's replay buffer.
+
+        A between-turn replacement keeps one logical session, so the operator
+        must not lose the transcript that session already showed. The buffer
+        is bounded, so this is best-effort history, not an archive — the same
+        promise it made before the replacement.
+        """
+        carried = list(self.events)
+        self.events.clear()
+        self.events.extend(events)
+        self.events.extend(carried)
 
     async def read_native_model_state(self) -> NativeModelState | None:
         """The child's actual model and resolved thinking level via
@@ -439,7 +520,16 @@ class AgentHandle:
 class AgentSupervisor:
     """(Task id, session name) → live AgentHandle (workflow-engine design
     D-1); in-memory only — session identity persists via the `task_sessions`
-    registry rows written by the workflow engine on lazy spawn."""
+    registry rows written by the workflow engine on lazy spawn.
+
+    The supervisor also owns the *policy handoff* (ADR-0027): putting one
+    session's child on the next consumer's complete model policy without
+    splitting the session. Every mutation of a session's process runs inside
+    that session's own boundary, so a workflow step, a recovery resume, and
+    an operator follow-up cannot interleave halfway through a replacement.
+    The boundary is per session on purpose — a task-wide lock would let one
+    wedged container stall its siblings.
+    """
 
     def __init__(
         self, config: Config, hub: EventHub, tracker: SessionTracker | None = None
@@ -448,6 +538,7 @@ class AgentSupervisor:
         self._hub = hub
         self._tracker = tracker
         self._handles: dict[tuple[int, str], AgentHandle] = {}
+        self._locks: dict[tuple[int, str], asyncio.Lock] = {}
         self._waiters: set[asyncio.Task] = set()
         self._ask_timeout_verified: set[int] = set()
         # Set once by `shutdown()` (crash-recovery capability, design D-6):
@@ -457,6 +548,218 @@ class AgentSupervisor:
     def get(self, task_id: int, session: str) -> AgentHandle | None:
         return self._handles.get((task_id, session))
 
+    def session_boundary(self, task_id: int, session: str) -> asyncio.Lock:
+        """This session's mutation boundary.
+
+        Prompt-producing callers hold it only long enough to read the current
+        handle, never across the turn itself: a turn can wait for an operator
+        answer, and a lock held that long would deadlock the answer.
+        """
+        key = (task_id, session)
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[key] = lock
+        return lock
+
+    async def acquire(self, task_id: int, session: str) -> AgentHandle | None:
+        """The session's live handle, read inside its own boundary.
+
+        Every caller that is about to *prompt* a session uses this rather
+        than `get`: it cannot hand back a child that a concurrent handoff has
+        already begun retiring, and it settles the ordering against that
+        handoff without holding the boundary across the turn itself.
+
+        Follow-ups, interrupt-and-prompt, review-comment loopback, and ship
+        drafting all continue on whatever policy the session last applied.
+        They never reset it to the task's default, because the session's
+        conversation belongs to the consumer that last took ownership of it.
+        """
+        async with self.session_boundary(task_id, session):
+            handle = self._handles.get((task_id, session))
+            if handle is None or handle.returncode is not None:
+                return None
+            return handle
+
+    async def apply_session_policy(
+        self,
+        task_id: int,
+        session: str,
+        clone_path: str,
+        *,
+        policy: ModelPolicy,
+        commit: Callable[[], None],
+        resume: str | None = None,
+    ) -> AgentHandle:
+        """Put this session on `policy` and return a handle safe to prompt.
+
+        `commit` durably records the applied policy and runs only after the
+        native state has been verified — and always before the caller can
+        prompt. That ordering is what makes a crash survivable in one
+        direction only: a crash before the commit cannot have sent the new
+        prompt, so recovery restores the previous policy and the workflow
+        re-attempts its own step; a crash after it restores the new one.
+
+        `resume` names the native session for a *fresh* start that should
+        restore a conversation (recovery). A replacement driven from here
+        reads the identity off the running child instead, because that is the
+        session the transcript is actually in.
+        """
+        async with self.session_boundary(task_id, session):
+            # Re-read under the boundary: the handle a caller saw before
+            # waiting for the lock may have been stopped or replaced since.
+            handle = self._handles.get((task_id, session))
+            if handle is None or handle.returncode is not None:
+                return await self._start_locked(
+                    task_id,
+                    session,
+                    clone_path,
+                    policy=policy,
+                    resume=resume,
+                    commit=commit,
+                )
+            if handle.policy is not None and handle.policy.auxiliary_equals(policy):
+                # Only the active pair may differ, and omp has acknowledged
+                # controls for exactly that. Keep the process, keep the
+                # conversation, and verify rather than assume.
+                return await self._reconfigure_in_place(
+                    task_id, session, handle, policy=policy, commit=commit
+                )
+            # An auxiliary pair changed, and omp v18.1.10 exposes no setter
+            # for `smol`/`slow`/`plan` — they are start-time flags. The only
+            # honest way to change them is to replace the process and resume
+            # its native session.
+            return await self._replace_for_policy(
+                task_id, session, clone_path, handle, policy=policy, commit=commit
+            )
+
+    async def _await_turn_boundary(
+        self, task_id: int, session: str, handle: AgentHandle
+    ) -> None:
+        """Refuse a policy change that would land in the middle of work."""
+        pending = self._tracker.pending(task_id, session) if self._tracker else None
+        if pending is not None:
+            raise SessionBusyError(
+                f"session {session!r} has an unanswered question; "
+                "its model policy cannot change until the turn ends"
+            )
+        try:
+            activity = await handle.read_activity()
+        except (rpc.RequestFailedError, rpc.AgentGoneError, TimeoutError) as exc:
+            raise ModelConfigurationError(
+                f"session {session!r} did not report its state: {exc}"
+            ) from exc
+        if activity.busy:
+            raise SessionBusyError(
+                f"session {session!r} is not at a turn boundary "
+                f"({activity.describe()}); its model policy cannot change now"
+            )
+
+    async def _reconfigure_in_place(
+        self,
+        task_id: int,
+        session: str,
+        handle: AgentHandle,
+        *,
+        policy: ModelPolicy,
+        commit: Callable[[], None],
+    ) -> AgentHandle:
+        await self._await_turn_boundary(task_id, session, handle)
+        try:
+            native = await handle.apply_model_policy(policy, reassert=True)
+        except (ModelConfigurationError, rpc.RequestFailedError, rpc.AgentGoneError) as exc:
+            # The child is now on an unknown active pair: it may have taken
+            # the model and refused the thinking level, or answered neither.
+            # Leaving it prompt-capable would send the next turn under
+            # settings nobody verified.
+            await self._retire(task_id, session, handle)
+            raise ModelConfigurationError(str(exc)) from exc
+        except TimeoutError as exc:
+            await self._retire(task_id, session, handle)
+            raise ModelConfigurationError(
+                f"session {session!r} did not answer the model configuration handshake"
+            ) from exc
+        previous = handle.policy
+        handle.policy = policy
+        try:
+            commit()
+        except Exception as exc:
+            handle.policy = previous
+            await self._retire(task_id, session, handle)
+            raise ModelConfigurationError(
+                f"the applied model policy for session {session!r} could not be "
+                f"recorded: {exc}"
+            ) from exc
+        self._publish_native_model(task_id, session, native, policy)
+        return handle
+
+    async def _replace_for_policy(
+        self,
+        task_id: int,
+        session: str,
+        clone_path: str,
+        handle: AgentHandle,
+        *,
+        policy: ModelPolicy,
+        commit: Callable[[], None],
+    ) -> AgentHandle:
+        session_id = await handle.read_session_id()
+        if session_id is None:
+            raise MissingResumeIdentityError(
+                f"session {session!r} must be restarted to change its auxiliary "
+                "model roles, but omp did not name its native session; refusing "
+                "to continue in a fresh conversation"
+            )
+        await self._await_turn_boundary(task_id, session, handle)
+        if self._tracker is not None:
+            self._tracker.agent_reconfiguring(task_id, session)
+        history = handle.snapshot()
+        # Retire the old child completely before the replacement can publish:
+        # its exit watcher must not later remove the new handle or paint the
+        # session `failed` behind it.
+        await self._retire(task_id, session, handle)
+        replacement = await self._start_locked(
+            task_id,
+            session,
+            clone_path,
+            policy=policy,
+            resume=session_id,
+            commit=commit,
+            expect_session_id=session_id,
+            history=history,
+        )
+        return replacement
+
+    async def _retire(
+        self, task_id: int, session: str, handle: AgentHandle
+    ) -> None:
+        """Stop a child whose session is being handed on or given up.
+
+        Marking it `retiring` first is what keeps its exit from being read as
+        a crash. `terminate` gives container-side omp its bounded chance to
+        flush the session file, which is what the resume then reads.
+        """
+        handle.retiring = True
+        if self._handles.get((task_id, session)) is handle:
+            del self._handles[(task_id, session)]
+        await handle.terminate(self._config.shutdown_grace)
+
+    def _publish_native_model(
+        self,
+        task_id: int,
+        session: str,
+        native: NativeModelState,
+        policy: ModelPolicy,
+    ) -> None:
+        if self._tracker is not None:
+            self._tracker.record_native_model(
+                task_id,
+                session,
+                model=native.model,
+                thinking_level=native.thinking_level,
+                accepted_thinking=policy.active.thinking,
+            )
+
     async def start(
         self,
         task_id: int,
@@ -465,6 +768,29 @@ class AgentSupervisor:
         *,
         policy: ModelPolicy,
         resume: str | None = None,
+        commit: Callable[[], None] | None = None,
+    ) -> AgentHandle:
+        async with self.session_boundary(task_id, session):
+            return await self._start_locked(
+                task_id,
+                session,
+                clone_path,
+                policy=policy,
+                resume=resume,
+                commit=commit,
+            )
+
+    async def _start_locked(
+        self,
+        task_id: int,
+        session: str,
+        clone_path: str,
+        *,
+        policy: ModelPolicy,
+        resume: str | None = None,
+        commit: Callable[[], None] | None = None,
+        expect_session_id: str | None = None,
+        history: list[Event] | None = None,
     ) -> AgentHandle:
         key = (task_id, session)
         if key in self._handles:
@@ -484,12 +810,16 @@ class AgentSupervisor:
             ready_timeout=self._config.agent_ready_timeout,
             ring_buffer_size=self._config.agent_ring_buffer_size,
         )
+        if history:
+            handle.seed_history(history)
         # Between ready and the first prompt: assert the accepted policy and
         # read back what the child actually runs (ADR-0026). A child that
         # cannot be put on the accepted model is killed here rather than
         # prompted under substituted settings.
         try:
             native = await handle.apply_model_policy(policy, reassert=resume is not None)
+            if expect_session_id is not None:
+                await self._verify_resumed_identity(handle, expect_session_id)
         except (ModelConfigurationError, rpc.RequestFailedError, rpc.AgentGoneError) as exc:
             await handle.kill()
             if self._tracker is not None:
@@ -503,14 +833,20 @@ class AgentSupervisor:
                 "omp did not answer the model configuration handshake"
             ) from exc
         handle.policy = policy
-        if self._tracker is not None:
-            self._tracker.record_native_model(
-                task_id,
-                session,
-                model=native.model,
-                thinking_level=native.thinking_level,
-                accepted_thinking=policy.active.thinking,
-            )
+        if commit is not None:
+            try:
+                commit()
+            except Exception as exc:
+                await handle.kill()
+                if self._tracker is not None:
+                    self._tracker.session_start_failed(
+                        task_id, session, f"applied policy could not be recorded: {exc}"
+                    )
+                raise ModelConfigurationError(
+                    f"the applied model policy for session {session!r} could not be "
+                    f"recorded: {exc}"
+                ) from exc
+        self._publish_native_model(task_id, session, native, policy)
         if key in self._handles:
             # A concurrent start won the race while this one awaited spawn.
             await handle.kill()
@@ -522,6 +858,23 @@ class AgentSupervisor:
         self._waiters.add(waiter)
         waiter.add_done_callback(self._waiters.discard)
         return handle
+
+    @staticmethod
+    async def _verify_resumed_identity(handle: AgentHandle, expected: str) -> None:
+        """A resumed child must be *the same* native session.
+
+        omp will happily start a new session when the recorded id no longer
+        names a saved conversation (proposal probe: an unused session reports
+        an id before a resumable file exists). Continuing there would look
+        like continuity and be a fresh context, so the identity is compared
+        rather than assumed from a successful start.
+        """
+        actual = await handle.read_session_id()
+        if actual != expected:
+            raise ModelConfigurationError(
+                f"omp resumed session {actual!r} instead of {expected!r}; "
+                "refusing to continue in a different conversation"
+            )
 
     async def stop(self, task_id: int, session: str) -> None:
         handle = self._handles.get((task_id, session))
@@ -547,6 +900,12 @@ class AgentSupervisor:
         code = await handle.wait_exited()
         if self._handles.get((task_id, session)) is handle:
             del self._handles[(task_id, session)]
+        if handle.retiring:
+            # A deliberate handoff (ADR-0027): this exit is a step in putting
+            # the same session on a new policy, not a crash. The replacement
+            # owns the session's status and events from here; a late exit
+            # from the retired child must not fail or unregister it.
+            return
         if self._shutting_down:
             # A graceful-shutdown exit is not a crash (design D-6): no
             # tracker call, no event — the task stays `created` for the next

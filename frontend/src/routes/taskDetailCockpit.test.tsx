@@ -60,21 +60,41 @@ const project = {
  * the detail view renders its accepted-configuration panel rather than the
  * legacy confirmation form. */
 const acceptedInputs: TaskExecutionInputs = {
-  version: 1,
+  version: 2,
   provenance: "accepted",
   accepted_at: "2026-07-18T00:00:00Z",
   project_name: "maas",
   workflow_name: "single-step",
   model_profile_name: "balanced",
   model_profile_source: "project",
-  roles: {
-    default: { model: "anthropic/claude-sonnet-4.5", thinking: "medium" },
-    smol: { model: "openai/gpt-4.1-mini", thinking: "off" },
-    slow: { model: "openai/o3", thinking: "high" },
-    plan: { model: "google/gemini-2.5-pro", thinking: "max" },
+  step_bindings: {
+    work: {
+      profile_name: "balanced",
+      profile_source: "project",
+      role: "default",
+      role_source: "workflow",
+      roles: {
+        default: { model: "anthropic/claude-sonnet-4.5", thinking: "medium" },
+        smol: { model: "openai/gpt-4.1-mini", thinking: "off" },
+        slow: { model: "openai/o3", thinking: "high" },
+        plan: { model: "google/gemini-2.5-pro", thinking: "max" },
+      },
+    },
   },
-  step_roles: { work: "default" },
-  judge_role: "slow",
+  auxiliary_bindings: {
+    judge: {
+      profile_name: "balanced",
+      profile_source: "project",
+      role: "slow",
+      role_source: "workflow",
+      roles: {
+        default: { model: "anthropic/claude-sonnet-4.5", thinking: "medium" },
+        smol: { model: "openai/gpt-4.1-mini", thinking: "off" },
+        slow: { model: "openai/o3", thinking: "high" },
+        plan: { model: "google/gemini-2.5-pro", thinking: "max" },
+      },
+    },
+  },
   workspace: {
     base_branch: "master",
     branch_pattern: "bjornt/<slug>",

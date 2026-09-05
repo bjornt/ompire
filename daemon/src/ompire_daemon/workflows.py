@@ -51,10 +51,21 @@ from sqlalchemy import Engine as SAEngine
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.execution_inputs import ModelPolicy, TaskExecutionInputs
+from ompire_daemon.execution_inputs import (
+    AUXILIARY_JUDGE,
+    ConsumerBinding,
+    MissingConsumerBindingError,
+    ModelPolicy,
+    TaskExecutionInputs,
+)
 from ompire_daemon.model_config import JUDGE_ROLE, MODEL_ROLES
 from ompire_daemon.projectfiles import mention_tokens, unresolved_mentions
-from ompire_daemon.registry.sessions import mark_session_id, record_session_spawned
+from ompire_daemon.registry.sessions import (
+    build_applied_policy,
+    mark_session_id,
+    record_applied_policy,
+    record_session_spawned,
+)
 from ompire_daemon.registry.tasks import require_task_inputs, task_payload
 from ompire_daemon.registry.workflows import (
     StepRecord,
@@ -362,13 +373,10 @@ def describe_workflows() -> list[WorkflowDescriptor]:
     return [describe_workflow(get_workflow(name)) for name in registered_workflows()]
 
 
-def agent_step_roles(workflow: Workflow) -> dict[str, str]:
-    """Agent step name → abstract role, pinned onto a task at acceptance."""
-    return {
-        step.name: step.role
-        for step in workflow.steps
-        if isinstance(step, AgentStep)
-    }
+def agent_steps(workflow: Workflow) -> tuple[AgentStep, ...]:
+    """The workflow's model-consuming steps, in declaration order. Every one
+    of them gets its own pinned binding at acceptance (ADR-0027)."""
+    return tuple(step for step in workflow.steps if isinstance(step, AgentStep))
 
 
 # --- the single-step workflow (design D-10) ------------------------------------
@@ -1122,45 +1130,74 @@ class WorkflowRunner:
         assert isinstance(step, GateStep)
         return _StepResult(gate_message=step.message(ctx))
 
-    async def _ensure_session(self, task: Task, session: str, *, policy: ModelPolicy):
-        """Lazy spawn (design D-1): the same supervised start the old
-        pipeline used — ask-timeout preflight, ready handshake, native model
-        policy handshake, then per-session omp identity capture — shared by
-        workflow sessions and the engine-reserved judge session. Raises on
-        failure.
+    async def _ensure_session(
+        self,
+        task: Task,
+        session: str,
+        *,
+        binding: ConsumerBinding,
+        consumer_kind: str,
+        consumer_name: str,
+    ):
+        """Put this session on the consumer's accepted policy and hand back a
+        handle that may be prompted (ADR-0027).
 
-        A cached handle is reused only when it was started under this same
-        policy. Every step of this change's built-in workflows resolves to the
-        task's single active pair, so that condition always holds today; the
-        check is what keeps it honest once per-step overrides arrive.
+        This covers all four cases in one place: a first lazy spawn, a step
+        that wants exactly what the session already runs, a step that changes
+        only the active pair, and a step that changes an auxiliary role and
+        therefore needs the process replaced around the same native session.
+        A cached live handle is never by itself the answer — the supervisor
+        re-asserts and reads back the active pair every time, because an
+        operator `/model` inside the container would otherwise masquerade as
+        the accepted policy.
+
+        The applied policy is committed durably before the caller can prompt,
+        so a restart continues this session on what it actually ran under
+        rather than on whichever step happened to open it.
         """
-        handle = self._supervisor.get(task.id, session)
-        if handle is not None and handle.returncode is None:
-            if handle.policy == policy:
-                return handle
-            raise _StepInfraFailure(
-                f"session {session!r} is running under a different model policy "
-                "than this step requires"
+        policy = ModelPolicy.from_binding(binding)
+        # The row must exist before the applied-policy write, which updates it.
+        record_session_spawned(self._engine, task.id, session)
+
+        def commit() -> None:
+            record_applied_policy(
+                self._engine,
+                task.id,
+                session,
+                build_applied_policy(
+                    policy,
+                    profile_name=binding.profile_name,
+                    role=binding.role,
+                    consumer_kind=consumer_kind,
+                    consumer_name=consumer_name,
+                ),
             )
+
+        # Only for the failure message: a session that had no live child was
+        # being spawned, one that had a live child was being handed over, and
+        # the operator reading the reason should be told which.
+        was_live = self._supervisor.get(task.id, session) is not None
         try:
-            handle = await self._supervisor.start(
+            handle = await self._supervisor.apply_session_policy(
                 task.id,
                 session,
                 task.clone_path,
                 policy=policy,
+                commit=commit,
             )
         except Exception as exc:
             detail = str(exc)
             stderr = getattr(exc, "stderr", "")
             if stderr:
                 detail = f"{detail}\n{stderr}"
+            what = "model policy handoff" if was_live else "session spawn"
             self._tracker.session_start_failed(
-                task.id, session, f"session spawn failed: {exc}"
+                task.id, session, f"{what} failed: {exc}"
             )
             raise _StepInfraFailure(detail) from exc
-        record_session_spawned(self._engine, task.id, session)
         # Best-effort identity capture (crash-recovery): a miss is logged
-        # inside `read_session_id` and never fails the step.
+        # inside `read_session_id` and never fails the step. Re-read after a
+        # replacement too — the recorded id is what the next resume uses.
         session_id = await handle.read_session_id()
         if session_id is not None:
             mark_session_id(self._engine, task.id, session, session_id)
@@ -1173,10 +1210,21 @@ class WorkflowRunner:
         record: StepRecord,
     ) -> _StepResult:
         task = ctx.task
-        policy = ModelPolicy.for_step(ctx.inputs, step.name)
-        await self._ensure_session(task, step.session, policy=policy)
-        handle = self._supervisor.get(task.id, step.session)
-        assert handle is not None
+        try:
+            binding = ctx.inputs.binding_for_step(step.name)
+        except MissingConsumerBindingError as exc:
+            # The workflow declares a step this task never accepted a policy
+            # for — a definition changed under an accepted task. Failing the
+            # step is the only honest option: there is no reviewed policy to
+            # run it under.
+            raise _StepInfraFailure(str(exc)) from exc
+        handle = await self._ensure_session(
+            task,
+            step.session,
+            binding=binding,
+            consumer_kind="step",
+            consumer_name=step.name,
+        )
 
         if isinstance(step, _NudgedAgentStep):
             prompt = step.nudge
@@ -1331,20 +1379,30 @@ class WorkflowRunner:
         instruction: str,
     ) -> dict[str, Any] | None:
         """One judgment on the engine-reserved `judge` session (design D-4):
-        spawn lazily on the task profile's `slow` binding, dump the judged
-        session's transcript tail into the clone, prompt, await the turn, read
-        the outcome. Any failure degrades to None — judging never fails a run.
+        spawn lazily on its own accepted binding, dump the judged session's
+        transcript tail into the clone, prompt, await the turn, read the
+        outcome. Any failure degrades to None — judging never fails a run.
 
-        The judge has no model setting of its own any more (ADR-0026): its
-        active pair is the disclosed `slow` role of the same profile the rest
-        of the task runs under, and it carries the full auxiliary role map
-        like every other process."""
+        The judge has no model setting of its own (ADR-0026) and no hidden
+        exception from per-consumer choice (ADR-0027): it is an ordinary
+        model consumer with its own accepted profile and role, defaulting to
+        the task profile's `slow` binding and overridable at launch like any
+        agent step. It carries the full auxiliary role map like every other
+        process."""
         task = ctx.task
         try:
             handle = await self._ensure_session(
-                task, JUDGE_SESSION, policy=ModelPolicy.for_judge(ctx.inputs)
+                task,
+                JUDGE_SESSION,
+                binding=ctx.inputs.binding_for_auxiliary(AUXILIARY_JUDGE),
+                consumer_kind="auxiliary",
+                consumer_name=AUXILIARY_JUDGE,
             )
-        except _StepInfraFailure as exc:
+        except (_StepInfraFailure, MissingConsumerBindingError) as exc:
+            # Existing no-judgment semantics (design D-4): a judge that
+            # cannot be put on its accepted binding produces no judgment, and
+            # the null outcome or the escalation gate stands. It never fails
+            # the run and never falls back to another model.
             logger.warning("judge session unavailable for task %d: %s", task.id, exc)
             return None
 

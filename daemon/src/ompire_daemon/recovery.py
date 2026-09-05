@@ -29,14 +29,25 @@ from sqlalchemy import Engine
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.execution_inputs import ModelPolicy
-from ompire_daemon.registry.sessions import list_resumable_sessions
+from ompire_daemon.execution_inputs import (
+    MissingConsumerBindingError,
+    ModelPolicy,
+)
+from ompire_daemon.registry.sessions import (
+    APPLIED_ORIGIN_MIGRATED,
+    AppliedPolicy,
+    build_applied_policy,
+    get_session,
+    list_resumable_sessions,
+    record_applied_policy,
+)
 from ompire_daemon.registry.tasks import (
     Task,
     mark_failed,
     reconcile_startup,
     task_payload,
 )
+from ompire_daemon.registry.workflows import list_step_records
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.workflows import WorkflowRunner
 from ompire_daemon.workshop import workshop_status
@@ -80,22 +91,45 @@ async def _resume_session(
     task: Task,
     session_name: str,
     omp_session_id: str,
-    policy: ModelPolicy,
+    applied: AppliedPolicy,
 ) -> bool:
-    """Resume one recorded session under the task's *accepted* policy.
+    """Resume one recorded session under the policy *that session* last ran.
 
-    A resumed omp restores its own model settings from the session file, so
-    the supervisor re-asserts the accepted active pair over the acknowledged
-    native controls and verifies the result before anything is prompted. A
-    profile edited or deleted since acceptance changes nothing here — the
-    policy comes off the task."""
+    Not the task's first step's policy, and not today's profiles: two steps
+    sharing a session can pin different bindings, so only the session's own
+    applied record says what its conversation was configured with. A resumed
+    omp restores its model settings from the session file, so the supervisor
+    still re-asserts the pair over the acknowledged native controls and
+    verifies the result before anything is prompted. A profile edited or
+    deleted since acceptance changes nothing here.
+
+    The record is re-committed after a verified resume so its origin becomes
+    `verified` — a migrated continuation policy stops being a guess once a
+    process has actually been put on it.
+    """
+
+    def commit() -> None:
+        record_applied_policy(
+            engine,
+            task.id,
+            session_name,
+            build_applied_policy(
+                applied.policy,
+                profile_name=applied.profile_name,
+                role=applied.role,
+                consumer_kind=applied.consumer_kind,
+                consumer_name=applied.consumer_name,
+            ),
+        )
+
     try:
         await supervisor.start(
             task.id,
             session_name,
             task.clone_path,
-            policy=policy,
+            policy=applied.policy,
             resume=omp_session_id,
+            commit=commit,
         )
     except Exception as exc:  # noqa: BLE001 — any resume failure lands the session `failed`
         reason = f"resume failed: {exc}"
@@ -106,6 +140,52 @@ async def _resume_session(
         return False
     tracker.session_recovered(task.id, session_name)
     return True
+
+
+def _continuation_policy(
+    engine: Engine, task: Task, session_name: str
+) -> AppliedPolicy | None:
+    """What this session continues under, or None if nothing records it.
+
+    The applied record is the answer whenever there is one. Failing that, a
+    step that was interrupted *before* its prompt went out has an accepted
+    binding that the run is about to apply anyway, so resuming on it is the
+    same decision the workflow is about to make rather than an inference.
+    Anything else is genuinely unknown, and a session is left unresumed
+    rather than restored under a policy nobody chose.
+    """
+    session = get_session(engine, task.id, session_name)
+    if session is not None and session.applied_policy is not None:
+        return session.applied_policy
+    inputs = task.execution_inputs
+    if inputs is None:
+        return None
+    records = list_step_records(engine, task.id)
+    pending = next(
+        (
+            record
+            for record in reversed(records)
+            if record.status == "running"
+            and record.kind == "agent"
+            and record.session == session_name
+            and record.prompted_at is None
+        ),
+        None,
+    )
+    if pending is None:
+        return None
+    try:
+        binding = inputs.binding_for_step(pending.step)
+    except MissingConsumerBindingError:
+        return None
+    return build_applied_policy(
+        ModelPolicy.from_binding(binding),
+        profile_name=binding.profile_name,
+        role=binding.role,
+        consumer_kind="step",
+        consumer_name=pending.step,
+        origin=APPLIED_ORIGIN_MIGRATED,
+    )
 
 
 async def recover_task(
@@ -155,16 +235,35 @@ async def _recover_one(
             task.id,
         )
         return
-    inputs = task.execution_inputs
-    policy = ModelPolicy.from_roles(inputs.roles)
-
-    # 1. Resume every recorded session (bounded concurrency across tasks).
+    # 1. Resume every recorded session (bounded concurrency across tasks),
+    #    each under its own last applied policy.
     sessions = list_resumable_sessions(engine, task.id)
 
     async def bound(name: str, omp_session_id: str) -> bool:
+        applied = _continuation_policy(engine, task, name)
+        if applied is None:
+            # No record of what this session ran under. Resuming it would
+            # mean choosing a model policy for a conversation already in
+            # progress, which is exactly the guess per-consumer pinning
+            # exists to avoid. The workspace, transcript and step history
+            # are untouched; the engine spawns a fresh session if the run
+            # needs one, and says so.
+            logger.info(
+                "task %d session %s has no recorded model policy; leaving it "
+                "unresumed rather than choosing one",
+                task.id,
+                name,
+            )
+            tracker.recovery_failed(
+                task.id,
+                name,
+                "no recorded model policy for this session; it cannot be "
+                "resumed without choosing one",
+            )
+            return False
         async with semaphore:
             return await _resume_session(
-                engine, events, supervisor, tracker, task, name, omp_session_id, policy
+                engine, events, supervisor, tracker, task, name, omp_session_id, applied
             )
 
     results = await asyncio.gather(

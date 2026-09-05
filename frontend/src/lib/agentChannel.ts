@@ -12,6 +12,12 @@ import { getDaemonToken } from "./token";
  * one is terminal, since the stream is genuinely done and `enabled` will soon
  * flip false as the session lands `failed` on the main socket anyway.
  *
+ * Code 4409 ("agent replaced") is likewise non-terminal: a between-turn model
+ * policy handoff (ADR-0027) replaces the child while the logical session and
+ * its conversation continue, and the replacement carries the retired child's
+ * events forward. Reconnecting replays the carried-over buffer from the top,
+ * which is exactly what the reset-on-connect below expects.
+ *
  * Code 4404 ("no live agent for this task yet") is NOT treated as terminal:
  * a session can be `starting` (crash-recovery capability — recovering after a
  * daemon restart, or the ordinary spawn-in-progress window) for a long time
@@ -115,7 +121,8 @@ export function useAgentChannel(taskId: number, session: string, enabled: boolea
         setConnected(false);
         if (!run.active) return;
         // Only code 1000 ("agent exited", buffer flushed) is terminal; 4404
-        // ("no live agent yet") retries — see the module doc comment above.
+        // ("no live agent yet") and 4409 ("agent replaced") retry — see the
+        // module doc comment above.
         if (event.code === 1000) return;
         const delay = run.backoff;
         run.backoff = Math.min(run.backoff * 2, MAX_BACKOFF_MS);

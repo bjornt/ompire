@@ -1,17 +1,52 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { previewTask, spawnTask } from "../lib/api";
-import type { LaunchInput, LaunchPreview, WorkspaceOverridesInput } from "../lib/api";
+import type {
+  ConsumerOverrideInput,
+  LaunchInput,
+  LaunchPreview,
+  WorkspaceOverridesInput,
+} from "../lib/api";
 import { PromptMentions } from "./PromptMentions";
 import { useDaemonState } from "../lib/useDaemonState";
 import {
   WORKSPACE_FIELDS,
   loadSpawnDraft,
+  pruneConsumerOverrides,
   saveSpawnDraft,
+  type DraftConsumerOverrides,
   type SpawnDraft,
 } from "../lib/spawnDraft";
-import type { SpawnStepName, SpawnStepPayload, Task } from "../types";
+import type {
+  ConsumerBinding,
+  ModelRole,
+  SpawnStepName,
+  SpawnStepPayload,
+  Task,
+} from "../types";
 import "./SpawnView.css";
+
+/** The four abstract roles, in the daemon's presentation order. */
+const MODEL_ROLES: ModelRole[] = ["default", "smol", "slow", "plan"];
+
+/** Which override map a row belongs to. `null` marks a row with no model at
+ * all — a command, decision, or gate — which gets no controls rather than
+ * disabled ones for a binding it will never have. */
+type ConsumerNamespace = "step" | "auxiliary" | null;
+
+/** One row of the preview, whether or not resolution succeeded. Controls are
+ * rendered from the daemon's workflow catalog, so a row whose selected
+ * profile has gone missing stays on screen with a way to correct it instead
+ * of disappearing with the failed resolution. */
+interface ConsumerRow {
+  name: string;
+  kind: string;
+  session: string | null;
+  conditional: boolean;
+  declaredRole: ModelRole | null;
+  namespace: ConsumerNamespace;
+  binding: ConsumerBinding | null;
+}
 
 const PIPELINE_STEPS: { name: SpawnStepName; label: string; detail: (task: Task) => string }[] = [
   { name: "fetch", label: "Fetch", detail: (t) => `git fetch (project ${t.project_name})` },
@@ -75,6 +110,9 @@ export function SpawnView() {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [staleReview, setStaleReview] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  // Set when a workflow change discarded row overrides, so the operator is
+  // told rather than silently losing selections they made.
+  const [clearedRows, setClearedRows] = useState<string[] | null>(null);
   const submitLockRef = useRef(false);
   const seenRef = useRef(false);
   // Monotonic request id: a slow preview response must never replace a newer
@@ -89,6 +127,51 @@ export function SpawnView() {
     setDraft((current) => ({ ...current, ...patch }));
   }, []);
 
+  /** Switching workflows discards every row override.
+   *
+   * A step name that repeats across workflows is a different step, and
+   * carrying a choice over by position or by a coincidentally matching name
+   * would silently apply a model policy to work the operator never looked
+   * at. Slug, prompt, the task-wide profile, and the workspace overrides are
+   * not workflow-scoped, so they stay. */
+  const selectWorkflow = useCallback(
+    (workflow: string) => {
+      setDraft((current) => {
+        if (workflow === current.workflow) return current;
+        const cleared = [
+          ...Object.keys(current.stepOverrides),
+          ...Object.keys(current.auxiliaryOverrides),
+        ];
+        setClearedRows(cleared.length > 0 ? cleared.sort() : null);
+        return { ...current, workflow, stepOverrides: {}, auxiliaryOverrides: {} };
+      });
+    },
+    [],
+  );
+
+  /** Change one dimension of one row. `undefined` resets that dimension
+   * alone and leaves the other exactly as it was. */
+  const setRowOverride = useCallback(
+    (namespace: Exclude<ConsumerNamespace, null>, name: string, patch: { profile?: string | undefined; role?: ModelRole | undefined }) => {
+      setDraft((current) => {
+        const key = namespace === "step" ? "stepOverrides" : "auxiliaryOverrides";
+        const next: DraftConsumerOverrides = {
+          ...current[key],
+          [name]: { ...(current[key][name] ?? {}), ...patch },
+        };
+        // `{...entry, profile: undefined}` keeps the key, which would still
+        // read as "chosen". Delete it so a reset is genuinely a reset.
+        for (const dimension of ["profile", "role"] as const) {
+          if (dimension in patch && patch[dimension] === undefined) {
+            delete next[name][dimension];
+          }
+        }
+        return { ...current, [key]: pruneConsumerOverrides(next) };
+      });
+    },
+    [],
+  );
+
   const launchInput: LaunchInput | null = useMemo(() => {
     if (!draft.project || !draft.workflow || !draft.slug) return null;
     const overrides: WorkspaceOverridesInput = {};
@@ -100,6 +183,18 @@ export function SpawnView() {
         overrides[field] = value as never;
       }
     }
+    const consumers = (source: DraftConsumerOverrides) => {
+      const out: Record<string, ConsumerOverrideInput> = {};
+      for (const [name, entry] of Object.entries(source)) {
+        const value: ConsumerOverrideInput = {};
+        if (entry.profile !== undefined) value.model_profile = entry.profile;
+        if (entry.role !== undefined) value.role = entry.role;
+        if (Object.keys(value).length > 0) out[name] = value;
+      }
+      return out;
+    };
+    const stepOverrides = consumers(draft.stepOverrides);
+    const auxiliaryOverrides = consumers(draft.auxiliaryOverrides);
     return {
       project_name: draft.project,
       workflow_name: draft.workflow,
@@ -107,8 +202,61 @@ export function SpawnView() {
       prompt: draft.prompt,
       ...(draft.profile ? { model_profile: draft.profile } : {}),
       ...(Object.keys(overrides).length > 0 ? { workspace_overrides: overrides } : {}),
+      ...(Object.keys(stepOverrides).length > 0 ? { step_overrides: stepOverrides } : {}),
+      ...(Object.keys(auxiliaryOverrides).length > 0
+        ? { auxiliary_overrides: auxiliaryOverrides }
+        : {}),
     };
   }, [draft]);
+
+  const workflow = workflowCatalog.find((w) => w.name === draft.workflow) ?? null;
+
+  /** The rows to render. Preview rows when a resolution exists; otherwise the
+   * declared catalog, so an invalid selection can still be corrected on the
+   * row that carries it. */
+  const rows: ConsumerRow[] = useMemo(() => {
+    if (preview !== null) {
+      return preview.steps.map((step) => ({
+        name: step.step,
+        kind: step.kind,
+        session: step.session,
+        conditional: step.conditional,
+        declaredRole: step.declared_role,
+        namespace:
+          step.kind === "judge" ? "auxiliary" : step.kind === "agent" ? "step" : null,
+        binding: step.binding,
+      }));
+    }
+    if (workflow === null) return [];
+    return [
+      ...workflow.steps.map((step) => ({
+        name: step.name,
+        kind: step.kind,
+        session: step.session,
+        conditional: step.conditional,
+        declaredRole: step.role,
+        namespace: (step.kind === "agent" ? "step" : null) as ConsumerNamespace,
+        binding: null,
+      })),
+      {
+        name: workflow.judge_session,
+        kind: "judge",
+        session: workflow.judge_session,
+        conditional: true,
+        declaredRole: workflow.judge_role,
+        namespace: "auxiliary" as ConsumerNamespace,
+        binding: null,
+      },
+    ];
+  }, [preview, workflow]);
+
+  /** A profile a row still names but the registry no longer offers: kept as a
+   * selectable option so the row shows what is wrong instead of silently
+   * snapping back to inheritance. Deleting a profile never re-picks one. */
+  const profileNames = useMemo(
+    () => new Set(modelProfiles.map((p) => p.name)),
+    [modelProfiles],
+  );
 
   // Every change to an effective choice re-resolves. Stale responses are
   // dropped by generation, so the rows on screen always describe the draft
@@ -221,7 +369,7 @@ export function SpawnView() {
             <select
               id="spawn-workflow"
               value={draft.workflow}
-              onChange={(e) => update({ workflow: e.target.value })}
+              onChange={(e) => selectWorkflow(e.target.value)}
               disabled={locked}
               data-testid="spawn-workflow"
             >
@@ -475,56 +623,216 @@ export function SpawnView() {
                   choices — submit again to launch with them.
                 </div>
               )}
-              {preview === null ? (
+              {clearedRows !== null && (
+                <div className="submitError" role="status" data-testid="cleared-overrides">
+                  Changing workflow cleared the per-step choices you had made (
+                  {clearedRows.join(", ")}). A step name in another workflow is a
+                  different step, so nothing was carried over.
+                </div>
+              )}
+              {rows.length === 0 ? (
                 <p className="hint">
                   Choose a workflow, a project and a slug to see every step this run can
                   execute and the model each one would use.
                 </p>
               ) : (
                 <>
-                  <div className="hint" data-testid="profile-source">
-                    Profile <code>{preview.model_profile}</code>{" "}
-                    {preview.model_profile_source === "task"
-                      ? "— selected for this task"
-                      : "— inherited from the project"}
-                  </div>
+                  {preview !== null && (
+                    <div className="hint" data-testid="profile-source">
+                      Profile <code>{preview.model_profile}</code>{" "}
+                      {preview.model_profile_source === "task"
+                        ? "— selected for this task"
+                        : "— inherited from the project"}
+                    </div>
+                  )}
                   <table className="stepTable" data-testid="step-preview">
                     <thead>
                       <tr>
                         <th>Step</th>
                         <th>Kind</th>
                         <th>Session</th>
+                        <th>Profile</th>
                         <th>Role</th>
                         <th>Model</th>
                         <th>Thinking</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {preview.steps.map((step) => (
-                        <tr key={`${step.kind}-${step.step}`} data-testid={`step-${step.step}`}>
-                          <td className="mono">
-                            {step.step}
-                            {step.conditional && (
-                              <span className="conditional" title="a decision may route past this step">
-                                {" "}
-                                conditional
-                              </span>
-                            )}
-                          </td>
-                          <td>{step.kind}</td>
-                          <td className="mono">{step.session ?? "—"}</td>
-                          <td>{step.role ?? "—"}</td>
-                          <td className="mono">{step.model ?? "—"}</td>
-                          <td>{step.thinking ?? "—"}</td>
-                        </tr>
-                      ))}
+                      {rows.map((row) => {
+                        const chosen =
+                          row.namespace === "step"
+                            ? draft.stepOverrides[row.name]
+                            : row.namespace === "auxiliary"
+                              ? draft.auxiliaryOverrides[row.name]
+                              : undefined;
+                        const binding = row.binding;
+                        const missingProfile =
+                          chosen?.profile !== undefined && !profileNames.has(chosen.profile);
+                        return (
+                          <tr
+                            key={`${row.kind}-${row.name}`}
+                            data-testid={`step-${row.name}`}
+                          >
+                            <td className="mono">
+                              {row.name}
+                              {row.conditional && (
+                                <span
+                                  className="conditional"
+                                  title="a decision may route past this step"
+                                >
+                                  {" "}
+                                  conditional
+                                </span>
+                              )}
+                            </td>
+                            <td>{row.kind}</td>
+                            <td className="mono">{row.session ?? "—"}</td>
+                            <td>
+                              {/* A command, decision, or gate has no binding
+                                  and therefore no controls: an override box
+                                  on a step that never reaches a provider
+                                  would be a fiction. */}
+                              {row.namespace === null ? (
+                                "—"
+                              ) : (
+                                <>
+                                  <select
+                                    aria-label={`Model profile for ${row.name}`}
+                                    value={chosen?.profile ?? ""}
+                                    disabled={locked}
+                                    data-testid={`row-profile-${row.name}`}
+                                    onChange={(e) =>
+                                      setRowOverride(row.namespace as "step" | "auxiliary", row.name, {
+                                        profile: e.target.value || undefined,
+                                      })
+                                    }
+                                  >
+                                    <option value="">
+                                      inherit — {preview?.model_profile ?? "task profile"}
+                                    </option>
+                                    {missingProfile && (
+                                      <option value={chosen!.profile}>
+                                        {chosen!.profile} — unavailable
+                                      </option>
+                                    )}
+                                    {modelProfiles.map((candidate) => (
+                                      <option key={candidate.name} value={candidate.name}>
+                                        {candidate.name}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  {chosen?.profile !== undefined && (
+                                    <button
+                                      className="linkButton"
+                                      type="button"
+                                      disabled={locked}
+                                      data-testid={`reset-row-profile-${row.name}`}
+                                      onClick={() =>
+                                        setRowOverride(
+                                          row.namespace as "step" | "auxiliary",
+                                          row.name,
+                                          { profile: undefined },
+                                        )
+                                      }
+                                    >
+                                      Reset profile
+                                    </button>
+                                  )}
+                                  <div className="hint">
+                                    {binding
+                                      ? binding.profile_source === "step"
+                                        ? "overridden for this step"
+                                        : `inherited from the ${binding.profile_source}`
+                                      : "—"}
+                                  </div>
+                                </>
+                              )}
+                            </td>
+                            <td>
+                              {row.namespace === null ? (
+                                "—"
+                              ) : (
+                                <>
+                                  <select
+                                    aria-label={`Model role for ${row.name}`}
+                                    value={chosen?.role ?? ""}
+                                    disabled={locked}
+                                    data-testid={`row-role-${row.name}`}
+                                    onChange={(e) =>
+                                      setRowOverride(row.namespace as "step" | "auxiliary", row.name, {
+                                        role: (e.target.value || undefined) as
+                                          | ModelRole
+                                          | undefined,
+                                      })
+                                    }
+                                  >
+                                    <option value="">
+                                      inherit — {row.declaredRole ?? "declared"}
+                                    </option>
+                                    {MODEL_ROLES.map((role) => (
+                                      <option key={role} value={role}>
+                                        {role}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  {chosen?.role !== undefined && (
+                                    <button
+                                      className="linkButton"
+                                      type="button"
+                                      disabled={locked}
+                                      data-testid={`reset-row-role-${row.name}`}
+                                      onClick={() =>
+                                        setRowOverride(
+                                          row.namespace as "step" | "auxiliary",
+                                          row.name,
+                                          { role: undefined },
+                                        )
+                                      }
+                                    >
+                                      Reset role
+                                    </button>
+                                  )}
+                                  <div className="hint">
+                                    {binding
+                                      ? binding.role_source === "step"
+                                        ? "overridden for this step"
+                                        : "declared by the workflow"
+                                      : "—"}
+                                  </div>
+                                </>
+                              )}
+                            </td>
+                            <td className="mono">{binding?.roles[binding.role].model ?? "—"}</td>
+                            <td>
+                              {binding?.roles[binding.role].thinking ?? "—"}
+                              {binding && (
+                                <details data-testid={`row-policy-${row.name}`}>
+                                  <summary>native roles</summary>
+                                  <ul className="nativeRoles">
+                                    {MODEL_ROLES.map((role) => (
+                                      <li key={role}>
+                                        <code>{role}</code>: {binding.roles[role].model} ·{" "}
+                                        {binding.roles[role].thinking}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </details>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                   <p className="hint">
                     Every step this workflow declares, in order. A conditional step may be
                     routed past; the judge runs only when a route or outcome cannot be
-                    resolved. Thinking is the policy you chose — omp may resolve{" "}
-                    <code>auto</code> and <code>max</code> to a model-specific level.
+                    resolved — it is an auxiliary model consumer, not a step you can route
+                    to. Each row&apos;s profile and role can be set independently, and
+                    every process carries the whole native <code>smol</code>/
+                    <code>slow</code>/<code>plan</code> map shown under its thinking level.
+                    Thinking is the policy you chose — omp may resolve <code>auto</code>{" "}
+                    and <code>max</code> to a model-specific level.
                   </p>
                 </>
               )}

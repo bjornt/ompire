@@ -294,8 +294,10 @@ class ShipManager:
             raise ShipAlreadyPublishedError(task.id)
 
         primary = get_workflow(task.workflow_name).primary
-        handle = self._agents.get(task.id, primary)
-        if handle is None or handle.returncode is not None:
+        # Drafting continues the primary session's conversation on the policy
+        # it last applied (ADR-0027), acquired inside that session's boundary.
+        handle = await self._agents.acquire(task.id, primary)
+        if handle is None:
             raise NoLiveAgentError(task.id)
         session = self._sessions.get(task.id, primary)
         if session is None or session.status != "idle":

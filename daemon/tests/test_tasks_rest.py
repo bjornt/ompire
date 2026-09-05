@@ -93,13 +93,22 @@ def test_accepted_task_pins_the_reviewed_inputs(
     inputs = task["execution_inputs"]
     assert inputs["model_profile_name"] == "demo"
     assert inputs["model_profile_source"] == "project"
-    assert inputs["roles"]["default"] == {
+    work = inputs["step_bindings"]["work"]
+    assert work["role"] == "default"
+    assert work["role_source"] == "workflow"
+    assert work["profile_name"] == "demo"
+    assert work["profile_source"] == "project"
+    assert work["roles"]["default"] == {
         "model": "testing/main-model",
         "thinking": "medium",
     }
-    assert inputs["roles"]["slow"]["model"] == "testing/slow-model"
-    assert inputs["judge_role"] == "slow"
-    assert inputs["step_roles"] == {"work": "default"}
+    # The whole native map travels with every consumer, not just its active
+    # pair: a `/switch slow` inside the container has to land on the model
+    # the operator chose.
+    assert work["roles"]["slow"]["model"] == "testing/slow-model"
+    judge = inputs["auxiliary_bindings"]["judge"]
+    assert judge["role"] == "slow"
+    assert judge["roles"]["slow"]["model"] == "testing/slow-model"
     assert inputs["workspace"]["base_branch"] == "main"
     assert inputs["checkout_path"] == demo_project["checkout_path"]
     _wait_settled(client, auth_headers, task["id"])
@@ -111,7 +120,12 @@ def test_accepted_task_pins_the_reviewed_inputs(
         {"template_name": "demo"},
         {"model": "fable-5"},
         {"thinking": "high"},
-        {"step_overrides": {"work": "other"}},
+        # A row override is a profile/role choice, never a concrete model or
+        # thinking level: those belong in profile management, not a third
+        # override hierarchy (ADR-0027).
+        {"step_overrides": {"work": {"model": "fable-5"}}},
+        {"step_overrides": {"work": {"thinking": "high"}}},
+        {"auxiliary_overrides": {"judge": {"model": "fable-5"}}},
     ],
 )
 def test_retired_and_future_fields_are_refused_not_ignored(
@@ -128,6 +142,33 @@ def test_retired_and_future_fields_are_refused_not_ignored(
     assert client.get("/api/tasks", headers=auth_headers).json() == []
 
 
+@pytest.mark.parametrize(
+    ("malformed", "expected"),
+    [
+        ({"step_overrides": {"work": "other"}}, "model_attributes_type"),
+        ({"step_overrides": {"work": ["other"]}}, "model_attributes_type"),
+        ({"auxiliary_overrides": {"judge": "other"}}, "model_attributes_type"),
+        ({"step_overrides": "work"}, "dict_type"),
+    ],
+)
+def test_malformed_row_overrides_are_refused(
+    client: TestClient,
+    auth_headers: dict,
+    demo_project: dict,
+    malformed: dict,
+    expected: str,
+) -> None:
+    """A row override is an object with two optional named choices. A bare
+    string is not a shorthand for "use this profile": guessing which
+    dimension it meant would pick a model policy the operator never made."""
+    response = client.post(
+        "/api/tasks/preview", headers=auth_headers, json={**launch_body(), **malformed}
+    )
+    assert response.status_code == 422
+    assert expected in response.text
+    assert client.get("/api/tasks", headers=auth_headers).json() == []
+
+
 def test_preview_and_acceptance_resolve_identically(
     client: TestClient, auth_headers: dict, demo_project: dict
 ) -> None:
@@ -139,7 +180,8 @@ def test_preview_and_acceptance_resolve_identically(
         json={**body, "preview_token": preview["preview_token"]},
     ).json()
     inputs = accepted["execution_inputs"]
-    assert preview["roles"] == inputs["roles"]
+    assert preview["steps"][0]["binding"] == inputs["step_bindings"]["work"]
+    assert preview["steps"][-1]["binding"] == inputs["auxiliary_bindings"]["judge"]
     assert preview["branch"] == inputs["branch"]
     assert preview["workspace"] == inputs["workspace"]
     # Every declared step is described, plus the conditional judge row.
@@ -268,7 +310,14 @@ def test_accepted_inputs_survive_project_and_profile_edits(
 
     after = client.get(f"/api/tasks/{task['id']}", headers=auth_headers).json()
     inputs = after["execution_inputs"]
-    assert inputs["roles"]["default"]["model"] == "testing/main-model"
+    assert (
+        inputs["step_bindings"]["work"]["roles"]["default"]["model"]
+        == "testing/main-model"
+    )
+    assert (
+        inputs["auxiliary_bindings"]["judge"]["roles"]["slow"]["model"]
+        == "testing/slow-model"
+    )
     assert inputs["workspace"]["base_branch"] == "main"
     assert inputs["workspace"]["preamble"] == ""
 

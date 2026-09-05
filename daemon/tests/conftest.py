@@ -264,20 +264,52 @@ def make_execution_inputs(
     fetch_remote: str = "origin",
     upstream_url: str = "https://example.com/demo.git",
     fork_url: str | None = None,
+    step_roles: dict | None = None,
+    step_profile_names: dict | None = None,
+    step_profiles: dict | None = None,
+    judge_role: str | None = None,
 ):
     """A complete accepted-input document for tests that build a task row
-    directly instead of going through preview/accept."""
+    directly instead of going through preview/accept.
+
+    `step_roles` and `step_profile_names` express per-consumer overrides the
+    way a launch would: a step named in either gets `step` attribution on
+    that dimension. `step_profiles` supplies the role maps those named
+    profiles bind, so a test can give two steps genuinely different models.
+    """
     from ompire_daemon.execution_inputs import (
+        AUXILIARY_JUDGE,
         PROFILE_SOURCE_PROJECT,
         PROVENANCE_ACCEPTED,
+        ROLE_SOURCE_WORKFLOW,
+        ConsumerBinding,
         TaskExecutionInputs,
         WorkspaceInputs,
     )
     from ompire_daemon.model_config import JUDGE_ROLE
     from ompire_daemon.registry.model_profiles import RoleBinding
-    from ompire_daemon.workflows import agent_step_roles, get_workflow
+    from ompire_daemon.workflows import agent_steps, get_workflow
 
     source = roles or TEST_ROLES
+    decoded = {
+        role: RoleBinding(model=binding["model"], thinking=binding["thinking"])
+        for role, binding in source.items()
+    }
+
+    def binding(role, *, profile=None, profile_source=None, role_source=None):
+        return ConsumerBinding(
+            profile_name=profile if profile is not None else model_profile,
+            profile_source=profile_source or PROFILE_SOURCE_PROJECT,
+            role=role,
+            role_source=role_source or ROLE_SOURCE_WORKFLOW,
+            roles=dict(bindings_for(profile)),
+        )
+
+    def bindings_for(profile):
+        if profile is None or profile == model_profile:
+            return decoded
+        return (step_profiles or {})[profile]
+
     return TaskExecutionInputs(
         provenance=PROVENANCE_ACCEPTED,
         accepted_at="2026-09-05T00:00:00+00:00",
@@ -285,12 +317,18 @@ def make_execution_inputs(
         workflow_name=workflow_name,
         model_profile_name=model_profile,
         model_profile_source=PROFILE_SOURCE_PROJECT,
-        roles={
-            role: RoleBinding(model=binding["model"], thinking=binding["thinking"])
-            for role, binding in source.items()
+        step_bindings={
+            step.name: binding(
+                (step_roles or {}).get(step.name, step.role),
+                profile=(step_profile_names or {}).get(step.name),
+                profile_source=(
+                    "step" if step.name in (step_profile_names or {}) else None
+                ),
+                role_source="step" if step.name in (step_roles or {}) else None,
+            )
+            for step in agent_steps(get_workflow(workflow_name))
         },
-        step_roles=agent_step_roles(get_workflow(workflow_name)),
-        judge_role=JUDGE_ROLE,
+        auxiliary_bindings={AUXILIARY_JUDGE: binding(judge_role or JUDGE_ROLE)},
         workspace=WorkspaceInputs(
             base_branch=base_branch,
             branch_pattern=branch_pattern,

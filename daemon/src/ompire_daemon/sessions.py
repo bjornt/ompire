@@ -324,6 +324,15 @@ class SessionTracker:
         """The agent child is being spawned; covers the ready handshake too."""
         self._transition(task_id, session, "starting", "agent spawned")
 
+    def agent_reconfiguring(self, task_id: int, session: str) -> None:
+        """The session's child is being replaced to change its native model
+        roles (ADR-0027). Deliberately the same `starting` status a spawn
+        uses: the session is briefly unavailable, and it is *not* failed —
+        the conversation is being resumed, not abandoned."""
+        self._transition(
+            task_id, session, "starting", "applying a new model policy"
+        )
+
     def record_native_model(
         self,
         task_id: int,

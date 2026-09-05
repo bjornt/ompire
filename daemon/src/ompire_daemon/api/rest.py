@@ -9,13 +9,14 @@ import asyncio
 import logging
 import secrets
 import shutil
+from collections.abc import Mapping
 from dataclasses import asdict
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, status
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import Engine
 
 from ompire_daemon import auth, launchconfig
@@ -36,6 +37,7 @@ from ompire_daemon.gpg import (
     gpg_signing_refusal,
 )
 from ompire_daemon.launch import (
+    ConsumerOverride,
     LaunchInputError,
     LaunchRequest,
     PreviewChangedError,
@@ -926,13 +928,27 @@ class WorkspaceOverridesIn(BaseModel):
     preamble: str | None = None
 
 
+class ConsumerOverrideIn(BaseModel):
+    """One model consumer's row-level selections (ADR-0027).
+
+    Each dimension is independently optional: omitted or null means inherit,
+    a value means the operator chose it. `extra="forbid"` keeps a typo like
+    `model` or `thinking` from being silently ignored — those are profile
+    settings, deliberately not a third override hierarchy.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_profile: str | None = None
+    role: str | None = None
+
+
 class TaskCreate(BaseModel):
-    """The one supported creation contract (ADR-0026).
+    """The one supported creation contract (ADR-0026, ADR-0027).
 
     `extra="forbid"` is load-bearing: `template_name`, and the old scalar
     `model`/`thinking` spawn overrides, must be refused rather than ignored,
-    or a stale caller would silently get a launch it did not ask for. Future
-    per-step overrides are refused the same way until they exist.
+    or a stale caller would silently get a launch it did not ask for.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -945,6 +961,12 @@ class TaskCreate(BaseModel):
     # profile for this task and replaces the inheritance.
     model_profile: str | None = None
     workspace_overrides: WorkspaceOverridesIn | None = None
+    # Per-consumer overrides, keyed by declared agent step name and by
+    # engine-reserved auxiliary consumer name. Two namespaces so a decision
+    # step can never become an agent binding by sharing a name with the
+    # judge. Absent maps mean "everything inherits".
+    step_overrides: dict[str, ConsumerOverrideIn] = Field(default_factory=dict)
+    auxiliary_overrides: dict[str, ConsumerOverrideIn] = Field(default_factory=dict)
 
     @field_validator("slug")
     @classmethod
@@ -990,7 +1012,40 @@ def _launch_request(body: TaskCreate) -> LaunchRequest:
             "model_profile" in body.model_fields_set and body.model_profile is not None
         ),
         workspace_overrides=overrides,
+        step_overrides=_consumer_overrides(body.step_overrides, "step_overrides"),
+        auxiliary_overrides=_consumer_overrides(
+            body.auxiliary_overrides, "auxiliary_overrides"
+        ),
     )
+
+
+def _consumer_overrides(
+    supplied: Mapping[str, ConsumerOverrideIn], field: str
+) -> dict[str, ConsumerOverride]:
+    """Normalize the row override maps before anything resolves or
+    fingerprints them.
+
+    Null and omitted both mean inherit, and an entry that overrides nothing
+    is dropped entirely: `{"fix": {}}` and an absent `fix` are the same
+    launch, and letting them fingerprint differently would invalidate a
+    reviewed preview over a difference the operator cannot see. An empty
+    profile name is refused rather than read as a reset — a reset is
+    expressed by omitting the field.
+    """
+    normalized: dict[str, ConsumerOverride] = {}
+    for name, entry in supplied.items():
+        if entry.model_profile is not None and not entry.model_profile.strip():
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                f"{field}.{name}.model_profile: a model profile name must not be "
+                "empty; omit the field to inherit",
+            )
+        override = ConsumerOverride(
+            model_profile=entry.model_profile, role=entry.role
+        )
+        if not override.is_empty():
+            normalized[name] = override
+    return normalized
 
 
 def _preview_changed(resolved) -> HTTPException:
@@ -1493,10 +1548,17 @@ class AgentMessage(BaseModel):
     message: str
 
 
-def _require_live_agent(
+async def _require_live_agent(
     supervisor: AgentSupervisor, task_id: int, session: str
 ) -> AgentHandle:
-    handle = supervisor.get(task_id, session)
+    """The session's live agent, taken inside its own boundary (ADR-0027).
+
+    A composer action prompts the session, so it must not be handed a child
+    that a concurrent policy handoff has already started retiring. It runs on
+    whatever policy that session last applied — never a reset to the task
+    default.
+    """
+    handle = await supervisor.acquire(task_id, session)
     if handle is None:
         raise HTTPException(
             status.HTTP_409_CONFLICT, str(NoLiveAgentError(task_id, session))
@@ -1532,7 +1594,7 @@ async def steer_agent_route(
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     _require_declared_session(task, session)
-    handle = _require_live_agent(supervisor, task_id, session)
+    handle = await _require_live_agent(supervisor, task_id, session)
     return await _agent_request(handle, "steer", message=body.message)
 
 
@@ -1546,7 +1608,7 @@ async def follow_up_agent_route(
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     _require_declared_session(task, session)
-    handle = _require_live_agent(supervisor, task_id, session)
+    handle = await _require_live_agent(supervisor, task_id, session)
     return await _agent_request(handle, "follow_up", message=body.message)
 
 
@@ -1561,7 +1623,7 @@ async def interrupt_agent_route(
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     _require_declared_session(task, session)
-    handle = _require_live_agent(supervisor, task_id, session)
+    handle = await _require_live_agent(supervisor, task_id, session)
     # Any pending question is moot once the turn is aborted (design D-6); the
     # abort's own agent_start/agent_end then drives state normally.
     sessions.clear_pending(task_id, session)
@@ -1610,7 +1672,7 @@ async def answer_agent_route(
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     _require_declared_session(task, session)
-    handle = _require_live_agent(supervisor, task_id, session)
+    handle = await _require_live_agent(supervisor, task_id, session)
     pending = sessions.pending(task_id, session)
     if pending is None or pending.id != body.question_id:
         raise HTTPException(
@@ -1639,7 +1701,7 @@ async def agent_state_route(
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     _require_declared_session(task, session)
-    handle = _require_live_agent(supervisor, task_id, session)
+    handle = await _require_live_agent(supervisor, task_id, session)
     # Pass the agent's `data` through untouched (isStreaming, queuedMessageCount,
     # todos, context usage, model); the daemon never reinterprets its meaning.
     response = await _agent_request(handle, "get_state")
@@ -1656,7 +1718,7 @@ async def agent_stats_route(
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     _require_declared_session(task, session)
-    handle = _require_live_agent(supervisor, task_id, session)
+    handle = await _require_live_agent(supervisor, task_id, session)
     response = await _agent_request(handle, "get_session_stats")
     data = response.get("data")
     return data if isinstance(data, dict) else {}
@@ -1706,7 +1768,7 @@ async def start_review_route(
             status.HTTP_409_CONFLICT,
             f"task {task_id} session {primary!r} is not idle",
         )
-    if supervisor.get(task_id, primary) is None:
+    if await supervisor.acquire(task_id, primary) is None:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             f"task {task_id} session {primary!r} has no live agent",

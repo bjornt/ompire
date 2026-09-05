@@ -85,32 +85,76 @@ export function TaskConfigurationPanel({
       <table className="stepTable" data-testid="accepted-roles">
         <thead>
           <tr>
+            <th>Consumer</th>
+            <th>Profile</th>
             <th>Role</th>
             <th>Model</th>
             <th>Thinking (accepted)</th>
-            <th>Consumers</th>
           </tr>
         </thead>
         <tbody>
-          {(["default", "smol", "slow", "plan"] as const).map((role) => {
-            const steps = Object.entries(inputs.step_roles)
-              .filter(([, bound]) => bound === role)
-              .map(([step]) => step);
-            const consumers = [
-              ...steps,
-              ...(inputs.judge_role === role ? ["judge (conditional)"] : []),
-            ];
-            return (
-              <tr key={role} data-testid={`role-${role}`}>
-                <td>{role}</td>
-                <td className="mono">{inputs.roles[role].model}</td>
-                <td>{inputs.roles[role].thinking}</td>
-                <td>{consumers.length > 0 ? consumers.join(", ") : "auxiliary only"}</td>
-              </tr>
-            );
-          })}
+          {[
+            ...Object.entries(inputs.step_bindings).map(
+              ([name, binding]) => [name, binding, false] as const,
+            ),
+            ...Object.entries(inputs.auxiliary_bindings).map(
+              ([name, binding]) => [name, binding, true] as const,
+            ),
+          ].map(([name, binding, auxiliary]) => (
+            <tr key={`${auxiliary ? "aux" : "step"}-${name}`} data-testid={`consumer-${name}`}>
+              <td className="mono">
+                {name}
+                {auxiliary && (
+                  <span className="noForkNote"> · auxiliary, conditional</span>
+                )}
+              </td>
+              <td>
+                {binding.profile_name}
+                <span className="noForkNote">
+                  {" "}
+                  ·{" "}
+                  {binding.profile_source === "step"
+                    ? "overridden for this step"
+                    : `inherited from the ${binding.profile_source}`}
+                </span>
+              </td>
+              <td>
+                {binding.role}
+                <span className="noForkNote">
+                  {" "}
+                  ·{" "}
+                  {binding.role_source === "step"
+                    ? "overridden for this step"
+                    : "declared by the workflow"}
+                </span>
+              </td>
+              <td className="mono">{binding.roles[binding.role].model}</td>
+              <td>
+                {binding.roles[binding.role].thinking}
+                {/* The whole native map, because a `/switch slow` inside the
+                    container runs one of these — the active pair alone does
+                    not describe what this process can reach. */}
+                <details data-testid={`consumer-policy-${name}`}>
+                  <summary>native roles</summary>
+                  <ul className="nativeRoles">
+                    {(["default", "smol", "slow", "plan"] as const).map((role) => (
+                      <li key={role}>
+                        <code>{role}</code>: {binding.roles[role].model} ·{" "}
+                        {binding.roles[role].thinking}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              </td>
+            </tr>
+          ))}
         </tbody>
       </table>
+      <p className="hint">
+        Each model consumer keeps the policy it was accepted under. Editing or
+        deleting a profile since then changes what the next launch resolves to,
+        never this task.
+      </p>
 
       <NativeModelState sessions={sessions} />
     </div>

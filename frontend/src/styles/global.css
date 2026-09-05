@@ -123,6 +123,34 @@ a:hover {
   overflow-wrap: break-word;
 }
 
+/* Per-consumer override controls (ADR-0027). The row is the unit of choice,
+   so its two selectors and their resets sit inside the cell they govern and
+   stay usable when the panel is narrow. */
+
+.stepTable select {
+  width: 100%;
+  min-width: 0;
+  font-size: 11px;
+  font-family: inherit;
+}
+
+/* The complete native map behind one row's active pair. Disclosed rather than
+   always shown: it is four more model ids per row, and the operator needs it
+   when they are deciding, not while they scan the run. */
+
+.nativeRoles {
+  margin: 4px 0 0;
+  padding-left: 14px;
+  font-size: 11px;
+  color: var(--muted);
+  list-style: none;
+}
+
+.nativeRoles code {
+  font-family: var(--mono);
+  color: var(--faint);
+}
+
 .unknownList {
   margin: 4px 0 0;
   padding-left: 18px;
