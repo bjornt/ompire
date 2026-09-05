@@ -131,11 +131,40 @@ task, and every later stage — the spawn pipeline, the engine, recovery, review
 shipping — reads it instead of re-reading mutable configuration. Editing a
 project or a profile changes the next launch and nothing already accepted.
 
+The document pins one complete binding per *model consumer* — every declared
+agent step, plus the engine's judge — rather than one policy per task, so a
+step can be sent to a different profile or role without touching the workflow
+or anything else. Runtime lookup is exact and fails closed; there is no
+task-wide fallback to substitute.
+
 Templates were the previous form. Retiring them meant an upgrade that
 preserves every old value as inert evidence and asks the operator wherever it
 would otherwise have had to guess.
 
-See [ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md).
+See [ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)
+and [ADR-0027](../../adr/0027-hand-off-model-policy-between-turns.md).
+
+### What a launch decides, and what a session remembers
+
+Immutable launch intent and mutable applied state are different facts, and
+keeping them apart is what makes a restart honest.
+
+The task says what each consumer *may* run. The session records what actually
+took effect — its last verified policy, written before the turn that depends on
+it. Two steps sharing a session can pin different bindings, so nothing but the
+session can answer "what was this conversation configured with", and a
+step-start record is not an answer: a configuration can fail after the step
+opened.
+
+Putting a live session on the next consumer's policy is a supervised handoff at
+a turn boundary. Changing only the active pair is done in place over omp's
+acknowledged controls; changing an auxiliary role requires replacing the
+process, because those are start-time flags — so the native session is resumed
+under the same identity and the conversation carries over. Nothing is
+interrupted, nothing falls back, and a failure leaves no process that may be
+prompted.
+
+See [ADR-0027](../../adr/0027-hand-off-model-policy-between-turns.md).
 
 ## Attention is derived centrally
 

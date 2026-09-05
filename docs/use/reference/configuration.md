@@ -120,11 +120,13 @@ configures nothing.
 
 | Key | Retired in favour of |
 |---|---|
-| `judge_model` | The task model profile's `slow` binding |
+| `judge_model` | The judge's own accepted model binding, chosen at launch |
 
-The workflow engine's judge has no separate model setting any more: it runs on
-the profile the task was launched with, disclosed in the launch preview like
-every other model consumer (ADR-0026).
+The workflow engine's judge has no separate model setting any more. It is an
+ordinary model consumer: it declares the `slow` role, inherits the task's model
+profile, is disclosed in the launch preview beside every declared step, and can
+be given a different profile or role there like any agent step (ADR-0026,
+ADR-0027).
 
 Ompire never rewrites your `config.toml`. If it finds `judge_model` set, it
 records the value and asks you to acknowledge, per affected project, that the

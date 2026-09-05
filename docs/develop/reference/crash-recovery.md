@@ -33,6 +33,24 @@ present, the daemon resumes each recorded session by starting the agent with
 `--resume` against that session's recorded identity, inside the task's
 container, and re-establishes session tracking.
 
+Each session is resumed under **its own recorded applied policy** — what that
+session's child last verifiably ran — not the task's first step's policy and
+not today's profiles
+([ADR-0027](../../adr/0027-hand-off-model-policy-between-turns.md)). Two steps
+sharing a session can pin different bindings, so the task document alone cannot
+answer the question; the session's `applied_policy_json` can.
+
+A session with no recorded policy is **not** resumed. Choosing one for a
+conversation already in progress is the guess per-consumer pinning exists to
+avoid, so the session is left alone with the reason reported, its workspace and
+history intact, and the engine spawns it fresh if the run needs it. The one
+exception is a step interrupted before its prompt went out: its accepted
+binding is the decision the run is about to make anyway.
+
+A resumed session's record is re-committed as verified once the process is
+actually running under it — a policy an upgrade derived stops being a
+derivation the moment a child has been put on it.
+
 A resumed agent is **not** re-prompted with the task's stored prompt. Whether
 and what to re-deliver is the workflow engine's per-step decision — see
 [restart recovery](../../use/reference/workflow-engine.md#restart-recovery).

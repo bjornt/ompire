@@ -229,8 +229,14 @@ were never blocked.
 ## The judge is not using the model I configured
 
 `judge_model` in `config.toml` is retired and configures nothing. The workflow
-engine's judge runs on the model profile the task was launched with — its
-`slow` binding — which the Spawn view shows before you launch.
+engine's judge is an ordinary model consumer: it declares the `slow` role and
+inherits the task's model profile, and the Spawn view shows the result before
+you launch.
 
-To give the judge a specific model, bind that model as `slow` in a profile and
-launch with it. See [Configuration](../reference/configuration.md#retired-keys).
+Two ways to give it a specific model. Bind that model as `slow` in the profile
+the task uses — which also changes what `slow` means everywhere else — or
+override the judge row itself on the Spawn view, giving it a different profile,
+a different role, or both. An accepted task keeps whichever you chose; editing
+a profile afterwards does not reach it. See
+[Configuration](../reference/configuration.md#retired-keys) and [Spawn a
+task](spawn-a-task.md#override-a-single-step).

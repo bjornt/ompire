@@ -135,7 +135,7 @@ Published on the dashboard channel:
 | `project_setup_step` | A clone-mode project setup step starts, succeeds, or fails |
 | `spawn_step` | A spawn step starts, succeeds, or fails |
 | `workshop_additions` | Which additions source applied for a task's launch, including when the selected one was absent |
-| `session_model` | A session's omp child reported the model it is running and the thinking level omp resolved |
+| `session_model` | A session's omp child reported the model it is running and the thinking level omp resolved. Published only after a policy was verified, so a session mid-transition never appears to have applied one |
 | `workflow_step` | A workflow step transitions |
 | `status_changed` | A session's status transitions |
 | `question_posted`, `question_resolved` | A pending question appears or clears |
@@ -197,6 +197,13 @@ Connecting to a session with no live agent closes with code `4404`.
 Connecting with a session name the task's workflow does not declare closes
 with an error and sends no events.
 
+A channel whose child is being replaced to apply a different model policy
+closes with `4409` rather than `1000`
+([ADR-0027](../../adr/0027-hand-off-model-policy-between-turns.md)). The
+logical session is continuing, so a client must reconnect: the replacement
+carries the retired child's ring buffer forward, and a reconnect replays it
+from the top. Treating `4409` as terminal would end a transcript mid-session.
+
 The buffer bounds memory per session and means a client attaching mid-turn
 gets recent context rather than nothing — but it also means events older than
 the buffer are gone. The channel is a live view, not a transcript store.
@@ -212,4 +219,5 @@ events.
 | Code | Meaning |
 |---|---|
 | `1008` | Policy violation — token rotated, or authentication failed |
-| `4404` | No live agent behind this session channel |
+| `4404` | No live agent behind this session channel — retry, the session may be starting |
+| `4409` | The child was replaced to apply a new model policy — reconnect to the replacement |

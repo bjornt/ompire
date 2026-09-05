@@ -29,6 +29,8 @@ Both calls accept:
 | `prompt` | yes | The operator's instruction, including any `@file` mentions |
 | `model_profile` | no | Omitted means "inherit the project default"; a name replaces that inheritance for this task |
 | `workspace_overrides` | no | Task-local overrides of the project's workspace defaults |
+| `step_overrides` | no | Per-agent-step profile and role choices, keyed by declared step name |
+| `auxiliary_overrides` | no | The same, keyed by engine-reserved consumer name (today: `judge`) |
 | `preview_token` | on `POST /api/tasks` | The token from the preview that was reviewed |
 
 `workspace_overrides` may carry `base_branch`, `branch_pattern`,
@@ -39,9 +41,59 @@ a meaningful empty value. Any other field — including the retired
 `template_name` and the old scalar `model` and `thinking` overrides — is
 refused rather than ignored.
 
-The preview returns the resolved role bindings, the effective workspace values
-with the project's own values beside them, the rendered branch, every declared
-step of the workflow, and a `preview_token`.
+### Per-consumer overrides
+
+Each entry of `step_overrides` and `auxiliary_overrides` is an object with two
+optional fields, `model_profile` and `role`. Omitting a field — or passing
+`null` — inherits that dimension; an entry that overrides neither is the same
+launch as no entry at all, and resolves to the same `preview_token`.
+
+```json
+{
+  "step_overrides": {
+    "reproduce": {"model_profile": "economy"},
+    "fix": {"role": "plan"},
+    "validate-agent": {"model_profile": "thorough", "role": "slow"}
+  },
+  "auxiliary_overrides": {"judge": {"model_profile": "thorough"}}
+}
+```
+
+Precedence per consumer:
+
+| Dimension | Order |
+|---|---|
+| Profile | row override → explicit task `model_profile` → project default |
+| Role | row override → the role the workflow declares for that step |
+
+The role selects one complete `(model, thinking)` pair from the effective
+profile, so changing a role changes both together. All four roles — `default`,
+`smol`, `slow`, `plan` — are selectable for any consumer. Choosing an active
+role never rewrites the profile's other role bindings: every process still
+carries the complete native map.
+
+The two namespaces are separate, so a decision step can never become an agent
+binding by sharing a name with an auxiliary consumer. Refused at the named
+field, creating nothing: an unknown step, a step with no model (a command,
+decision, or gate), an unknown auxiliary consumer, a role outside the four, an
+empty or unknown profile name, and any unknown field inside an entry. A
+concrete `model` or `thinking` is not accepted here — those are profile
+settings, deliberately not a third override hierarchy.
+
+A task profile is still required even when every row is overridden.
+
+The preview returns each consumer's resolved binding, the task-wide profile's
+own role map, the effective workspace values with the project's own values
+beside them, the rendered branch, every declared step of the workflow, and a
+`preview_token`. Each step row carries `declared_role` — the role the workflow
+declares — and a `binding` object identical to what acceptance stores for that
+consumer, or `null` for a step with no model.
+
+The `preview_token` covers every consumer's *complete* role map, not just its
+active pair. Editing a profile's `slow` binding changes no summary line and
+still invalidates the review, because it changes what a `/switch slow` inside
+that step's container would reach. An edit to a profile this launch does not
+use leaves the review valid.
 
 `POST /api/tasks` returns `202` with the new task and its pinned
 `execution_inputs`, and the pipeline runs asynchronously. If the resolution
@@ -69,8 +121,26 @@ Beside the form, the preview lists every step the workflow declares, in order,
 with its kind, session, abstract role, concrete model, and thinking policy. A
 command, decision, or gate step is shown with no model, because it never
 reaches one. A step a decision can route past is marked *conditional*, and the
-engine's judge appears as a conditional row on the profile's `slow` binding.
-The list is what the run *may* execute, not a prediction that it will.
+engine's judge appears as a conditional row on `slow`. The list is what the run
+*may* execute, not a prediction that it will.
+
+Every row that consumes a model carries its own profile and role selectors,
+each with its own reset, and states separately whether its profile and its role
+are inherited or set here. A row with no binding gets no controls. Expanding a
+row's **native roles** shows the complete `smol`/`slow`/`plan` map its process
+will carry.
+
+The controls are rendered from the daemon's workflow catalog rather than from
+the resolution, so a row whose selected profile has since been deleted stays on
+screen — with that profile still shown, marked unavailable — and can be
+corrected. Ompire never silently re-picks a profile for you.
+
+Rows follow the task profile only while they are inherited: changing the task
+profile moves every inherited row and leaves explicit ones alone. An explicit
+choice equal to what would have been inherited is still explicit. Changing the
+workflow clears every row choice and says which were cleared; nothing transfers
+by position or by a coincidentally matching name, and the slug, prompt, task
+profile, and workspace overrides stay.
 
 Thinking is shown as the policy the profile states. omp resolves `auto` and
 `max` to a model-specific level at run time; [task detail](task-detail.md)
@@ -116,7 +186,8 @@ accepted task is deleted or purged while the form is locked, the form unlocks
 and says so.
 
 Leaving the form to create a model profile in Settings keeps the draft: coming
-back restores the workflow, project, slug, prompt, and every override.
+back restores the workflow, project, slug, prompt, and every override,
+including the per-row choices.
 
 ## File mentions
 
@@ -207,9 +278,13 @@ rendered branch, and the Workshop additions source — in the same transaction
 that created the task row. Editing the project between the `202` and the
 pipeline cannot repoint the fetch or move the branch point.
 
-The same is true of model policy: the four role bindings are on the task, and
-the workflow engine passes them to every session it spawns, including the
-judge. There is no fallback to the agent's own default.
+The same is true of model policy: one complete binding per model consumer is on
+the task, and the workflow engine applies the right one to each session's
+process before every turn, including the judge's. A consumer with no stored
+binding fails the step rather than falling back — neither to a task-wide
+default nor to the agent's own. See [Workflow
+engine](workflow-engine.md#model-policy-per-turn) for how a policy reaches a
+session that is already live.
 
 The preamble is *not* applied by the pipeline. Prompt construction belongs to
 the workflow.

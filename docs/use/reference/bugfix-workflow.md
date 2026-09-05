@@ -28,7 +28,9 @@ task-scoped agent operations target the coder.
 
 Splitting reproduction and fixing across two sessions is deliberate: the
 session that decides whether the bug still reproduces is not the session that
-wrote the fix.
+wrote the fix. That separation is about context, not about models — each of
+these steps carries its own accepted model policy, and two steps in one session
+may differ.
 
 ```mermaid
 flowchart TD
@@ -151,10 +153,19 @@ Choose `bugfix` as the workflow on the Spawn view, or pass
 `POST /api/tasks`. Every project can run it; nothing has to be configured
 first.
 
-Every agent step of this workflow declares the `default` role, so all of them
-run the profile's `default` binding. The judge, which fires only when a route
-or an outcome cannot be resolved, runs the `slow` binding. The Spawn view
-lists all of that before launch.
+Every agent step of this workflow declares the `default` role, and the judge —
+which fires only when a route or an outcome cannot be resolved — declares
+`slow`. That is the starting point, not a fixed one: each of those rows can be
+sent to a different model profile or a different role at launch, independently.
+The Spawn view lists all of it before you submit.
+
+`reproduce` and `validate-agent` share the `reproducer` session, so they share
+its conversation, and they can still run under different policies. When
+`validate-agent` needs a different `smol`, `slow`, or `plan` binding than
+`reproduce` left in effect, that session's agent process is restarted and its
+native session resumed: the context carries over, and the session reads as
+*starting* for a moment. A repeated `fix` uses `fix`'s own accepted binding
+each time, whatever ran in between.
 
 The task prompt should be the issue — what is wrong, and how to observe it.
 The workflow supplies the procedure.

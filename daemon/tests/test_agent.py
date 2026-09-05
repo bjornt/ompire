@@ -518,7 +518,7 @@ async def test_an_auxiliary_change_replaces_the_process_and_resumes_the_session(
 async def test_a_retired_child_cannot_unregister_its_replacement(handoff) -> None:
     """The old exit watcher must not fire late and drop the handle the
     session is now using."""
-    sup, hub, _, _ = handoff
+    sup, _, _, _ = handoff
     await sup.start(1, "main", "/clone", policy=make_test_policy())
     changed = _policy(plan={"model": "testing/other-plan", "thinking": "off"})
     replacement = await sup.apply_session_policy(

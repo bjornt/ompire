@@ -1686,7 +1686,7 @@ async def test_a_failed_handoff_fails_the_step_and_keeps_the_previous_record(
 ) -> None:
     """A refused native configuration must not authorize the prompt, and must
     not overwrite what the session is durably known to have run."""
-    runner, supervisor, _, _, _ = rig
+    runner, _, _, _, _ = rig
     task = _make_task(
         engine,
         tmp_path,
@@ -1729,7 +1729,7 @@ async def test_the_judge_runs_on_its_own_accepted_binding(
     )
     register_workflow(workflow)
     try:
-        runner, supervisor, _, _, _ = rig
+        runner, _, _, _, _ = rig
         task = _make_task(engine, tmp_path, workflow="judge-policy", judge_role="plan")
         runner.start_run(task)
         await wait_for_run(engine, task.id, {"complete", "failed"})
@@ -1749,7 +1749,7 @@ async def test_recovery_restores_the_session_policy_that_actually_applied(
 ) -> None:
     """After a restart the session resumes on what it last ran, not on the
     task's `default` role — the bug a single task-wide policy could not see."""
-    runner, supervisor, tracker, hub, _ = rig
+    runner, supervisor, _, _, _ = rig
     task = _make_task(
         engine,
         tmp_path,

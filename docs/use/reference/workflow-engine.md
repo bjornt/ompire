@@ -59,9 +59,11 @@ intervention.
 ### Lazy sessions
 
 A session is spawned on first use by an `agent` step, through the same
-supervised-start path as any session — resolved model and thinking flags, the
-ask-timeout preflight, the ready handshake, session-identity capture — and
-stays alive until cleanup.
+supervised-start path as any session — the consumer's complete model policy,
+the ask-timeout preflight, the ready handshake, session-identity capture — and
+stays alive until cleanup, though its underlying process may be replaced to
+apply a different policy (see [Model policy per
+turn](#model-policy-per-turn)).
 
 All of a task's sessions share the task's clone and container, so **the
 working tree is the primary handoff channel between steps**.
@@ -157,11 +159,17 @@ It runs as an engine-reserved session named `judge` in the task's container
 and clone, spawned lazily through the normal supervised-start path and
 surfaced in the session tracker, snapshot, and UI like any other session.
 
-It has no model setting of its own. Its active pair is the task profile's
-`slow` binding, disclosed in the launch preview beside every declared step, and
-it carries the same full auxiliary role map as any other session. The retired
-`judge_model` config key configures nothing; see
-[Configuration](configuration.md#retired-keys).
+It has no model setting of its own and no hidden exception from per-consumer
+choice: it is an ordinary model consumer with its own accepted binding. It
+declares `slow`, inherits the task's profile, is disclosed in the launch
+preview beside every declared step, and can have its profile and role
+overridden there like any agent step. It carries the same full auxiliary role
+map as any other session. The retired `judge_model` config key configures
+nothing; see [Configuration](configuration.md#retired-keys).
+
+A judge whose accepted binding cannot be applied produces no judgment — the
+existing no-judgment path. The null outcome or the escalation gate stands; it
+never fails the run and never falls back to another model.
 
 Each judgment is self-contained: the prompt names the step and its purpose,
 references a daemon-written transcript tail at
@@ -214,8 +222,18 @@ The resume nudge exists because the resumed session retains its context —
 restarting the prompt would duplicate work. For outcome-bearing steps the
 nudge re-states the outcome-file instruction.
 
+Each session is resumed on **the policy it last actually ran**, recorded on the
+session itself — not on the task's first step's policy, and not on today's
+profiles. Two steps sharing a session can pin different bindings, so only the
+session knows which one took effect. A session with no recorded policy is left
+unresumed with the reason stated, rather than restored under a policy nobody
+chose; the engine will spawn it fresh if the run needs it. A step interrupted
+before its prompt went out is the one exception: its accepted binding is the
+decision the run is about to make anyway.
+
 A run that was `complete` or `failed` is never re-driven. Its sessions are
-only resumed.
+only resumed — on that same last-applied policy, which is what a follow-up,
+review feedback, or ship drafting then continues with.
 
 ### Git exclusion
 
@@ -225,9 +243,9 @@ status`, diffs, reviews, or pull requests.
 
 ## Configuration
 
-| Key | Effect |
-|---|---|
-| `judge_model` | Model for the judge session. Unset means the agent's default. |
+The engine has no model configuration of its own. Every model a run uses comes
+from the task's accepted bindings; the retired `judge_model` key configures
+nothing (see [Configuration](configuration.md#retired-keys)).
 
 ## Interfaces
 
@@ -251,17 +269,42 @@ catalog cannot change while the process runs.
 A launch validates its `workflow_name` against this registry; an unregistered
 name is rejected with `422`.
 
-### Model policy
+### Model policy per turn
 
 A step declares an abstract role, never a model. Which model answers to that
-role is the launch's choice, pinned onto the task at acceptance and read from
-there — including after a restart, and including when the profile is edited or
-deleted afterwards.
+role is the launch's choice, pinned onto the task at acceptance — one complete
+binding for every agent step and for the judge — and read from there, including
+after a restart and after the source profile is edited or deleted. Overriding a
+step's profile or role is a launch-time choice; an accepted task's policy does
+not change.
 
-Every omp process the engine starts receives the task's full role map: the
-step's active pair as `--model`/`--thinking`, and all three auxiliary roles as
-`--smol`, `--slow`, and `--plan`, each with its own thinking level. A resumed
-session has its accepted active pair re-asserted before any prompt, because a
-resumed omp restores its own settings from its session file. The child's active
-model is then read back and compared; a mismatch fails the step rather than
-prompting under a substituted model.
+Every omp process receives a complete policy: the consumer's active pair as
+`--model`/`--thinking`, and all three auxiliary roles as `--smol`, `--slow`,
+and `--plan`, each with its own thinking level.
+
+Because two steps can share one session and still differ, the policy is applied
+**before every declared turn**, at the turn boundary the engine already owns:
+
+| Situation | What happens |
+|---|---|
+| Policy unchanged | The process is kept, and its active pair is still re-asserted and read back — a cached process is not evidence that it is on the accepted model |
+| Only the active pair differs | The process is kept and reconfigured over omp's acknowledged `set_model` / `set_thinking_level`, then read back and compared exactly |
+| Any of `smol`, `slow`, `plan` differs | omp has no setter for those — they are start-time flags — so the session's native id is captured, the process is stopped gracefully, and a replacement is started with `--resume` and all four new pairs |
+
+A replacement keeps the same logical session, the same native session id, and
+its transcript; the conversation carries over. The session reads as *starting*
+briefly and the transcript channel reconnects. It is not a new conversation and
+not a failure.
+
+A policy change never interrupts work: if the session is streaming, compacting,
+holds queued messages, or has an unanswered question, the transition is refused
+as a step-infrastructure failure rather than aborting the turn.
+
+The verified policy is recorded on the session before the turn that depends on
+it. A refused configuration, a timeout, a resumed session whose identity does
+not match, or a failed record leaves no process that may be prompted: the step
+fails with the workspace and history intact.
+
+Repeated visits to a step use that step's accepted binding again. Follow-ups,
+review feedback, and ship drafting continue on the session's last applied
+policy until another declared consumer takes it over.

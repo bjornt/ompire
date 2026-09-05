@@ -166,6 +166,13 @@ insufficient to describe a run (the next epic child extends the same pinned
 document rather than replacing it), or if an external service can provide
 transactional immutable task resolution.
 
+> **Extended by [ADR-0027](0027-hand-off-model-policy-between-turns.md).** Per-step
+> overrides did arrive, and a single active pair is no longer sufficient: the
+> pinned document now carries one complete binding per model consumer, and a
+> session records which policy it last verifiably ran. Resolution still happens
+> once, at acceptance, under the same reservation and fingerprint. Nothing in
+> the record above is withdrawn.
+
 ## Alternatives considered
 
 ### Keep templates and add a profile field

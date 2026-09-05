@@ -17,19 +17,31 @@ creation time, and elapsed time.
 
 ### Accepted configuration panel
 
-The launch decision this task was accepted under: its workflow, its model
-profile and where that profile came from, the effective base branch, Workshop
-additions source and preamble with any task-local override marked, and all four
-role bindings with the steps that consume each. The judge appears as a
-consumer of the `slow` binding.
+The launch decision this task was accepted under: its workflow, the task-wide
+model profile and where it came from, the effective base branch, Workshop
+additions source and preamble with any task-local override marked, and one row
+per model consumer.
+
+Each consumer row — every declared agent step, plus the judge, marked auxiliary
+and conditional — names its source profile, its role, the concrete model and
+thinking policy those resolve to, and, separately for the profile and the role,
+whether that value was inherited or set for this step. Expanding a row shows
+the complete `smol`/`slow`/`plan` map that consumer's process carries.
 
 These are the stored values, not a recomputation — a project or profile edited
-since acceptance does not change what this panel shows or what the task runs.
+or deleted since acceptance does not change what this panel shows or what the
+task runs. A named profile is provenance; the snapshot beside it is what
+executes.
 
 While a session is live, a **Running now** table adds what omp reports it is
 actually running: the active model, the thinking policy the profile states, and
 the level omp resolved it to. Those last two differ legitimately for `auto` and
 `max`, which resolve per model.
+
+A session whose process is being replaced to apply a different policy reads as
+*starting* while that happens, and reports no model until the new one is
+verified. Transitioning is never shown as a successfully applied new policy,
+and it is not a failure: the conversation is resumed, not restarted.
 
 A task created before launch inputs were recorded shows a **Configuration
 needed** form instead: what is known, what is unknown and unrecoverable, and

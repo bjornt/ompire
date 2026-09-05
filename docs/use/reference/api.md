@@ -102,10 +102,29 @@ event; the same catalog rides in the WebSocket snapshot.
 Both launch calls take `project_name`, `workflow_name`, `slug`, `prompt`, an
 optional `model_profile` (omitted inherits the project default), and an
 optional `workspace_overrides` object limited to `base_branch`,
-`branch_pattern`, `workshop_additions`, and `preamble`. Acceptance adds the
-`preview_token`. Unknown fields — including the retired `template_name` and the
+`branch_pattern`, `workshop_additions`, and `preamble`.
+
+They also take `step_overrides` and `auxiliary_overrides`: maps keyed by
+declared agent-step name and by engine-reserved consumer name (`judge`), whose
+entries carry an optional `model_profile` and an optional `role`. An omitted or
+null field inherits, and an entry overriding neither resolves to the same
+`preview_token` as no entry. An unknown or non-agent step, an unknown auxiliary
+consumer, a role outside `default`/`smol`/`slow`/`plan`, an unknown profile, and
+any unknown field inside an entry are all `422` at the named field, creating
+nothing.
+
+Acceptance adds the `preview_token`, which covers every consumer's complete
+four-role map — so an edit to a profile's `slow` binding invalidates the review
+even though no active model changed, while an edit to an unrelated profile does
+not. Unknown top-level fields — including the retired `template_name` and the
 old scalar `model`/`thinking` overrides — are refused, not ignored. See
 [Task spawn](task-spawn.md).
+
+A preview's step rows carry `declared_role` and a `binding` object — the source
+profile, its source, the effective role, its source, and the full role map —
+identical to what acceptance stores for that consumer, or `null` for a step
+with no model. A task's `execution_inputs` carries `step_bindings` and
+`auxiliary_bindings` in that same shape.
 
 ## Sessions
 

@@ -44,6 +44,7 @@ relying on it.
 | [0024](0024-keep-operator-state-outside-package-revisions.md) | Keep operator state outside package revisions | Accepted |
 | [0025](0025-store-global-model-profiles-separately-from-launch-policy.md) | Store global model profiles separately from launch policy | Accepted |
 | [0026](0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md) | Resolve launch inputs once and pin them to the task | Accepted |
+| [0027](0027-hand-off-model-policy-between-turns.md) | Hand off model policy between turns and record what applied | Accepted |
 
 ## Template
 

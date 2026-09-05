@@ -31,10 +31,12 @@ from ompire_daemon.agent import (
     AgentStartError,
     AgentSupervisor,
     ModelConfigurationError,
+    build_agent_argv,
+    role_flag_value,
 )
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.execution_inputs import ModelPolicy
+from ompire_daemon.execution_inputs import ModelPolicy, split_model_identifier
 from ompire_daemon.registry.model_profiles import RoleBinding
 
 pytestmark = pytest.mark.skipif(shutil.which("omp") is None, reason="real omp not on PATH")
@@ -204,20 +206,36 @@ async def test_a_thinking_policy_of_off_reaches_the_provider_as_no_reasoning(
 async def test_every_auxiliary_role_is_configured_on_the_child(
     monkeypatch: pytest.MonkeyPatch, supervisor: AgentSupervisor, workdir: Path
 ) -> None:
-    """All four roles reach the process, each with its own level. omp reports
-    the active pair through `get_state`; the auxiliary flags it echoes back
-    are what a `/switch smol` inside the container would use."""
+    """All four roles reach the process, each with its own level.
+
+    Asserted through the roles themselves, not through the active pair: real
+    omp does not report its role flags in `get_state` (only the fakes do), so
+    the evidence is what a `/switch <role>` — the same lookup an internal role
+    use inside the container performs — actually resolves to.
+    """
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "capture-server-not-a-real-key")
     handle = await supervisor.start(3, "main", str(workdir), policy=_policy())
     try:
-        state = await handle.read_native_model_state()
+        active = await handle.read_native_model_state()
+        assert active is not None
+        assert (active.model, active.thinking_level) == (ACTIVE_MODEL, "low")
+
+        # Each auxiliary role carries its own pair — a different model for
+        # `smol`, and three different thinking levels.
+        smol = await _switch_to(handle, "smol")
+        assert (smol.model, smol.thinking_level) == (SMOL_MODEL, "off")
+        slow = await _switch_to(handle, "slow")
+        assert (slow.model, slow.thinking_level) == (ACTIVE_MODEL, "high")
+        plan = await _switch_to(handle, "plan")
+        assert (plan.model, plan.thinking_level) == (ACTIVE_MODEL, "medium")
+
+        # The accepted active pair is restored after the inspection, so the
+        # session is left as the operator configured it.
+        restored = await handle.apply_model_policy(_policy(), reassert=True)
+        assert restored.model == ACTIVE_MODEL
     finally:
         await supervisor.stop(3, "main")
-
-    assert state is not None
-    assert state.model == ACTIVE_MODEL
-    assert state.thinking_level == "low"
 
 
 async def test_max_resolves_to_a_model_level_without_losing_the_policy(
@@ -262,3 +280,169 @@ async def test_an_unavailable_model_fails_the_start_instead_of_substituting(
     assert supervisor.get(5, "main") is None
     detail = f"{exc_info.value}\n{getattr(exc_info.value, 'stderr', '')}".lower()
     assert "not found" in detail or "substituted" in detail
+
+
+# --- between-turn policy handoff against real omp (ADR-0027) -----------------
+#
+# The auxiliary roles are the reason this section exists. omp v18.1.10 has no
+# RPC setter for `smol`/`slow`/`plan` — they are start-time flags — so a step
+# that changes one needs the process replaced and its native session resumed.
+# Nothing in the daemon can assert that worked: only the real executable can
+# say whether the conversation came back and whether the new role flags govern
+# the roles a `/switch` reaches.
+#
+# `/switch <role>` is a local command (it answers `agentInvoked: false`), so
+# reading the active pair after one is free: it costs no provider call and it
+# reports exactly what an internal role use inside the container would run.
+
+
+async def _switch_to(handle, role: str):
+    """Ask the child to make one of its auxiliary roles active, and report
+    what that resolved to. No model is called."""
+    response = await asyncio.wait_for(handle.prompt(f"/switch {role}"), timeout=60)
+    assert (response.get("data") or {}).get("agentInvoked") is False, response
+    state = await handle.read_native_model_state()
+    assert state is not None
+    return state
+
+
+@pytest.fixture
+def recording_supervisor(monkeypatch: pytest.MonkeyPatch, workdir: Path, tmp_path: Path):
+    """Like `supervisor`, but with session recording on.
+
+    The default fixture appends `--no-session` because most of these tests
+    only care about one turn. A handoff cannot be tested that way: `--resume`
+    needs a saved conversation. `--session-dir` keeps that store inside the
+    test's own tmp_path rather than the operator's.
+    """
+    from ompire_daemon import agent as agent_module
+
+    real_build = agent_module.build_agent_argv
+    session_dir = tmp_path / "omp-sessions"
+    session_dir.mkdir()
+
+    def build(clone: str, *, policy: ModelPolicy, resume: str | None = None) -> list[str]:
+        argv = real_build(clone, policy=policy, resume=resume)
+        omp_index = argv.index("omp")
+        return [*argv[omp_index:], "--cwd", clone, "--session-dir", str(session_dir)]
+
+    async def no_preflight(clone_path: str) -> None:
+        return None
+
+    monkeypatch.setattr(agent_module, "build_agent_argv", build)
+    monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
+    return AgentSupervisor(
+        Config(agent_ready_timeout=90, agent_ring_buffer_size=200, shutdown_grace=15),
+        EventHub(),
+    )
+
+
+async def test_changed_auxiliary_roles_reach_the_child_across_a_resumed_handoff(
+    monkeypatch: pytest.MonkeyPatch, recording_supervisor: AgentSupervisor, workdir: Path
+) -> None:
+    """The whole contract in one run: a step changes all three auxiliary
+    pairs, the process is replaced, the same native session comes back with
+    its conversation, the new role map governs what each role reaches, and
+    the accepted active pair is what the next turn runs under."""
+    supervisor = recording_supervisor
+    with _CaptureServer() as server:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", f"http://127.0.0.1:{server.port}")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "capture-server-not-a-real-key")
+
+        first = await supervisor.start(10, "shared", str(workdir), policy=_policy())
+        try:
+            # A real turn, so there is a conversation worth preserving.
+            await asyncio.wait_for(first.prompt("MARKER-ALPHA say ok"), timeout=90)
+            await server.wait_for_body(timeout=90)
+            original_session = await first.read_session_id()
+            assert original_session is not None
+
+            # Under the accepted policy, `slow` is sonnet at `high`.
+            before = await _switch_to(first, "slow")
+            assert before.model == ACTIVE_MODEL
+            assert before.thinking_level == "high"
+            # Put the child back on its accepted active pair before the
+            # handoff, exactly as an inspection must.
+            await first.apply_model_policy(_policy(), reassert=True)
+
+            # A step that changes every auxiliary pair — and only those.
+            changed = _policy(
+                smol=RoleBinding(model=ACTIVE_MODEL, thinking="xhigh"),
+                slow=RoleBinding(model=SMOL_MODEL, thinking="minimal"),
+                plan=RoleBinding(model=SMOL_MODEL, thinking="off"),
+            )
+            commits: list[int] = []
+            replacement = await supervisor.apply_session_policy(
+                10,
+                "shared",
+                str(workdir),
+                policy=changed,
+                commit=lambda: commits.append(1),
+            )
+
+            # A different process, the same native session.
+            assert replacement is not first
+            assert first.returncode is not None
+            assert await replacement.read_session_id() == original_session
+            assert commits == [1]
+
+            # Each role now reaches the pair this step chose, and each carries
+            # its own thinking level rather than the active one.
+            slow = await _switch_to(replacement, "slow")
+            assert (slow.model, slow.thinking_level) == (SMOL_MODEL, "minimal")
+            plan = await _switch_to(replacement, "plan")
+            assert (plan.model, plan.thinking_level) == (SMOL_MODEL, "off")
+            smol = await _switch_to(replacement, "smol")
+            assert (smol.model, smol.thinking_level) == (ACTIVE_MODEL, "xhigh")
+
+            # Restore the accepted active pair after the inspection and prompt.
+            await replacement.apply_model_policy(changed, reassert=True)
+            server.bodies.clear()
+            await asyncio.wait_for(replacement.prompt("MARKER-BETA say ok"), timeout=90)
+            request = await server.wait_for_body(timeout=90)
+        finally:
+            await supervisor.stop(10, "shared")
+
+    # The turn after the handoff carries the conversation from before it —
+    # a matching session id is not by itself proof that history survived.
+    body = json.dumps(request)
+    assert "MARKER-ALPHA" in body
+    assert "MARKER-BETA" in body
+    # And it ran on the accepted active pair, not on a role left active by
+    # the inspection.
+    assert request["model"] == ACTIVE_ID
+
+
+async def test_a_thinking_policy_of_auto_resolves_without_being_echoed_back(
+    monkeypatch: pytest.MonkeyPatch, supervisor: AgentSupervisor, workdir: Path
+) -> None:
+    """`auto` is a policy omp resolves per model, like `max`. The daemon keeps
+    the accepted spelling and reports the resolved level separately."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "capture-server-not-a-real-key")
+    policy = _policy(default=RoleBinding(model=ACTIVE_MODEL, thinking="auto"))
+    handle = await supervisor.start(6, "main", str(workdir), policy=policy)
+    try:
+        state = await handle.read_native_model_state()
+    finally:
+        await supervisor.stop(6, "main")
+
+    assert state is not None
+    assert state.model == ACTIVE_MODEL
+    assert state.thinking_level not in (None, "auto")
+
+
+def test_a_role_flag_keeps_every_slash_after_the_provider() -> None:
+    """A nested provider catalog names models with slashes in the id. The
+    flag encoding splits the provider off the *first* slash only — a plain
+    `split("/")` would silently truncate such an id.
+
+    This is about the daemon's encoding rather than a live provider: the test
+    environment has no nested-catalog model to start, and asserting against a
+    fabricated one would prove nothing about omp.
+    """
+    nested = RoleBinding(model="openrouter/vendor/model-9", thinking="medium")
+    assert role_flag_value(nested) == "openrouter/vendor/model-9:medium"
+    assert split_model_identifier(nested.model) == ("openrouter", "vendor/model-9")
+    argv = build_agent_argv("/clone", policy=_policy(smol=nested))
+    assert argv[argv.index("--smol") + 1] == "openrouter/vendor/model-9:medium"

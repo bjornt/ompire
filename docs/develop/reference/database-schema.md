@@ -145,13 +145,29 @@ quiet across restarts while a *changed* one reopens as new evidence.
 | `spawn_completed_at` | string, nullable | |
 | `created_at`, `updated_at` | string | ISO-8601 |
 
-`execution_inputs_json` carries the four role bindings, each agent step's
-abstract role, the judge binding, the effective workspace values with their
-inheritance attribution, the rendered branch, and the project-derived checkout
-path, fetch remote, and upstream/fork routing. Everything downstream reads it;
-nothing re-resolves. Editing a project or a profile — or deleting a profile
-nothing references — changes the next launch and not this task
-([ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)).
+`execution_inputs_json` carries the effective workspace values with their
+inheritance attribution, the rendered branch, the project-derived checkout
+path, fetch remote and upstream/fork routing, and — since version 2 — one
+complete binding per model consumer. Everything downstream reads it; nothing
+re-resolves. Editing a project or a profile, or deleting a profile nothing
+references, changes the next launch and not this task
+([ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md),
+[ADR-0027](../../adr/0027-hand-off-model-policy-between-turns.md)).
+
+`step_bindings` is keyed by declared agent-step name and `auxiliary_bindings`
+by engine-reserved consumer name (today `judge`). Each entry holds the source
+profile name, that profile's source (`step`, `task`, `project`, or
+`legacy-confirmed`), the effective role, the role's source (`step` or
+`workflow`), and the full four-role snapshot the profile bound. Runtime lookup
+is exact and fails closed: a consumer with no entry is an error, never a fall
+back to the task-wide profile. `model_profile_name` remains as the task-wide
+decision unoverridden consumers inherited, not as an executable fallback.
+
+Migration `0014` converted version-1 documents — which carried one `roles` map,
+a `step_roles` map, and a `judge_role` — into version 2, using only what those
+documents already stored. It re-read no profile and consulted no current
+workflow definition, and it attributed every binding to the workflow, because
+version 1 had no way to express a per-step choice.
 
 It follows the registry's existing JSON-text convention rather than a dozen
 columns: nothing queries a task by a nested binding, and a partial update would
@@ -174,9 +190,28 @@ once.
 | `name` | string | Part of the primary key |
 | `omp_session_id` | string, nullable | The agent's own session identity |
 | `spawned_at` | string | ISO-8601 |
+| `applied_policy_json` | text, nullable | The complete model policy this session's child last verifiably ran |
 
-Sessions are addressed as `(task_id, name)`. This table holds identity only —
-live status is in-memory and does not survive a restart.
+Sessions are addressed as `(task_id, name)`. Live status is in-memory and does
+not survive a restart.
+
+`applied_policy_json` is mutable *execution state*, deliberately a different
+kind of fact from the task's immutable inputs: the task says what each consumer
+may run, the session says what actually took effect. It cannot be recomputed
+from the task document, because two steps sharing a session can pin different
+bindings and only the session knows which one applied. It holds the four-role
+policy, the source profile and role, the consumer that applied it, and whether
+it is `verified` or `migrated` — the latter meaning an upgrade derived a
+continuation policy rather than a step having applied one, which makes no claim
+about turns already taken.
+
+It is written only after the native state was verified and always before the
+turn that depends on it, so a crash between them can only lose the prompt, not
+the knowledge of how the process was configured. Recovery resumes each session
+on this record; a session that has none is left unresumed with the reason
+stated ([ADR-0027](../../adr/0027-hand-off-model-policy-between-turns.md)).
+Migration `0014` added the column and backfilled it for resumable sessions of
+version-1 tasks from those tasks' own pinned map.
 
 ## `workflow_steps`
 

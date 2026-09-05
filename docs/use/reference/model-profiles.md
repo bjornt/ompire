@@ -41,21 +41,55 @@ A slug is lowercase alphanumerics separated by single hyphens — `balanced` and
 Every profile binds all four, in this order. There are no other roles, no
 custom aliases, and no way to leave one out.
 
-| Role | Intended use | Who consumes it |
+| Role | Intended use | Declared by |
 |---|---|---|
 | `default` | The ordinary active agent | Every agent step of the built-in workflows |
 | `smol` | Lightweight work | omp's own auxiliary use inside the container |
 | `slow` | Thorough reasoning | omp's auxiliary use, and the workflow engine's conditional judge |
 | `plan` | Planning | omp's own auxiliary use inside the container |
 
+The third column is what a consumer *declares*, not what it is stuck with: any
+of the four roles can be selected for any agent step or for the judge at
+launch. See [Per-consumer
+precedence](#per-consumer-precedence).
+
 All four reach every omp process Ompire starts for a task, each with its own
 thinking level — the active pair as `--model`/`--thinking`, and the other three
 as omp's `--smol`, `--slow`, and `--plan` role flags. There is no separate
-setting for the judge: it runs on this profile's `slow` binding, shown in the
-launch preview like every other model consumer.
+setting for the judge: it is an ordinary model consumer, declaring `slow` and
+shown in the launch preview like every other one.
 
 The same model and level may be used for several roles — the roles are
 distinct bindings, not distinct models.
+
+## Per-consumer precedence
+
+A profile is chosen per *model consumer*: every declared agent step of the
+workflow, plus the judge. Each consumer resolves two things independently.
+
+| Dimension | Order, narrowest first |
+|---|---|
+| Profile | the step's own choice → the task-wide choice → the project's default |
+| Role | the step's own choice → the role the workflow declares |
+
+The role then selects one complete `(model, thinking)` pair out of the
+effective profile. Changing a role changes the model and the thinking level
+together — that is what makes a role an abstraction rather than a label — and
+it never rewrites the profile's other role bindings. The process still carries
+the whole native map, so a `/switch smol` inside the container reaches what the
+profile says.
+
+A task-wide profile is required even when every step overrides it: it is what
+unoverridden consumers inherit, and the judge inherits it too unless you say
+otherwise.
+
+A step you have not touched follows the task-wide choice; one you set stays
+where you put it, even if it happens to equal what it would have inherited.
+Both are visible per row before launch and per consumer after acceptance.
+
+The row-level choices are made in the [Spawn view](task-spawn.md), not here.
+Editing a profile is how you change what a model *is*; overriding a step is how
+you change which profile that step uses.
 
 ### Model identifiers
 
@@ -188,6 +222,13 @@ the project API.
 Saved profiles and project assignments are stored in the daemon's database.
 They survive a browser reload, a reconnect, and a daemon restart. Rejected
 operations never publish a successful-looking change.
+
+An accepted task holds a *snapshot* of every binding it uses, not a live
+reference. Editing a profile changes what the next launch resolves to and
+nothing about a task already accepted — including one whose individual steps
+selected that profile. Deleting a profile is refused only while a project uses
+it as a default; a task that was accepted with it keeps running exactly as
+accepted, and its task detail still names it as the source.
 
 Existing projects have no default after upgrading. None is inferred from a
 template's model, from configured provider credentials, from omp's own

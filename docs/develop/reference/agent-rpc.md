@@ -64,6 +64,40 @@ prompted. Thinking is a policy, not a resolved value: omp may resolve `auto`
 and `max` to a model-specific level, and the accepted policy and the observed
 resolved level stay separately visible rather than one overwriting the other.
 
+### Changing policy on a live session
+
+Consumers of one session can pin different policies
+([ADR-0027](../../adr/0027-hand-off-model-policy-between-turns.md)), and the
+native contract is asymmetric: `set_model` and `set_thinking_level` exist,
+while `--smol`, `--slow`, and `--plan` are start-time flags with no setter
+(verified against omp v18.1.10). The supervisor therefore owns a **per-session
+boundary** — per session, never per task, and never held across a turn, since a
+turn can wait for an operator's answer — and inside it:
+
+| Difference from what the session is running | Action |
+|---|---|
+| None | Keep the process; still reassert and read back the active pair, because a cached handle is not evidence |
+| Active pair only | Keep the process; `set_model`, then `set_thinking_level`, then read back and compare exactly |
+| Any auxiliary pair | Capture the native session id off the running child, stop it gracefully so container-side omp flushes its session file, and start a replacement with `--resume` and all four new pairs |
+
+A transition is refused unless the child is at a turn boundary: `get_state`'s
+`isStreaming`, `isCompacting`, and `queuedMessageCount`, plus any tracked
+unanswered question, all mean the change fails through the ordinary
+infrastructure path rather than aborting work.
+
+A replacement is verified before it may be prompted: the resumed session id
+must equal the captured one — omp opens a *new* session when the recorded id
+names nothing, which would look like continuity and be a fresh context — and
+the active pair is read back as usual. The verified policy is recorded durably
+before the turn that depends on it. Any refusal, timeout, identity mismatch, or
+failed record leaves no promptable handle: the candidate is stopped and the
+consumer fails.
+
+The replacement inherits the logical session: the `(task_id, session)` key, the
+tracker entry, and the bounded event ring buffer carry over, and the retired
+child is flagged so its exit is not published as a crash and cannot unregister
+or fail its successor. Model choice is never part of session identity.
+
 ### Request correlation
 
 Requests are NDJSON frames with daemon-generated unique ids. `response` frames
@@ -134,9 +168,15 @@ The daemon observes every child exit, any cause and any code, publishes
 stream, and deregisters the agent.
 
 **A mid-run exit is never auto-restarted or auto-resumed.** Resuming happens
-only as part of daemon-startup recovery. An agent that died while the daemon
-was healthy died for a reason the daemon does not understand, and restarting
-it would hide that.
+only as part of daemon-startup recovery, or as the second half of a deliberate
+policy handoff. An agent that died while the daemon was healthy died for a
+reason the daemon does not understand, and restarting it would hide that.
+
+An exit that *is* part of a handoff publishes no `agent_exited` and does not
+fail the session: the replacement owns the session from that point. The
+per-session event channel closes with code `4409` ("agent replaced") instead of
+`1000`, so a connected client reconnects to the replacement and replays the
+carried-over transcript rather than treating it as finished.
 
 ## Failures and recovery
 
@@ -146,6 +186,9 @@ it would hide that.
 | No `ready` frame within the timeout | Child killed, start fails with a timeout error |
 | `response` reports failure | The request fails with the frame's error text |
 | omp refuses the model or thinking level, reports no active model, or resolves to a different one | Start fails with a model-configuration error and the child is killed; no prompt is sent under substituted settings |
+| A policy change is due while the session is streaming, compacting, holds queued messages, or has an unanswered question | Refused as a session-busy error; the turn in flight is untouched |
+| A process must be replaced but omp does not name its native session | Refused; a fresh conversation is never substituted for a resume |
+| A replacement resumes a different native session, or its applied policy cannot be recorded | The candidate is stopped and the consumer fails; the previous durable record and conversation stand |
 | Stop on a session with no live agent | `409` |
 | Stop for an unknown task or undeclared session name | `404` |
 
