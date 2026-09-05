@@ -258,6 +258,18 @@ export function SpawnView() {
     [modelProfiles],
   );
 
+  /** A signature of the profile registry.
+   *
+   * A profile edited or deleted while the form is open changes what these
+   * selections resolve to, and a row still showing the old model would be a
+   * lie — most visibly for a profile that no longer exists at all. Keyed on
+   * the values rather than the array identity so an unrelated snapshot does
+   * not re-resolve a draft that cannot have changed. */
+  const profileRevision = useMemo(
+    () => JSON.stringify(modelProfiles.map((p) => [p.name, p.roles])),
+    [modelProfiles],
+  );
+
   // Every change to an effective choice re-resolves. Stale responses are
   // dropped by generation, so the rows on screen always describe the draft
   // as it stands.
@@ -284,7 +296,9 @@ export function SpawnView() {
     return () => {
       cancelled = true;
     };
-  }, [launchInput]);
+    // `profileRevision` is a dependency, not an input: it re-resolves when
+    // the registry moves under an open draft.
+  }, [launchInput, profileRevision]);
 
   const locked = phase.kind !== "idle";
   const spawnedId = phase.kind === "launching" || phase.kind === "failed" ? phase.taskId : null;

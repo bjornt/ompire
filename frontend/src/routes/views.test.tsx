@@ -591,6 +591,32 @@ describe("SpawnView", () => {
     expect(within(control).getByRole("option", { name: /unavailable/ })).toBeInTheDocument();
   });
 
+  it("re-resolves when the profile registry moves under an open draft", async () => {
+    const fetchMock = stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+    const before = fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/preview").length;
+
+    // Editing a profile changes what these selections resolve to. Leaving the
+    // old model on screen would be a lie, so the form asks the daemon again
+    // rather than continuing to show a resolution that no longer holds.
+    act(() => {
+      socket().emit("model_profile_updated", {
+        ...balanced,
+        roles: {
+          ...balanced.roles,
+          slow: { model: "openai/o4", thinking: "minimal" },
+        },
+      });
+    });
+
+    await waitFor(() => {
+      const after = fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/preview").length;
+      expect(after).toBeGreaterThan(before);
+    });
+  });
+
   it("sends only the advanced fields the operator actually overrode", async () => {
     const fetchMock = stubLaunchFetch();
     await renderAt("/spawn", launchSnapshot);
