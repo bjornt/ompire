@@ -100,6 +100,9 @@ class Task:
     workflow_name: str
     workflow_status: str | None
     workflow_step: str | None
+    # The declared ending a format-2 run reached; None while it runs, and
+    # for every format-1 run (ADR-0029).
+    workflow_result: str | None
     pr_url: str | None
     pr_state: str | None
     pr_merged_at: str | None
@@ -225,6 +228,7 @@ def _row_to_task(row) -> Task:
         workflow_name=row.workflow_name,
         workflow_status=row.workflow_status,
         workflow_step=row.workflow_step,
+        workflow_result=row.workflow_result,
         pr_url=row.pr_url,
         pr_state=row.pr_state,
         pr_merged_at=row.pr_merged_at,
@@ -269,6 +273,7 @@ def create_task(
         "workflow_name": workflow_name,
         "workflow_status": None,
         "workflow_step": None,
+        "workflow_result": None,
         "pr_url": None,
         "spawn_completed_at": None,
         "created_at": now,

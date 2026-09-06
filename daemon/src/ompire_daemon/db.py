@@ -171,6 +171,12 @@ tasks = Table(
     Column("workflow_name", String, nullable=False, server_default="single-step"),
     Column("workflow_status", String, nullable=True),
     Column("workflow_step", String, nullable=True),
+    # The declared ending a format-2 run reached (ADR-0029): `validated`,
+    # `stopped-without-fix`, and so on. `workflow_status` says the run stopped;
+    # only this says what stopping meant. NULL for a run still going, and for
+    # every format-1 run — those have no name for their ending and none is
+    # invented for them.
+    Column("workflow_result", String, nullable=True),
     Column("pr_url", String, nullable=True),
     Column("pr_state", String, nullable=True),
     Column("pr_merged_at", String, nullable=True),
@@ -230,6 +236,13 @@ workflow_step_records = Table(
     # the attempt's evidence with a synthetic success is exactly what this
     # column exists to avoid.
     Column("pause_json", Text, nullable=True),
+    # The prior attempts this attempt bound when it opened (ADR-0029), alias →
+    # `{step, seq}` or null for an optional selector that matched nothing.
+    # Frozen: the prompt, the routing decision, the gate message, and recovery
+    # all read these same records, so what a step was given cannot drift as
+    # later attempts land. NULL means the attempt recorded none — a format-1
+    # attempt, or one whose step declares no evidence — never an empty binding.
+    Column("evidence_json", Text, nullable=True),
     Column("prompted_at", String, nullable=True),
     Column("started_at", String, nullable=False),
     Column("finished_at", String, nullable=True),

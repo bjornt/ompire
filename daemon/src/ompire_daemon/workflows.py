@@ -39,9 +39,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import signal
 import traceback
+from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
@@ -68,22 +70,30 @@ from ompire_daemon.registry.sessions import (
 from ompire_daemon.registry.tasks import require_task_inputs, task_payload
 from ompire_daemon.registry.workflow_definitions import register_revisions
 from ompire_daemon.registry.workflows import (
+    GATE_SNAPSHOT_VERSION,
+    MAX_FEEDBACK_BYTES,
     PAUSE_CONDITION_UNRESOLVED,
+    PAUSE_MISSING_EVIDENCE,
     PAUSE_MISSING_OUTCOME,
     PAUSE_PROMPT_UNRENDERABLE,
     PAUSE_UNRESOLVED_DECISION,
     RETRY_NOTE,
     StepRecord,
+    WorkflowGateChoiceError,
     WorkflowWaitConflictError,
     append_step_record,
+    build_gate_snapshot,
     build_pause,
     finish_step_record,
+    get_step_record,
     latest_step_record,
     list_step_records,
     mark_prompt_sent,
     park_gate,
     pause_step,
+    resolve_gate,
     retry_paused_step,
+    set_run_complete,
     set_run_failed,
     set_run_status,
 )
@@ -92,11 +102,14 @@ from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.workflow_definitions import (
     AgentStep,
     CommandStep,
+    CompleteDestination,
     DecisionStep,
     Destination,
     EvaluationContext,
+    EvidenceBinding,
     GateStep,
     HistoryRecord,
+    OutcomeContract,
     PauseDestination,
     RenderError,
     Step,
@@ -105,10 +118,16 @@ from ompire_daemon.workflow_definitions import (
     WorkflowDefinition,
     WorkflowDocumentError,
     WorkflowRevision,
+    bindings_document,
+    bindings_from_document,
     describe,
+    destination_document,
     evaluate_predicate,
+    evidence_views,
     load_definition,
     render_text,
+    resolve_evidence,
+    validate_result_document,
 )
 
 if TYPE_CHECKING:
@@ -133,6 +152,120 @@ When you have finished the work above, write your result as JSON to \
   "summary": "<one-paragraph human-readable result>",
   "artifacts": {{ "<name>": "<value>", ... }}   // optional
 }}"""
+
+# --- format-2 result protocol (ADR-0029) -------------------------------------
+# Same file, same fresh-file lifecycle, a different envelope: version 2 names a
+# *declared* result instead of a generic success/failed, and carries the
+# artifacts that result promised. The instruction is built per step, because
+# what counts as a result is a property of the step, not of the engine.
+
+MAX_RESULT_BYTES = 1024 * 1024
+MAX_RESULT_DEPTH = 32
+
+
+def result_instruction(contract: OutcomeContract) -> str:
+    """The outcome block for one step's declared results.
+
+    Spelled out per result rather than as a generic schema, so the agent is
+    told the exact names it may use and the exact fields each one owes. A
+    negative result is listed beside a positive one on purpose: reporting one
+    is finishing the step, not failing it.
+    """
+    lines = [
+        "When you have finished the work above, write your result as JSON to "
+        f"`{OUTCOME_PATH}` with exactly this envelope:",
+        "{",
+        '  "version": 2,',
+        '  "result": "<one of the results below>",',
+        '  "summary": "<one-paragraph human-readable result>",',
+        '  "artifacts": { "<name>": <value>, ... }',
+        "}",
+        "",
+        "This step declares these results:",
+    ]
+    for result in contract.results:
+        if result.required:
+            fields = ", ".join(
+                f"{field} ({declared})" for field, declared in result.required
+            )
+            lines.append(f'- "{result.name}" — required artifacts: {fields}')
+        else:
+            lines.append(f'- "{result.name}" — no required artifacts')
+    lines.extend(
+        [
+            "",
+            "Report the result that is actually true, including a negative "
+            "one: every result listed above has a declared route, and a "
+            "negative result is a real answer rather than a failure. Do not "
+            "use a name that is not listed, and do not leave a required "
+            "artifact empty — the run stops for a person rather than "
+            "continuing on a result it cannot read.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r}")
+        seen[key] = value
+    return seen
+
+
+def _check_bounds(value: Any, depth: int = 0) -> str | None:
+    """Depth and finiteness, checked over the parsed document.
+
+    A result is data the daemon stores, re-serializes, and shows. A document
+    that is too deep or holds an infinity is refused at this boundary rather
+    than somewhere later that cannot say what went wrong.
+    """
+    if depth > MAX_RESULT_DEPTH:
+        return f"result document nests deeper than {MAX_RESULT_DEPTH}"
+    if isinstance(value, float) and not math.isfinite(value):
+        return "result document contains a non-finite number"
+    if isinstance(value, list):
+        for item in value:
+            reason = _check_bounds(item, depth + 1)
+            if reason is not None:
+                return reason
+    elif isinstance(value, dict):
+        for item in value.values():
+            reason = _check_bounds(item, depth + 1)
+            if reason is not None:
+                return reason
+    return None
+
+
+def read_result(
+    clone_path: str, contract: OutcomeContract
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read and validate a format-2 result against the step's contract.
+
+    Returns `(document, None)` or `(None, reason)`. Every refusal is a reason
+    an operator can act on, and none of them is ever silently a result.
+    """
+    path = Path(clone_path) / OUTCOME_PATH
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None, "no result file written"
+    if len(raw) > MAX_RESULT_BYTES:
+        return None, f"result file is larger than {MAX_RESULT_BYTES} bytes"
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "result file is not valid UTF-8"
+    try:
+        document = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    except ValueError as exc:
+        return None, f"result file is not valid JSON: {exc}"
+    reason = _check_bounds(document)
+    if reason is not None:
+        return None, reason
+    return validate_result_document(document, contract)
+
 
 # Sent once to a session whose in-flight turn was lost to a daemon restart
 # (design D-6); the resumed session retains its context, so this only asks it
@@ -328,7 +461,8 @@ class _StepResult:
     outcome: dict[str, Any] | None = None
     error_note: str | None = None  # recorded on an otherwise-ok record
     destination: Destination | None = None  # decisions: the chosen route
-    gate_message: str | None = None  # a declared gate parks the run here
+    gate_message: str | None = None  # a format-1 gate parks the run here
+    gate_snapshot: dict[str, Any] | None = None  # a format-2 gate's question
     pause: _Pause | None = None  # the engine will not guess
 
 
@@ -348,8 +482,36 @@ class _Attempt:
     retry: bool = False  # an operator-authorized retry after a pause
 
 
+def history_records(
+    records: list[StepRecord], before_seq: int | None = None
+) -> tuple[HistoryRecord, ...]:
+    """Persisted attempts as expressions see them, optionally cut at `before_seq`.
+
+    Each record carries its own frozen bindings, so a later step can ask which
+    attempt an earlier one was actually looking at.
+    """
+    return tuple(
+        HistoryRecord(
+            seq=record.seq,
+            step=record.step,
+            status=record.status,
+            outcome=record.outcome,
+            evidence=(record.evidence or {}).get("bindings")
+            if record.evidence
+            else None,
+        )
+        for record in records
+        if before_seq is None or record.seq < before_seq
+    )
+
+
 def evaluation_context(
-    task: Task, inputs: TaskExecutionInputs, records: list[StepRecord], before_seq: int
+    task: Task,
+    inputs: TaskExecutionInputs,
+    records: list[StepRecord],
+    before_seq: int,
+    *,
+    bindings: Sequence[EvidenceBinding] = (),
 ) -> EvaluationContext:
     """What a definition may read at this attempt's entry.
 
@@ -357,7 +519,12 @@ def evaluation_context(
     prompt sees what happened *before* it — which is how a retried `fix` can
     carry the previous iteration's rejection report without reading its own
     empty record.
+
+    `bindings` are what *this* attempt froze when it opened. They are resolved
+    into views here rather than re-selected, so the prompt, the route, and a
+    restart three days later all read the same records.
     """
+    history = history_records(records, before_seq)
     return EvaluationContext(
         inputs={
             "task.prompt": task.prompt,
@@ -365,16 +532,25 @@ def evaluation_context(
             "task.branch": task.branch,
             "workspace.preamble": inputs.preamble,
         },
-        records=tuple(
-            HistoryRecord(
-                seq=record.seq,
-                step=record.step,
-                status=record.status,
-                outcome=record.outcome,
-            )
-            for record in records
-            if record.seq < before_seq
-        ),
+        records=history,
+        evidence=evidence_views(bindings, history),
+    )
+
+
+def missing_required_evidence(
+    step: Step, bindings: Sequence[EvidenceBinding]
+) -> tuple[str, ...]:
+    """Declared-required selectors this attempt could not bind.
+
+    Read back from the attempt's own persisted bindings rather than
+    re-selected, so a restart reaches the same verdict as the first entry did.
+    """
+    bound = {binding.name: binding for binding in bindings}
+    return tuple(
+        selector.name
+        for selector in step.evidence
+        if selector.required
+        and (selector.name not in bound or bound[selector.name].seq is None)
     )
 
 
@@ -453,6 +629,109 @@ class WorkflowRunner:
             raise WorkflowNotWaitingError(task_id, task.workflow_status)
         future.set_result(note)
 
+    def answer_gate(
+        self,
+        task: Task,
+        revision: WorkflowRevision,
+        *,
+        expected_seq: int,
+        choice_id: str,
+        note: str | None,
+    ) -> Task:
+        """Answer a format-2 gate with one of its declared choices.
+
+        The whole point is the order: validate against the attempt the
+        operator was looking at, commit the decision *and* the run's next state
+        together, and only then wake the parked run. The previous design
+        acknowledged first and advanced afterwards, which meant a crash in
+        between silently discarded a decision a person had already made.
+
+        Feedback is data. It is recorded verbatim, shown back as text, and
+        handed to a later prompt as content — it never names a route, and a
+        choice cannot grant authority the definition did not declare.
+        """
+        definition = revision.definition
+        record = latest_step_record(self._engine, task.id)
+        if (
+            task.workflow_status != "waiting"
+            or record is None
+            or record.status != "waiting"
+        ):
+            raise WorkflowNotWaitingError(task.id, task.workflow_status)
+        if record.seq != expected_seq:
+            raise WorkflowWaitConflictError(task.id, expected_seq, record.seq)
+        if record.pause is not None:
+            # An uncertainty pause is not a question with options. Answering it
+            # with a choice would be answering something nobody asked.
+            raise WorkflowNotWaitingError(task.id, "uncertainty-pause")
+        step = definition.step_named(record.step)
+        if not isinstance(step, GateStep) or not step.choices:
+            raise WorkflowGateChoiceError(
+                f"the step {record.step!r} does not offer named choices"
+            )
+        choice = step.choice_named(choice_id)
+        if choice is None:
+            raise WorkflowGateChoiceError(
+                f"{choice_id!r} is not one of this gate's choices: "
+                f"{', '.join(c.id for c in step.choices)}"
+            )
+        feedback = note if note is not None and note.strip() else None
+        if choice.feedback_required and feedback is None:
+            raise WorkflowGateChoiceError(
+                f"the choice {choice_id!r} requires feedback", field="note"
+            )
+        if feedback is not None and len(feedback.encode("utf-8")) > MAX_FEEDBACK_BYTES:
+            raise WorkflowGateChoiceError(
+                f"feedback is longer than {MAX_FEEDBACK_BYTES} bytes", field="note"
+            )
+
+        successor: tuple[str, str, str | None, dict[str, Any] | None] | None = None
+        terminal_result: str | None = None
+        if isinstance(choice.next, StepDestination):
+            records = list_step_records(self._engine, task.id)
+            target = definition.step_named(choice.next.step)
+            assert target is not None  # validated at load
+            # A human answer passes through the same visit bound as any other
+            # edge: a gate can route into a loop, but it cannot refill it.
+            target = self._bounded_step(task.id, definition, target, records)
+            _bindings, document = self._entry_evidence(target, records)
+            successor = (
+                target.name,
+                target.kind,
+                target.session if isinstance(target, AgentStep) else None,
+                document,
+            )
+        else:
+            assert isinstance(choice.next, CompleteDestination)
+            terminal_result = choice.next.result
+
+        _record, updated = resolve_gate(
+            self._engine,
+            task.id,
+            expected_seq,
+            choice_id=choice_id,
+            feedback=feedback,
+            successor=successor,
+            terminal_result=terminal_result,
+        )
+        answered = get_step_record(self._engine, task.id, expected_seq)
+        self._publish_gate_step(
+            task.id,
+            step.name,
+            "ok",
+            snapshot=answered.outcome if answered is not None else None,
+        )
+        self._publish_task_updated(updated)
+        future = self._gate_waits.get(task.id)
+        if future is not None and not future.done():
+            future.set_result(None)
+        elif successor is not None:
+            # No coroutine was parked on this gate — a run whose loop is gone
+            # while the decision still stands. The state is already committed,
+            # so re-drive from it rather than losing the answer.
+            self._kick(task.id, require_task_inputs(updated), revision, recover=True)
+        return updated
+
     def retry_step(
         self, task: Task, revision: WorkflowRevision, *, expected_seq: int
     ) -> Task:
@@ -464,11 +743,31 @@ class WorkflowRunner:
         never a second attempt appended for the same decision.
         """
         inputs = require_task_inputs(task)
+        definition = revision.definition
+        target = self._retry_target(task.id, definition, expected_seq)
+        # The retry is a new attempt, so it binds its own evidence: re-reading
+        # the recorded history is exactly what an operator asked for, and the
+        # step that produces a missing handoff may have run since.
+        records = list_step_records(self._engine, task.id)
+        retry_name = target[0] if target is not None else None
+        if retry_name is None:
+            waiting = next((r for r in records if r.seq == expected_seq), None)
+            pause = waiting.pause if waiting is not None else None
+            retry_name = (pause or {}).get("retry_step") or (
+                waiting.step if waiting is not None else None
+            )
+        retry_step = definition.step_named(retry_name) if retry_name else None
+        _bindings, document = (
+            self._entry_evidence(retry_step, records)
+            if retry_step is not None
+            else ((), None)
+        )
         record, updated = retry_paused_step(
             self._engine,
             task.id,
             expected_seq,
-            target=self._retry_target(task.id, revision.definition, expected_seq),
+            target=target,
+            evidence=document,
         )
         step = revision.definition.step_named(record.step)
         if step is None:
@@ -587,11 +886,38 @@ class WorkflowRunner:
         else:
             current = self._open(task_id, definition, definition.steps[0])
 
+        terminal_result: str | None = None
         while current is not None:
             task = get_task(self._engine, task_id)
             records = list_step_records(self._engine, task_id)
-            ctx = evaluation_context(task, inputs, records, current.record.seq)
             step = current.step
+            bindings = bindings_from_document(current.record.evidence)
+            missing = missing_required_evidence(step, bindings)
+            if missing:
+                # The attempt exists and says what it could not find. Prompting
+                # anyway would send an agent to work without a handoff its
+                # author declared it must have, and routing anyway would decide
+                # on evidence nobody produced.
+                listed = ", ".join(repr(name) for name in missing)
+                self._pause(
+                    task_id,
+                    step,
+                    current.record.seq,
+                    _Pause(
+                        reason=PAUSE_MISSING_EVIDENCE,
+                        message=(
+                            f"The step {step.name!r} requires evidence that does "
+                            f"not exist yet ({listed}). Retry it once the step "
+                            "that produces it has run; retrying re-selects from "
+                            "the recorded history and nothing else."
+                        ),
+                        error=f"required evidence missing: {listed}",
+                    ),
+                )
+                return
+            ctx = evaluation_context(
+                task, inputs, records, current.record.seq, bindings=bindings
+            )
             updated = set_run_status(self._engine, task_id, "running", step.name)
             self._publish_task_updated(updated)
             self._publish_step(task_id, step, "started")
@@ -611,6 +937,17 @@ class WorkflowRunner:
             if result.pause is not None:
                 self._pause(task_id, step, current.record.seq, result.pause)
                 return
+
+            if result.gate_snapshot is not None:
+                # A gate with declared choices. Answering it is a transaction
+                # the operator's request commits, so this coroutine parks and
+                # then reads what was committed rather than deciding anything.
+                current = await self._park_at_choice_gate(
+                    task_id, definition, step, current.record.seq, result.gate_snapshot
+                )
+                if current is None:
+                    return  # completed, or re-parked, inside the answer
+                continue
 
             if result.gate_message is not None:
                 next_step = await self._park_at_gate(
@@ -633,13 +970,17 @@ class WorkflowRunner:
             )
             self._publish_step(task_id, step, "ok")
             next_step = self._destination_step(definition, step, result.destination)
-            current = (
-                self._open(task_id, definition, next_step)
-                if next_step is not None
-                else None
-            )
+            if next_step is None:
+                terminal_result = (
+                    result.destination.result
+                    if isinstance(result.destination, CompleteDestination)
+                    else None
+                )
+                current = None
+            else:
+                current = self._open(task_id, definition, next_step)
 
-        updated = set_run_status(self._engine, task_id, "complete", None)
+        updated = set_run_complete(self._engine, task_id, terminal_result)
         self._publish_task_updated(updated)
 
     def _destination_step(
@@ -654,18 +995,21 @@ class WorkflowRunner:
             return target
         return None  # `complete` — a pause never reaches here
 
-    def _open(
-        self, task_id: int, definition: WorkflowDefinition, step: Step
-    ) -> _Attempt:
-        """Append the next attempt, enforcing declared visit bounds first.
+    def _bounded_step(
+        self,
+        task_id: int,
+        definition: WorkflowDefinition,
+        step: Step,
+        records: list[StepRecord],
+    ) -> Step:
+        """Where opening this step actually lands, honouring declared bounds.
 
-        The bound is checked here, in the engine, and not by any route
+        The bound is enforced here, in the engine, and not by any route
         predicate: a definition whose routing is wrong must still not be able
         to loop forever, so the count that stops it is the one taken before a
-        new attempt is opened. Resuming an already-open attempt never passes
-        through here, which is why a restart costs no visit.
+        new attempt is opened. A human answer routes through this too — a
+        retry choice is not a way past a budget the definition set.
         """
-        records = list_step_records(self._engine, task_id)
         seen: set[str] = set()
         while step.max_visits is not None:
             attempts = len([r for r in records if r.step == step.name])
@@ -685,12 +1029,40 @@ class WorkflowRunner:
                 target.name,
             )
             step = target
+        return step
+
+    def _entry_evidence(
+        self, step: Step, records: list[StepRecord]
+    ) -> tuple[tuple[EvidenceBinding, ...], dict[str, Any] | None]:
+        """Resolve this step's selectors against history, once.
+
+        The document is None when the step declares no evidence, so a
+        format-1 attempt and a format-2 step with nothing to bind stay
+        distinguishable from one that bound nothing.
+        """
+        if not step.evidence:
+            return (), None
+        bindings, _missing = resolve_evidence(step, history_records(records))
+        return bindings, bindings_document(bindings)
+
+    def _open(
+        self, task_id: int, definition: WorkflowDefinition, step: Step
+    ) -> _Attempt:
+        """Append the next attempt: bound first, then freeze its evidence.
+
+        Resuming an already-open attempt never passes through here, which is
+        why a restart costs no visit and re-binds no evidence.
+        """
+        records = list_step_records(self._engine, task_id)
+        step = self._bounded_step(task_id, definition, step, records)
+        _bindings, document = self._entry_evidence(step, records)
         record = append_step_record(
             self._engine,
             task_id,
             step=step.name,
             kind=step.kind,
             session=step.session if isinstance(step, AgentStep) else None,
+            evidence=document,
         )
         return _Attempt(record=record, step=step)
 
@@ -727,6 +1099,67 @@ class WorkflowRunner:
                 "pause": document,
             },
         )
+
+    async def _park_at_choice_gate(
+        self,
+        task_id: int,
+        definition: WorkflowDefinition,
+        step: Step,
+        seq: int,
+        snapshot: dict[str, Any],
+    ) -> _Attempt | None:
+        """Persist a format-2 gate's question, park, and resume where the
+        committed answer said to go."""
+        _record, updated = park_gate(
+            self._engine,
+            task_id,
+            seq,
+            step=step.name,
+            message=snapshot["message"],
+            snapshot=snapshot,
+        )
+        self._publish_task_updated(updated)
+        self._publish_gate_step(
+            task_id, step.name, "waiting", snapshot["message"], snapshot=snapshot
+        )
+        return await self._await_choice(task_id, definition, seq)
+
+    async def _await_choice(
+        self, task_id: int, definition: WorkflowDefinition, seq: int
+    ) -> _Attempt | None:
+        """Park until an answer is committed, then read what it committed to.
+
+        Nothing is decided here. `answer_gate` has already written the choice,
+        finished this attempt, and either opened the successor or completed the
+        run, all in one transaction; this future is a notification, not the
+        authority. That is why a crash between the two loses nothing: the
+        commit already happened or it did not.
+        """
+        future: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
+        self._gate_waits[task_id] = future
+        try:
+            await future
+        finally:
+            self._gate_waits.pop(task_id, None)
+        return self._attempt_after_decision(task_id, definition, seq)
+
+    def _attempt_after_decision(
+        self, task_id: int, definition: WorkflowDefinition, seq: int
+    ) -> _Attempt | None:
+        """The successor the committed answer opened, or None if it completed."""
+        record = latest_step_record(self._engine, task_id)
+        if record is None or record.seq <= seq:
+            return None  # the answer completed the run
+        step = definition.step_named(record.step)
+        if step is None:  # pragma: no cover - the destination was validated
+            failed = set_run_failed(
+                self._engine,
+                task_id,
+                f"step {record.step!r} is not declared by the pinned revision",
+            )
+            self._publish_task_updated(failed)
+            return None
+        return _Attempt(record=record, step=step)
 
     async def _park_at_gate(
         self,
@@ -806,12 +1239,21 @@ class WorkflowRunner:
                 )
                 return None
             # Declared gate: re-arm the SAME record (history stays one row)
-            # and re-broadcast the persisted message.
-            message = (last.outcome or {}).get("message")
+            # and re-broadcast the persisted question.
+            snapshot = last.outcome or {}
+            message = snapshot.get("message")
             if not isinstance(message, str) or not message:
                 message = "workflow gate"
             updated = set_run_status(self._engine, task_id, "waiting", last.step)
             self._publish_task_updated(updated)
+            if snapshot.get("version") == GATE_SNAPSHOT_VERSION:
+                # An unanswered question is the same question. Nothing is
+                # re-rendered and no choice is re-derived from today's
+                # definition: what was asked is what is still being asked.
+                self._publish_gate_step(
+                    task_id, last.step, "waiting", message, snapshot=snapshot
+                )
+                return await self._await_choice(task_id, definition, last.seq)
             self._publish_gate_step(task_id, last.step, "waiting", message)
             next_step = await self._await_gate(
                 task_id, definition, last.seq, last.step, message
@@ -819,8 +1261,9 @@ class WorkflowRunner:
             if next_step is None:
                 # The gate is the last declared step: resuming fell off the
                 # end — complete the run here, mirroring the main loop's
-                # fall-off (bugfix's `escalate` gate relies on this).
-                updated = set_run_status(self._engine, task_id, "complete", None)
+                # fall-off (bugfix's `escalate` gate relies on this). Format 1
+                # has no name for that ending, and none is invented.
+                updated = set_run_complete(self._engine, task_id, None)
                 self._publish_task_updated(updated)
                 return None
             return self._open(task_id, definition, next_step)
@@ -851,14 +1294,34 @@ class WorkflowRunner:
             route = last.outcome.get("route")
             if route == COMPLETE:
                 # The run completed itself at the decision; a restart in the
-                # narrow window before the status write lands completes here.
-                updated = set_run_status(self._engine, task_id, "complete", None)
+                # narrow window before the status write lands completes here,
+                # with the ending the decision recorded rather than a fresh
+                # evaluation against history that has moved on.
+                result = last.outcome.get("result")
+                updated = set_run_complete(
+                    self._engine, task_id, result if isinstance(result, str) else None
+                )
                 self._publish_task_updated(updated)
                 return None
             if isinstance(route, str):
                 target = definition.step_named(route)
                 if target is not None:
                     return self._open(task_id, definition, target)
+        if last.kind == "gate" and (last.outcome or {}).get(
+            "version"
+        ) == GATE_SNAPSHOT_VERSION:
+            # A format-2 gate has no fall-through: its choices are its only
+            # edges, and answering one commits the successor in the same
+            # transaction. Reaching here means the answer and the successor
+            # disagree, so say so instead of walking to the next declared step.
+            updated = set_run_failed(
+                self._engine,
+                task_id,
+                f"the answered gate {last.step!r} has no recorded successor; "
+                "the run cannot continue without inventing a route",
+            )
+            self._publish_task_updated(updated)
+            return None
         following = definition.step_after(last.step)
         return (
             self._open(task_id, definition, following) if following is not None else None
@@ -894,7 +1357,26 @@ class WorkflowRunner:
                     error=exc.reason,
                 )
             )
-        return _StepResult(gate_message=message)
+        if not step.choices:
+            return _StepResult(gate_message=message)
+        # The question, captured whole before anyone can answer it: the text
+        # shown, the options offered, and the records it is asking about.
+        # An answer means nothing without the question it answered.
+        return _StepResult(
+            gate_snapshot=build_gate_snapshot(
+                message=message,
+                choices=[
+                    {
+                        "id": choice.id,
+                        "label": choice.label,
+                        "feedback_required": choice.feedback_required,
+                        "next": destination_document(choice.next, 2),
+                    }
+                    for choice in step.choices
+                ],
+                evidence=(attempt.record.evidence or {}).get("bindings", {}),
+            )
+        )
 
     def _run_decision_step(
         self, step: DecisionStep, ctx: EvaluationContext
@@ -941,7 +1423,12 @@ class WorkflowRunner:
         route = (
             destination.step if isinstance(destination, StepDestination) else COMPLETE
         )
-        return _StepResult(outcome={"route": route}, destination=destination)
+        outcome: dict[str, Any] = {"route": route}
+        if isinstance(destination, CompleteDestination) and destination.result:
+            # Which ending, not just that it ended. Recovery reads this back
+            # rather than re-evaluating the decision against later history.
+            outcome["result"] = destination.result
+        return _StepResult(outcome=outcome, destination=destination)
 
     async def _ensure_session(
         self,
@@ -1055,11 +1542,14 @@ class WorkflowRunner:
         )
 
         if attempt.nudge:
-            prompt = (
-                f"{RESUME_NUDGE} Finish by writing `{OUTCOME_PATH}`."
-                if step.expects_outcome
-                else RESUME_NUDGE
-            )
+            if step.outcome is not None:
+                # Re-state the contract, not just the path: the interrupted
+                # turn may never have been told which results it may declare.
+                prompt = f"{RESUME_NUDGE}\n\n{result_instruction(step.outcome)}"
+            elif step.expects_outcome:
+                prompt = f"{RESUME_NUDGE} Finish by writing `{OUTCOME_PATH}`."
+            else:
+                prompt = RESUME_NUDGE
         elif not gate:
             prompt = ""
         else:
@@ -1078,6 +1568,22 @@ class WorkflowRunner:
                 )
 
         if not prompt:
+            if gate and step.outcome is not None:
+                # An empty render is not a skip when the step owes a result.
+                # `when: false` is a deliberate skip; a prompt that rendered to
+                # nothing is a definition that cannot ask for what it requires,
+                # and continuing would invent a result nobody produced.
+                return _StepResult(
+                    pause=_Pause(
+                        reason=PAUSE_PROMPT_UNRENDERABLE,
+                        message=(
+                            f"The step {step.name!r} must produce a result but "
+                            "its prompt rendered empty, so nothing was asked "
+                            "of the agent."
+                        ),
+                        error="prompt rendered empty for a result-bearing step",
+                    )
+                )
             # Nothing sent; the step completes once the session is ready
             # (parity with the old promptless-spawn idle behavior). No outcome
             # instruction was given, so any file on disk is stale by
@@ -1096,7 +1602,7 @@ class WorkflowRunner:
         if not attempt.nudge:
             if attempt.retry:
                 prompt = f"{RETRY_PREFIX}\n\n{prompt}"
-            if step.expects_outcome:
+            if step.requires_outcome:
                 # A stale file from an earlier step or a failed attempt is
                 # never this attempt's result (design D-3). Skipped for a
                 # restart nudge: the agent may have written it before the
@@ -1105,7 +1611,12 @@ class WorkflowRunner:
                     (Path(task.clone_path) / OUTCOME_PATH).unlink()
                 except FileNotFoundError:
                     pass
-                prompt = f"{prompt}\n\n{OUTCOME_INSTRUCTION}"
+                instruction = (
+                    result_instruction(step.outcome)
+                    if step.outcome is not None
+                    else OUTCOME_INSTRUCTION
+                )
+                prompt = f"{prompt}\n\n{instruction}"
 
         # Omp resolves `@path` mentions against the child's working directory
         # and drops silently what it cannot find (findings-omp-file-mentions.md),
@@ -1137,10 +1648,15 @@ class WorkflowRunner:
         # dying mid-step is an infra failure; a pending question just keeps
         # the run running until the operator answers and the turn ends.
         await self._await_step_idle(task.id, step.session)
-        if not step.expects_outcome:
+        if not step.requires_outcome:
             return _StepResult()
-        outcome, note = read_outcome(task.clone_path)
+        if step.outcome is not None:
+            outcome, note = read_result(task.clone_path, step.outcome)
+        else:
+            outcome, note = read_outcome(task.clone_path)
         if outcome is not None:
+            # A declared negative result is a result: the attempt finishes `ok`
+            # and the definition's own route takes it from here.
             return _StepResult(outcome=outcome)
         # The agent had its chance and produced nothing readable. The attempt
         # keeps its absent result and the reason; a person decides what next.
@@ -1231,10 +1747,21 @@ class WorkflowRunner:
         )
 
     def _publish_gate_step(
-        self, task_id: int, step_name: str, status: str, message: str | None = None
+        self,
+        task_id: int,
+        step_name: str,
+        status: str,
+        message: str | None = None,
+        *,
+        snapshot: dict[str, Any] | None = None,
     ) -> None:
         """Gate transitions by name (the step object isn't always at hand —
-        recovery re-arms from the persisted record)."""
+        recovery re-arms from the persisted record).
+
+        A format-2 gate ships its whole snapshot: a client must render the
+        choices that were offered and, once answered, the choice that was
+        taken, without asking today's catalog what this gate looks like now.
+        """
         payload: dict[str, Any] = {
             "task_id": task_id,
             "step": step_name,
@@ -1244,6 +1771,8 @@ class WorkflowRunner:
         }
         if message is not None:
             payload["message"] = message
+        if snapshot is not None:
+            payload["gate"] = snapshot
         self._hub.publish("workflow_step", payload)
 
 
@@ -1265,6 +1794,7 @@ def _is_retry_attempt(records: list[StepRecord], attempt: StepRecord) -> bool:
 __all__ = [
     "BUILTIN_NAMES",
     "COMPLETE",
+    "MAX_RESULT_BYTES",
     "OUTCOME_INSTRUCTION",
     "OUTCOME_PATH",
     "RESUME_NUDGE",
@@ -1280,7 +1810,9 @@ __all__ = [
     "install_definition",
     "load_packaged_workflows",
     "read_outcome",
+    "read_result",
     "register_catalog",
+    "result_instruction",
     "reset_catalog",
     "uninstall_definition",
 ]

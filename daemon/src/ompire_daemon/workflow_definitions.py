@@ -1,4 +1,4 @@
-"""The declarative workflow document: format 1.
+"""The declarative workflow document: formats 1 and 2.
 
 A workflow definition is *data*. It is authored as a bounded YAML subset,
 normalized into one canonical JSON document, and identified by the SHA-256 of
@@ -32,10 +32,29 @@ type error is `Unresolved`, never `False`, so a decision that cannot be made
 pauses for the operator instead of guessing a route.
 
 Format 1's interpreter semantics are frozen. A change to what a retained
-document *means* requires format 2; a retained format-1 document is always
-read under these rules.
+document *means* requires a new format version; a retained format-1 document
+is always read under format-1 rules, and its canonical bytes — and therefore
+its revision identity — are unchanged by anything format 2 adds.
 
-ADR-0028 (docs/adr/0028-retain-declarative-workflow-revisions.md)
+*Format 2* adds the vocabulary a domain flow needs and takes away the two
+places format 1 let meaning leak:
+
+- An agent step declares an `outcome` contract: the named results it may
+  produce and, per result, the artifact fields that result must carry. A
+  result outside the contract, or missing a required field, is not a result.
+- A step declares its `evidence`: named selectors over prior attempts,
+  resolved *once* at attempt entry and then frozen. `{op: evidence, name: …}`
+  reads one of those bindings, so what a prompt or a route saw is a recorded
+  fact rather than whatever "latest" would mean when it is asked again.
+  Format 2 therefore has no `latest` operation, and format 1 has no `evidence`.
+- A gate declares named `choices` with static destinations, so answering it is
+  choosing a declared route rather than pressing Resume.
+- Completion is named: `{complete: true, result: <slug>}`. Falling off the end
+  of the step list is rejected, because "the run ended" is not a work result.
+
+ADR-0009, ADR-0028, ADR-0029, ADR-0030
+(docs/adr/0029-declare-domain-outcomes-and-evidence-handoffs.md,
+docs/adr/0030-commit-human-decisions-before-advancing.md)
 """
 
 from __future__ import annotations
@@ -45,6 +64,7 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
+from types import MappingProxyType
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,8 +76,8 @@ from ompire_daemon.model_config import MODEL_ROLES
 # statement that the meaning of a document changed, not that a field was
 # added: a retained format-1 document keeps being read under format-1 rules
 # forever, and an unsupported version is refused rather than reinterpreted.
-FORMAT_VERSION = 1
-SUPPORTED_FORMATS = (1,)
+FORMAT_VERSION = 2
+SUPPORTED_FORMATS = (1, 2)
 
 # Loader bounds. They protect the daemon from a hostile or accidental
 # document; every packaged built-in is orders of magnitude below them.
@@ -79,6 +99,19 @@ COMPARISONS = ("eq", "ne", "lt", "lte", "gt", "gte")
 
 DEFAULT_COMMAND_TIMEOUT = 600.0
 DEFAULT_ROLE = "default"
+
+# Format-2 bounds. Like the loader bounds above these exist so a definition
+# cannot grow without limit; they are not a statement about what is useful.
+MAX_RESULTS = 16
+MAX_REQUIRED_FIELDS = 32
+MAX_EVIDENCE = 16
+MAX_CHOICES = 8
+
+# What a required artifact field may be declared as. `null` is absent from the
+# list on purpose: a required field whose accepted type is "nothing" would let
+# an agent satisfy the contract by writing nothing, which is the whole failure
+# mode the contract exists to close.
+REQUIRED_TYPES = ("boolean", "integer", "number", "string", "array", "object")
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 # JSON's own number grammar. YAML 1.1 octals, sexagesimals, `.inf`, and `.nan`
@@ -335,6 +368,21 @@ class CountValue:
 
 
 @dataclass(frozen=True)
+class EvidenceValue:
+    """One of *this step's* declared evidence bindings, by alias (format 2).
+
+    The difference from `LatestValue` is when the question is asked. `latest`
+    re-scans history every time it is evaluated, so a prompt and the decision
+    that routes on it can disagree, and a restart can answer with a record
+    that did not exist when the attempt opened. An evidence alias is resolved
+    once, at attempt entry, and recorded on the attempt: every later read —
+    prompt, predicate, gate message, recovery — sees that same record.
+    """
+
+    name: str
+
+
+@dataclass(frozen=True)
 class CoalesceValue:
     """First non-missing, non-null value. An empty string is a value."""
 
@@ -342,7 +390,13 @@ class CoalesceValue:
 
 
 ValueExpr = (
-    LiteralValue | InputValue | LatestValue | GetValue | CountValue | CoalesceValue
+    LiteralValue
+    | InputValue
+    | LatestValue
+    | EvidenceValue
+    | GetValue
+    | CountValue
+    | CoalesceValue
 )
 
 
@@ -453,7 +507,15 @@ class StepDestination:
 
 @dataclass(frozen=True)
 class CompleteDestination:
-    pass
+    """The run ends here.
+
+    In format 2 `result` names *which* ending this is, because "the workflow
+    finished" and "the bug was fixed" are different facts and a run that
+    conflates them cannot be read afterwards. Format 1 has no name for its
+    ending, so `result` is None there and stays None.
+    """
+
+    result: str | None = None
 
 
 @dataclass(frozen=True)
@@ -470,17 +532,92 @@ class DecisionCase:
     next: Destination
 
 
+# --- format 2: result contracts, evidence selectors, gate choices -------------
+
+
+@dataclass(frozen=True)
+class ResultContract:
+    """One declared result name and the artifact fields it must carry.
+
+    `required` is a sorted tuple of `(field, json type)` pairs rather than a
+    dict so the contract stays hashable and frozen like everything else here.
+    The types are JSON's, checked structurally: this says a `findings` field
+    is a nonblank string, never that its content is true.
+    """
+
+    name: str
+    required: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class OutcomeContract:
+    """What results an agent step may declare. Nonempty by construction."""
+
+    results: tuple[ResultContract, ...]
+
+    def result_named(self, name: str) -> ResultContract | None:
+        for result in self.results:
+            if result.name == name:
+                return result
+        return None
+
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(result.name for result in self.results)
+
+
+@dataclass(frozen=True)
+class EvidenceSelector:
+    """A named selection over prior attempts, resolved once at attempt entry.
+
+    `steps`, `after`, and `with_outcome` mean exactly what they mean for
+    format 1's `latest` — the newest finished `ok` attempt among `steps`,
+    newer than the anchor step's own newest attempt, optionally requiring a
+    recorded outcome. `required` is what happens when nothing matches: a
+    required selector pauses the attempt before it prompts or routes, an
+    optional one binds to explicit absence.
+    """
+
+    name: str
+    steps: tuple[str, ...]
+    after: str | None
+    with_outcome: bool
+    required: bool
+
+
+@dataclass(frozen=True)
+class GateChoice:
+    """One answer a person may give, and where it goes.
+
+    The destination is static: a choice cannot compute a route, and it cannot
+    pause. Answering a gate is picking a declared edge, which is what makes
+    the decision replayable from the record and refusable when stale.
+    """
+
+    id: str
+    label: str
+    feedback_required: bool
+    next: Destination
+
+
 @dataclass(frozen=True)
 class AgentStep:
     name: str
     session: str
     role: str
     prompt: TextDocument
-    expects_outcome: bool
+    expects_outcome: bool  # format 1's generic success/failed envelope
     when: Predicate
     max_visits: int | None
     on_exhausted: StepDestination | None
+    outcome: OutcomeContract | None = None  # format 2's declared results
+    evidence: tuple[EvidenceSelector, ...] = ()
     kind: str = "agent"
+
+    @property
+    def requires_outcome(self) -> bool:
+        """Whether this step must produce a result document to finish."""
+        return self.expects_outcome or self.outcome is not None
 
 
 @dataclass(frozen=True)
@@ -491,6 +628,7 @@ class CommandStep:
     idempotent: bool
     max_visits: int | None
     on_exhausted: StepDestination | None
+    evidence: tuple[EvidenceSelector, ...] = ()
     kind: str = "command"
 
 
@@ -501,6 +639,7 @@ class DecisionStep:
     otherwise: Destination
     max_visits: int | None
     on_exhausted: StepDestination | None
+    evidence: tuple[EvidenceSelector, ...] = ()
     kind: str = "decision"
 
 
@@ -510,7 +649,15 @@ class GateStep:
     message: TextDocument
     max_visits: int | None
     on_exhausted: StepDestination | None
+    choices: tuple[GateChoice, ...] = ()  # format 2; empty means fall-through
+    evidence: tuple[EvidenceSelector, ...] = ()
     kind: str = "gate"
+
+    def choice_named(self, choice_id: str) -> GateChoice | None:
+        for choice in self.choices:
+            if choice.id == choice_id:
+                return choice
+        return None
 
 
 Step = AgentStep | CommandStep | DecisionStep | GateStep
@@ -617,11 +764,25 @@ def _is_json_data(value: Any, depth: int = 0) -> bool:
     return False
 
 
-def _parse_value(data: Any, location: str) -> ValueExpr:
+def _parse_value(data: Any, location: str, version: int) -> ValueExpr:
     data = _require_mapping(data, location)
     op = data.get("op")
     if not isinstance(op, str):
         raise WorkflowDocumentError(location, "value expression needs a string 'op'")
+    if op == "latest" and version != 1:
+        raise WorkflowDocumentError(
+            location,
+            "'latest' belongs to format 1; format 2 reads prior attempts "
+            "through a step's declared 'evidence' selectors, which are "
+            "resolved once when the attempt opens",
+        )
+    if op == "evidence" and version == 1:
+        raise WorkflowDocumentError(
+            location, "'evidence' is a format-2 value operation"
+        )
+    if op == "evidence":
+        _reject_unknown(data, ("op", "name"), location)
+        return EvidenceValue(name=_require_slug(data, "name", location))
     if op == "literal":
         _reject_unknown(data, ("op", "value"), location)
         if "value" not in data:
@@ -678,7 +839,7 @@ def _parse_value(data: Any, location: str) -> ValueExpr:
                     "must be a string key or an integer index",
                 )
         return GetValue(
-            value=_parse_value(data["value"], f"{location}.value"),
+            value=_parse_value(data["value"], f"{location}.value", version),
             keys=tuple(raw_keys),
         )
     if op == "count":
@@ -693,14 +854,14 @@ def _parse_value(data: Any, location: str) -> ValueExpr:
             )
         return CoalesceValue(
             values=tuple(
-                _parse_value(item, f"{location}.values[{index}]")
+                _parse_value(item, f"{location}.values[{index}]", version)
                 for index, item in enumerate(raw_values)
             )
         )
     raise WorkflowDocumentError(location, f"unknown value operation {op!r}")
 
 
-def _parse_predicate(data: Any, location: str) -> Predicate:
+def _parse_predicate(data: Any, location: str, version: int) -> Predicate:
     if isinstance(data, bool):
         return LiteralPredicate(value=data)
     data = _require_mapping(data, location)
@@ -714,14 +875,16 @@ def _parse_predicate(data: Any, location: str) -> Predicate:
                 raise WorkflowDocumentError(location, f"missing required field {key!r}")
         return ComparePredicate(
             op=op,
-            left=_parse_value(data["left"], f"{location}.left"),
-            right=_parse_value(data["right"], f"{location}.right"),
+            left=_parse_value(data["left"], f"{location}.left", version),
+            right=_parse_value(data["right"], f"{location}.right", version),
         )
     if op == "exists":
         _reject_unknown(data, ("op", "value"), location)
         if "value" not in data:
             raise WorkflowDocumentError(location, "missing required field 'value'")
-        return ExistsPredicate(value=_parse_value(data["value"], f"{location}.value"))
+        return ExistsPredicate(
+            value=_parse_value(data["value"], f"{location}.value", version)
+        )
     if op == "is_type":
         _reject_unknown(data, ("op", "value", "type"), location)
         if "value" not in data:
@@ -733,7 +896,8 @@ def _parse_predicate(data: Any, location: str) -> Predicate:
                 f"unknown JSON type {json_type!r}; one of {', '.join(JSON_TYPES)}",
             )
         return IsTypePredicate(
-            value=_parse_value(data["value"], f"{location}.value"), type=json_type
+            value=_parse_value(data["value"], f"{location}.value", version),
+            type=json_type,
         )
     if op in ("all", "any"):
         _reject_unknown(data, ("op", "of"), location)
@@ -745,7 +909,7 @@ def _parse_predicate(data: Any, location: str) -> Predicate:
         return JunctionPredicate(
             op=op,
             of=tuple(
-                _parse_predicate(item, f"{location}.of[{index}]")
+                _parse_predicate(item, f"{location}.of[{index}]", version)
                 for index, item in enumerate(raw)
             ),
         )
@@ -753,11 +917,11 @@ def _parse_predicate(data: Any, location: str) -> Predicate:
         _reject_unknown(data, ("op", "of"), location)
         if "of" not in data:
             raise WorkflowDocumentError(location, "missing required field 'of'")
-        return NotPredicate(of=_parse_predicate(data["of"], f"{location}.of"))
+        return NotPredicate(of=_parse_predicate(data["of"], f"{location}.of", version))
     raise WorkflowDocumentError(location, f"unknown predicate operation {op!r}")
 
 
-def _parse_text(data: Any, location: str) -> TextDocument:
+def _parse_text(data: Any, location: str, version: int) -> TextDocument:
     data = _require_mapping(data, location)
     _reject_unknown(data, ("separator", "parts"), location)
     separator = data.get("separator", "")
@@ -770,11 +934,11 @@ def _parse_text(data: Any, location: str) -> TextDocument:
         raise WorkflowDocumentError(f"{location}.parts", "must be a list")
     parts: list[Part] = []
     for index, item in enumerate(raw_parts):
-        parts.append(_parse_part(item, f"{location}.parts[{index}]"))
+        parts.append(_parse_part(item, f"{location}.parts[{index}]", version))
     return TextDocument(separator=separator, parts=tuple(parts))
 
 
-def _parse_part(data: Any, location: str) -> Part:
+def _parse_part(data: Any, location: str, version: int) -> Part:
     data = _require_mapping(data, location)
     present = sorted({"text", "value", "if"} & set(data))
     if len(present) != 1:
@@ -799,32 +963,46 @@ def _parse_part(data: Any, location: str) -> Part:
                 f"must be one of {', '.join(VALUE_FORMATS)}",
             )
         return ValuePart(
-            value=_parse_value(data["value"], f"{location}.value"),
+            value=_parse_value(data["value"], f"{location}.value", version),
             format=value_format,
         )
     _reject_unknown(data, ("if", "then", "else"), location)
     if "then" not in data:
         raise WorkflowDocumentError(location, "a conditional part needs 'then'")
     return ConditionalPart(
-        when=_parse_predicate(data["if"], f"{location}.if"),
-        then=_parse_text(data["then"], f"{location}.then"),
+        when=_parse_predicate(data["if"], f"{location}.if", version),
+        then=_parse_text(data["then"], f"{location}.then", version),
         otherwise=(
-            _parse_text(data["else"], f"{location}.else")
+            _parse_text(data["else"], f"{location}.else", version)
             if "else" in data
             else EMPTY_TEXT
         ),
     )
 
 
-def _parse_destination(data: Any, location: str) -> Destination:
+def _parse_destination(
+    data: Any, location: str, version: int, *, allow_pause: bool = True
+) -> Destination:
     data = _require_mapping(data, location)
     present = sorted({"step", "complete", "pause"} & set(data))
     if len(present) != 1:
         raise WorkflowDocumentError(
             location,
-            "a destination is exactly one of 'step', 'complete', or 'pause'",
+            "a destination is exactly one of 'step', 'complete', or 'pause'"
+            if allow_pause
+            else "a destination is exactly one of 'step' or 'complete'",
         )
-    _reject_unknown(data, (present[0],), location)
+    if present[0] == "pause" and not allow_pause:
+        raise WorkflowDocumentError(
+            location,
+            "this destination cannot be a pause: it must name where the run "
+            "goes, not ask the engine to stop again",
+        )
+    _reject_unknown(
+        data,
+        ("complete", "result") if present[0] == "complete" and version >= 2 else (present[0],),
+        location,
+    )
     if present[0] == "step":
         value = data["step"]
         if not isinstance(value, str):
@@ -834,13 +1012,22 @@ def _parse_destination(data: Any, location: str) -> Destination:
         raise WorkflowDocumentError(
             f"{location}.{present[0]}", "must be literally true"
         )
-    return CompleteDestination() if present[0] == "complete" else PauseDestination()
+    if present[0] == "pause":
+        return PauseDestination()
+    if version == 1:
+        return CompleteDestination()
+    # Format 2: an ending has a name. "The run stopped" is not a work result,
+    # and a reader months later cannot tell a validated fix from an abandoned
+    # investigation if both simply ended.
+    return CompleteDestination(result=_require_slug(data, "result", location))
 
 
 _COMMON_STEP_FIELDS = ("name", "kind", "max_visits", "on_exhausted")
 
 
-def _parse_bound(data: Mapping[str, Any], location: str) -> tuple[int | None, StepDestination | None]:
+def _parse_bound(
+    data: Mapping[str, Any], location: str, version: int
+) -> tuple[int | None, StepDestination | None]:
     max_visits = data.get("max_visits")
     if max_visits is not None and (
         not isinstance(max_visits, int)
@@ -853,7 +1040,9 @@ def _parse_bound(data: Mapping[str, Any], location: str) -> tuple[int | None, St
     on_exhausted_raw = data.get("on_exhausted")
     on_exhausted: StepDestination | None = None
     if on_exhausted_raw is not None:
-        destination = _parse_destination(on_exhausted_raw, f"{location}.on_exhausted")
+        destination = _parse_destination(
+            on_exhausted_raw, f"{location}.on_exhausted", version, allow_pause=False
+        )
         if not isinstance(destination, StepDestination):
             raise WorkflowDocumentError(
                 f"{location}.on_exhausted",
@@ -868,7 +1057,169 @@ def _parse_bound(data: Mapping[str, Any], location: str) -> tuple[int | None, St
     return max_visits, on_exhausted
 
 
-def _parse_step(data: Any, location: str) -> Step:
+def _parse_outcome(data: Any, location: str) -> OutcomeContract | None:
+    """An agent step's declared results (format 2).
+
+    `null` is a real declaration — "this step is not asked for a result" — and
+    is why the field is required rather than defaulted: a step that silently
+    produced no contract would be indistinguishable from one whose author
+    forgot, and only one of those should be allowed to finish on nothing.
+    """
+    if data is None:
+        return None
+    data = _require_mapping(data, location)
+    _reject_unknown(data, ("results",), location)
+    raw_results = data.get("results")
+    if not isinstance(raw_results, dict) or not raw_results:
+        raise WorkflowDocumentError(
+            f"{location}.results",
+            "must be a nonempty mapping from result name to its contract",
+        )
+    if len(raw_results) > MAX_RESULTS:
+        raise WorkflowDocumentError(
+            f"{location}.results", f"more than {MAX_RESULTS} declared results"
+        )
+    results: list[ResultContract] = []
+    for result_name in sorted(raw_results):
+        result_location = f"{location}.results.{result_name}"
+        if not _SLUG_RE.match(result_name):
+            raise WorkflowDocumentError(
+                result_location,
+                "a result name must be slug-format (a-z, 0-9, hyphens)",
+            )
+        contract = _require_mapping(raw_results[result_name], result_location)
+        _reject_unknown(contract, ("required",), result_location)
+        raw_required = contract.get("required", {})
+        if not isinstance(raw_required, dict):
+            raise WorkflowDocumentError(
+                f"{result_location}.required",
+                "must be a mapping from artifact field name to its JSON type",
+            )
+        if len(raw_required) > MAX_REQUIRED_FIELDS:
+            raise WorkflowDocumentError(
+                f"{result_location}.required",
+                f"more than {MAX_REQUIRED_FIELDS} required fields",
+            )
+        required: list[tuple[str, str]] = []
+        for field in sorted(raw_required):
+            declared = raw_required[field]
+            if not isinstance(declared, str) or declared not in REQUIRED_TYPES:
+                raise WorkflowDocumentError(
+                    f"{result_location}.required.{field}",
+                    f"must be one of {', '.join(REQUIRED_TYPES)}",
+                )
+            required.append((field, declared))
+        results.append(ResultContract(name=result_name, required=tuple(required)))
+    return OutcomeContract(results=tuple(results))
+
+
+def _parse_evidence(data: Any, location: str) -> tuple[EvidenceSelector, ...]:
+    """A step's named evidence selectors (format 2)."""
+    if data is None:
+        return ()
+    data = _require_mapping(data, location)
+    if len(data) > MAX_EVIDENCE:
+        raise WorkflowDocumentError(
+            location, f"more than {MAX_EVIDENCE} evidence selectors"
+        )
+    selectors: list[EvidenceSelector] = []
+    for alias in sorted(data):
+        alias_location = f"{location}.{alias}"
+        if not _SLUG_RE.match(alias):
+            raise WorkflowDocumentError(
+                alias_location, "an evidence alias must be slug-format"
+            )
+        selector = _require_mapping(data[alias], alias_location)
+        _reject_unknown(
+            selector, ("steps", "after", "with_outcome", "required"), alias_location
+        )
+        raw_steps = selector.get("steps")
+        if not isinstance(raw_steps, list) or not raw_steps:
+            raise WorkflowDocumentError(
+                f"{alias_location}.steps", "must be a nonempty list of step names"
+            )
+        steps: list[str] = []
+        for index, item in enumerate(raw_steps):
+            if not isinstance(item, str):
+                raise WorkflowDocumentError(
+                    f"{alias_location}.steps[{index}]", "must be a step name"
+                )
+            steps.append(item)
+        after = selector.get("after")
+        if after is not None and not isinstance(after, str):
+            raise WorkflowDocumentError(
+                f"{alias_location}.after", "must be a step name"
+            )
+        with_outcome = selector.get("with_outcome", True)
+        if not isinstance(with_outcome, bool):
+            raise WorkflowDocumentError(
+                f"{alias_location}.with_outcome", "must be a boolean"
+            )
+        required = selector.get("required", True)
+        if not isinstance(required, bool):
+            raise WorkflowDocumentError(
+                f"{alias_location}.required", "must be a boolean"
+            )
+        selectors.append(
+            EvidenceSelector(
+                name=alias,
+                steps=tuple(steps),
+                after=after,
+                with_outcome=with_outcome,
+                required=required,
+            )
+        )
+    return tuple(selectors)
+
+
+def _parse_choices(data: Any, location: str, version: int) -> tuple[GateChoice, ...]:
+    """A format-2 gate's declared answers, in the order they are offered."""
+    if not isinstance(data, list) or not data:
+        raise WorkflowDocumentError(
+            location, "a format-2 gate needs a nonempty ordered list of 'choices'"
+        )
+    if len(data) > MAX_CHOICES:
+        raise WorkflowDocumentError(location, f"more than {MAX_CHOICES} choices")
+    choices: list[GateChoice] = []
+    seen: set[str] = set()
+    for index, item in enumerate(data):
+        choice_location = f"{location}[{index}]"
+        item = _require_mapping(item, choice_location)
+        _reject_unknown(
+            item, ("id", "label", "feedback_required", "next"), choice_location
+        )
+        choice_id = _require_slug(item, "id", choice_location)
+        if choice_id in seen:
+            raise WorkflowDocumentError(
+                f"{choice_location}.id", f"duplicate choice {choice_id!r}"
+            )
+        seen.add(choice_id)
+        label = _require_str(item, "label", choice_location)
+        if not label.strip():
+            raise WorkflowDocumentError(f"{choice_location}.label", "must not be blank")
+        feedback_required = item.get("feedback_required", False)
+        if not isinstance(feedback_required, bool):
+            raise WorkflowDocumentError(
+                f"{choice_location}.feedback_required", "must be a boolean"
+            )
+        if "next" not in item:
+            raise WorkflowDocumentError(
+                choice_location, "a choice needs an explicit 'next' destination"
+            )
+        choices.append(
+            GateChoice(
+                id=choice_id,
+                label=label,
+                feedback_required=feedback_required,
+                next=_parse_destination(
+                    item["next"], f"{choice_location}.next", version, allow_pause=False
+                ),
+            )
+        )
+    return tuple(choices)
+
+
+def _parse_step(data: Any, location: str, version: int) -> Step:
     data = _require_mapping(data, location)
     name = _require_slug(data, "name", location)
     kind = _require_str(data, "kind", location)
@@ -876,11 +1227,26 @@ def _parse_step(data: Any, location: str) -> Step:
         raise WorkflowDocumentError(
             f"{location}.kind", f"must be one of {', '.join(STEP_KINDS)}"
         )
-    max_visits, on_exhausted = _parse_bound(data, location)
+    max_visits, on_exhausted = _parse_bound(data, location, version)
+    # Format 2 adds `evidence` to every kind: a decision routes on the same
+    # frozen records its neighbours were prompted with, not on a fresh scan.
+    common = _COMMON_STEP_FIELDS if version == 1 else (*_COMMON_STEP_FIELDS, "evidence")
+    evidence = (
+        ()
+        if version == 1
+        else _parse_evidence(data.get("evidence"), f"{location}.evidence")
+    )
     if kind == "agent":
         _reject_unknown(
             data,
-            (*_COMMON_STEP_FIELDS, "session", "role", "prompt", "expects_outcome", "when"),
+            (
+                *common,
+                "session",
+                "role",
+                "prompt",
+                "when",
+                *(("expects_outcome",) if version == 1 else ("outcome",)),
+            ),
             location,
         )
         role = data.get("role", DEFAULT_ROLE)
@@ -889,31 +1255,42 @@ def _parse_step(data: Any, location: str) -> Step:
                 f"{location}.role",
                 f"unknown model role {role!r}; one of {', '.join(MODEL_ROLES)}",
             )
-        expects_outcome = data.get("expects_outcome", False)
-        if not isinstance(expects_outcome, bool):
+        expects_outcome = False
+        outcome: OutcomeContract | None = None
+        if version == 1:
+            expects_outcome = data.get("expects_outcome", False)
+            if not isinstance(expects_outcome, bool):
+                raise WorkflowDocumentError(
+                    f"{location}.expects_outcome", "must be a boolean"
+                )
+        elif "outcome" not in data:
             raise WorkflowDocumentError(
-                f"{location}.expects_outcome", "must be a boolean"
+                location,
+                "a format-2 agent step must declare 'outcome': either null "
+                "(no result is asked for) or the results it may produce",
             )
+        else:
+            outcome = _parse_outcome(data["outcome"], f"{location}.outcome")
         if "prompt" not in data:
             raise WorkflowDocumentError(location, "an agent step needs a 'prompt'")
         return AgentStep(
             name=name,
             session=_require_str(data, "session", location),
             role=role,
-            prompt=_parse_text(data["prompt"], f"{location}.prompt"),
+            prompt=_parse_text(data["prompt"], f"{location}.prompt", version),
             expects_outcome=expects_outcome,
             when=(
-                _parse_predicate(data["when"], f"{location}.when")
+                _parse_predicate(data["when"], f"{location}.when", version)
                 if "when" in data
                 else LiteralPredicate(value=True)
             ),
             max_visits=max_visits,
             on_exhausted=on_exhausted,
+            outcome=outcome,
+            evidence=evidence,
         )
     if kind == "command":
-        _reject_unknown(
-            data, (*_COMMON_STEP_FIELDS, "argv", "timeout", "idempotent"), location
-        )
+        _reject_unknown(data, (*common, "argv", "timeout", "idempotent"), location)
         raw_argv = data.get("argv")
         if not isinstance(raw_argv, list) or not raw_argv:
             raise WorkflowDocumentError(
@@ -947,9 +1324,10 @@ def _parse_step(data: Any, location: str) -> Step:
             idempotent=True,
             max_visits=max_visits,
             on_exhausted=on_exhausted,
+            evidence=evidence,
         )
     if kind == "decision":
-        _reject_unknown(data, (*_COMMON_STEP_FIELDS, "cases", "otherwise"), location)
+        _reject_unknown(data, (*common, "cases", "otherwise"), location)
         raw_cases = data.get("cases")
         if not isinstance(raw_cases, list) or not raw_cases:
             raise WorkflowDocumentError(
@@ -966,8 +1344,12 @@ def _parse_step(data: Any, location: str) -> Step:
                 )
             cases.append(
                 DecisionCase(
-                    when=_parse_predicate(item["when"], f"{case_location}.when"),
-                    next=_parse_destination(item["next"], f"{case_location}.next"),
+                    when=_parse_predicate(
+                        item["when"], f"{case_location}.when", version
+                    ),
+                    next=_parse_destination(
+                        item["next"], f"{case_location}.next", version
+                    ),
                 )
             )
         if "otherwise" not in data:
@@ -979,18 +1361,29 @@ def _parse_step(data: Any, location: str) -> Step:
         return DecisionStep(
             name=name,
             cases=tuple(cases),
-            otherwise=_parse_destination(data["otherwise"], f"{location}.otherwise"),
+            otherwise=_parse_destination(
+                data["otherwise"], f"{location}.otherwise", version
+            ),
             max_visits=max_visits,
             on_exhausted=on_exhausted,
+            evidence=evidence,
         )
-    _reject_unknown(data, (*_COMMON_STEP_FIELDS, "message"), location)
+    _reject_unknown(
+        data, (*common, "message", *(() if version == 1 else ("choices",))), location
+    )
     if "message" not in data:
         raise WorkflowDocumentError(location, "a gate step needs a 'message'")
     return GateStep(
         name=name,
-        message=_parse_text(data["message"], f"{location}.message"),
+        message=_parse_text(data["message"], f"{location}.message", version),
         max_visits=max_visits,
         on_exhausted=on_exhausted,
+        choices=(
+            ()
+            if version == 1
+            else _parse_choices(data.get("choices"), f"{location}.choices", version)
+        ),
+        evidence=evidence,
     )
 
 
@@ -1030,7 +1423,7 @@ def definition_from_document(document: Mapping[str, Any]) -> WorkflowDefinition:
     steps: list[Step] = []
     seen: set[str] = set()
     for index, item in enumerate(raw_steps):
-        step = _parse_step(item, f"steps[{index}]")
+        step = _parse_step(item, f"steps[{index}]", version)
         if step.name in RESERVED_NAMES:
             raise WorkflowDocumentError(
                 f"steps[{index}].name", f"{step.name!r} is reserved by the engine"
@@ -1056,7 +1449,7 @@ def definition_from_document(document: Mapping[str, Any]) -> WorkflowDefinition:
 def _validate_references(definition: WorkflowDefinition) -> None:
     names = {step.name for step in definition.steps}
 
-    def check_value(value: ValueExpr, location: str) -> None:
+    def check_value(value: ValueExpr, location: str, aliases: set[str]) -> None:
         if isinstance(value, LatestValue):
             for step_name in value.steps:
                 if step_name not in names:
@@ -1067,37 +1460,52 @@ def _validate_references(definition: WorkflowDefinition) -> None:
                 raise WorkflowDocumentError(
                     location, f"references undeclared step {value.after!r}"
                 )
+        elif isinstance(value, EvidenceValue):
+            # An alias is *this step's* binding. Reading another step's
+            # evidence would read a record this attempt never froze, which is
+            # the whole thing the binding exists to pin down.
+            if value.name not in aliases:
+                raise WorkflowDocumentError(
+                    location,
+                    f"reads evidence {value.name!r}, which this step does not "
+                    "declare"
+                    + (
+                        f"; it declares {', '.join(sorted(aliases))}"
+                        if aliases
+                        else "; it declares none"
+                    ),
+                )
         elif isinstance(value, CountValue):
             if value.step not in names:
                 raise WorkflowDocumentError(
                     location, f"references undeclared step {value.step!r}"
                 )
         elif isinstance(value, GetValue):
-            check_value(value.value, location)
+            check_value(value.value, location, aliases)
         elif isinstance(value, CoalesceValue):
             for item in value.values:
-                check_value(item, location)
+                check_value(item, location, aliases)
 
-    def check_predicate(predicate: Predicate, location: str) -> None:
+    def check_predicate(predicate: Predicate, location: str, aliases: set[str]) -> None:
         if isinstance(predicate, ComparePredicate):
-            check_value(predicate.left, location)
-            check_value(predicate.right, location)
+            check_value(predicate.left, location, aliases)
+            check_value(predicate.right, location, aliases)
         elif isinstance(predicate, (ExistsPredicate, IsTypePredicate)):
-            check_value(predicate.value, location)
+            check_value(predicate.value, location, aliases)
         elif isinstance(predicate, JunctionPredicate):
             for item in predicate.of:
-                check_predicate(item, location)
+                check_predicate(item, location, aliases)
         elif isinstance(predicate, NotPredicate):
-            check_predicate(predicate.of, location)
+            check_predicate(predicate.of, location, aliases)
 
-    def check_text(text: TextDocument, location: str) -> None:
+    def check_text(text: TextDocument, location: str, aliases: set[str]) -> None:
         for part in text.parts:
             if isinstance(part, ValuePart):
-                check_value(part.value, location)
+                check_value(part.value, location, aliases)
             elif isinstance(part, ConditionalPart):
-                check_predicate(part.when, location)
-                check_text(part.then, location)
-                check_text(part.otherwise, location)
+                check_predicate(part.when, location, aliases)
+                check_text(part.then, location, aliases)
+                check_text(part.otherwise, location, aliases)
 
     def check_destination(destination: Destination, location: str) -> None:
         if isinstance(destination, StepDestination) and destination.step not in names:
@@ -1107,6 +1515,20 @@ def _validate_references(definition: WorkflowDefinition) -> None:
 
     for index, step in enumerate(definition.steps):
         location = f"steps[{index}]"
+        aliases = {selector.name for selector in step.evidence}
+        for selector in step.evidence:
+            selector_location = f"{location}.evidence.{selector.name}"
+            for step_name in selector.steps:
+                if step_name not in names:
+                    raise WorkflowDocumentError(
+                        f"{selector_location}.steps",
+                        f"references undeclared step {step_name!r}",
+                    )
+            if selector.after is not None and selector.after not in names:
+                raise WorkflowDocumentError(
+                    f"{selector_location}.after",
+                    f"references undeclared step {selector.after!r}",
+                )
         if step.on_exhausted is not None:
             check_destination(step.on_exhausted, f"{location}.on_exhausted")
             target = definition.step_named(step.on_exhausted.step)
@@ -1122,29 +1544,68 @@ def _validate_references(definition: WorkflowDefinition) -> None:
                     f"{location}.session",
                     f"names undeclared session {step.session!r}",
                 )
-            check_text(step.prompt, f"{location}.prompt")
-            check_predicate(step.when, f"{location}.when")
+            check_text(step.prompt, f"{location}.prompt", aliases)
+            check_predicate(step.when, f"{location}.when", aliases)
         elif isinstance(step, DecisionStep):
             for case_index, case in enumerate(step.cases):
-                check_predicate(case.when, f"{location}.cases[{case_index}].when")
+                check_predicate(
+                    case.when, f"{location}.cases[{case_index}].when", aliases
+                )
                 check_destination(case.next, f"{location}.cases[{case_index}].next")
             check_destination(step.otherwise, f"{location}.otherwise")
         elif isinstance(step, GateStep):
-            check_text(step.message, f"{location}.message")
+            check_text(step.message, f"{location}.message", aliases)
+            for choice_index, choice in enumerate(step.choices):
+                check_destination(
+                    choice.next, f"{location}.choices[{choice_index}].next"
+                )
+
+    if definition.format >= 2:
+        _validate_named_endings(definition)
+
+
+def _validate_named_endings(definition: WorkflowDefinition) -> None:
+    """Format 2: a run may only end somewhere that says what ending it is.
+
+    Format 1 lets the last step fall off the end and calls that complete. That
+    is exactly the silence this format removes: an operator reading a finished
+    bugfix must be able to tell a validated fix from an abandoned one, and a
+    run that ended by running out of list says neither.
+    """
+    for index, step in enumerate(definition.steps):
+        location = f"steps[{index}]"
+        if isinstance(step, DecisionStep):
+            continue
+        if isinstance(step, GateStep) and step.choices:
+            continue
+        if definition.step_after(step.name) is None:
+            raise WorkflowDocumentError(
+                location,
+                f"step {step.name!r} is last and falls off the end of the "
+                "workflow; format 2 ends only at a declared "
+                "'{complete: true, result: <name>}' destination",
+            )
 
 
 def _successors(definition: WorkflowDefinition, step: Step) -> list[str]:
-    """Every step this one can reach in one move, exhaustion aside."""
+    """Every step this one can reach in one move, exhaustion aside.
+
+    A format-2 gate's choices are edges like any other. Leaving them out would
+    let a definition build a loop out of human answers — retry, retry, retry —
+    that no visit bound cuts, which is the one thing graph validation is for.
+    """
     targets: list[str] = []
     if isinstance(step, DecisionStep):
-        destinations = [case.next for case in step.cases] + [step.otherwise]
-        for destination in destinations:
-            if isinstance(destination, StepDestination):
-                targets.append(destination.step)
+        destinations: list[Destination] = [case.next for case in step.cases]
+        destinations.append(step.otherwise)
+    elif isinstance(step, GateStep) and step.choices:
+        destinations = [choice.next for choice in step.choices]
     else:
         following = definition.step_after(step.name)
-        if following is not None:
-            targets.append(following.name)
+        return [following.name] if following is not None else []
+    for destination in destinations:
+        if isinstance(destination, StepDestination):
+            targets.append(destination.step)
     return targets
 
 
@@ -1236,6 +1697,8 @@ def _value_document(value: ValueExpr) -> dict[str, Any]:
             "after": value.after,
             "with_outcome": value.with_outcome,
         }
+    if isinstance(value, EvidenceValue):
+        return {"op": "evidence", "name": value.name}
     if isinstance(value, GetValue):
         return {
             "op": "get",
@@ -1292,33 +1755,77 @@ def _text_document(text: TextDocument) -> dict[str, Any]:
     return {"separator": text.separator, "parts": parts}
 
 
-def _destination_document(destination: Destination) -> dict[str, Any]:
+def _destination_document(destination: Destination, version: int) -> dict[str, Any]:
     if isinstance(destination, StepDestination):
         return {"step": destination.step}
     if isinstance(destination, CompleteDestination):
-        return {"complete": True}
+        if version == 1:
+            return {"complete": True}
+        return {"complete": True, "result": destination.result}
     return {"pause": True}
 
 
-def _step_document(step: Step) -> dict[str, Any]:
+def _outcome_document(outcome: OutcomeContract | None) -> dict[str, Any] | None:
+    if outcome is None:
+        return None
+    return {
+        "results": {
+            result.name: {"required": dict(result.required)}
+            for result in outcome.results
+        }
+    }
+
+
+def _evidence_document(
+    selectors: tuple[EvidenceSelector, ...],
+) -> dict[str, dict[str, Any]]:
+    return {
+        selector.name: {
+            "steps": list(selector.steps),
+            "after": selector.after,
+            "with_outcome": selector.with_outcome,
+            "required": selector.required,
+        }
+        for selector in selectors
+    }
+
+
+def destination_document(destination: Destination, version: int) -> dict[str, Any]:
+    """A destination in its persisted form.
+
+    Public because a gate snapshot records where each offered choice would
+    have gone. The record has to hold the route as it was offered, not a name
+    to look up in whatever the definition says later.
+    """
+    return _destination_document(destination, version)
+
+
+def _step_document(step: Step, version: int) -> dict[str, Any]:
     document: dict[str, Any] = {
         "name": step.name,
         "kind": step.kind,
         "max_visits": step.max_visits,
         "on_exhausted": (
-            _destination_document(step.on_exhausted)
+            _destination_document(step.on_exhausted, version)
             if step.on_exhausted is not None
             else None
         ),
     }
+    # Format-1 canonical bytes are frozen: nothing format 2 added may appear
+    # in them, or every retained revision would change identity.
+    if version >= 2:
+        document["evidence"] = _evidence_document(step.evidence)
     if isinstance(step, AgentStep):
         document.update(
             session=step.session,
             role=step.role,
             prompt=_text_document(step.prompt),
-            expects_outcome=step.expects_outcome,
             when=_predicate_document(step.when),
         )
+        if version == 1:
+            document["expects_outcome"] = step.expects_outcome
+        else:
+            document["outcome"] = _outcome_document(step.outcome)
     elif isinstance(step, CommandStep):
         document.update(
             argv=list(step.argv), timeout=step.timeout, idempotent=step.idempotent
@@ -1328,14 +1835,24 @@ def _step_document(step: Step) -> dict[str, Any]:
             cases=[
                 {
                     "when": _predicate_document(case.when),
-                    "next": _destination_document(case.next),
+                    "next": _destination_document(case.next, version),
                 }
                 for case in step.cases
             ],
-            otherwise=_destination_document(step.otherwise),
+            otherwise=_destination_document(step.otherwise, version),
         )
     else:
         document.update(message=_text_document(step.message))
+        if version >= 2:
+            document["choices"] = [
+                {
+                    "id": choice.id,
+                    "label": choice.label,
+                    "feedback_required": choice.feedback_required,
+                    "next": _destination_document(choice.next, version),
+                }
+                for choice in step.choices
+            ]
     return document
 
 
@@ -1346,7 +1863,9 @@ def canonical_document(definition: WorkflowDefinition) -> dict[str, Any]:
         "name": definition.name,
         "sessions": list(definition.sessions),
         "primary": definition.primary,
-        "steps": [_step_document(step) for step in definition.steps],
+        "steps": [
+            _step_document(step, definition.format) for step in definition.steps
+        ],
     }
 
 
@@ -1392,12 +1911,38 @@ def load_canonical_document(document: Mapping[str, Any]) -> WorkflowDefinition:
 
 @dataclass(frozen=True)
 class HistoryRecord:
-    """One finished (or in-flight) attempt, as an expression sees it."""
+    """One finished (or in-flight) attempt, as an expression sees it.
+
+    `evidence` is that attempt's own frozen bindings — alias → `{step, seq}`
+    or None. It travels with the record so a later step can ask not just what
+    a verifier concluded but *which* fix it was looking at, which is how a
+    stale approval is caught rather than trusted.
+    """
 
     seq: int
     step: str
     status: str
     outcome: dict[str, Any] | None
+    evidence: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class EvidenceBinding:
+    """What one selector actually selected, recorded on the attempt.
+
+    `seq` is None when an optional selector matched nothing. That is a
+    different fact from "not resolved yet", and keeping them apart is what
+    lets a prompt say "no rejection report" instead of rendering an empty
+    string that reads like one.
+    """
+
+    name: str
+    step: str | None
+    seq: int | None
+
+    @property
+    def present(self) -> bool:
+        return self.seq is not None
 
 
 @dataclass(frozen=True)
@@ -1407,10 +1952,17 @@ class EvaluationContext:
     Both are captured at attempt entry and are task-local. There is nothing
     else to read — no project, no profile, no clock, no filesystem — so two
     evaluations of the same expression over the same history agree.
+
+    `evidence` is the format-2 addition: alias → the record view this attempt
+    bound when it opened, or None for an optional selector that matched
+    nothing. It is not recomputed here, which is the point — the same view is
+    handed to the prompt, to the routing decision, to the gate message, and to
+    recovery after a restart.
     """
 
     inputs: Mapping[str, str]
     records: tuple[HistoryRecord, ...]
+    evidence: Mapping[str, dict[str, Any] | None] = MappingProxyType({})
 
 
 class RenderError(Exception):
@@ -1432,6 +1984,12 @@ def evaluate_value(value: ValueExpr, context: EvaluationContext) -> Any:
         return value.value
     if isinstance(value, InputValue):
         return context.inputs.get(value.name, MISSING)
+    if isinstance(value, EvidenceValue):
+        # Absence — an optional selector that matched nothing — is MISSING,
+        # not None: `exists` must say false, and a `get` through it must not
+        # yield a null that reads like a written value.
+        view = context.evidence.get(value.name)
+        return MISSING if view is None else view
     if isinstance(value, LatestValue):
         floor = (
             _latest_attempt_seq(context, value.after) if value.after is not None else 0
@@ -1505,6 +2063,8 @@ def _describe(value: ValueExpr) -> str:
         return f"input {value.name}"
     if isinstance(value, LatestValue):
         return f"latest result of {', '.join(value.steps)}"
+    if isinstance(value, EvidenceValue):
+        return f"evidence {value.name}"
     if isinstance(value, GetValue):
         return f"{_describe(value.value)}.{'.'.join(str(k) for k in value.keys)}"
     if isinstance(value, CountValue):
@@ -1649,6 +2209,207 @@ def _render_parts(text: TextDocument, context: EvaluationContext) -> str:
     return text.separator.join(pieces)
 
 
+# --- format 2: evidence resolution and result validation ----------------------
+
+
+def record_view(record: HistoryRecord) -> dict[str, Any]:
+    """One attempt as a definition sees it.
+
+    `evidence` carries that attempt's own bindings, so a route can ask which
+    fix a verifier actually checked instead of assuming it checked the newest.
+    """
+    return {
+        "step": record.step,
+        "seq": record.seq,
+        "status": record.status,
+        "outcome": record.outcome,
+        "evidence": dict(record.evidence) if record.evidence is not None else {},
+    }
+
+
+def select_evidence(
+    selector: EvidenceSelector, records: Sequence[HistoryRecord]
+) -> HistoryRecord | None:
+    """The record one selector picks, by format 1's `latest` rules.
+
+    Same rules, different moment: this runs once, when the attempt opens, and
+    what it picked is then written down.
+    """
+    floor = 0
+    if selector.after is not None:
+        floor = max(
+            (r.seq for r in records if r.step == selector.after), default=0
+        )
+    candidates = [
+        record
+        for record in records
+        if record.step in selector.steps
+        and record.status == "ok"
+        and record.seq > floor
+        and (record.outcome is not None or not selector.with_outcome)
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda record: record.seq)
+
+
+def resolve_evidence(
+    step: Step, records: Sequence[HistoryRecord]
+) -> tuple[tuple[EvidenceBinding, ...], tuple[str, ...]]:
+    """Bind every selector this step declares; report the required misses.
+
+    Missing required evidence is returned rather than raised because the
+    caller has to *record* the attempt before it can pause it: an attempt that
+    vanished would take the reason with it.
+    """
+    bindings: list[EvidenceBinding] = []
+    missing: list[str] = []
+    for selector in step.evidence:
+        found = select_evidence(selector, records)
+        if found is None:
+            if selector.required:
+                missing.append(selector.name)
+            bindings.append(EvidenceBinding(name=selector.name, step=None, seq=None))
+            continue
+        bindings.append(
+            EvidenceBinding(name=selector.name, step=found.step, seq=found.seq)
+        )
+    return tuple(bindings), tuple(missing)
+
+
+def evidence_views(
+    bindings: Sequence[EvidenceBinding], records: Sequence[HistoryRecord]
+) -> dict[str, dict[str, Any] | None]:
+    """Turn recorded bindings back into the record views expressions read.
+
+    A binding whose record is gone resolves to None rather than to some other
+    record: history that cannot be shown is unavailable, never substituted.
+    """
+    by_seq = {record.seq: record for record in records}
+    views: dict[str, dict[str, Any] | None] = {}
+    for binding in bindings:
+        record = by_seq.get(binding.seq) if binding.seq is not None else None
+        views[binding.name] = record_view(record) if record is not None else None
+    return views
+
+
+def bindings_document(bindings: Sequence[EvidenceBinding]) -> dict[str, Any]:
+    """The persisted shape of an attempt's frozen evidence."""
+    return {
+        "version": 1,
+        "bindings": {
+            binding.name: (
+                None
+                if binding.seq is None
+                else {"step": binding.step, "seq": binding.seq}
+            )
+            for binding in bindings
+        },
+    }
+
+
+def bindings_from_document(
+    document: Mapping[str, Any] | None,
+) -> tuple[EvidenceBinding, ...]:
+    """Read back what an attempt froze. An absent column is no bindings."""
+    if not isinstance(document, Mapping):
+        return ()
+    raw = document.get("bindings")
+    if not isinstance(raw, Mapping):
+        return ()
+    bindings: list[EvidenceBinding] = []
+    for name in sorted(raw):
+        entry = raw[name]
+        if entry is None:
+            bindings.append(EvidenceBinding(name=name, step=None, seq=None))
+            continue
+        if not isinstance(entry, Mapping):
+            continue
+        seq = entry.get("seq")
+        step = entry.get("step")
+        if not isinstance(seq, int) or isinstance(seq, bool):
+            continue
+        bindings.append(
+            EvidenceBinding(
+                name=name, step=step if isinstance(step, str) else None, seq=seq
+            )
+        )
+    return tuple(bindings)
+
+
+# The format-2 result envelope. Version 2 is the document's own, independent of
+# the workflow format that asked for it, so a reader can tell which rules a
+# retained result was written under.
+RESULT_ENVELOPE_VERSION = 2
+_ENVELOPE_KEYS = ("version", "result", "summary", "artifacts")
+
+
+def validate_result_document(
+    document: Any, contract: OutcomeContract
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Check one result document against the step's declared contract.
+
+    Returns `(document, None)` or `(None, reason)`. Every refusal names the
+    field, because "invalid result" tells an operator nothing about whether to
+    retry the step or fix the workflow.
+
+    What this establishes is structure and attribution: that the step declared
+    this result and wrote the evidence it promised. It says nothing about
+    whether that evidence is *true* — no validator can — and nothing here may
+    be read as permission to act on the content.
+    """
+    if not isinstance(document, dict):
+        return None, "result document is not a JSON object"
+    unknown = sorted(set(document) - set(_ENVELOPE_KEYS))
+    if unknown:
+        return None, f"unknown result field(s) {', '.join(repr(k) for k in unknown)}"
+    if document.get("version") != RESULT_ENVELOPE_VERSION:
+        return (
+            None,
+            f"result version must be {RESULT_ENVELOPE_VERSION}, got "
+            f"{document.get('version')!r}",
+        )
+    result = document.get("result")
+    if not isinstance(result, str):
+        return None, "result must be a string naming one of this step's results"
+    declared = contract.result_named(result)
+    if declared is None:
+        return (
+            None,
+            f"result {result!r} is not declared by this step; it declares "
+            f"{', '.join(contract.names)}",
+        )
+    summary = document.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return None, "summary must be a nonblank string"
+    artifacts = document.get("artifacts", {})
+    if artifacts is None:
+        artifacts = {}
+    if not isinstance(artifacts, dict) or not all(
+        isinstance(key, str) for key in artifacts
+    ):
+        return None, "artifacts must be a string-keyed object"
+    for field, expected in declared.required:
+        if field not in artifacts:
+            return (
+                None,
+                f"result {result!r} requires the artifact {field!r} ({expected})",
+            )
+        value = artifacts[field]
+        actual = _json_type_of(value)
+        # An integer satisfies a declared `number`; nothing else widens.
+        if actual != expected and not (expected == "number" and actual == "integer"):
+            return (
+                None,
+                f"artifact {field!r} must be {expected}, got "
+                f"{actual if actual is not None else 'nothing'}",
+            )
+        if expected == "string" and not value.strip():
+            return None, f"artifact {field!r} must not be blank"
+    return document, None
+
+
+
 # --- catalog description ------------------------------------------------------
 
 
@@ -1676,11 +2437,13 @@ def describe(revision: WorkflowRevision) -> WorkflowDescriptor:
 
     A step is `conditional` when a declared route can pass it by or its own
     `when` can hold it back. The engine does not predict outcomes, so this is
-    a statement about the declaration.
+    a statement about the declaration. A format-2 gate branches too: its
+    choices are routes, so everything after one is reachable rather than
+    certain.
     """
     definition = revision.definition
     steps: list[StepDescriptor] = []
-    after_decision = False
+    after_branch = False
     for step in definition.steps:
         agent = step if isinstance(step, AgentStep) else None
         gated = agent is not None and agent.when != LiteralPredicate(value=True)
@@ -1690,11 +2453,13 @@ def describe(revision: WorkflowRevision) -> WorkflowDescriptor:
                 kind=step.kind,
                 session=agent.session if agent else None,
                 role=agent.role if agent else None,
-                conditional=after_decision or gated,
+                conditional=after_branch or gated,
             )
         )
-        if isinstance(step, DecisionStep):
-            after_decision = True
+        if isinstance(step, DecisionStep) or (
+            isinstance(step, GateStep) and step.choices
+        ):
+            after_branch = True
     return WorkflowDescriptor(
         name=definition.name,
         revision=revision.revision,

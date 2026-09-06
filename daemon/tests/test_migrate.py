@@ -52,7 +52,7 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0015"
+    assert version == "0016"
     assert "projects" in tables
     assert "tasks" in tables
     # Templates are retired (ADR-0026): the live table is gone and only inert
@@ -198,7 +198,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0015"
+    assert version == "0016"
     assert row == "demo"
 
 
@@ -1614,3 +1614,111 @@ def _pinned_raw(conn, slug: str) -> str:
         text("SELECT execution_inputs_json FROM tasks WHERE slug = :slug"),
         {"slug": slug},
     ).scalar_one()
+
+
+# --- 0016: recorded evidence and named endings (ADR-0029, ADR-0030) ----------
+
+
+def _land_at_0015(db_path: Path) -> None:
+    from alembic import command
+
+    command.upgrade(_alembic_cfg(db_path), "0015")
+
+
+def test_0016_leaves_existing_history_unrecorded_rather_than_backfilled(
+    tmp_path: Path,
+) -> None:
+    """The load-bearing refusal, again.
+
+    A pre-upgrade attempt froze no evidence and a pre-upgrade run declared no
+    ending. NULL says exactly that. An empty binding map would claim the
+    attempt looked at nothing, and a terminal result inferred from `complete`
+    would claim a run reported an outcome it never had a vocabulary for.
+    """
+    db_path = tmp_path / "ompire.db"
+    _land_at_0015(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "historic", _v2_document())
+        task_id = conn.execute(
+            text("SELECT id FROM tasks WHERE slug = 'historic'")
+        ).scalar_one()
+        conn.execute(
+            text(
+                "UPDATE tasks SET workflow_status = 'complete', "
+                "workflow_step = NULL WHERE id = :task"
+            ),
+            {"task": task_id},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO workflow_step_records "
+                "(task_id, seq, step, kind, session, status, outcome_json, "
+                "error, pause_json, prompted_at, started_at, finished_at) VALUES "
+                "(:task, 1, 'reproduce', 'agent', 'reproducer', 'ok', "
+                "'{\"status\": \"success\"}', NULL, NULL, "
+                "'2026-09-01T00:00:00+00:00', '2026-09-01T00:00:00+00:00', "
+                "'2026-09-01T00:01:00+00:00')"
+            ),
+            {"task": task_id},
+        )
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        step_columns = {
+            row[1]
+            for row in conn.execute(text("PRAGMA table_info(workflow_step_records)"))
+        }
+        task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
+        record = conn.execute(
+            text(
+                "SELECT outcome_json, evidence_json FROM workflow_step_records "
+                "WHERE task_id = :task AND seq = 1"
+            ),
+            {"task": task_id},
+        ).one()
+        result, status = conn.execute(
+            text("SELECT workflow_result, workflow_status FROM tasks WHERE id = :task"),
+            {"task": task_id},
+        ).one()
+
+    assert "evidence_json" in step_columns
+    assert "workflow_result" in task_columns
+    # The attempt's own evidence is untouched, and it gained no bindings.
+    assert record == ('{"status": "success"}', None)
+    # The run is still complete, and still says nothing about what that meant.
+    assert (status, result) == ("complete", None)
+
+
+def test_0016_downgrade_drops_only_the_two_new_columns(tmp_path: Path) -> None:
+    from alembic import command
+
+    db_path = tmp_path / "ompire.db"
+    _land_at_0015(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "historic", _v2_document())
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    command.downgrade(_alembic_cfg(db_path), "0015")
+
+    with engine.connect() as conn:
+        version = conn.execute(
+            text("SELECT version_num FROM alembic_version")
+        ).scalar_one()
+        step_columns = {
+            row[1]
+            for row in conn.execute(text("PRAGMA table_info(workflow_step_records)"))
+        }
+        task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
+        slug = conn.execute(text("SELECT slug FROM tasks")).scalar_one()
+
+    assert version == "0015"
+    assert "evidence_json" not in step_columns
+    assert "workflow_result" not in task_columns
+    # Everything 0015 owns survives the round trip.
+    assert "pause_json" in step_columns
+    assert slug == "historic"

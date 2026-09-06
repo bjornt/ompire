@@ -34,8 +34,10 @@ from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.sessions import get_session
 from ompire_daemon.registry.tasks import Task, create_task, get_task
 from ompire_daemon.registry.workflows import (
+    WorkflowGateChoiceError,
     WorkflowWaitConflictError,
     list_step_records,
+    resolve_gate,
 )
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.taskdefinition import (
@@ -2187,3 +2189,586 @@ def _role_bindings(roles: dict) -> dict:
         role: RoleBinding(model=pair["model"], thinking=pair["thinking"])
         for role, pair in roles.items()
     }
+
+
+# --- format 2: declared results, frozen evidence, answered gates -------------
+#
+# What these cover is the difference format 2 makes at run time: a negative
+# result routes instead of stopping, a consuming step is handed the exact
+# attempt it was bound to rather than the newest one, and a human answer is
+# committed before the run moves.
+
+F2_YAML = """
+format: 2
+name: f2-wf
+sessions: [qa, coder]
+primary: coder
+steps:
+  - name: reproduce
+    kind: agent
+    session: qa
+    max_visits: 3
+    on_exhausted: {step: exhausted}
+    outcome:
+      results:
+        reproduced:
+          required: {attempts: string}
+        not-reproduced:
+          required: {attempts: string}
+    prompt:
+      parts:
+        - text: "reproduce it"
+  - name: route
+    kind: decision
+    evidence:
+      repro: {steps: [reproduce]}
+    cases:
+      - when:
+          op: eq
+          left: {op: get, value: {op: evidence, name: repro}, keys: [outcome, result]}
+          right: {op: literal, value: reproduced}
+        next: {step: fix}
+    otherwise: {step: decide}
+  - name: fix
+    kind: agent
+    session: coder
+    evidence:
+      repro: {steps: [reproduce]}
+    outcome: null
+    prompt:
+      separator: ""
+      parts:
+        - text: "fix what qa saw in attempt "
+        - value: {op: get, value: {op: evidence, name: repro}, keys: [seq]}
+          format: text
+        - text: ": "
+        - value: {op: get, value: {op: evidence, name: repro}, keys: [outcome, summary]}
+          format: text
+  - name: done
+    kind: decision
+    cases:
+      - when: true
+        next: {complete: true, result: validated}
+    otherwise: {complete: true, result: validated}
+  - name: exhausted
+    kind: gate
+    message:
+      parts:
+        - text: "out of reproduction attempts"
+    choices:
+      - id: stop
+        label: Stop without a fix
+        next: {complete: true, result: stopped-without-fix}
+  - name: decide
+    kind: gate
+    evidence:
+      repro: {steps: [reproduce]}
+    message:
+      separator: ""
+      parts:
+        - text: "could not reproduce: "
+        - value: {op: get, value: {op: evidence, name: repro}, keys: [outcome, summary]}
+          format: text
+    choices:
+      - id: retry
+        label: Supply information and retry
+        feedback_required: true
+        next: {step: reproduce}
+      - id: stop
+        label: Stop without a fix
+        next: {complete: true, result: stopped-without-fix}
+"""
+
+
+@pytest.fixture
+def f2_workflow(engine: Engine):
+    return install_test_workflow(engine, F2_YAML)
+
+
+def _result(result: str, summary: str, **artifacts) -> str:
+    return json.dumps(
+        {
+            "version": 2,
+            "result": result,
+            "summary": summary,
+            "artifacts": artifacts or {"attempts": "ran it"},
+        }
+    )
+
+
+def answer(
+    runner: WorkflowRunner,
+    engine: Engine,
+    task: Task,
+    choice_id: str,
+    note: str | None = None,
+):
+    return runner.answer_gate(
+        get_task(engine, task.id),
+        resolve_task_definition(engine, task),
+        expected_seq=waiting_seq(engine, task.id),
+        choice_id=choice_id,
+        note=note,
+    )
+
+
+async def test_a_declared_negative_result_routes_instead_of_stopping(
+    rig, engine, project, tmp_path: Path, f2_workflow
+) -> None:
+    """`not-reproduced` is an answer, not an absence.
+
+    Format 1 could only say success/failed and had to be told what that meant
+    by a route reading `status`. Here the step declares the name, the run
+    finishes the attempt `ok`, and the decision sends it to the gate its
+    author chose.
+    """
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="f2-wf", slug="f2-negative")
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor,
+            task.id,
+            "qa",
+            Path(task.clone_path),
+            _result("not-reproduced", "no repro on main", attempts="ran the suite"),
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+
+    records = list_step_records(engine, task.id)
+    assert [(r.step, r.status) for r in records] == [
+        ("reproduce", "ok"),
+        ("route", "ok"),
+        ("decide", "waiting"),
+    ]
+    # The producing attempt kept its declared result, not a synthetic failure.
+    assert records[0].outcome["result"] == "not-reproduced"
+    assert records[0].pause is None
+    # And the gate is a real question with the evidence it is asking about.
+    snapshot = records[-1].outcome
+    assert snapshot["version"] == 2
+    assert "no repro on main" in snapshot["message"]
+    assert [c["id"] for c in snapshot["choices"]] == ["retry", "stop"]
+    assert snapshot["evidence"]["repro"] == {"step": "reproduce", "seq": 1}
+
+
+async def test_a_result_outside_the_contract_pauses_rather_than_routing(
+    rig, engine, project, tmp_path: Path, f2_workflow
+) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="f2-wf", slug="f2-undeclared")
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor,
+            task.id,
+            "qa",
+            Path(task.clone_path),
+            _result("mostly-reproduced", "sort of", attempts="tried"),
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+
+    record = list_step_records(engine, task.id)[-1]
+    assert record.step == "reproduce"
+    assert record.status == "waiting"
+    assert record.outcome is None  # nothing that could later read as a result
+    assert record.pause["reason"] == "missing_outcome"
+    assert "is not declared by this step" in record.error
+
+
+async def test_a_missing_required_artifact_is_not_a_result(
+    rig, engine, project, tmp_path: Path, f2_workflow
+) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="f2-wf", slug="f2-incomplete")
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor,
+            task.id,
+            "qa",
+            Path(task.clone_path),
+            json.dumps(
+                {
+                    "version": 2,
+                    "result": "reproduced",
+                    "summary": "it fails",
+                    "artifacts": {},
+                }
+            ),
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+
+    record = list_step_records(engine, task.id)[-1]
+    assert record.outcome is None
+    assert "requires the artifact 'attempts'" in record.error
+
+
+async def test_the_prompt_names_the_results_the_step_may_declare(
+    rig, engine, project, tmp_path: Path, f2_workflow
+) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="f2-wf", slug="f2-instruction")
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor,
+            task.id,
+            "qa",
+            Path(task.clone_path),
+            _result("not-reproduced", "nope", attempts="tried"),
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+
+    prompt = user_prompts(supervisor, task.id, "qa")[0]
+    assert '"version": 2' in prompt
+    assert '"reproduced"' in prompt and '"not-reproduced"' in prompt
+    assert "required artifacts: attempts (string)" in prompt
+
+
+async def test_a_consumer_is_handed_the_attempt_it_was_bound_to(
+    rig, engine, project, tmp_path: Path, f2_workflow
+) -> None:
+    """The frozen-evidence property, end to end.
+
+    `fix` renders the *sequence number* of the reproduction it was given. If
+    the binding were re-selected on read rather than frozen at entry, this
+    would silently be whatever ran most recently.
+    """
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="f2-wf", slug="f2-handoff")
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor,
+            task.id,
+            "qa",
+            Path(task.clone_path),
+            _result("reproduced", "fails on main", attempts="ran the suite"),
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"complete"})
+    await writer
+
+    task_row = get_task(engine, task.id)
+    assert task_row.workflow_result == "validated"
+    prompt = user_prompts(supervisor, task.id, "coder")[0]
+    assert "fix what qa saw in attempt 1: fails on main" in prompt
+    fix_record = next(r for r in list_step_records(engine, task.id) if r.step == "fix")
+    assert fix_record.evidence == {
+        "version": 1,
+        "bindings": {"repro": {"step": "reproduce", "seq": 1}},
+    }
+
+
+async def test_answering_a_gate_records_the_choice_and_takes_its_route(
+    rig, engine, project, tmp_path: Path, f2_workflow
+) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="f2-wf", slug="f2-answer")
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor,
+            task.id,
+            "qa",
+            Path(task.clone_path),
+            _result("not-reproduced", "nope", attempts="tried"),
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+    gate_seq = waiting_seq(engine, task.id)
+
+    updated = answer(runner, engine, task, "stop")
+
+    assert updated.workflow_status == "complete"
+    assert updated.workflow_result == "stopped-without-fix"
+    gate = next(r for r in list_step_records(engine, task.id) if r.seq == gate_seq)
+    assert gate.status == "ok"
+    decision = gate.outcome["decision"]
+    assert decision["choice_id"] == "stop"
+    assert decision["label"] == "Stop without a fix"
+    assert decision["destination"] == {
+        "complete": True,
+        "result": "stopped-without-fix",
+    }
+    assert decision["actor"] == "operator"
+    # The question is still readable beside the answer.
+    assert gate.outcome["message"].startswith("could not reproduce")
+    assert [c["id"] for c in gate.outcome["choices"]] == ["retry", "stop"]
+
+
+async def test_a_gate_answer_is_refused_twice_and_when_stale(
+    rig, engine, project, tmp_path: Path, f2_workflow
+) -> None:
+    """A duplicate submit and a stale tab look identical from the daemon, and
+    both must be refused rather than applied to whatever is waiting now."""
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="f2-wf", slug="f2-replay")
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor,
+            task.id,
+            "qa",
+            Path(task.clone_path),
+            _result("not-reproduced", "nope", attempts="tried"),
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+    gate_seq = waiting_seq(engine, task.id)
+
+    answer(runner, engine, task, "stop")
+    with pytest.raises((WorkflowWaitConflictError, WorkflowNotWaitingError)):
+        runner.answer_gate(
+            get_task(engine, task.id),
+            resolve_task_definition(engine, task),
+            expected_seq=gate_seq,
+            choice_id="retry",
+            note="second thoughts",
+        )
+    # Exactly one decision, and no second successor for it.
+    records = list_step_records(engine, task.id)
+    answered = [r for r in records if r.kind == "gate" and (r.outcome or {}).get("decision")]
+    assert len(answered) == 1
+    assert answered[0].outcome["decision"]["choice_id"] == "stop"
+    assert [r.seq for r in records] == sorted(r.seq for r in records)
+    assert records[-1].seq == gate_seq  # nothing opened after the completion
+
+
+async def test_a_choice_the_gate_does_not_offer_is_refused(
+    rig, engine, project, tmp_path: Path, f2_workflow
+) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="f2-wf", slug="f2-unknown-choice")
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor,
+            task.id,
+            "qa",
+            Path(task.clone_path),
+            _result("not-reproduced", "nope", attempts="tried"),
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+
+    with pytest.raises(WorkflowGateChoiceError, match="not one of this gate's choices"):
+        answer(runner, engine, task, "proceed-anyway")
+    # Feedback the choice declares as required cannot be skipped.
+    with pytest.raises(WorkflowGateChoiceError, match="requires feedback"):
+        answer(runner, engine, task, "retry", "   ")
+    # Nothing advanced.
+    assert get_task(engine, task.id).workflow_status == "waiting"
+    assert list_step_records(engine, task.id)[-1].status == "waiting"
+
+
+async def test_a_retry_choice_spends_a_visit_and_cannot_refill_the_budget(
+    rig, engine, project, tmp_path: Path, f2_workflow
+) -> None:
+    """A human edge is an edge.
+
+    Three reproduction attempts is a lifetime budget for the run, so the third
+    retry lands on the exhaustion gate — which offers only stopping — rather
+    than on a fourth attempt.
+    """
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="f2-wf", slug="f2-budget")
+    clone = Path(task.clone_path)
+    negative = _result("not-reproduced", "nope", attempts="tried")
+
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(supervisor, task.id, "qa", clone, negative)
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+
+    for attempt in (2, 3):
+        writer = asyncio.create_task(
+            _write_outcome_when_session_prompted(
+                supervisor, task.id, "qa", clone, negative, prompt_count=attempt
+            )
+        )
+        answer(runner, engine, task, "retry", f"try harder ({attempt})")
+        await wait_for_run(engine, task.id, {"waiting"})
+        await writer
+
+    # Budget spent: three `reproduce` attempts, and the next retry is refused
+    # a fourth.
+    assert len([r for r in list_step_records(engine, task.id) if r.step == "reproduce"]) == 3
+    answer(runner, engine, task, "retry", "one more?")
+    await wait_for_run(engine, task.id, {"waiting"})
+    records = list_step_records(engine, task.id)
+    assert len([r for r in records if r.step == "reproduce"]) == 3
+    assert records[-1].step == "exhausted"
+    assert [c["id"] for c in records[-1].outcome["choices"]] == ["stop"]
+
+    answer(runner, engine, task, "stop")
+    final = get_task(engine, task.id)
+    assert (final.workflow_status, final.workflow_result) == (
+        "complete",
+        "stopped-without-fix",
+    )
+
+
+async def test_an_unanswered_gate_is_the_same_question_after_a_restart(
+    rig, engine, project, tmp_path: Path, f2_workflow
+) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="f2-wf", slug="f2-restart-gate")
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor,
+            task.id,
+            "qa",
+            Path(task.clone_path),
+            _result("not-reproduced", "nope on main", attempts="tried"),
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+    before = list_step_records(engine, task.id)[-1]
+
+    await runner.shutdown()
+    await supervisor.shutdown()
+    runner2, supervisor2, tracker2, _hub2 = _restart_rig(engine, tmp_path)
+    try:
+        await _resume_recorded_sessions(
+            engine, supervisor2, tracker2, get_task(engine, task.id)
+        )
+        _recover(runner2, engine, get_task(engine, task.id))
+        await wait_for_run(engine, task.id, {"waiting"})
+
+        after = list_step_records(engine, task.id)[-1]
+        # The same row, the same question, no second gate attempt.
+        assert after.seq == before.seq
+        assert after.outcome == before.outcome
+        assert after.outcome.get("decision") is None
+
+        answer(runner2, engine, task, "stop")
+        final = get_task(engine, task.id)
+        assert (final.workflow_status, final.workflow_result) == (
+            "complete",
+            "stopped-without-fix",
+        )
+    finally:
+        await runner2.shutdown()
+        await supervisor2.shutdown()
+
+
+async def test_an_answer_committed_before_a_crash_is_not_lost_or_replayed(
+    rig, engine, project, tmp_path: Path, f2_workflow
+) -> None:
+    """The exact interruption the in-memory future could not survive.
+
+    The decision commits, and *then* the process dies before anything is
+    scheduled. Recovery must find the successor the answer already opened —
+    not re-arm the gate, and not open a second attempt.
+    """
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="f2-wf", slug="f2-crash-after-commit")
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor,
+            task.id,
+            "qa",
+            Path(task.clone_path),
+            _result("not-reproduced", "nope", attempts="tried"),
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+    gate_seq = waiting_seq(engine, task.id)
+
+    # Commit the answer directly, exactly as `answer_gate` does, and never let
+    # the parked run observe it: this is the post-commit / pre-schedule window.
+    definition = resolve_task_definition(engine, task).definition
+    target = definition.step_named("reproduce")
+    resolve_gate(
+        engine,
+        task.id,
+        gate_seq,
+        choice_id="retry",
+        feedback="here is a hint",
+        successor=(target.name, target.kind, target.session, None),
+        terminal_result=None,
+    )
+    await runner.shutdown()
+    await supervisor.shutdown()
+
+    records = list_step_records(engine, task.id)
+    assert records[-2].seq == gate_seq
+    assert records[-2].outcome["decision"]["choice_id"] == "retry"
+    assert records[-2].outcome["decision"]["feedback"] == "here is a hint"
+    assert (records[-1].step, records[-1].status) == ("reproduce", "running")
+
+    runner2, supervisor2, tracker2, _hub2 = _restart_rig(engine, tmp_path)
+    try:
+        await _resume_recorded_sessions(
+            engine, supervisor2, tracker2, get_task(engine, task.id)
+        )
+        writer = asyncio.create_task(
+            _write_outcome_when_session_prompted(
+                supervisor2,
+                task.id,
+                "qa",
+                Path(task.clone_path),
+                _result("not-reproduced", "still nope", attempts="tried again"),
+                prompt_count=1,
+            )
+        )
+        _recover(runner2, engine, get_task(engine, task.id))
+        await wait_for_run(engine, task.id, {"waiting"})
+        await writer
+
+        after = list_step_records(engine, task.id)
+        # The answered gate was neither re-armed nor answered twice, and the
+        # successor it opened was re-driven rather than duplicated.
+        assert len([r for r in after if r.seq == gate_seq]) == 1
+        assert len([r for r in after if r.step == "reproduce"]) == 2
+        assert after[gate_seq - 1].outcome["decision"]["choice_id"] == "retry"
+    finally:
+        await runner2.shutdown()
+        await supervisor2.shutdown()
+
+
+async def test_missing_required_evidence_pauses_instead_of_prompting(
+    engine, project, tmp_path: Path
+) -> None:
+    """A required handoff that does not exist stops the attempt where it is.
+
+    The attempt is recorded — with the reason — rather than skipped, because
+    an attempt that vanished would take the explanation with it.
+    """
+    from ompire_daemon.registry.workflows import append_step_record
+    from ompire_daemon.workflows import missing_required_evidence
+    from ompire_daemon.workflow_definitions import bindings_from_document
+
+    revision = install_test_workflow(engine, F2_YAML)
+    step = revision.definition.step_named("fix")
+    # `fix` requires a reproduction. With no history there is nothing to bind.
+    assert missing_required_evidence(step, bindings_from_document(None)) == ("repro",)
+    bound = bindings_from_document(
+        {"version": 1, "bindings": {"repro": {"step": "reproduce", "seq": 2}}}
+    )
+    assert missing_required_evidence(step, bound) == ()
+    # An optional selector that matched nothing is not missing.
+    decide = revision.definition.step_named("decide")
+    assert decide.evidence[0].required is True
+    assert missing_required_evidence(decide, bindings_from_document(
+        {"version": 1, "bindings": {"repro": None}}
+    )) == ("repro",)

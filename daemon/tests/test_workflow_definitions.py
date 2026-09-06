@@ -1,5 +1,5 @@
-"""Format-1 workflow documents: the loader's refusals, the identity rules, and
-three-valued evaluation.
+"""Workflow documents: the loader's refusals, the identity rules, and
+three-valued evaluation, in both formats.
 
 The point of these tests is the boundary, not the built-ins: what a document
 may say, what changes its revision, and what "cannot decide" means.
@@ -15,19 +15,31 @@ from ompire_daemon.workflow_definitions import (
     MISSING,
     AgentStep,
     CommandStep,
+    CompleteDestination,
     EvaluationContext,
+    EvidenceBinding,
+    EvidenceSelector,
+    EvidenceValue,
+    GateStep,
     HistoryRecord,
     RenderError,
+    StepDestination,
     Unresolved,
     UnsupportedWorkflowFormatError,
     WorkflowDocumentError,
+    bindings_document,
+    bindings_from_document,
     canonical_bytes,
     describe,
     evaluate_predicate,
     evaluate_value,
+    evidence_views,
     load_definition,
     parse_yaml_document,
+    record_view,
     render_text,
+    resolve_evidence,
+    validate_result_document,
 )
 
 MINIMAL = """
@@ -121,8 +133,10 @@ def test_oversized_document_is_refused_before_parsing() -> None:
 
 
 def test_unsupported_format_is_refused_not_reinterpreted() -> None:
+    # A version this interpreter does not implement is refused rather than
+    # read under the newest rules it happens to know.
     with pytest.raises(UnsupportedWorkflowFormatError):
-        load(MINIMAL.replace("format: 1", "format: 2"))
+        load(MINIMAL.replace("format: 1", "format: 3"))
 
 
 @pytest.mark.parametrize(
@@ -333,13 +347,13 @@ def test_latest_selects_the_newest_ok_attempt_and_says_which_step_answered() -> 
 def parse_value(document):
     from ompire_daemon.workflow_definitions import _parse_value
 
-    return _parse_value(document, "test")
+    return _parse_value(document, "test", 1)
 
 
 def parse_predicate(document):
     from ompire_daemon.workflow_definitions import _parse_predicate
 
-    return _parse_predicate(document, "test")
+    return _parse_predicate(document, "test", 1)
 
 
 def test_after_excludes_attempts_older_than_the_anchor() -> None:
@@ -501,7 +515,7 @@ def test_a_missing_value_without_a_fallback_refuses_to_render() -> None:
     from ompire_daemon.workflow_definitions import _parse_text
 
     with pytest.raises(RenderError, match="missing"):
-        render_text(_parse_text(document, "t"), context())
+        render_text(_parse_text(document, "t", 1), context())
 
 
 def test_an_unresolved_conditional_refuses_rather_than_dropping_the_section() -> None:
@@ -522,7 +536,7 @@ def test_an_unresolved_conditional_refuses_rather_than_dropping_the_section() ->
         ],
     }
     with pytest.raises(RenderError, match="cannot be resolved"):
-        render_text(_parse_text(document, "t"), context())
+        render_text(_parse_text(document, "t", 1), context())
 
 
 def test_json_format_is_stable_and_sorted() -> None:
@@ -538,7 +552,7 @@ def test_json_format_is_stable_and_sorted() -> None:
         ],
     }
     ctx = context(records=[record(1, "a", {"b": 2, "a": 1})])
-    assert render_text(_parse_text(document, "t"), ctx) == '{"a": 1, "b": 2}'
+    assert render_text(_parse_text(document, "t", 1), ctx) == '{"a": 1, "b": 2}'
 
 
 # --- description --------------------------------------------------------------
@@ -574,3 +588,310 @@ steps:
         ("later", True),
     ]
     assert descriptor.revision == revision.revision
+
+
+# --- format 2 -----------------------------------------------------------------
+#
+# The boundary that matters here is what format 2 *removes*: a route can no
+# longer read a record the attempt did not freeze, a step can no longer finish
+# on a result it never declared, and a run can no longer end without saying
+# which ending it was.
+
+FORMAT_2 = """
+format: 2
+name: two
+sessions: [qa, coder]
+primary: coder
+steps:
+  - name: reproduce
+    kind: agent
+    session: qa
+    max_visits: 3
+    on_exhausted: {step: exhausted}
+    outcome:
+      results:
+        reproduced:
+          required: {attempts: string, script_available: boolean}
+        not-reproduced:
+          required: {attempts: string}
+    prompt:
+      parts: [{text: "reproduce it"}]
+  - name: route
+    kind: decision
+    evidence:
+      repro: {steps: [reproduce]}
+    cases:
+      - when:
+          op: eq
+          left: {op: get, value: {op: evidence, name: repro}, keys: [outcome, result]}
+          right: {op: literal, value: reproduced}
+        next: {complete: true, result: validated}
+    otherwise: {step: undecided}
+  - name: exhausted
+    kind: gate
+    message: {parts: [{text: "out of attempts"}]}
+    choices:
+      - id: stop
+        label: Stop
+        next: {complete: true, result: stopped-without-fix}
+  - name: undecided
+    kind: gate
+    evidence:
+      repro: {steps: [reproduce], required: false}
+    message: {parts: [{text: "could not reproduce"}]}
+    choices:
+      - id: retry
+        label: Try again
+        feedback_required: true
+        next: {step: reproduce}
+      - id: stop
+        label: Stop
+        next: {complete: true, result: stopped-without-fix}
+"""
+
+
+def test_format_2_parses_contracts_selectors_and_choices() -> None:
+    definition = load(FORMAT_2).definition
+    reproduce = definition.step_named("reproduce")
+    assert isinstance(reproduce, AgentStep)
+    assert reproduce.outcome is not None
+    assert reproduce.outcome.names == ("not-reproduced", "reproduced")
+    assert reproduce.outcome.result_named("reproduced").required == (
+        ("attempts", "string"),
+        ("script_available", "boolean"),
+    )
+    assert reproduce.requires_outcome is True
+    undecided = definition.step_named("undecided")
+    assert isinstance(undecided, GateStep)
+    assert [choice.id for choice in undecided.choices] == ["retry", "stop"]
+    assert undecided.choice_named("retry").next == StepDestination(step="reproduce")
+    assert undecided.choice_named("stop").next == CompleteDestination(
+        result="stopped-without-fix"
+    )
+    assert undecided.evidence[0] == EvidenceSelector(
+        name="repro", steps=("reproduce",), after=None, with_outcome=True, required=False
+    )
+
+
+def test_the_two_formats_keep_their_own_vocabularies() -> None:
+    # `latest` re-reads history whenever it is asked, which is exactly what
+    # format 2 replaced; `evidence` is frozen at attempt entry, which format 1
+    # has no place to record. Neither leaks into the other.
+    with pytest.raises(WorkflowDocumentError, match="belongs to format 1"):
+        load(
+            FORMAT_2.replace(
+                "{op: evidence, name: repro}", "{op: latest, steps: [reproduce]}"
+            )
+        )
+    with pytest.raises(WorkflowDocumentError, match="format-2 value operation"):
+        load(MINIMAL.replace('- text: "do it"', "- value: {op: evidence, name: x}"))
+    with pytest.raises(WorkflowDocumentError, match="unknown field 'expects_outcome'"):
+        load(FORMAT_2.replace("    outcome:", "    expects_outcome: true\n    outcome:"))
+    with pytest.raises(WorkflowDocumentError, match="unknown field 'choices'"):
+        load(
+            MINIMAL
+            + "  - name: g\n    kind: gate\n    message: {parts: []}\n"
+            + "    choices: [{id: a, label: A, next: {complete: true}}]\n"
+        )
+
+
+def test_a_format_2_agent_step_must_say_whether_it_produces_a_result() -> None:
+    # Omitting the field is not "no result": it is an author who did not say,
+    # and a step allowed to finish on nothing is how a run continues past
+    # evidence nobody wrote.
+    with pytest.raises(WorkflowDocumentError, match="must declare 'outcome'"):
+        load(
+            FORMAT_2.replace(
+                "    outcome:\n      results:\n"
+                "        reproduced:\n"
+                "          required: {attempts: string, script_available: boolean}\n"
+                "        not-reproduced:\n"
+                "          required: {attempts: string}\n",
+                "",
+            )
+        )
+
+
+def test_an_evidence_alias_is_local_to_the_step_that_declared_it() -> None:
+    with pytest.raises(WorkflowDocumentError, match="which this step does not declare"):
+        load(FORMAT_2.replace("name: repro}", "name: elsewhere}"))
+    with pytest.raises(WorkflowDocumentError, match="undeclared step"):
+        load(FORMAT_2.replace("repro: {steps: [reproduce]}", "repro: {steps: [nope]}"))
+
+
+def test_format_2_endings_are_named_and_never_implicit() -> None:
+    with pytest.raises(WorkflowDocumentError, match="missing required field 'result'"):
+        load(FORMAT_2.replace("{complete: true, result: validated}", "{complete: true}"))
+    falls_off = """
+format: 2
+name: falloff
+sessions: [qa]
+primary: qa
+steps:
+  - name: work
+    kind: agent
+    session: qa
+    outcome: null
+    prompt: {parts: [{text: hi}]}
+"""
+    with pytest.raises(WorkflowDocumentError, match="falls off the end"):
+        load(falls_off)
+
+
+def test_gate_choices_are_edges_the_bound_check_can_see() -> None:
+    # A retry choice is a loop like any other. If graph validation ignored
+    # human edges, a definition could spin forever on answers alone.
+    unbounded = FORMAT_2.replace(
+        "    max_visits: 3\n    on_exhausted: {step: exhausted}\n", ""
+    )
+    with pytest.raises(WorkflowDocumentError, match="unbounded cycle"):
+        load(unbounded)
+    # And an exhaustion gate may not hand the run back into the loop it just
+    # left, however it is phrased.
+    with pytest.raises(WorkflowDocumentError, match="can return to it"):
+        load(FORMAT_2.replace("on_exhausted: {step: exhausted}", "on_exhausted: {step: undecided}"))
+
+
+def test_a_gate_choice_cannot_pause_or_repeat_an_id() -> None:
+    # A choice says where the run goes. "Stop again" is not a destination, and
+    # two choices with one id make the recorded answer ambiguous.
+    with pytest.raises(WorkflowDocumentError, match="cannot be a pause"):
+        load(
+            FORMAT_2.replace(
+                "        next: {step: reproduce}", "        next: {pause: true}"
+            )
+        )
+    with pytest.raises(WorkflowDocumentError, match="duplicate choice 'retry'"):
+        load(
+            FORMAT_2.replace(
+                "        next: {step: reproduce}\n      - id: stop\n",
+                "        next: {step: reproduce}\n      - id: retry\n",
+            )
+        )
+
+
+def test_editing_a_result_or_a_route_changes_the_revision() -> None:
+    base = load(FORMAT_2).revision
+    # A prompt edit already changed identity in format 1; what is new is that
+    # the *contract* and the *choices* are part of what a task pinned.
+    assert load(FORMAT_2.replace("attempts: string", "attempts: object")).revision != base
+    assert (
+        load(FORMAT_2.replace("result: stopped-without-fix", "result: abandoned")).revision
+        != base
+    )
+    assert load(FORMAT_2.replace("label: Try again", "label: Retry")).revision != base
+    assert (
+        load(FORMAT_2.replace("repro: {steps: [reproduce]}", "repro: {steps: [reproduce], after: route}")).revision
+        != base
+    )
+    # Key order and comments still do not.
+    assert load("# a comment\n" + FORMAT_2).revision == base
+
+
+def test_format_1_canonical_bytes_carry_nothing_format_2_added() -> None:
+    document = json.loads(canonical_bytes(load(MINIMAL).definition))
+    assert document["format"] == 1
+    step = document["steps"][0]
+    assert "expects_outcome" in step
+    assert "evidence" not in step
+    assert "outcome" not in step
+    two = json.loads(canonical_bytes(load(FORMAT_2).definition))
+    assert two["steps"][0]["evidence"] == {}
+    assert "expects_outcome" not in two["steps"][0]
+    assert two["steps"][2]["choices"][0]["next"] == {
+        "complete": True,
+        "result": "stopped-without-fix",
+    }
+
+
+def test_evidence_binds_once_and_records_what_it_bound() -> None:
+    definition = load(FORMAT_2).definition
+    route = definition.step_named("route")
+    records = [
+        HistoryRecord(seq=1, step="reproduce", status="ok", outcome={"result": "x"}),
+        HistoryRecord(seq=2, step="reproduce", status="ok", outcome={"result": "y"}),
+    ]
+    bindings, missing = resolve_evidence(route, records)
+    assert missing == ()
+    assert bindings == (EvidenceBinding(name="repro", step="reproduce", seq=2),)
+    # The binding survives a round trip through its persisted form, and a
+    # later record does not move it.
+    restored = bindings_from_document(bindings_document(bindings))
+    assert restored == bindings
+    records.append(
+        HistoryRecord(seq=3, step="reproduce", status="ok", outcome={"result": "z"})
+    )
+    views = evidence_views(restored, records)
+    assert views["repro"]["seq"] == 2
+    assert views["repro"]["outcome"] == {"result": "y"}
+
+
+def test_a_required_selector_that_matches_nothing_is_reported_not_guessed() -> None:
+    definition = load(FORMAT_2).definition
+    bindings, missing = resolve_evidence(definition.step_named("route"), [])
+    assert missing == ("repro",)
+    assert bindings == (EvidenceBinding(name="repro", step=None, seq=None),)
+    # An optional one binds to explicit absence, and absence reads as missing
+    # rather than as a null someone wrote.
+    optional, optional_missing = resolve_evidence(
+        definition.step_named("undecided"), []
+    )
+    assert optional_missing == ()
+    context = EvaluationContext(
+        inputs={}, records=(), evidence=evidence_views(optional, [])
+    )
+    assert evaluate_value(EvidenceValue(name="repro"), context) is MISSING
+
+
+def test_a_view_carries_the_evidence_the_record_itself_bound() -> None:
+    # This is what lets a route ask "which fix did that verification check?"
+    # instead of assuming it checked the newest one.
+    record = HistoryRecord(
+        seq=7,
+        step="verify",
+        status="ok",
+        outcome={"result": "validated"},
+        evidence={"fix": {"step": "fix", "seq": 5}},
+    )
+    assert record_view(record)["evidence"] == {"fix": {"step": "fix", "seq": 5}}
+
+
+def test_a_result_must_be_declared_and_carry_what_it_promised() -> None:
+    contract = load(FORMAT_2).definition.step_named("reproduce").outcome
+    valid = {
+        "version": 2,
+        "result": "reproduced",
+        "summary": "it fails on main",
+        "artifacts": {"attempts": "ran the suite", "script_available": True},
+    }
+    assert validate_result_document(valid, contract) == (valid, None)
+    for document, expected in [
+        ({**valid, "version": 1}, "result version must be 2"),
+        ({**valid, "result": "fixed"}, "is not declared by this step"),
+        ({**valid, "summary": "   "}, "summary must be a nonblank string"),
+        ({**valid, "artifacts": {"attempts": "x"}}, "requires the artifact"),
+        (
+            {**valid, "artifacts": {"attempts": " ", "script_available": True}},
+            "must not be blank",
+        ),
+        (
+            {**valid, "artifacts": {"attempts": "x", "script_available": "yes"}},
+            "must be boolean",
+        ),
+        ({**valid, "note": "hi"}, "unknown result field"),
+        ("nope", "not a JSON object"),
+    ]:
+        outcome, reason = validate_result_document(document, contract)
+        assert outcome is None
+        assert reason is not None and expected in reason
+
+
+def test_describe_treats_a_choice_gate_as_a_branch() -> None:
+    descriptor = describe(load(FORMAT_2))
+    assert [(step.name, step.conditional) for step in descriptor.steps] == [
+        ("reproduce", False),
+        ("route", False),
+        ("exhausted", True),
+        ("undecided", True),
+    ]
+    assert descriptor.format == 2
