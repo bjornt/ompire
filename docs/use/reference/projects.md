@@ -226,7 +226,7 @@ project record is reported the same way and adds nothing to the list.
 
 | State | Meaning |
 |---|---|
-| `ready` | The checkout is usable. Templates and tasks may reference the project. |
+| `ready` | The checkout is usable. Tasks may be launched against the project. |
 | `cloning` | Ompire is creating the checkout. Progress shows on the card. |
 | `failed` | Setup did not finish. The card shows the failing step and git's stderr, and offers **Retry setup** and **Remove project**. |
 
@@ -303,7 +303,7 @@ nothing under `.git`.
 | Clone job fails | Project becomes `failed`; `setup_error` carries the step and git's stderr |
 | Editing a cloned project's `checkout_path` | `409` — the path is fixed |
 | Edit or delete while setup is running | `409` |
-| Template or task references a project that is not `ready` | `409` |
+| A launch names a project that is not `ready` | `409` |
 | Delete or rename while tasks reference it | `409` naming the tasks |
 | Rename to a name already in use | `409`, both projects unchanged |
 | `default_model_profile` names a profile that does not exist | `422`, the entire create or update unapplied |
