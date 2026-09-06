@@ -809,6 +809,64 @@
   resize: vertical;
 }
 
+/* A format-2 gate's declared choices (ADR-0030). Radios rather than a row of
+   buttons: the operator must be able to see every option and what each one
+   does before committing, and nothing may be selected for them. Wraps at
+   narrow widths so a long label never pushes the destination off-screen. */
+
+.gateChoices {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface2);
+  padding: 8px 10px 10px;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.gateChoices legend {
+  padding: 0 4px;
+}
+
+.gateChoice {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.gateChoice:hover,
+.gateChoice:focus-within {
+  background: color-mix(in srgb, var(--amber) 10%, transparent);
+}
+
+.gateChoice input {
+  flex: none;
+  margin: 0;
+  accent-color: var(--amber);
+}
+
+.gateChoiceLabel {
+  color: var(--fg);
+}
+
+.gateChoiceNext {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.gateChoiceRequired {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: color-mix(in srgb, var(--amber) 75%, var(--muted));
+}
+
 /* Pinned launch inputs and legacy confirmation (ADR-0026). */
 
 .subheading {

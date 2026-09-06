@@ -126,6 +126,7 @@ from ompire_daemon.taskdefinition import (
     workflow_readiness,
 )
 from ompire_daemon.workflow_definitions import (
+    RESULT_ENVELOPE_VERSION,
     DecisionStep,
     WorkflowRevision,
     describe,
@@ -510,6 +511,28 @@ def _compatibility_problems(
     definition = revision.definition
     problems: list[str] = []
     records = list_step_records(engine, task.id)
+    if definition.format >= 2:
+        # A format-2 definition reads results by declared name; this history
+        # was written under the generic success/failed envelope. Even where
+        # every step name still matched, the recorded outcomes would mean
+        # something the candidate cannot express, so there is no honest
+        # continuation — and no automatic upgrade is offered in its place.
+        legacy_outcomes = [
+            record.seq
+            for record in records
+            if record.kind == "agent"
+            and record.outcome is not None
+            and record.outcome.get("version") != RESULT_ENVELOPE_VERSION
+        ]
+        if legacy_outcomes:
+            listed = ", ".join(f"#{seq}" for seq in legacy_outcomes)
+            problems.append(
+                f"the current {revision.name!r} definition is workflow format "
+                f"{definition.format}, which reads results by declared name, "
+                f"but this task's attempts ({listed}) recorded results under "
+                "the older success/failed envelope; those cannot be "
+                "reinterpreted under the new contract"
+            )
     for index, record in enumerate(records):
         step = definition.step_named(record.step)
         if step is None:

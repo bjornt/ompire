@@ -598,6 +598,73 @@ def test_an_archived_legacy_task_stays_readable_without_confirmation(
         assert client.delete(f"/api/tasks/{task_id}", headers=headers).status_code == 200
 
 
+LEGACY_FORMAT_1_BUGFIX = """
+format: 1
+name: bugfix
+sessions: [reproducer, coder]
+primary: coder
+steps:
+  - name: reproduce
+    kind: agent
+    session: reproducer
+    expects_outcome: true
+    prompt: {parts: [{text: "reproduce it"}]}
+  - name: triage
+    kind: decision
+    cases:
+      - when:
+          op: eq
+          left:
+            op: get
+            value: {op: latest, steps: [reproduce]}
+            keys: [outcome, status]
+          right: {op: literal, value: "success"}
+        next: {step: fix}
+    otherwise: {step: escalate}
+  - name: fix
+    kind: agent
+    session: coder
+    expects_outcome: true
+    max_visits: 3
+    on_exhausted: {step: escalate}
+    prompt: {parts: [{text: "fix it"}]}
+  - name: route-validate
+    kind: decision
+    cases:
+      - when: true
+        next: {step: validate-agent}
+    otherwise: {step: validate-agent}
+  - name: validate-agent
+    kind: agent
+    session: reproducer
+    expects_outcome: true
+    prompt: {parts: [{text: "validate it"}]}
+  - name: check
+    kind: decision
+    cases:
+      - when:
+          op: eq
+          left:
+            op: get
+            value: {op: latest, steps: [validate-agent], after: fix}
+            keys: [outcome, status]
+          right: {op: literal, value: "success"}
+        next: {complete: true}
+    otherwise: {pause: true}
+  - name: escalate
+    kind: gate
+    message: {parts: [{text: "operator call"}]}
+"""
+
+
+def _install_format_1_bugfix() -> None:
+    """Make the process catalog's `bugfix` a format-1 definition."""
+    from ompire_daemon.workflow_definitions import load_definition
+    from ompire_daemon.workflows import catalog, install_definition
+
+    catalog()  # load the packaged set first, then shadow one entry
+    install_definition(load_definition(LEGACY_FORMAT_1_BUGFIX))
+
 def _seed_legacy_bugfix_at_a_synthesized_gate(config: Config, checkout: Path) -> int:
     """A bugfix task parked exactly as the pre-ADR-0028 engine left one.
 
@@ -664,6 +731,53 @@ def _seed_legacy_bugfix_at_a_synthesized_gate(config: Config, checkout: Path) ->
     return task_id
 
 
+def test_a_format_2_candidate_cannot_claim_format_1_history(
+    daemon_config: Config, git_checkout: Path
+) -> None:
+    """The format boundary, enforced where a continuation is offered.
+
+    The packaged `bugfix` is format 2: it reads results by declared name, and
+    it does not declare the steps this task actually ran. Its history recorded
+    generic success/failed outcomes that the new contract has no way to
+    express. Offering it as a continuation would point a different procedure
+    at somebody else's history, so it is refused with the reasons named — and
+    no automatic upgrade is offered in its place.
+    """
+    _land_at_0012(daemon_config)
+    _seed(daemon_config, git_checkout, [{"name": "t"}])
+    task_id = _seed_legacy_bugfix_at_a_synthesized_gate(daemon_config, git_checkout)
+    app = create_app(daemon_config, frontend_dist=daemon_config.data_dir / "no-dist")
+    with TestClient(app) as client:
+        headers = {"Authorization": f"Bearer {app.state.auth_token}"}
+        configuration = client.get(
+            f"/api/tasks/{task_id}/configuration", headers=headers
+        ).json()
+        candidate = configuration["workflow_candidate"]
+
+    assert candidate["format"] == 2
+    assert candidate["compatible"] is False
+    problems = " ".join(candidate["problems"])
+    # Both halves are named: the results cannot be reinterpreted, and the
+    # steps are not even declared.
+    assert "older success/failed envelope" in problems
+    assert "workflow format 2" in problems
+    assert "'triage'" in problems
+    # The history itself is untouched and still readable.
+    from ompire_daemon.registry.workflows import list_step_records
+
+    records = list_step_records(app.state.engine, task_id)
+    assert [r.step for r in records] == [
+        "reproduce",
+        "triage",
+        "fix",
+        "route-validate",
+        "validate-agent",
+        "check",
+        "check",
+    ]
+    assert records[-1].status == "waiting"
+
+
 def test_an_old_synthesized_escalation_gate_retries_the_decision(
     daemon_config: Config, git_checkout: Path
 ) -> None:
@@ -675,6 +789,7 @@ def test_an_old_synthesized_escalation_gate_retries_the_decision(
     confirmation the waiting record becomes an uncertainty pause whose action
     retries the decision — never the old fall-through to the next step.
     """
+    _install_format_1_bugfix()
     _land_at_0012(daemon_config)
     _seed(daemon_config, git_checkout, [{"name": "t"}])
     task_id = _seed_legacy_bugfix_at_a_synthesized_gate(daemon_config, git_checkout)

@@ -234,13 +234,29 @@ export function answerAgent(
  * required: a stale tab and a double submit are indistinguishable otherwise,
  * and both would apply a decision to evidence nobody saw. 409 when the run
  * has moved on. */
+/** Answer whatever the run is waiting on.
+ *
+ * One endpoint, three different waits, and the daemon decides which this is
+ * from what it is actually waiting on rather than from what the caller sends:
+ * an uncertainty pause retries its blocked step, a format-1 gate resumes with
+ * an optional note, and a format-2 gate needs the id of a declared choice.
+ * `expectedSeq` names the attempt the operator was looking at, so a stale tab
+ * or a double submit is refused instead of applied to a different one. */
 export function resumeWorkflow(
   id: number,
   expectedSeq: number,
   note?: string,
-): Promise<{ task_id: number; workflow: "resumed" | "retried"; step: string | null }> {
+  choiceId?: string,
+): Promise<{
+  task_id: number;
+  workflow: "resumed" | "retried" | "answered";
+  choice_id?: string;
+  step: string | null;
+  result?: string | null;
+}> {
   return request("POST", `/api/tasks/${id}/workflow/resume`, {
     expected_seq: expectedSeq,
+    choice_id: choiceId ?? null,
     note: note ?? null,
   });
 }

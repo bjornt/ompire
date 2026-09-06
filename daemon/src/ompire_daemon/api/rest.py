@@ -136,6 +136,8 @@ from ompire_daemon.registry.workflow_definitions import (
     get_revision,
 )
 from ompire_daemon.registry.workflows import (
+    GATE_SNAPSHOT_VERSION,
+    WorkflowGateChoiceError,
     WorkflowWaitConflictError,
     latest_step_record,
 )
@@ -1850,6 +1852,13 @@ class WorkflowResumeBody(BaseModel):
     # resume is a request to advance "whatever is waiting now", which is not
     # what the operator decided.
     expected_seq: int
+    # A format-2 gate's declared choice. Required there and rejected
+    # everywhere else: a format-1 gate has no choices to name, and an
+    # uncertainty pause is not a question with options, so accepting one would
+    # be answering something nobody asked.
+    choice_id: str | None = None
+    # Feedback for the choice, and the note a format-1 resume already carried.
+    # Data either way: it is recorded and shown, and it never names a route.
     note: str | None = None
 
 
@@ -1864,6 +1873,24 @@ async def resume_workflow_route(
     runner: WorkflowRunner = request.app.state.workflow_runner
     waiting = latest_step_record(engine, task_id)
     paused = waiting is not None and waiting.status == "waiting" and waiting.pause is not None
+    offers_choices = (
+        waiting is not None
+        and waiting.status == "waiting"
+        and waiting.pause is None
+        and (waiting.outcome or {}).get("version") == GATE_SNAPSHOT_VERSION
+    )
+    if body.choice_id is not None and not offers_choices:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "this task is not waiting at a gate with declared choices; "
+            "a retry or a format-1 resume takes no 'choice_id'",
+        )
+    if offers_choices and body.choice_id is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "this gate asks a question with named choices; 'choice_id' names "
+            "the one being answered",
+        )
     try:
         if paused:
             # A retry re-enters the blocked step. It never continues past it,
@@ -1877,7 +1904,32 @@ async def resume_workflow_route(
                 "workflow": "retried",
                 "step": updated.workflow_step,
             }
+        if offers_choices:
+            assert body.choice_id is not None
+            revision = resolve_task_definition(engine, task)
+            updated = runner.answer_gate(
+                task,
+                revision,
+                expected_seq=body.expected_seq,
+                choice_id=body.choice_id,
+                note=body.note,
+            )
+            return {
+                "task_id": task.id,
+                "workflow": "answered",
+                "choice_id": body.choice_id,
+                "step": updated.workflow_step,
+                "result": updated.workflow_result,
+            }
         runner.resume_gate(task.id, expected_seq=body.expected_seq, note=body.note)
+    except WorkflowGateChoiceError as exc:
+        # The operator is looking at the right question and gave an answer it
+        # does not accept, so name the field rather than telling them to
+        # reload.
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {"field": exc.field, "detail": exc.detail},
+        ) from exc
     except WorkflowWaitConflictError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except WorkflowNotWaitingError as exc:

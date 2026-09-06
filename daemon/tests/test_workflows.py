@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from importlib import resources
 from pathlib import Path
 
 import pytest
@@ -32,7 +33,7 @@ from ompire_daemon.events import EventHub
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.sessions import get_session
-from ompire_daemon.registry.tasks import Task, create_task, get_task
+from ompire_daemon.registry.tasks import Task, create_task, get_task, task_payload
 from ompire_daemon.registry.workflows import (
     WorkflowGateChoiceError,
     WorkflowWaitConflictError,
@@ -1420,6 +1421,9 @@ async def test_gate_survives_restart(rig, engine, project, tmp_path: Path) -> No
     assert events == [
         {
             "task_id": task.id,
+            # Addressed by sequence: a bounded step is visited under the same
+            # name repeatedly, so the name alone cannot identify an attempt.
+            "seq": 1,
             "step": "approve",
             "kind": "gate",
             "session": None,
@@ -1491,6 +1495,268 @@ def test_workflow_resume_endpoint_404_and_409(
     assert missing.status_code == 422
 
 
+def test_a_choice_is_required_at_a_choice_gate_and_refused_anywhere_else(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """The request contract, from the daemon's side.
+
+    Which kind of wait this is comes from what the run is actually waiting on,
+    never from what the caller sent. A gate with named choices needs one; an
+    uncertainty pause and a format-1 gate refuse one, because answering with a
+    choice would be answering a question nobody asked.
+    """
+    from ompire_daemon.registry.tasks import create_task as _create
+    from ompire_daemon.registry.workflows import (
+        append_step_record,
+        build_gate_snapshot,
+        build_pause,
+        park_gate,
+        pause_step,
+        set_run_status,
+    )
+
+    from .conftest import make_adoptable_checkout
+
+    engine = client.app.state.engine
+    checkout = make_adoptable_checkout(client.app.state.config.checkout_root, "demo")
+    assert (
+        client.post(
+            "/api/projects",
+            headers=auth_headers,
+            json={
+                "name": "demo",
+                "title": "Demo",
+                "upstream_url": "https://example.com/demo.git",
+                "checkout_path": str(checkout),
+            },
+        ).status_code
+        == 201
+    )
+
+    def waiting_task(slug: str):
+        task = _create(
+            engine,
+            project_name="demo",
+            slug=slug,
+            branch=f"ompire/{slug}",
+            clone_path="/tmp/nonexistent-clone",
+            prompt="x",
+            workflow_name="bugfix",
+            execution_inputs=make_execution_inputs(
+                checkout_path=str(checkout),
+                workflow_name="bugfix",
+            ),
+        )
+        set_run_status(engine, task.id, "running", "reproduction-gate")
+        return task
+
+    def post(task_id: int, **body):
+        return client.post(
+            f"/api/tasks/{task_id}/workflow/resume", headers=auth_headers, json=body
+        )
+
+    # --- a gate with declared choices -------------------------------------
+    gated = waiting_task("gated")
+    record = append_step_record(
+        engine, gated.id, step="reproduction-gate", kind="gate"
+    )
+    snapshot = build_gate_snapshot(
+        message="QA still cannot reproduce it.",
+        choices=[
+            {
+                "id": "stop",
+                "label": "Stop without a fix",
+                "feedback_required": False,
+                "next": {"complete": True, "result": "stopped-without-fix"},
+            },
+            {
+                "id": "proceed-without-reproduction",
+                "label": "Fix it anyway",
+                "feedback_required": True,
+                "next": {"step": "fix"},
+            },
+        ],
+        evidence={},
+    )
+    park_gate(
+        engine,
+        gated.id,
+        record.seq,
+        step="reproduction-gate",
+        message=snapshot["message"],
+        snapshot=snapshot,
+    )
+
+    # No choice at all: the question has options, so it needs an answer.
+    missing = post(gated.id, expected_seq=record.seq)
+    assert missing.status_code == 422
+    assert "choice_id" in missing.json()["detail"]
+
+    # A choice this gate does not offer names the field, not a reload.
+    unknown = post(gated.id, expected_seq=record.seq, choice_id="invented")
+    assert unknown.status_code == 422
+    assert unknown.json()["detail"]["field"] == "choice_id"
+
+    # A choice that declares feedback required cannot be answered without it.
+    blank = post(
+        gated.id,
+        expected_seq=record.seq,
+        choice_id="proceed-without-reproduction",
+        note="   ",
+    )
+    assert blank.status_code == 422
+    assert blank.json()["detail"]["field"] == "note"
+
+    # Feedback is bounded: it is stored, re-rendered, and handed to a prompt.
+    too_long = post(
+        gated.id,
+        expected_seq=record.seq,
+        choice_id="proceed-without-reproduction",
+        note="x" * (16 * 1024 + 1),
+    )
+    assert too_long.status_code == 422
+    assert too_long.json()["detail"]["field"] == "note"
+
+    # An attempt the operator was not looking at is a conflict, not an answer.
+    stale = post(gated.id, expected_seq=record.seq + 5, choice_id="stop")
+    assert stale.status_code == 409
+
+    # Nothing above advanced the run.
+    assert get_task(engine, gated.id).workflow_status == "waiting"
+
+    # --- an uncertainty pause ---------------------------------------------
+    paused = waiting_task("paused")
+    pause_record = append_step_record(
+        engine, paused.id, step="reproduce", kind="agent", session="reproducer"
+    )
+    pause_step(
+        engine,
+        paused.id,
+        pause_record.seq,
+        pause=build_pause(
+            reason="missing_outcome",
+            message="no result",
+            step="reproduce",
+            retry_step="reproduce",
+        ),
+        error="no outcome file written",
+    )
+    refused = post(paused.id, expected_seq=pause_record.seq, choice_id="stop")
+    assert refused.status_code == 422
+    assert "not waiting at a gate with declared choices" in refused.json()["detail"]
+    assert get_task(engine, paused.id).workflow_status == "waiting"
+
+    # Unknown request fields are refused rather than ignored.
+    extra = client.post(
+        f"/api/tasks/{paused.id}/workflow/resume",
+        headers=auth_headers,
+        json={"expected_seq": pause_record.seq, "authorize": True},
+    )
+    assert extra.status_code == 422
+
+
+def test_answering_a_gate_over_rest_records_it_and_advances_once(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """The accepted path, and its refusal on a second submit."""
+    from ompire_daemon.registry.tasks import create_task as _create
+    from ompire_daemon.registry.workflows import (
+        append_step_record,
+        build_gate_snapshot,
+        list_step_records,
+        park_gate,
+        set_run_status,
+    )
+
+    from .conftest import make_adoptable_checkout
+
+    engine = client.app.state.engine
+    checkout = make_adoptable_checkout(client.app.state.config.checkout_root, "demo")
+    assert (
+        client.post(
+            "/api/projects",
+            headers=auth_headers,
+            json={
+                "name": "demo",
+                "title": "Demo",
+                "upstream_url": "https://example.com/demo.git",
+                "checkout_path": str(checkout),
+            },
+        ).status_code
+        == 201
+    )
+    task = _create(
+        engine,
+        project_name="demo",
+        slug="answerable",
+        branch="ompire/answerable",
+        clone_path="/tmp/nonexistent-clone",
+        prompt="x",
+        workflow_name="bugfix",
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(checkout),
+            workflow_name="bugfix",
+        ),
+    )
+    set_run_status(engine, task.id, "running", "investigation-exhausted")
+    record = append_step_record(
+        engine, task.id, step="investigation-exhausted", kind="gate"
+    )
+    snapshot = build_gate_snapshot(
+        message="Investigation has used up its attempts.",
+        choices=[
+            {
+                "id": "stop",
+                "label": "Stop without a fix",
+                "feedback_required": False,
+                "next": {"complete": True, "result": "stopped-without-fix"},
+            }
+        ],
+        evidence={},
+    )
+    park_gate(
+        engine,
+        task.id,
+        record.seq,
+        step="investigation-exhausted",
+        message=snapshot["message"],
+        snapshot=snapshot,
+    )
+
+    accepted = client.post(
+        f"/api/tasks/{task.id}/workflow/resume",
+        headers=auth_headers,
+        json={"expected_seq": record.seq, "choice_id": "stop", "note": "agreed"},
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["workflow"] == "answered"
+    assert accepted.json()["result"] == "stopped-without-fix"
+
+    answered = list_step_records(engine, task.id)[-1]
+    decision = answered.outcome["decision"]
+    assert decision["choice_id"] == "stop"
+    assert decision["feedback"] == "agreed"
+    assert decision["actor"] == "operator"
+    # The question is still readable beside the answer.
+    assert answered.outcome["message"].startswith("Investigation has used up")
+    # And the run's ending is named on the task itself.
+    final = get_task(engine, task.id)
+    assert (final.workflow_status, final.workflow_result) == (
+        "complete",
+        "stopped-without-fix",
+    )
+    assert final.workflow_result in task_payload(final, engine=engine).values()
+
+    # A second submit of the same decision advances nothing.
+    replay = client.post(
+        f"/api/tasks/{task.id}/workflow/resume",
+        headers=auth_headers,
+        json={"expected_seq": record.seq, "choice_id": "stop"},
+    )
+    assert replay.status_code in (409, 422)
+    assert len(list_step_records(engine, task.id)) == 1
+
+
 def test_a_retained_revision_is_readable_and_a_damaged_one_is_classified(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
@@ -1506,7 +1772,7 @@ def test_a_retained_revision_is_readable_and_a_damaged_one_is_classified(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["name"] == "bugfix"
-    assert body["format"] == 1
+    assert body["format"] == 2
     assert body["primary_session"] == "coder"
     assert body["definition"]["steps"][0]["name"] == "reproduce"
 
@@ -1623,114 +1889,128 @@ steps:
     assert records[-1].outcome == {"message": "out of attempts"}
 
 
-# --- the bugfix built-in (design D-1/D-2/D-6) ---------------------------------
+# --- the bugfix built-in, format 2 -------------------------------------------
+#
+# The flow these cover is the epic's worked example, and the property that
+# matters most is the one format 1 could not express: failing to reproduce
+# does not end the run and does not permit a fix. It reaches diagnosis with
+# its negative evidence, and a candidate cause goes back to QA — in QA's own
+# session, against unfixed code — before anything is changed.
 
 
-def _bugfix_outcome(status: str, summary: str, **artifacts: str) -> str:
-    outcome: dict = {"version": 1, "status": status, "summary": summary}
-    if artifacts:
-        outcome["artifacts"] = artifacts
-    return json.dumps(outcome)
-
-
-async def test_bugfix_happy_path_script_validates(rig, engine, project, tmp_path: Path) -> None:
-    """reproduce → triage → fix → script validation → complete, with the
-    agent-validation step skipped and the escalate gate never reached."""
-    runner, supervisor, tracker, _hub, _scenario = rig
-    task = _make_task(
-        engine, tmp_path, workflow="bugfix", preamble="PRE", prompt="bug: off by one"
+def _bug_result(result: str, summary: str, **artifacts) -> str:
+    return json.dumps(
+        {
+            "version": 2,
+            "result": result,
+            "summary": summary,
+            "artifacts": artifacts,
+        }
     )
+
+
+def _reproduced(summary: str = "reproduced it", *, script: bool = True) -> str:
+    return _bug_result(
+        "reproduced",
+        summary,
+        attempts="ran the failing input",
+        expected_behavior="returns empty",
+        observed_behavior="IndexError",
+        reproduction_evidence="traceback in the log",
+        script_available=script,
+    )
+
+
+def _not_reproduced(summary: str = "could not reproduce") -> str:
+    return _bug_result(
+        "not-reproduced",
+        summary,
+        attempts="ran the suite and the reported steps",
+        observed_behavior="everything passed",
+        missing_prerequisites="none known",
+    )
+
+
+def _candidate(summary: str = "found a candidate") -> str:
+    return _bug_result(
+        "candidate-found",
+        summary,
+        findings="the empty branch is unguarded",
+        suspected_trigger="an empty input list",
+        suggested_reproduction="call it with []",
+    )
+
+
+def _no_root_cause(summary: str = "nothing conclusive") -> str:
+    return _bug_result(
+        "no-root-cause",
+        summary,
+        findings="read the parser and the caller",
+        missing_information="the exact input that failed",
+    )
+
+
+def _implemented(summary: str = "guarded the empty case") -> str:
+    return _bug_result(
+        "implemented", summary, changes="added a guard", validation_notes="ran the tests"
+    )
+
+
+def _verified(result: str, summary: str) -> str:
+    return _bug_result(
+        result,
+        summary,
+        checks="re-ran the reproduction",
+        observations="no longer raises",
+        limitations="only the reported input",
+    )
+
+
+def _feed(supervisor, task_id: int, clone: Path, plan: list[tuple[str, int, str]]):
+    """Answer each session's Nth prompt with a result document.
+
+    Every entry waits for its own session's own prompt count, so the writers
+    fire in the order the run actually prompts rather than on a timer.
+    """
 
     async def drive() -> None:
-        await _write_outcome_when_session_prompted(
-            supervisor, task.id, "reproducer", Path(task.clone_path),
-            _bugfix_outcome(
-                "success", "reproduced: index error on empty input",
-                repro_command="bash .ompire/repro.sh",
-                expected_behavior="empty list", observed_behavior="IndexError",
-            ),
-        )
-        await _write_outcome_when_session_prompted(
-            supervisor, task.id, "coder", Path(task.clone_path),
-            _bugfix_outcome("success", "guarded the empty case"),
-        )
+        for session, count, content in plan:
+            await _write_outcome_when_session_prompted(
+                supervisor, task_id, session, clone, content, prompt_count=count
+            )
 
-    driver = asyncio.create_task(drive())
-    _start(runner, engine, task)
-    await wait_for_run(engine, task.id, {"complete"})
-    await driver
-
-    records = list_step_records(engine, task.id)
-    assert [(r.step, r.kind, r.status) for r in records] == [
-        ("reproduce", "agent", "ok"),
-        ("triage", "decision", "ok"),
-        ("fix", "agent", "ok"),
-        ("route-validate", "decision", "ok"),
-        ("validate-script", "command", "ok"),
-        ("validate-agent", "agent", "ok"),
-        ("check", "decision", "ok"),
-    ]
-    assert records[1].outcome == {"route": "fix"}
-    assert records[3].outcome == {"route": "validate-script"}
-    assert records[4].outcome is not None and records[4].outcome["exit_code"] == 0
-    # The agent validation was deliberately inert: no prompt, no outcome, no
-    # pause, and the coder's self-report was NOT read as its outcome.
-    assert records[5].outcome is None and records[5].prompted_at is None
-    assert records[5].pause is None
-    assert "deliberately not prompted" in (records[5].error or "")
-    assert records[6].outcome == {"route": COMPLETE}
-
-    repro_prompt = user_prompts(supervisor, task.id, "reproducer")[0]
-    assert repro_prompt.startswith("PRE\n\n")
-    assert "bug: off by one" in repro_prompt and ".ompire/repro.sh" in repro_prompt
-    assert "do not commit" in repro_prompt
-    fix_prompt = user_prompts(supervisor, task.id, "coder")[0]
-    assert "reproduced: index error on empty input" in fix_prompt
-    assert "bash .ompire/repro.sh" in fix_prompt
-    # The ship flow squashes the branch tip's tree: the coder must commit.
-    assert "Commit your change" in fix_prompt and "never push" in fix_prompt
-    # No engine-reserved session was ever spawned.
-    assert supervisor.get(task.id, "judge") is None
-    assert tracker.get(task.id, "coder") is not None
+    return asyncio.create_task(drive())
 
 
-async def test_bugfix_unreproducible_bug_escalates_before_fix(
-    rig, engine, project, tmp_path: Path
+
+async def _wait_for_prompted(
+    engine: Engine, task_id: int, step: str, timeout: float = 10.0
 ) -> None:
-    """A declared `failed` reproduction is a real result and follows the
-    definition's own route — it is not missing evidence, so it never pauses."""
-    runner, supervisor, _tracker, _hub, _scenario = rig
-    task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: flaky test")
-
-    driver = asyncio.create_task(
-        _write_outcome_when_session_prompted(
-            supervisor, task.id, "reproducer", Path(task.clone_path),
-            _bugfix_outcome("failed", "cannot reproduce: no failing input found"),
-        )
-    )
-    _start(runner, engine, task)
-    await wait_for_run(engine, task.id, {"waiting"})
-    await driver
-
-    records = list_step_records(engine, task.id)
-    assert [r.step for r in records] == ["reproduce", "triage", "escalate"]
-    assert records[1].outcome == {"route": "escalate"}
-    gate = records[2]
-    assert gate.kind == "gate" and gate.status == "waiting"
-    assert gate.pause is None
-    assert "could not be reproduced" in gate.outcome["message"]
-    # The coder was never spawned.
-    assert supervisor.get(task.id, "coder") is None
-
-    resume(runner, engine, task.id)
-    await wait_for_run(engine, task.id, {"complete"})
+    """Poll until `step`'s newest attempt has had its prompt sent."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        matching = [r for r in list_step_records(engine, task_id) if r.step == step]
+        if matching and matching[-1].prompted_at is not None:
+            return
+        await asyncio.sleep(0.02)
+    raise RuntimeError(f"{step!r} was never prompted")
 
 
-async def test_bugfix_rejection_loops_then_escalates(
-    rig, engine, project, tmp_path: Path, fake_workshop_cli: Path
+async def _wait_for_step_count(
+    engine: Engine, task_id: int, step: str, count: int, timeout: float = 10.0
 ) -> None:
-    """The reproducer script keeps failing: fix is re-prompted with the
-    validation report, and the run escalates after the third attempt."""
+    """Poll until `step` has been attempted `count` times."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        records = list_step_records(engine, task_id)
+        if len([r for r in records if r.step == step]) >= count:
+            return
+        await asyncio.sleep(0.02)
+    raise RuntimeError(f"{step!r} never reached {count} attempts")
+
+
+def _failing_repro_script(fake_workshop_cli: Path) -> None:
+    """Make `bash .ompire/repro.sh` exit non-zero through the fake workshop."""
     fake_workshop_cli.write_text(
         "#!/bin/sh\n"
         'case "$*" in\n'
@@ -1740,245 +2020,589 @@ async def test_bugfix_rejection_loops_then_escalates(
         '  *) exit 0 ;;\n'
         "esac\n"
     )
-    runner, supervisor, _tracker, _hub, _scenario = rig
-    task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: crash")
 
-    async def drive() -> None:
-        await _write_outcome_when_session_prompted(
-            supervisor, task.id, "reproducer", Path(task.clone_path),
-            _bugfix_outcome("success", "reproduced", repro_command="bash .ompire/repro.sh"),
-        )
-        for attempt in (1, 2, 3):
-            await _write_outcome_when_session_prompted(
-                supervisor, task.id, "coder", Path(task.clone_path),
-                _bugfix_outcome("success", f"fix attempt {attempt}"),
-                prompt_count=attempt,
-            )
 
-    driver = asyncio.create_task(drive())
+def _bugfix_task(engine, tmp_path: Path, slug: str, **kwargs) -> Task:
+    return _make_task(
+        engine,
+        tmp_path,
+        workflow="bugfix",
+        slug=slug,
+        prompt="bug: off by one",
+        **kwargs,
+    )
+
+
+async def test_bugfix_reproduced_runs_through_diagnosis_script_and_qa(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """The straightforward path — and it still spends a QA turn.
+
+    A passing script says the script passes. The epic's contract is that QA
+    verifies in its original session, so the script is evidence handed to that
+    turn rather than a substitute for it.
+    """
+    runner, supervisor, tracker, _hub, _scenario = rig
+    task = _bugfix_task(engine, tmp_path, "bugfix-happy", preamble="PRE")
+    clone = Path(task.clone_path)
+    driver = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [
+            ("reproducer", 1, _reproduced()),
+            ("coder", 1, _candidate()),
+            ("coder", 2, _implemented()),
+            ("reproducer", 2, _verified("validated", "the bug is gone")),
+        ],
+    )
     _start(runner, engine, task)
-    await wait_for_run(engine, task.id, {"waiting"})
+    final = await wait_for_run(engine, task.id, {"complete"})
     await driver
 
     records = list_step_records(engine, task.id)
-    fixes = [r for r in records if r.step == "fix"]
-    assert len(fixes) == 3
-    checks = [r for r in records if r.step == "check"]
-    assert [r.outcome for r in checks] == [
-        {"route": "fix"}, {"route": "fix"}, {"route": "fix"},
+    assert [(r.step, r.kind, r.status) for r in records] == [
+        ("reproduce", "agent", "ok"),
+        ("diagnose", "agent", "ok"),
+        ("route-diagnosis", "decision", "ok"),
+        ("fix", "agent", "ok"),
+        ("route-fix", "decision", "ok"),
+        ("run-script", "command", "ok"),
+        ("verify", "agent", "ok"),
+        ("route-verification", "decision", "ok"),
     ]
-    # The third `check` still routes to `fix`; the *engine* stops it, because
-    # the bound is counted before an attempt opens rather than trusted to a
-    # route predicate.
-    gate = records[-1]
-    assert gate.step == "escalate" and gate.kind == "gate" and gate.status == "waiting"
-    assert "3 times" in gate.outcome["message"]
-    assert "still broken" in gate.outcome["message"]
-
-    coder_prompts = user_prompts(supervisor, task.id, "coder")
-    assert len(coder_prompts) == 3
-    assert "did NOT validate" not in coder_prompts[0]
-    for prompt in coder_prompts[1:]:
-        assert "did NOT validate" in prompt
-        assert "still broken" in prompt
-
-    resume(runner, engine, task.id)
-    await wait_for_run(engine, task.id, {"complete"})
+    assert final.workflow_result == "validated"
+    assert records[-1].outcome == {"route": COMPLETE, "result": "validated"}
+    # QA reproduced and verified in one conversation; the coder owns the change.
+    assert len(user_prompts(supervisor, task.id, "reproducer")) == 2
+    assert tracker.get(task.id, "coder") is not None
+    assert supervisor.get(task.id, "judge") is None
+    repro_prompt = user_prompts(supervisor, task.id, "reproducer")[0]
+    assert repro_prompt.startswith("PRE\n\n")
+    assert "bug: off by one" in repro_prompt
+    # Verification was handed the script's result, not asked to trust the coder.
+    verify_prompt = user_prompts(supervisor, task.id, "reproducer")[1]
+    assert "exited 0" in verify_prompt
+    assert "do not take the coder's word" in verify_prompt
 
 
-async def test_bugfix_agent_validation_when_no_script(rig, engine, project, tmp_path: Path) -> None:
-    """No repro_command artifact: validation is a turn on the reproducer
-    session (which keeps its reproduction context), not the command step."""
+async def test_bugfix_non_reproduction_reaches_diagnosis_and_returns_to_qa(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """The epic's headline journey.
+
+    QA cannot reproduce. That does not end the run and does not authorize a
+    fix: diagnosis gets the negative evidence, its candidate findings go back
+    to the *same QA session* against still-unfixed code, and only QA's second
+    attempt establishes the reproduction that permits fixing.
+    """
     runner, supervisor, _tracker, _hub, _scenario = rig
-    task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: colors wrong")
-
-    async def drive() -> None:
-        await _write_outcome_when_session_prompted(
-            supervisor, task.id, "reproducer", Path(task.clone_path),
-            _bugfix_outcome("success", "reproduced visually", expected_behavior="blue"),
-        )
-        await _write_outcome_when_session_prompted(
-            supervisor, task.id, "coder", Path(task.clone_path),
-            _bugfix_outcome("success", "fixed the palette"),
-        )
-        await _write_outcome_when_session_prompted(
-            supervisor, task.id, "reproducer", Path(task.clone_path),
-            _bugfix_outcome("success", "verified: now blue"),
-            prompt_count=2,
-        )
-
-    driver = asyncio.create_task(drive())
+    task = _bugfix_task(engine, tmp_path, "bugfix-informed")
+    clone = Path(task.clone_path)
+    driver = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [
+            ("reproducer", 1, _not_reproduced("nothing on main")),
+            ("coder", 1, _candidate("the empty branch looks wrong")),
+            ("reproducer", 2, _reproduced("now it fails", script=False)),
+            ("coder", 2, _implemented()),
+            ("reproducer", 3, _verified("validated", "gone")),
+        ],
+    )
     _start(runner, engine, task)
-    await wait_for_run(engine, task.id, {"complete"})
+    final = await wait_for_run(engine, task.id, {"complete"})
     await driver
 
     records = list_step_records(engine, task.id)
     assert [r.step for r in records] == [
-        "reproduce", "triage", "fix", "route-validate", "validate-agent", "check",
+        "reproduce",
+        "diagnose",
+        "route-diagnosis",
+        "reproduce-informed",
+        "route-informed",
+        "fix",
+        "route-fix",
+        "verify",
+        "route-verification",
     ]
-    assert records[3].outcome == {"route": "validate-agent"}
-    assert records[4].outcome is not None
-    assert records[4].outcome["summary"] == "verified: now blue"
-    assert records[5].outcome == {"route": COMPLETE}
-    validate_prompt = user_prompts(supervisor, task.id, "reproducer")[1]
-    assert "Validate the fix" in validate_prompt
+    assert final.workflow_result == "validated"
+    # Diagnosis saw the failure as a failure, with what QA tried intact.
+    diagnose_prompt = user_prompts(supervisor, task.id, "coder")[0]
+    assert "not-reproduced" in diagnose_prompt
+    assert "ran the suite and the reported steps" in diagnose_prompt
+    assert "not proof that the code is correct" in diagnose_prompt
+    assert "do not commit" in diagnose_prompt.lower()
+    # The informed attempt is the same QA conversation, told what to try, and
+    # told the code is still unfixed.
+    informed_prompt = user_prompts(supervisor, task.id, "reproducer")[1]
+    assert "the empty branch is unguarded" in informed_prompt
+    assert "call it with []" in informed_prompt
+    assert "still unfixed" in informed_prompt
+    assert "plausible is not a reproduction" in informed_prompt
+    # The fix was given the *informed* reproduction, not the original failure.
+    fix_record = next(r for r in records if r.step == "fix")
+    informed_seq = next(r for r in records if r.step == "reproduce-informed").seq
+    assert fix_record.evidence["bindings"]["reproduction"]["seq"] == informed_seq
+    # Three roles, one QA session — reproduce, informed reproduce, verify.
+    assert len(user_prompts(supervisor, task.id, "reproducer")) == 3
 
 
-async def test_bugfix_pauses_on_a_missing_reproduce_outcome(
+async def test_bugfix_no_root_cause_asks_a_person_rather_than_permitting_a_fix(
     rig, engine, project, tmp_path: Path
 ) -> None:
-    """The reproducer idles without an outcome file. Nothing classifies the
-    step for it: the run stops with the reason, and the coder is never
-    spawned on evidence that does not exist."""
     runner, supervisor, _tracker, _hub, _scenario = rig
-    task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: crash")
-
-    _start(runner, engine, task)
-    await wait_for_run(engine, task.id, {"waiting"})
-
-    records = list_step_records(engine, task.id)
-    assert len(records) == 1
-    reproduce = records[0]
-    assert reproduce.step == "reproduce" and reproduce.status == "waiting"
-    assert reproduce.outcome is None
-    assert reproduce.pause["reason"] == "missing_outcome"
-    assert supervisor.get(task.id, "coder") is None
-    assert supervisor.get(task.id, "judge") is None
-
-    # Retrying gives the reproducer another attempt in its own session.
-    driver = asyncio.create_task(
-        _write_outcome_when_session_prompted(
-            supervisor, task.id, "reproducer", Path(task.clone_path),
-            _bugfix_outcome("failed", "still cannot reproduce"),
-            prompt_count=2,
-        )
+    task = _bugfix_task(engine, tmp_path, "bugfix-no-cause")
+    clone = Path(task.clone_path)
+    driver = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [
+            ("reproducer", 1, _not_reproduced()),
+            ("coder", 1, _no_root_cause("could not pin it down")),
+        ],
     )
-    retry(runner, engine, task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"waiting"})
     await driver
 
     records = list_step_records(engine, task.id)
-    assert [(r.step, r.status) for r in records] == [
-        ("reproduce", "failed"),
-        ("reproduce", "ok"),
-        ("triage", "ok"),
-        ("escalate", "waiting"),
-    ]
+    assert records[-1].step == "diagnosis-gate"
+    snapshot = records[-1].outcome
+    assert [c["id"] for c in snapshot["choices"]] == ["retry-diagnosis", "stop"]
+    assert "read the parser and the caller" in snapshot["message"]
+    assert "the exact input that failed" in snapshot["message"]
+    # No `fix` was reached: nothing authorized one.
+    assert not [r for r in records if r.step == "fix"]
+
+    final = answer(runner, engine, task, "stop")
+    assert (final.workflow_status, final.workflow_result) == (
+        "complete",
+        "stopped-without-fix",
+    )
 
 
-async def test_bugfix_restart_mid_loop_nudges_and_continues(
-    rig, engine, project, tmp_path: Path, fake_workshop_cli: Path
+async def test_bugfix_retry_diagnosis_carries_the_operators_words_back(
+    rig, engine, project, tmp_path: Path
 ) -> None:
-    """Restart with a fix turn in flight: the coder is resumed and nudged, the
-    same attempt is re-driven rather than replaced, and the run completes."""
-    fake_workshop_cli.write_text(
-        "#!/bin/sh\n"
-        'case "$*" in\n'
-        '  *"config get ask.timeout"*) echo 0 ;;\n'
-        '  *"--mode rpc-ui"*) exit 1 ;;\n'
-        '  *repro.sh*) exit 1 ;;\n'  # first validation rejects
-        '  *) exit 0 ;;\n'
-        "esac\n"
-    )
     runner, supervisor, _tracker, _hub, _scenario = rig
-    task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: crash")
-
-    async def drive_first_half() -> None:
-        await _write_outcome_when_session_prompted(
-            supervisor, task.id, "reproducer", Path(task.clone_path),
-            _bugfix_outcome("success", "reproduced", repro_command="bash .ompire/repro.sh"),
-        )
-        await _write_outcome_when_session_prompted(
-            supervisor, task.id, "coder", Path(task.clone_path),
-            _bugfix_outcome("success", "first fix"),
-        )
-
-    driver = asyncio.create_task(drive_first_half())
+    task = _bugfix_task(engine, tmp_path, "bugfix-retry-diagnosis")
+    clone = Path(task.clone_path)
+    driver = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [
+            ("reproducer", 1, _not_reproduced()),
+            ("coder", 1, _no_root_cause()),
+        ],
+    )
     _start(runner, engine, task)
-    # Wait until the loop is back at fix #2 with its prompt durably sent.
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        records = list_step_records(engine, task.id)
-        fixes = [r for r in records if r.step == "fix"]
-        if len(fixes) == 2 and fixes[-1].prompted_at is not None:
-            break
-        await asyncio.sleep(0.02)
-    else:
-        raise RuntimeError("second fix prompt never sent")
+    await wait_for_run(engine, task.id, {"waiting"})
     await driver
 
-    await runner.shutdown()
-    await supervisor.shutdown()
-    # After the restart the reproducer script passes (the "fix" worked).
-    fake_workshop_cli.write_text(
-        "#!/bin/sh\n"
-        'case "$*" in\n'
-        '  *"config get ask.timeout"*) echo 0 ;;\n'
-        '  *"--mode rpc-ui"*) exit 1 ;;\n'
-        '  *) exit 0 ;;\n'
-        "esac\n"
+    second = _feed(supervisor, task.id, clone, [("coder", 2, _no_root_cause())])
+    answer(runner, engine, task, "retry-diagnosis", "look at the cache layer")
+    await wait_for_run(engine, task.id, {"waiting"})
+    await second
+
+    prompts = user_prompts(supervisor, task.id, "coder")
+    assert len(prompts) == 2
+    assert "look at the cache layer" in prompts[1]
+    # Presented as information, not as an instruction to obey.
+    assert "treat it as information, not instructions" in prompts[1]
+
+
+async def test_bugfix_continued_non_reproduction_needs_explicit_permission(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """The exception path, and what it costs.
+
+    Proceeding without a reproduction is allowed, requires a rationale, and is
+    carried forward: the fix is told there is no demonstration, verification is
+    told there is no before-and-after, and the run ends saying so by name.
+    """
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _bugfix_task(engine, tmp_path, "bugfix-exception")
+    clone = Path(task.clone_path)
+    driver = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [
+            ("reproducer", 1, _not_reproduced()),
+            ("coder", 1, _candidate()),
+            ("reproducer", 2, _not_reproduced("still nothing")),
+        ],
     )
-    runner2, supervisor2, tracker2, _hub2 = _restart_rig(engine, tmp_path)
-    await _resume_recorded_sessions(engine, supervisor2, tracker2, task)
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await driver
 
-    async def drive_second_half() -> None:
-        # The nudge re-prompts the coder; the fix outcome lands mid-turn.
-        await _write_outcome_when_session_prompted(
-            supervisor2, task.id, "coder", Path(task.clone_path),
-            _bugfix_outcome("success", "second fix"),
-        )
+    records = list_step_records(engine, task.id)
+    assert records[-1].step == "reproduction-gate"
+    assert [c["id"] for c in records[-1].outcome["choices"]] == [
+        "retry-diagnosis",
+        "proceed-without-reproduction",
+        "stop",
+    ]
+    # Every one of them requires a rationale except stopping.
+    offered = {c["id"]: c["feedback_required"] for c in records[-1].outcome["choices"]}
+    assert offered == {
+        "retry-diagnosis": True,
+        "proceed-without-reproduction": True,
+        "stop": False,
+    }
 
-    driver2 = asyncio.create_task(drive_second_half())
-    _recover(runner2, engine, get_task(engine, task.id))
-    await wait_for_run(engine, task.id, {"complete"})
-    await driver2
+    rest = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [
+            ("coder", 2, _implemented()),
+            ("reproducer", 3, _verified("validated", "looks right now")),
+        ],
+    )
+    answer(
+        runner,
+        engine,
+        task,
+        "proceed-without-reproduction",
+        "customer confirmed it on their build; ship the guard",
+    )
+    final = await wait_for_run(engine, task.id, {"complete"})
+    await rest
 
-    coder_prompts = user_prompts(supervisor2, task.id, "coder")
-    assert coder_prompts[0].startswith("The daemon restarted")
-    assert "outcome.json" in coder_prompts[0]  # outcome-bearing nudge
+    # The ending says what it is: validated, but never demonstrated.
+    assert final.workflow_result == "validated-without-reproduction"
+    fix_prompt = user_prompts(supervisor, task.id, "coder")[1]
+    assert "nobody has demonstrated this bug" in fix_prompt
+    assert "customer confirmed it on their build" in fix_prompt
+    verify_prompt = user_prompts(supervisor, task.id, "reproducer")[2]
+    assert "never reproduced" in verify_prompt
+    assert "do not describe this as a verified before/after" in verify_prompt
+
+
+async def test_bugfix_a_rejected_fix_goes_back_with_the_report(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _bugfix_task(engine, tmp_path, "bugfix-rejected")
+    clone = Path(task.clone_path)
+    driver = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [
+            ("reproducer", 1, _reproduced(script=False)),
+            ("coder", 1, _candidate()),
+            ("coder", 2, _implemented("first attempt")),
+            (
+                "reproducer",
+                2,
+                _bug_result(
+                    "rejected",
+                    "still broken",
+                    checks="re-ran the reproduction",
+                    observations="still raises IndexError",
+                    limitations="none",
+                ),
+            ),
+            ("coder", 3, _implemented("second attempt")),
+            ("reproducer", 3, _verified("validated", "fixed now")),
+        ],
+    )
+    _start(runner, engine, task)
+    final = await wait_for_run(engine, task.id, {"complete"})
+    await driver
+
+    assert final.workflow_result == "validated"
     records = list_step_records(engine, task.id)
     fixes = [r for r in records if r.step == "fix"]
-    # Two work attempts, not three: the restart re-drove the open one.
-    assert [r.status for r in fixes] == ["ok", "ok"]
-    assert records[-1].outcome == {"route": COMPLETE}
-    await runner2.shutdown()
-    await supervisor2.shutdown()
+    assert len(fixes) == 2
+    # The second fix carries the rejection of the first, bound to that exact
+    # attempt rather than to whatever verification is newest.
+    second_fix_prompt = user_prompts(supervisor, task.id, "coder")[2]
+    assert "did NOT pass verification" in second_fix_prompt
+    assert "still raises IndexError" in second_fix_prompt
+    first_verify = next(r for r in records if r.step == "verify")
+    assert fixes[1].evidence["bindings"]["rejection"]["seq"] == first_verify.seq
+    # And the verification that passed checked the *second* fix.
+    last_verify = [r for r in records if r.step == "verify"][-1]
+    assert last_verify.evidence["bindings"]["fix"]["seq"] == fixes[1].seq
 
 
-async def test_bugfix_escalate_gate_survives_restart(
+async def test_bugfix_a_failing_script_is_not_overridable_by_a_positive_verdict(
+    rig, engine, project, tmp_path: Path, fake_workshop_cli: Path
+) -> None:
+    """Deterministic evidence wins.
+
+    If the reproducer script still fails, the bug is still there — whatever
+    the verification turn concluded. The run goes back to the coder.
+    """
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _bugfix_task(engine, tmp_path, "bugfix-script-fails")
+    clone = Path(task.clone_path)
+    (clone / ".ompire").mkdir(parents=True, exist_ok=True)
+    _failing_repro_script(fake_workshop_cli)
+    driver = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [
+            ("reproducer", 1, _reproduced()),
+            ("coder", 1, _candidate()),
+            ("coder", 2, _implemented()),
+            ("reproducer", 2, _verified("validated", "looks fine to me")),
+        ],
+    )
+    _start(runner, engine, task)
+    # The positive verdict does not complete the run; it re-enters `fix`.
+    await _wait_for_step_count(engine, task.id, "fix", 2)
+    driver.cancel()
+
+    records = list_step_records(engine, task.id)
+    script = next(r for r in records if r.step == "run-script")
+    assert script.outcome["exit_code"] != 0
+    verify = next(r for r in records if r.step == "verify")
+    assert verify.outcome["result"] == "validated"
+    route = [r for r in records if r.step == "route-verification"][-1]
+    assert route.outcome == {"route": "fix"}
+    assert get_task(engine, task.id).workflow_result is None
+
+
+async def test_bugfix_an_inconclusive_verification_asks_rather_than_deciding(
     rig, engine, project, tmp_path: Path
 ) -> None:
-    """A run parked at the escalate gate re-arms after a restart with the same
-    message and resumes to completion."""
     runner, supervisor, _tracker, _hub, _scenario = rig
-    task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: flaky")
-
-    driver = asyncio.create_task(
-        _write_outcome_when_session_prompted(
-            supervisor, task.id, "reproducer", Path(task.clone_path),
-            _bugfix_outcome("failed", "not reproducible"),
-        )
+    task = _bugfix_task(engine, tmp_path, "bugfix-inconclusive")
+    clone = Path(task.clone_path)
+    driver = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [
+            ("reproducer", 1, _reproduced(script=False)),
+            ("coder", 1, _candidate()),
+            ("coder", 2, _implemented()),
+            ("reproducer", 2, _verified("inconclusive", "cannot tell from here")),
+        ],
     )
     _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"waiting"})
     await driver
 
+    records = list_step_records(engine, task.id)
+    assert records[-1].step == "validation-gate"
+    assert [c["id"] for c in records[-1].outcome["choices"]] == [
+        "retry-verification",
+        "stop",
+    ]
+    # Neither a pass nor a failure was recorded on the way here.
+    assert next(r for r in records if r.step == "verify").outcome["result"] == (
+        "inconclusive"
+    )
+
+    final = answer(runner, engine, task, "stop")
+    assert (final.workflow_status, final.workflow_result) == (
+        "complete",
+        "stopped-unvalidated",
+    )
+
+
+async def test_bugfix_unable_to_fix_stops_instead_of_entering_verification(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _bugfix_task(engine, tmp_path, "bugfix-unable")
+    clone = Path(task.clone_path)
+    driver = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [
+            ("reproducer", 1, _reproduced(script=False)),
+            ("coder", 1, _candidate()),
+            (
+                "coder",
+                2,
+                _bug_result(
+                    "unable-to-fix",
+                    "needs an API change we cannot make here",
+                    changes="none",
+                    validation_notes="nothing to validate",
+                ),
+            ),
+        ],
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await driver
+
+    records = list_step_records(engine, task.id)
+    assert records[-1].step == "correction-exhausted"
+    assert not [r for r in records if r.step == "verify"]
+    final = answer(runner, engine, task, "stop")
+    assert final.workflow_result == "stopped-unvalidated"
+
+
+async def test_bugfix_a_missing_result_pauses_and_keeps_its_reason(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    runner, _supervisor, _tracker, _hub, _scenario = rig
+    task = _bugfix_task(engine, tmp_path, "bugfix-missing-result")
+
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+
+    record = list_step_records(engine, task.id)[-1]
+    assert (record.step, record.status) == ("reproduce", "waiting")
+    assert record.outcome is None
+    assert record.pause["reason"] == "missing_outcome"
+    assert record.pause["retry_step"] == "reproduce"
+
+
+async def test_bugfix_restart_during_the_return_to_qa_keeps_the_conversation(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """The interruption that would be worst to get wrong.
+
+    The daemon dies mid-way through QA's informed reproduction. On restart the
+    same attempt is re-driven in the same native session — nudged, not
+    re-prompted from scratch — and its evidence still points at the diagnosis
+    that sent it back.
+    """
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _bugfix_task(engine, tmp_path, "bugfix-restart-informed")
+    clone = Path(task.clone_path)
+    driver = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [
+            ("reproducer", 1, _not_reproduced()),
+            ("coder", 1, _candidate()),
+        ],
+    )
+    _start(runner, engine, task)
+    # Wait until QA has actually been sent back with the findings, then die
+    # mid-turn: an attempt whose prompt was never delivered has no lost turn
+    # to resume, and would correctly be prompted afresh.
+    await _wait_for_prompted(engine, task.id, "reproduce-informed")
+    await driver
+    informed = next(
+        r for r in list_step_records(engine, task.id) if r.step == "reproduce-informed"
+    )
     await runner.shutdown()
     await supervisor.shutdown()
+
     runner2, supervisor2, tracker2, _hub2 = _restart_rig(engine, tmp_path)
-    await _resume_recorded_sessions(engine, supervisor2, tracker2, task)
-    _recover(runner2, engine, get_task(engine, task.id))
-    await asyncio.sleep(0.3)
+    try:
+        await _resume_recorded_sessions(
+            engine, supervisor2, tracker2, get_task(engine, task.id)
+        )
+        rest = _feed(
+            supervisor2,
+            task.id,
+            clone,
+            [
+                ("reproducer", 1, _reproduced("now it fails", script=False)),
+                ("coder", 1, _implemented()),
+                ("reproducer", 2, _verified("validated", "gone")),
+            ],
+        )
+        _recover(runner2, engine, get_task(engine, task.id))
+        final = await wait_for_run(engine, task.id, {"complete"})
+        await rest
 
-    assert get_task(engine, task.id).workflow_status == "waiting"
-    gates = [r for r in list_step_records(engine, task.id) if r.kind == "gate"]
-    assert len(gates) == 1 and "could not be reproduced" in gates[0].outcome["message"]
+        assert final.workflow_result == "validated"
+        after = list_step_records(engine, task.id)
+        # One informed attempt, not two: a restart is not a work attempt.
+        assert len([r for r in after if r.step == "reproduce-informed"]) == 1
+        again = next(r for r in after if r.step == "reproduce-informed")
+        assert again.seq == informed.seq
+        assert again.evidence == informed.evidence
+        # The resumed turn was nudged into its existing conversation.
+        assert user_prompts(supervisor2, task.id, "reproducer")[0].startswith(
+            "The daemon restarted"
+        )
+    finally:
+        await runner2.shutdown()
+        await supervisor2.shutdown()
 
-    resume(runner2, engine, task.id)
-    await wait_for_run(engine, task.id, {"complete"})
-    await runner2.shutdown()
-    await supervisor2.shutdown()
 
+async def test_bugfix_exhausted_investigation_can_only_stop(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """Three diagnoses is the run's budget, and no answer refills it."""
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _bugfix_task(engine, tmp_path, "bugfix-exhausted")
+    clone = Path(task.clone_path)
+    driver = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [("reproducer", 1, _not_reproduced()), ("coder", 1, _no_root_cause())],
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await driver
+
+    for attempt in (2, 3):
+        more = _feed(supervisor, task.id, clone, [("coder", attempt, _no_root_cause())])
+        answer(runner, engine, task, "retry-diagnosis", f"hint {attempt}")
+        await wait_for_run(engine, task.id, {"waiting"})
+        await more
+
+    assert len([r for r in list_step_records(engine, task.id) if r.step == "diagnose"]) == 3
+    # A fourth retry reaches the exhaustion gate instead of a fourth diagnosis.
+    answer(runner, engine, task, "retry-diagnosis", "one more please")
+    await wait_for_run(engine, task.id, {"waiting"})
+    records = list_step_records(engine, task.id)
+    assert len([r for r in records if r.step == "diagnose"]) == 3
+    assert records[-1].step == "investigation-exhausted"
+    assert [c["id"] for c in records[-1].outcome["choices"]] == ["stop"]
+
+    final = answer(runner, engine, task, "stop")
+    assert final.workflow_result == "stopped-without-fix"
+
+
+async def test_bugfix_editing_the_catalog_does_not_touch_a_running_task(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """The pinning property, restated for the new definition."""
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _bugfix_task(engine, tmp_path, "bugfix-pinned")
+    pinned = resolve_task_definition(engine, task).revision
+    clone = Path(task.clone_path)
+    driver = _feed(
+        supervisor,
+        task.id,
+        clone,
+        [("reproducer", 1, _not_reproduced()), ("coder", 1, _no_root_cause())],
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await driver
+
+    gate_before = list_step_records(engine, task.id)[-1].outcome
+    # Edit the catalog under the running task: a different label on a choice.
+    edited = (
+        resources.files("ompire_daemon.builtin_workflows")
+        .joinpath("bugfix.yaml")
+        .read_text(encoding="utf-8")
+        .replace("label: Stop without a fix", "label: Abandon it")
+    )
+    install_test_workflow(engine, edited)
+    assert current_revision("bugfix").revision != pinned
+
+    # The waiting question is unchanged, and answering it uses what it asked.
+    assert list_step_records(engine, task.id)[-1].outcome == gate_before
+    final = answer(runner, engine, task, "stop")
+    assert final.workflow_result == "stopped-without-fix"
+    assert resolve_task_definition(engine, task).revision == pinned
 
 # --- prompt file mentions (add-spawn-file-mentions) --------------------------
 

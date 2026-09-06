@@ -15,6 +15,8 @@ import { projectReview } from "../lib/reviewPresentation";
 import { hasShipFlowHandoff } from "../lib/shipPresentation";
 import { useDaemonState } from "../lib/useDaemonState";
 import type {
+  GateChoice,
+  GateSnapshot,
   ReviewState,
   SessionInfo,
   StepRecord,
@@ -50,6 +52,29 @@ function hasLiveAgent(session: SessionInfo | null): boolean {
 function gateMessage(record: StepRecord | undefined): string | null {
   const message = record?.outcome?.message;
   return typeof message === "string" ? message : null;
+}
+
+/** A format-2 gate's persisted question, if this record is one.
+ *
+ * Read off the record rather than looked up in the catalog: the question a
+ * person is answering is the one that was asked, even if the definition has
+ * been edited since. */
+function gateSnapshot(record: StepRecord | undefined): GateSnapshot | null {
+  const outcome = record?.outcome;
+  if (!outcome || typeof outcome !== "object") return null;
+  const snapshot = outcome as unknown as GateSnapshot;
+  if (typeof snapshot.message !== "string" || !Array.isArray(snapshot.choices)) {
+    return null;
+  }
+  return snapshot;
+}
+
+/** The named ending a decided choice leads to, for the card's own summary. */
+function choiceDestination(choice: GateChoice): string | null {
+  const next = choice.next as { step?: unknown; result?: unknown } | undefined;
+  if (next && typeof next.step === "string") return next.step;
+  if (next && typeof next.result === "string") return next.result;
+  return null;
 }
 
 /** One-line summary for a finished step's chip title: the outcome's summary
@@ -116,32 +141,66 @@ function WorkflowStrip({ workflow, task }: { workflow: WorkflowState; task: Task
 
 /** Gate card (workflow-engine design D-9): shown while the run is `waiting`.
  *
- * Two different things park a run here and the card must not conflate them
- * (ADR-0028). A *declared gate* is the definition asking a person to look;
- * resuming finishes it and the run continues. An *uncertainty pause* is the
- * engine refusing to guess; the action retries the step that could not be
- * decided, and it never continues past it. The verb, the explanation, and the
- * note field all follow from which one it is.
+ * Three different things park a run here and the card must not conflate them
+ * (ADR-0028, ADR-0030).
  *
- * Both send the waiting attempt's own sequence number, so a stale tab or a
- * double submit is refused rather than applied to a different attempt. A 409
- * surfaces inline; the card also disappears by itself once the run leaves
- * `waiting`. */
+ * A *format-2 gate* is a question with named choices: the operator picks one,
+ * some require feedback, and each one has a declared destination. There is no
+ * generic Resume — answering means choosing a route the definition offered.
+ * A *format-1 gate* is the older "look at this and continue", with an
+ * optional note. An *uncertainty pause* is the engine refusing to guess; the
+ * action retries the step that could not be decided and never continues past
+ * it.
+ *
+ * All three send the waiting attempt's own sequence number, so a stale tab or
+ * a double submit is refused rather than applied to a different attempt.
+ * Nothing is pre-selected, so opening the card authorizes nothing. Errors
+ * surface inline; a 409 means the daemon has moved on, and the card is
+ * replaced by whatever it is waiting on now rather than re-submitting. */
 function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowState }) {
   const [note, setNote] = useState("");
+  const [choiceId, setChoiceId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const waiting = [...workflow.steps].reverse().find((r) => r.status === "waiting");
   const pause = waiting?.pause ?? null;
+  const snapshot = pause === null ? gateSnapshot(waiting) : null;
+  const choices = snapshot?.choices ?? [];
   const message =
-    pause?.message ?? gateMessage(waiting) ?? "Waiting at a workflow gate.";
+    pause?.message ?? snapshot?.message ?? gateMessage(waiting) ?? "Waiting at a workflow gate.";
+  // Unsent input belongs to the attempt it was typed against. When the run
+  // moves — another tab answered, a restart re-armed something else — the
+  // draft is dropped rather than carried onto a different question.
+  const identity = `${taskId}:${waiting?.seq ?? "none"}`;
+  const lastIdentity = useRef(identity);
+  useEffect(() => {
+    if (lastIdentity.current !== identity) {
+      lastIdentity.current = identity;
+      setNote("");
+      setChoiceId(null);
+      setError(null);
+    }
+  }, [identity]);
+
+  const selected = choices.find((c) => c.id === choiceId) ?? null;
+  const feedbackMissing = selected?.feedback_required === true && note.trim() === "";
+  const blocked =
+    busy ||
+    waiting === undefined ||
+    (choices.length > 0 && (selected === null || feedbackMissing));
 
   async function advance() {
     if (waiting === undefined) return;
+    if (choices.length > 0 && selected === null) return;
     setBusy(true);
     setError(null);
     try {
-      await resumeWorkflow(taskId, waiting.seq, note.trim() || undefined);
+      await resumeWorkflow(
+        taskId,
+        waiting.seq,
+        note.trim() || undefined,
+        selected?.id,
+      );
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -153,7 +212,7 @@ function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowStat
     <div
       className="panel gateCard"
       data-testid="gate-card"
-      data-waiting-kind={pause === null ? "gate" : "pause"}
+      data-waiting-kind={pause !== null ? "pause" : choices.length > 0 ? "choice" : "gate"}
     >
       <h2 className="panelTitle">
         <span className="gateDot" />{" "}
@@ -172,15 +231,64 @@ function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowStat
           allows goes to that workflow&apos;s gate instead.
         </p>
       )}
+      {choices.length > 0 && (
+        <fieldset className="gateChoices" data-testid="gate-choices">
+          <legend className="fieldHint">
+            Choose what happens next. Nothing is selected for you.
+          </legend>
+          {choices.map((choice) => {
+            const destination = choiceDestination(choice);
+            return (
+              <label
+                key={choice.id}
+                className="gateChoice"
+                data-testid={`gate-choice-${choice.id}`}
+              >
+                <input
+                  type="radio"
+                  name={`gate-choice-${waiting?.seq ?? 0}`}
+                  value={choice.id}
+                  checked={choiceId === choice.id}
+                  disabled={busy}
+                  onChange={() => setChoiceId(choice.id)}
+                />
+                <span className="gateChoiceLabel">{choice.label}</span>
+                {destination !== null && (
+                  <span className="gateChoiceNext mono">→ {destination}</span>
+                )}
+                {choice.feedback_required && (
+                  <span className="gateChoiceRequired">needs a reason</span>
+                )}
+              </label>
+            );
+          })}
+        </fieldset>
+      )}
       {pause === null && (
         <textarea
           className="gateNote"
-          aria-label="Resume note"
-          placeholder="Optional note for the workflow (e.g. reviewed, looks good)…"
+          aria-label={
+            choices.length === 0
+              ? "Resume note"
+              : selected?.feedback_required
+                ? "Reason (required)"
+                : "Reason"
+          }
+          placeholder={
+            selected?.feedback_required
+              ? "Why — this is recorded with your decision and shown to the next step…"
+              : "Optional note for the workflow (e.g. reviewed, looks good)…"
+          }
           rows={2}
           value={note}
           onChange={(e) => setNote(e.target.value)}
+          disabled={busy}
         />
+      )}
+      {feedbackMissing && (
+        <p className="fieldHint" data-testid="gate-feedback-required">
+          “{selected?.label}” needs a reason before it can be submitted.
+        </p>
       )}
       {error && (
         <div className="composerError" data-testid="gate-error">
@@ -191,17 +299,23 @@ function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowStat
         <button
           type="button"
           className="sendButton"
-          disabled={busy || waiting === undefined}
+          disabled={blocked}
           onClick={() => void advance()}
-          data-testid={pause === null ? "gate-resume" : "pause-retry"}
+          data-testid={
+            pause !== null ? "pause-retry" : choices.length > 0 ? "gate-answer" : "gate-resume"
+          }
         >
-          {pause === null
+          {pause !== null
             ? busy
-              ? "Resuming…"
-              : "Resume"
-            : busy
               ? "Retrying…"
-              : `Retry ${pause.retry_step}`}
+              : `Retry ${pause.retry_step}`
+            : choices.length > 0
+              ? busy
+                ? "Submitting…"
+                : "Submit decision"
+              : busy
+                ? "Resuming…"
+                : "Resume"}
         </button>
       </div>
     </div>

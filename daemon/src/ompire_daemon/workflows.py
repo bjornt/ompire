@@ -44,7 +44,7 @@ import os
 import signal
 import traceback
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -689,6 +689,16 @@ class WorkflowRunner:
         terminal_result: str | None = None
         if isinstance(choice.next, StepDestination):
             records = list_step_records(self._engine, task.id)
+            # The successor's evidence is resolved against the history the
+            # commit is about to create, which includes *this* gate finishing
+            # `ok`. Resolving against the pre-commit row would hide the
+            # decision from the step it authorizes — a fix told to proceed
+            # without a reproduction would never see the permission that sent
+            # it there.
+            records = [
+                replace(record, status="ok") if record.seq == expected_seq else record
+                for record in records
+            ]
             target = definition.step_named(choice.next.step)
             assert target is not None  # validated at load
             # A human answer passes through the same visit bound as any other
@@ -719,6 +729,7 @@ class WorkflowRunner:
             task.id,
             step.name,
             "ok",
+            seq=expected_seq,
             snapshot=answered.outcome if answered is not None else None,
         )
         self._publish_task_updated(updated)
@@ -920,7 +931,7 @@ class WorkflowRunner:
             )
             updated = set_run_status(self._engine, task_id, "running", step.name)
             self._publish_task_updated(updated)
-            self._publish_step(task_id, step, "started")
+            self._publish_step(task_id, step, "started", seq=current.record.seq)
             try:
                 result = await self._run_step(current, ctx, task, inputs)
             except _StepInfraFailure as exc:
@@ -968,7 +979,7 @@ class WorkflowRunner:
                 outcome=result.outcome,
                 error=result.error_note,
             )
-            self._publish_step(task_id, step, "ok")
+            self._publish_step(task_id, step, "ok", seq=current.record.seq)
             next_step = self._destination_step(definition, step, result.destination)
             if next_step is None:
                 terminal_result = (
@@ -1068,7 +1079,7 @@ class WorkflowRunner:
 
     def _fail_step(self, task_id: int, step: Step, seq: int, error: str) -> None:
         finish_step_record(self._engine, task_id, seq, status="failed", error=error)
-        self._publish_step(task_id, step, "failed", error=error)
+        self._publish_step(task_id, step, "failed", seq=seq, error=error)
         updated = set_run_failed(self._engine, task_id, error)
         self._publish_task_updated(updated)
 
@@ -1092,6 +1103,7 @@ class WorkflowRunner:
             "workflow_step",
             {
                 "task_id": task_id,
+                "seq": seq,
                 "step": step.name,
                 "kind": step.kind,
                 "session": step.session if isinstance(step, AgentStep) else None,
@@ -1120,7 +1132,12 @@ class WorkflowRunner:
         )
         self._publish_task_updated(updated)
         self._publish_gate_step(
-            task_id, step.name, "waiting", snapshot["message"], snapshot=snapshot
+            task_id,
+            step.name,
+            "waiting",
+            snapshot["message"],
+            seq=seq,
+            snapshot=snapshot,
         )
         return await self._await_choice(task_id, definition, seq)
 
@@ -1175,7 +1192,7 @@ class WorkflowRunner:
             self._engine, task_id, seq, step=step.name, message=message
         )
         self._publish_task_updated(updated)
-        self._publish_gate_step(task_id, step.name, "waiting", message)
+        self._publish_gate_step(task_id, step.name, "waiting", message, seq=seq)
         return await self._await_gate(task_id, definition, seq, step.name, message)
 
     async def _await_gate(
@@ -1201,7 +1218,7 @@ class WorkflowRunner:
             status="ok",
             outcome={"message": message, "note": note},
         )
-        self._publish_gate_step(task_id, step_name, "ok")
+        self._publish_gate_step(task_id, step_name, "ok", seq=seq)
         updated = set_run_status(self._engine, task_id, "running", step_name)
         self._publish_task_updated(updated)
         return definition.step_after(step_name)
@@ -1230,6 +1247,7 @@ class WorkflowRunner:
                     "workflow_step",
                     {
                         "task_id": task_id,
+                        "seq": last.seq,
                         "step": last.step,
                         "kind": last.kind,
                         "session": last.session,
@@ -1251,10 +1269,10 @@ class WorkflowRunner:
                 # re-rendered and no choice is re-derived from today's
                 # definition: what was asked is what is still being asked.
                 self._publish_gate_step(
-                    task_id, last.step, "waiting", message, snapshot=snapshot
+                    task_id, last.step, "waiting", message, seq=last.seq, snapshot=snapshot
                 )
                 return await self._await_choice(task_id, definition, last.seq)
-            self._publish_gate_step(task_id, last.step, "waiting", message)
+            self._publish_gate_step(task_id, last.step, "waiting", message, seq=last.seq)
             next_step = await self._await_gate(
                 task_id, definition, last.seq, last.step, message
             )
@@ -1733,11 +1751,20 @@ class WorkflowRunner:
     def _publish_task_updated(self, task: Task) -> None:
         self._hub.publish("task_updated", task_payload(task, engine=self._engine))
 
-    def _publish_step(self, task_id: int, step: Step, status: str, **extra: Any) -> None:
+    def _publish_step(
+        self, task_id: int, step: Step, status: str, *, seq: int, **extra: Any
+    ) -> None:
+        """One attempt transition, addressed by sequence.
+
+        The sequence is what identifies the attempt. A bounded step is visited
+        repeatedly under the same name, so a client matching on the name alone
+        would fold two iterations of `fix` into one row.
+        """
         self._hub.publish(
             "workflow_step",
             {
                 "task_id": task_id,
+                "seq": seq,
                 "step": step.name,
                 "kind": step.kind,
                 "session": step.session if isinstance(step, AgentStep) else None,
@@ -1753,6 +1780,7 @@ class WorkflowRunner:
         status: str,
         message: str | None = None,
         *,
+        seq: int,
         snapshot: dict[str, Any] | None = None,
     ) -> None:
         """Gate transitions by name (the step object isn't always at hand —
@@ -1764,6 +1792,7 @@ class WorkflowRunner:
         """
         payload: dict[str, Any] = {
             "task_id": task_id,
+            "seq": seq,
             "step": step_name,
             "kind": "gate",
             "session": None,

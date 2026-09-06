@@ -374,27 +374,40 @@ def test_workflow_catalog_describes_every_declared_step(
     bugfix = catalog["bugfix"]
     assert [step["name"] for step in bugfix["steps"]] == [
         "reproduce",
-        "triage",
+        "diagnose",
+        "route-diagnosis",
+        "reproduce-informed",
+        "route-informed",
         "fix",
-        "route-validate",
-        "validate-script",
-        "validate-agent",
-        "check",
-        "escalate",
+        "route-fix",
+        "run-script",
+        "verify",
+        "route-verification",
+        "diagnosis-gate",
+        "reproduction-gate",
+        "validation-gate",
+        "investigation-exhausted",
+        "correction-exhausted",
     ]
-    # Only agent steps name a role; a command or gate has no model.
+    # Every agent consumer this launch would need is disclosed, including the
+    # ones the previous definition did not have (ADR-0026).
+    agents = [step["name"] for step in bugfix["steps"] if step["role"] is not None]
+    assert agents == ["reproduce", "diagnose", "reproduce-informed", "fix", "verify"]
+    # Only agent steps name a role; a command, decision, or gate has no model.
     roles = {step["name"]: step["role"] for step in bugfix["steps"]}
     assert roles["reproduce"] == "default"
-    assert roles["triage"] is None
-    assert roles["validate-script"] is None
+    assert roles["route-diagnosis"] is None
+    assert roles["run-script"] is None
     # Everything after the first decision may be routed past.
     conditional = {step["name"]: step["conditional"] for step in bugfix["steps"]}
     assert conditional["reproduce"] is False
     assert conditional["fix"] is True
     # The catalog names the exact revision a new launch of this name would
-    # pin, and the semantics version it is read under (ADR-0028).
+    # pin, and the semantics version it is read under (ADR-0028). Two formats
+    # coexist: `single-step` is still read under format-1 rules.
     assert bugfix["revision"].startswith("sha256:")
-    assert bugfix["format"] == 1
+    assert bugfix["format"] == 2
+    assert catalog["single-step"]["format"] == 1
     # Nothing describes a model consumer outside the declared steps.
     assert "judge_session" not in bugfix
     assert "judge_role" not in bugfix
@@ -766,7 +779,7 @@ def test_row_profile_and_role_resolve_independently(
         step_overrides={
             "reproduce": {"model_profile": "thorough"},
             "fix": {"role": "plan"},
-            "validate-agent": {"model_profile": "thorough", "role": "slow"},
+            "verify": {"model_profile": "thorough", "role": "slow"},
         },
     )
 
@@ -785,10 +798,10 @@ def test_row_profile_and_role_resolve_independently(
     assert _row(preview, "fix")["model"] == fix["roles"]["plan"]["model"]
     assert _row(preview, "fix")["thinking"] == fix["roles"]["plan"]["thinking"]
 
-    validate = _row(preview, "validate-agent")["binding"]
+    validate = _row(preview, "verify")["binding"]
     assert validate["profile_name"] == "thorough"
     assert validate["role"] == "slow"
-    assert _row(preview, "validate-agent")["model"] == "vendor/slow"
+    assert _row(preview, "verify")["model"] == "vendor/slow"
 
 
 def test_an_untouched_row_follows_the_task_profile_and_an_explicit_one_does_not(
@@ -807,7 +820,7 @@ def test_an_untouched_row_follows_the_task_profile_and_an_explicit_one_does_not(
 
     assert _row(preview, "reproduce")["binding"]["profile_name"] == "thorough"
     assert _row(preview, "fix")["binding"]["profile_name"] == "economy"
-    assert _row(preview, "validate-agent")["binding"]["profile_name"] == "economy"
+    assert _row(preview, "verify")["binding"]["profile_name"] == "economy"
 
 
 def test_an_explicit_choice_equal_to_the_inherited_one_is_still_explicit(
@@ -855,7 +868,10 @@ def test_a_role_only_override_follows_a_task_profile_change(
     ("overrides", "expected_field"),
     [
         ({"step_overrides": {"nope": {"role": "plan"}}}, "step_overrides.nope"),
-        ({"step_overrides": {"triage": {"role": "plan"}}}, "step_overrides.triage"),
+        (
+            {"step_overrides": {"route-fix": {"role": "plan"}}},
+            "step_overrides.route-fix",
+        ),
         ({"step_overrides": {"fix": {"role": "wizard"}}}, "step_overrides.fix.role"),
         (
             {"step_overrides": {"fix": {"model_profile": "ghost"}}},

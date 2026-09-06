@@ -256,6 +256,11 @@ export interface Task {
   workflow_status: WorkflowRunStatus | null;
   /** Current step name; null when the run is not in flight. */
   workflow_step: string | null;
+  /** The declared ending a finished format-2 run reached — `validated`,
+   * `stopped-without-fix`, and so on. Null while the run is going, and for
+   * every format-1 run: those have no name for their ending and none is
+   * invented for them. */
+  workflow_result: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -303,7 +308,8 @@ export type PauseReason =
   | "missing_outcome"
   | "unresolved_decision"
   | "prompt_unrenderable"
-  | "condition_unresolved";
+  | "condition_unresolved"
+  | "missing_evidence";
 
 /** An uncertainty pause on one attempt. Distinct from a declared gate: the
  * attempt keeps its own kind, its absent outcome, and the error that stopped
@@ -318,11 +324,57 @@ export interface StepPause {
   retry_kind: StepKind | null;
 }
 
+/** One prior attempt an attempt was bound to, as the daemon recorded it. */
+export interface EvidenceBinding {
+  step: string;
+  seq: number;
+}
+
+/** What an attempt froze when it opened (ADR-0029): alias → the attempt it
+ * selected, or null for an optional selector that matched nothing. Null on
+ * the record itself means the attempt recorded none — a format-1 attempt, or
+ * a step declaring no evidence — which is not the same as binding nothing. */
+export interface StepEvidence {
+  version: number;
+  bindings: Record<string, EvidenceBinding | null>;
+}
+
+/** One answer a format-2 gate offers, and where it goes. Static: a choice
+ * cannot compute a route, so what the operator picked is what happened. */
+export interface GateChoice {
+  id: string;
+  label: string;
+  feedback_required: boolean;
+  next: Record<string, unknown>;
+}
+
+/** The operator's answer, once given. Recorded beside — never instead of —
+ * the question, so a decision stays readable after the definition changes. */
+export interface GateDecision {
+  choice_id: string;
+  label: string;
+  feedback: string | null;
+  next?: Record<string, unknown>;
+  destination?: Record<string, unknown>;
+  actor: string;
+  decided_at: string;
+}
+
+/** A format-2 gate's persisted question, carried in the attempt's outcome.
+ * Present without `decision` while it waits, and with one once answered. */
+export interface GateSnapshot {
+  version: number;
+  message: string;
+  choices: GateChoice[];
+  evidence: Record<string, EvidenceBinding | null>;
+  decision?: GateDecision | null;
+}
+
 /** One executed workflow step (workflow-engine capability), as persisted by
- * the daemon and replayed in the snapshot's `workflows` map. A waiting gate
- * carries its operator message in `outcome.message`; a waiting *pause*
- * carries `pause` instead. The outcome schema
- * (version/status/summary/artifacts, design D-3) is read defensively. */
+ * the daemon and replayed in the snapshot's `workflows` map. A waiting
+ * format-1 gate carries its operator message in `outcome.message`; a
+ * format-2 gate carries a whole `GateSnapshot` there; a waiting *pause*
+ * carries `pause` instead. Outcome shapes are read defensively. */
 export interface StepRecord {
   task_id: number;
   seq: number;
@@ -334,6 +386,8 @@ export interface StepRecord {
   error: string | null;
   /** Set only while this attempt is the one the run is waiting on. */
   pause: StepPause | null;
+  /** The attempts this one was handed, frozen when it opened. */
+  evidence: StepEvidence | null;
   prompted_at: string | null;
   started_at: string;
   finished_at: string | null;
@@ -353,6 +407,9 @@ export interface WorkflowState {
  * on `failed`. */
 export interface WorkflowStepPayload {
   task_id: number;
+  /** The attempt this transition belongs to. Sent so a client never has to
+   * guess which iteration of a bounded step an event is about. */
+  seq?: number;
   step: string;
   kind: StepKind;
   session: string | null;
@@ -360,6 +417,10 @@ export interface WorkflowStepPayload {
   error?: string;
   /** A declared gate's operator message. */
   message?: string;
+  /** A format-2 gate's whole question — and, on `ok`, the answer it got.
+   * Sent rather than looked up, so a client never renders choices from
+   * today's catalog for a gate that asked something else. */
+  gate?: GateSnapshot;
   /** An uncertainty pause, when the run stopped rather than guessing. */
   pause?: StepPause;
 }

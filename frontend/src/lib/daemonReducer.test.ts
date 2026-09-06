@@ -1181,6 +1181,7 @@ describe("applyEnvelope workflow events", () => {
         outcome: null,
         error: null,
         pause: null,
+        evidence: null,
         prompted_at: null,
         started_at: "t1",
         finished_at: null,

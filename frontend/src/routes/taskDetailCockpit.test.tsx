@@ -954,7 +954,7 @@ describe("gate card", () => {
         method: "POST",
         // The waiting attempt is named, so a stale tab cannot advance a
         // different one (ADR-0028).
-        body: JSON.stringify({ expected_seq: 2, note: "looks right" }),
+        body: JSON.stringify({ expected_seq: 2, choice_id: null, note: "looks right" }),
       }),
     );
   });
@@ -969,7 +969,7 @@ describe("gate card", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/tasks/1/workflow/resume",
       expect.objectContaining({
-        body: JSON.stringify({ expected_seq: 2, note: null }),
+        body: JSON.stringify({ expected_seq: 2, choice_id: null, note: null }),
       }),
     );
   });
@@ -1028,3 +1028,226 @@ describe("gate card", () => {
     expect(screen.queryByTestId("gate-card")).not.toBeInTheDocument();
   });
 });
+
+describe("choice gate", () => {
+  const choiceSnapshot = {
+    version: 2,
+    message: "QA still cannot reproduce the bug.",
+    choices: [
+      {
+        id: "retry-diagnosis",
+        label: "Supply information and diagnose again",
+        feedback_required: true,
+        next: { step: "diagnose" },
+      },
+      {
+        id: "proceed-without-reproduction",
+        label: "Fix it anyway, without a reproduction",
+        feedback_required: true,
+        next: { step: "fix" },
+      },
+      {
+        id: "stop",
+        label: "Stop without a fix",
+        feedback_required: false,
+        next: { complete: true, result: "stopped-without-fix" },
+      },
+    ],
+    evidence: { repro: { step: "reproduce-informed", seq: 4 } },
+  };
+
+  const waitingChoiceGate = {
+    "1": {
+      name: "bugfix",
+      status: "waiting",
+      step: "reproduction-gate",
+      steps: [
+        { ...twoSessionSnapshots.workflows["1"].steps[0], status: "ok" },
+        {
+          task_id: 1,
+          seq: 2,
+          step: "reproduction-gate",
+          kind: "gate",
+          session: null,
+          status: "waiting",
+          outcome: choiceSnapshot,
+          error: null,
+          pause: null,
+          evidence: null,
+          prompted_at: null,
+          started_at: "t1",
+          finished_at: null,
+        },
+      ],
+    },
+  };
+
+  it("offers every declared choice and pre-selects none", async () => {
+    stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, waitingChoiceGate);
+
+    const card = screen.getByTestId("gate-card");
+    expect(card).toHaveAttribute("data-waiting-kind", "choice");
+    expect(within(card).getByTestId("gate-message")).toHaveTextContent(
+      "QA still cannot reproduce the bug.",
+    );
+    // Each choice says where it goes, so the consequence is visible before
+    // the decision rather than after it.
+    expect(within(card).getByTestId("gate-choice-retry-diagnosis")).toHaveTextContent(
+      "diagnose",
+    );
+    expect(within(card).getByTestId("gate-choice-stop")).toHaveTextContent(
+      "stopped-without-fix",
+    );
+    // Opening the card authorizes nothing.
+    for (const radio of within(card).getAllByRole("radio")) {
+      expect(radio).not.toBeChecked();
+    }
+    expect(within(card).getByTestId("gate-answer")).toBeDisabled();
+    // There is no generic Resume to bypass the choices with.
+    expect(within(card).queryByTestId("gate-resume")).not.toBeInTheDocument();
+  });
+
+  it("submits the chosen id with its required reason", async () => {
+    const fetchMock = stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, waitingChoiceGate);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("radio", { name: /Fix it anyway/ }));
+    // A choice that declares feedback required cannot be submitted without it.
+    expect(screen.getByTestId("gate-answer")).toBeDisabled();
+    expect(screen.getByTestId("gate-feedback-required")).toBeInTheDocument();
+
+    await user.type(
+      screen.getByLabelText("Reason (required)"),
+      "customer confirmed it on their build",
+    );
+    await user.click(screen.getByTestId("gate-answer"));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/1/workflow/resume",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          expected_seq: 2,
+          choice_id: "proceed-without-reproduction",
+          note: "customer confirmed it on their build",
+        }),
+      }),
+    );
+  });
+
+  it("submits a choice that needs no reason", async () => {
+    const fetchMock = stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, waitingChoiceGate);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("radio", { name: /Stop without a fix/ }));
+    await user.click(screen.getByTestId("gate-answer"));
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/1/workflow/resume",
+      expect.objectContaining({
+        body: JSON.stringify({ expected_seq: 2, choice_id: "stop", note: null }),
+      }),
+    );
+  });
+
+  it("is keyboard reachable end to end", async () => {
+    const fetchMock = stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, waitingChoiceGate);
+
+    const user = userEvent.setup();
+    const first = screen.getByRole("radio", { name: /diagnose again/ });
+    first.focus();
+    await user.keyboard(" ");
+    expect(first).toBeChecked();
+    await user.type(screen.getByLabelText("Reason (required)"), "check the cache");
+    screen.getByTestId("gate-answer").focus();
+    await user.keyboard("{Enter}");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/tasks/1/workflow/resume",
+      expect.objectContaining({
+        body: JSON.stringify({
+          expected_seq: 2,
+          choice_id: "retry-diagnosis",
+          note: "check the cache",
+        }),
+      }),
+    );
+  });
+
+  it("does not re-submit an old answer against a new question", async () => {
+    // Another tab answered first. The daemon's state replaces this card, and
+    // the choice typed against the old question is dropped rather than
+    // carried onto whatever is waiting now.
+    stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, waitingChoiceGate);
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("radio", { name: /Stop without a fix/ }));
+
+    act(() => {
+      mainSocket().emit("workflow_step", {
+        task_id: 1,
+        seq: 2,
+        step: "reproduction-gate",
+        kind: "gate",
+        session: null,
+        status: "ok",
+        gate: {
+          ...choiceSnapshot,
+          decision: {
+            choice_id: "retry-diagnosis",
+            label: "Supply information and diagnose again",
+            feedback: "look again",
+            destination: { step: "diagnose" },
+            actor: "operator",
+            decided_at: "t2",
+          },
+        },
+      });
+      mainSocket().emit("workflow_step", {
+        task_id: 1,
+        seq: 3,
+        step: "diagnose",
+        kind: "agent",
+        session: "coder",
+        status: "started",
+      });
+      mainSocket().emit("task_updated", {
+        ...makeTask(),
+        workflow_status: "running",
+        workflow_step: "diagnose",
+      });
+    });
+
+    expect(screen.queryByTestId("gate-card")).not.toBeInTheDocument();
+  });
+
+  it("keeps a loop's iterations apart by sequence", async () => {
+    // Two attempts of one bounded step share a name. Matching on the name
+    // alone would fold them into a single row and lose an attempt.
+    stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, twoSessionSnapshots.workflows);
+
+    act(() => {
+      for (const seq of [7, 8]) {
+        mainSocket().emit("workflow_step", {
+          task_id: 1,
+          seq,
+          step: "fix",
+          kind: "agent",
+          session: "coder",
+          status: "started",
+        });
+      }
+    });
+
+    const strip = screen.getByTestId("workflow-strip");
+    expect(within(strip).getByTestId("workflow-chip-7")).toBeInTheDocument();
+    expect(within(strip).getByTestId("workflow-chip-8")).toBeInTheDocument();
+  });
+});
+

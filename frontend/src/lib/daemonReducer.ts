@@ -588,12 +588,17 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       const existing = state.workflows[p.task_id];
       const steps = [...(existing?.steps ?? [])];
       const nextSeq = steps.reduce((max, record) => Math.max(max, record.seq), 0) + 1;
+      // The daemon addresses each attempt by sequence. A bounded step is
+      // visited repeatedly under one name, so matching on the name alone
+      // would fold two iterations of `fix` into a single row.
+      const seq = p.seq ?? nextSeq;
+      const bySeq = steps.findIndex((s) => s.seq === seq);
       if (p.status === "started") {
         // Each execution appends a record daemon-side (append_step_record,
         // seq = max+1) — a looped/retried step gets one record per run.
-        steps.push({
+        const started: StepRecord = {
           task_id: p.task_id,
-          seq: nextSeq,
+          seq,
           step: p.step,
           kind: p.kind,
           session: p.session,
@@ -601,24 +606,36 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
           outcome: null,
           error: null,
           pause: null,
+          evidence: null,
           prompted_at: null,
           started_at: envelope.ts,
           finished_at: null,
-        });
+        };
+        if (bySeq >= 0) steps[bySeq] = started;
+        else steps.push(started);
       } else {
-        // ok/failed/waiting close out the newest record for this step
-        // name+kind (a legacy decision-escalation gate shares the decision's
-        // name, so kind disambiguates). Tolerate a terminal event whose
-        // `started` we never saw (e.g. joined mid-stream).
-        const idx = steps.findLastIndex((s) => s.step === p.step && s.kind === p.kind);
-        // A declared gate carries its message as an outcome; an uncertainty
-        // pause carries `pause` instead and keeps its absent outcome, so the
-        // two never read as the same waiting state (ADR-0028).
+        // ok/failed/waiting close out the attempt this event names. Fall back
+        // to the newest record of the same name+kind for a daemon that did
+        // not send a sequence, and tolerate a terminal event whose `started`
+        // we never saw (e.g. joined mid-stream).
+        const idx =
+          bySeq >= 0
+            ? bySeq
+            : steps.findLastIndex((s) => s.step === p.step && s.kind === p.kind);
+        // Three different waiting states, kept apart (ADR-0028, ADR-0030). A
+        // format-2 gate carries its whole question — and, once answered, the
+        // answer — as its outcome; a format-1 gate carries only its message;
+        // an uncertainty pause carries `pause` instead and keeps its absent
+        // outcome.
         const outcome =
-          p.status === "waiting" && p.message !== undefined ? { message: p.message } : null;
+          p.gate !== undefined
+            ? (p.gate as unknown as Record<string, unknown>)
+            : p.status === "waiting" && p.message !== undefined
+              ? { message: p.message }
+              : null;
         const updated: StepRecord = {
           task_id: p.task_id,
-          seq: idx >= 0 ? steps[idx].seq : nextSeq,
+          seq: idx >= 0 ? steps[idx].seq : seq,
           step: p.step,
           kind: p.kind,
           session: p.session,
@@ -626,6 +643,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
           outcome: outcome ?? (idx >= 0 ? steps[idx].outcome : null),
           error: p.status === "failed" ? (p.error ?? null) : idx >= 0 ? steps[idx].error : null,
           pause: p.status === "waiting" ? (p.pause ?? null) : null,
+          evidence: idx >= 0 ? steps[idx].evidence : null,
           prompted_at: idx >= 0 ? steps[idx].prompted_at : null,
           started_at: idx >= 0 ? steps[idx].started_at : envelope.ts,
           finished_at: p.status === "waiting" ? null : envelope.ts,

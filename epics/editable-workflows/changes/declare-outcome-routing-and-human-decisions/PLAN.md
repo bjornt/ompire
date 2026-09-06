@@ -293,13 +293,13 @@ that identity instead of silently prompting a new conversation.
   preserve uncertainty retry and old-format behavior. Verify missing/invalid
   results pause, explicit negative results route, old evidence cannot satisfy new
   work, and interruption after accepted choice does not lose/replay it. (R1–R4, R7)
-- [ ] Replace the new-launch bugfix YAML with the complete policy above, including
+- [x] Replace the new-launch bugfix YAML with the complete policy above, including
   diagnosis, informed QA, structured gates, evidence chains, explicit exception,
   script plus QA verification, inconclusive/rejected results, and all bounds.
   Extend existing executable workflow tests for the reachable branches, current
   fix/candidate association and QA native-session continuity. Keep accepted old
   bugfix revisions executable and single-step unchanged. (R1, R2, R4, R5, R7)
-- [ ] Extend the existing resume request/route, authoritative task/snapshot/event
+- [x] Extend the existing resume request/route, authoritative task/snapshot/event
   projections and exact-sequence history delivery; update frontend types/client/
   reducer and task-detail history/gate controls. Preserve legacy Resume/Retry,
   display named terminal results, handle 422/409/network errors without replay,
