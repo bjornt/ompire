@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/workflow-decisions — declared outcomes, evidence
+# handoffs, and human decisions (ADR-0029, ADR-0030).
+#
+# Drives the packaged format-2 `bugfix` through the journey the epic names,
+# against the real daemon with the executable fake omp:
+#
+#   1. QA cannot reproduce → the run does NOT stop and does NOT permit a fix;
+#      diagnosis runs with the negative evidence.
+#   2. Diagnosis finds a candidate → QA is sent back in its ORIGINAL session,
+#      against still-unfixed code, and only its new evidence reproduces.
+#   3. Fix → QA verification in that same session → the run ends `validated`.
+#
+# Then, on a second task, the branches a person owns: no-root-cause opens a
+# gate, its retry carries the operator's words into a new diagnosis, and
+# continued non-reproduction offers the explicit exception — whose ending is
+# named `validated-without-reproduction` rather than claiming proof.
+#
+# Everything goes through the published API. Nothing here writes daemon state.
+#
+# Preconditions: `local-test/env up` (daemon + project + model profile).
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+# --- 1. non-reproduction reaches diagnosis and returns to QA ------------------
+
+slug=$(unique_slug decisions)
+ws_start
+
+tid=$(spawn_task "$slug" \
+	"[[scenario:happy]]\n[[scenario-param:script=false]]\n[[scenario-param:results=not-reproduced,candidate-found,reproduced,implemented,validated]]\nBug: the empty list case explodes." \
+	bugfix)
+
+result=$(wait_for "run reaches a named ending" 240 workflow_result "$tid")
+[ "$result" = validated ] &&
+	ok "run ended 'validated'" ||
+	fail "terminal result" "expected validated, got $result"
+assert "task never failed" task_not_failed "$tid"
+
+steps=$(workflow_steps "$tid")
+
+# The route: reproduction failed, diagnosis still ran, QA was sent back.
+order=$(jq -r '[.[].step] | join(",")' <<<"$steps")
+case $order in
+reproduce,diagnose,route-diagnosis,reproduce-informed,route-informed,fix,route-fix,verify,route-verification)
+	ok "route: non-reproduction → diagnosis → informed QA → fix → verify" ;;
+*) fail "route" "$order" ;;
+esac
+
+# The first attempt really did report a negative result, and it finished `ok`
+# rather than pausing: a declared negative is data, not an absence.
+first=$(jq -c '.[0]' <<<"$steps")
+[ "$(jq -r '.outcome.result' <<<"$first")" = not-reproduced ] &&
+	[ "$(jq -r .status <<<"$first")" = ok ] &&
+	[ "$(jq -r '.pause // "null"' <<<"$first")" = null ] &&
+	ok "failed reproduction recorded as a declared result, not a pause" ||
+	fail "first attempt" "$first"
+
+# Diagnosis was handed that exact attempt, by sequence — not "the latest".
+repro_seq=$(jq -r '.[0].seq' <<<"$steps")
+bound=$(jq -r --arg s "$repro_seq" \
+	'first(.[] | select(.step == "diagnose")) | .evidence.bindings.reproduction.seq | tostring' <<<"$steps")
+[ "$bound" = "$repro_seq" ] &&
+	ok "diagnosis froze reproduction attempt #$repro_seq as its evidence" ||
+	fail "diagnosis evidence" "bound $bound, expected $repro_seq"
+
+# The fix was authorized by the INFORMED reproduction, not the failed one.
+informed_seq=$(jq -r 'first(.[] | select(.step == "reproduce-informed")) | .seq' <<<"$steps")
+fix_bound=$(jq -r 'first(.[] | select(.step == "fix")) | .evidence.bindings.reproduction.seq | tostring' <<<"$steps")
+[ "$fix_bound" = "$informed_seq" ] &&
+	ok "fix bound the informed reproduction #$informed_seq, not the failed attempt" ||
+	fail "fix evidence" "bound $fix_bound, expected $informed_seq"
+
+# QA continuity: one reproducer session covered all three of its roles.
+sessions=$(jq -r '[.[] | select(.session != null) | .session] | unique | join(",")' <<<"$steps")
+[ "$sessions" = "coder,reproducer" ] &&
+	ok "two sessions only: QA reproduced, re-reproduced, and verified in one" ||
+	fail "sessions" "$sessions"
+qa_turns=$(jq '[.[] | select(.session == "reproducer")] | length' <<<"$steps")
+[ "$qa_turns" = 3 ] &&
+	ok "QA took all three turns in its own conversation" ||
+	fail "QA turns" "$qa_turns"
+
+# Verification checked the fix that actually ran.
+fix_seq=$(jq -r 'first(.[] | select(.step == "fix")) | .seq' <<<"$steps")
+verify_bound=$(jq -r 'first(.[] | select(.step == "verify")) | .evidence.bindings.fix.seq | tostring' <<<"$steps")
+[ "$verify_bound" = "$fix_seq" ] &&
+	ok "verification bound fix attempt #$fix_seq" ||
+	fail "verification evidence" "bound $verify_bound, expected $fix_seq"
+
+# Nothing was published: this workflow declares no delivery action at all.
+[ -z "$(task_field "$tid" pr_url)" ] &&
+	ok "no PR was opened — the workflow declares no publication" ||
+	fail "publication" "task carries pr_url $(task_field "$tid" pr_url)"
+
+# --- 2. the branches a person owns -------------------------------------------
+
+slug2=$(unique_slug decisions-gate)
+tid2=$(spawn_task "$slug2" \
+	"[[scenario:happy]]\n[[scenario-param:script=false]]\n[[scenario-param:results=not-reproduced,no-root-cause,candidate-found,not-reproduced,implemented,validated]]\nBug: intermittent timeout nobody can pin down." \
+	bugfix)
+
+gate=$(wait_for "no-root-cause opens a gate" 180 workflow_gate "$tid2")
+[ "$(jq -r .step <<<"$gate")" = diagnosis-gate ] &&
+	ok "diagnosis with no root cause waits for a person" ||
+	fail "gate step" "$(jq -r .step <<<"$gate")"
+choices=$(jq -r '[.outcome.choices[].id] | join(",")' <<<"$gate")
+[ "$choices" = "retry-diagnosis,stop" ] &&
+	ok "gate offers its declared choices ($choices)" ||
+	fail "gate choices" "$choices"
+# No fix was authorized on the way here.
+jq -e 'any(.[]; .step == "fix") | not' <<<"$(workflow_steps "$tid2")" >/dev/null &&
+	ok "no fix was reached without a cause or a reproduction" ||
+	fail "premature fix" "$(workflow_steps "$tid2")"
+
+# A choice the gate does not offer, and a required reason left blank, are
+# refused with 422 — and neither advances the run.
+seq=$(jq -r .seq <<<"$gate")
+code=$(api_code POST "/api/tasks/$tid2/workflow/resume" \
+	"$(jq -n --argjson s "$seq" '{expected_seq: $s, choice_id: "publish-it"}')")
+[ "$code" = 422 ] && ok "an undeclared choice is refused (422)" ||
+	fail "undeclared choice" "got $code"
+code=$(api_code POST "/api/tasks/$tid2/workflow/resume" \
+	"$(jq -n --argjson s "$seq" '{expected_seq: $s, choice_id: "retry-diagnosis"}')")
+[ "$code" = 422 ] && ok "a required reason cannot be skipped (422)" ||
+	fail "missing feedback" "got $code"
+# A stale attempt number is a conflict, not an answer.
+code=$(api_code POST "/api/tasks/$tid2/workflow/resume" \
+	"$(jq -n --argjson s "$((seq + 7))" '{expected_seq: $s, choice_id: "stop"}')")
+[ "$code" = 409 ] && ok "a stale attempt number is refused (409)" ||
+	fail "stale answer" "got $code"
+[ "$(task_field "$tid2" workflow_status)" = waiting ] &&
+	ok "every refusal left the run exactly where it was" ||
+	fail "run advanced on a refused answer" "$(task_field "$tid2" workflow_status)"
+
+# Retry with a reason: it reaches a NEW diagnosis carrying the operator's words.
+answer_gate "$tid2" retry-diagnosis "look at the connection pool timeout"
+gate2=$(wait_for "the informed retry reaches its next decision" 180 workflow_gate "$tid2")
+steps2=$(workflow_steps "$tid2")
+diagnoses=$(jq '[.[] | select(.step == "diagnose")] | length' <<<"$steps2")
+[ "$diagnoses" = 2 ] &&
+	ok "the retry opened a second diagnosis, not a fourth attempt at something else" ||
+	fail "diagnosis count" "$diagnoses"
+answered=$(jq -c 'first(.[] | select(.step == "diagnosis-gate"))' <<<"$steps2")
+[ "$(jq -r '.outcome.decision.choice_id' <<<"$answered")" = retry-diagnosis ] &&
+	[ "$(jq -r '.outcome.decision.feedback' <<<"$answered")" = "look at the connection pool timeout" ] &&
+	[ "$(jq -r '.outcome.decision.actor' <<<"$answered")" = operator ] &&
+	ok "the decision is recorded with its choice, its words, and who made it" ||
+	fail "recorded decision" "$answered"
+# The question survives beside the answer.
+jq -e '.outcome.message and (.outcome.choices | length == 2)' <<<"$answered" >/dev/null &&
+	ok "the question it answered is still readable" ||
+	fail "question snapshot" "$answered"
+
+# The second diagnosis found a candidate, QA still could not reproduce, and the
+# exception gate is offered with its three declared answers.
+[ "$(jq -r .step <<<"$gate2")" = reproduction-gate ] &&
+	ok "continued non-reproduction waits for a person" ||
+	fail "second gate" "$(jq -r .step <<<"$gate2")"
+choices2=$(jq -r '[.outcome.choices[].id] | join(",")' <<<"$gate2")
+[ "$choices2" = "retry-diagnosis,proceed-without-reproduction,stop" ] &&
+	ok "the exception is offered explicitly ($choices2)" ||
+	fail "exception choices" "$choices2"
+
+answer_gate "$tid2" proceed-without-reproduction "customer confirmed it on their build"
+result2=$(wait_for "the authorized run reaches its ending" 240 workflow_result "$tid2")
+[ "$result2" = validated-without-reproduction ] &&
+	ok "the ending keeps the limitation: '$result2'" ||
+	fail "exception ending" "expected validated-without-reproduction, got $result2"
+
+# The fix really was told it had no demonstration to work from.
+steps2=$(workflow_steps "$tid2")
+jq -e 'any(.[]; .step == "fix" and (.evidence.bindings.exception.seq != null))' <<<"$steps2" >/dev/null &&
+	ok "the fix bound the operator's exception as its authority" ||
+	fail "exception evidence" "$(jq -c 'first(.[] | select(.step == "fix")) | .evidence' <<<"$steps2")"
+
+assert "task never failed (final)" task_not_failed "$tid2"
+assert "workflow_step events observed for the answered gate" \
+	_ws_seen '.type == "workflow_step" and .payload.step == "diagnosis-gate"' "$tid2"

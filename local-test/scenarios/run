@@ -27,6 +27,7 @@ MATRIX=(
 	project-onboarding
 	file-mentions
 	ask-approval
+	workflow-decisions
 	review-comments
 	ship-retain
 	ship-failures

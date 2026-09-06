@@ -245,6 +245,66 @@ review_open() { # review_open TASK_ID
 	return 1
 }
 
+# --- workflow gates and step history (ADR-0029, ADR-0030) ----------------------
+
+# The step-record history of a task's run, newest last.
+workflow_steps() { # workflow_steps TASK_ID
+	task_get "$1" | jq -c '.workflow_steps // []'
+}
+
+# Wait until the run is waiting at a gate offering named choices; echoes the
+# waiting attempt as JSON. Deliberately distinct from an uncertainty pause:
+# the two are different waits and a scenario must not confuse them.
+workflow_gate() { # workflow_gate TASK_ID
+	local status waiting
+	status=$(task_field "$1" workflow_status)
+	if [ "$status" != waiting ]; then
+		printf 'workflow_status=%s' "${status:-none}"
+		return 1
+	fi
+	waiting=$(task_get "$1" |
+		jq -c 'first(.workflow_steps[] | select(.status == "waiting"))' 2>/dev/null)
+	if [ -z "$waiting" ] || [ "$waiting" = null ]; then
+		printf 'waiting with no attempt recorded'
+		return 1
+	fi
+	if [ "$(jq -r '.outcome.version // empty' <<<"$waiting")" != 2 ]; then
+		printf 'waiting attempt is not a choice gate: %s' \
+			"$(jq -c '{step, pause: (.pause.reason // null)}' <<<"$waiting")"
+		return 1
+	fi
+	printf '%s' "$waiting"
+}
+
+# Wait until the run finishes with a named ending; echoes the result name.
+workflow_result() { # workflow_result TASK_ID
+	local status result
+	status=$(task_field "$1" workflow_status)
+	result=$(task_field "$1" workflow_result)
+	if [ "$status" = complete ] && [ -n "$result" ]; then
+		printf '%s' "$result"
+		return 0
+	fi
+	printf 'workflow_status=%s result=%s' "${status:-none}" "${result:-none}"
+	return 1
+}
+
+# Answer the gate the run is waiting at with one of its declared choices,
+# through the published API exactly as the UI does. Never writes daemon state.
+answer_gate() { # answer_gate TASK_ID CHOICE_ID [NOTE]
+	local tid=$1 choice=$2 note=${3:-} waiting seq body
+	waiting=$(workflow_gate "$tid") || die "task $tid is not at a choice gate: $waiting"
+	seq=$(jq -r .seq <<<"$waiting")
+	jq -e --arg c "$choice" 'any(.outcome.choices[]; .id == $c)' <<<"$waiting" >/dev/null ||
+		die "gate $(jq -r .step <<<"$waiting") does not offer choice '$choice': $(jq -c '[.outcome.choices[].id]' <<<"$waiting")"
+	body=$(jq -n --argjson s "$seq" --arg c "$choice" --arg n "$note" \
+		'{expected_seq: $s, choice_id: $c, note: (if $n == "" then null else $n end)}')
+	_api_run POST "/api/tasks/$tid/workflow/resume" "$body"
+	[ "$API_CODE" = 200 ] ||
+		die "answering '$choice' failed ($API_CODE): $API_BODY"
+	ok "answered $(jq -r .step <<<"$waiting") with '$choice'"
+}
+
 # --- uniqueness -----------------------------------------------------------------
 
 unique_slug() { # unique_slug FLOW — e.g. happy-0822-1435-12345

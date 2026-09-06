@@ -65,8 +65,20 @@ _NUDGE_PREFIX = "The daemon restarted while you were working; please continue."
 _RETRY_PREFIX = "Your previous attempt at this step finished without leaving"
 # review.py:_COMMENTS_PROMPT_PREFIX opens every comment loopback.
 _REVIEW_PREFIX = "The reviewer left the following comments on your changes."
-# workflows.py:OUTCOME_INSTRUCTION names this path inside backticks.
+# workflows.py:OUTCOME_INSTRUCTION and result_instruction both name this
+# path inside backticks.
 _OUTCOME_HINT = "`.ompire/outcome.json`"
+# workflows.py:result_instruction — the format-2 envelope. Its presence is how
+# this fake tells which result contract it is being asked to satisfy.
+_RESULT_HINT = '"version": 2,'
+# One declared result in that instruction:
+#   - "reproduced" — required artifacts: attempts (string), script_available (boolean)
+#   - "no-root-cause" — no required artifacts
+_RESULT_RE = re.compile(
+    r'^- "([a-z0-9-]+)" — (?:required artifacts: (.+)|no required artifacts)$',
+    re.MULTILINE,
+)
+_FIELD_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*) \((\w+)\)")
 
 OUTCOME_PATH = ".ompire/outcome.json"
 WORK_ARTIFACT = "fake-agent-work.txt"
@@ -229,6 +241,109 @@ def write_outcome(scenario: str, turn: int, status: str = "success",
     path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
 
+def parse_result_contract(message: str) -> list[tuple[str, list[tuple[str, str]]]]:
+    """The results this step declares, read out of its own instruction.
+
+    The fake does not know the bugfix workflow. It reads the contract the
+    daemon actually sent and satisfies that, so a definition edit changes what
+    this fake produces without anyone editing the fake — and a scenario that
+    asks for a result the step does not declare fails loudly rather than
+    quietly writing something the engine will reject.
+    """
+    results: list[tuple[str, list[tuple[str, str]]]] = []
+    for match in _RESULT_RE.finditer(message):
+        name, fields = match.group(1), match.group(2)
+        required = _FIELD_RE.findall(fields) if fields else []
+        results.append((name, required))
+    return results
+
+
+def _artifact_value(field: str, declared: str, params: dict) -> object:
+    if declared == "boolean":
+        # `script_available` decides whether the bugfix flow runs its
+        # reproducer script, so a scenario has to be able to steer it.
+        default = params.get("script", "true") == "true"
+        return default if field == "script_available" else True
+    if declared in ("integer", "number"):
+        return 1
+    if declared == "array":
+        return [f"fake omp {field}"]
+    if declared == "object":
+        return {"note": f"fake omp {field}"}
+    return f"fake omp: {field.replace('_', ' ')}"
+
+
+def write_result(scenario: str, turn: int, message: str, params: dict) -> str | None:
+    """Write a format-2 result satisfying this step's declared contract.
+
+    Which result is chosen comes from the ordered `results` parameter: the
+    first entry this step actually declares is taken and consumed, so one
+    parameter drives a whole multi-step flow without the fake knowing the
+    workflow's shape. With nothing left to match, the step's first declared
+    result is used.
+    """
+    declared = parse_result_contract(message)
+    if not declared:
+        return None
+    names = [name for name, _fields in declared]
+    queue = [item for item in (params.get("results") or "").split(",") if item]
+    chosen = next((item for item in queue if item in names), None)
+    if chosen is not None:
+        queue.remove(chosen)
+        params["results"] = ",".join(queue)
+    else:
+        chosen = names[0]
+    required = dict(declared)[chosen]
+    document = {
+        "version": 2,
+        "result": chosen,
+        "summary": f"fake omp {scenario} turn {turn}: {chosen}",
+        "artifacts": {
+            field: _artifact_value(field, declared_type, params)
+            for field, declared_type in required
+        },
+    }
+    path = Path.cwd() / OUTCOME_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    # Make the claim true on disk, so a workflow that routes on it finds what
+    # it was told to expect.
+    if document["artifacts"].get("script_available") is True:
+        write_repro_script()
+    if chosen == "implemented":
+        mark_fixed()
+    return chosen
+
+
+# A workflow step can declare that a runnable reproducer exists. Claiming one
+# without leaving it behind would make the engine run a script that is not
+# there and read the shell's "no such file" as the bug still being present —
+# a fake failure that looks exactly like a real one.
+REPRO_SCRIPT = ".ompire/repro.sh"
+FIXED_MARKER = ".ompire/fixed"
+
+
+def write_repro_script() -> None:
+    """Leave a reproducer that fails until a fix lands, then passes."""
+    path = Path.cwd() / REPRO_SCRIPT
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        "# fake omp reproducer: non-zero while the bug is present.\n"
+        f'[ -f "{FIXED_MARKER}" ] || {{ echo "bug still present"; exit 1; }}\n'
+        'echo "behaves correctly"\n',
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def mark_fixed() -> None:
+    """What a fix changes, from the reproducer's point of view."""
+    path = Path.cwd() / FIXED_MARKER
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("fixed by fake omp\n", encoding="utf-8")
+
+
 def append_work_artifact(scenario: str, turn: int) -> None:
     with (Path.cwd() / WORK_ARTIFACT).open("a", encoding="utf-8") as fh:
         fh.write(f"{scenario} turn {turn}: fake agent work\n")
@@ -278,6 +393,10 @@ class Engine:
         self.last_assistant_text: str | None = None
         self.last_scenario: str | None = None
         self.startup_scenario: str | None = None
+        # Remaining entries of the scenario's ordered `results` parameter.
+        self.results_queue: str | None = None
+        # Every other scenario parameter this run has ever declared.
+        self.scenario_params: dict[str, str] = {}
         self.resume_id = resume_id
         self.session_id = resume_id
         self.transcript: Transcript | None = None
@@ -511,6 +630,19 @@ class Engine:
                       message: str) -> dict | None:
         """Serve one prompt; returns a pending-ui dict when the scenario
         waits on an extension_ui_response."""
+        # Scenario parameters are a property of the run, not of one prompt.
+        # Only some steps quote the task prompt that carried them, so they are
+        # remembered here — otherwise a later step would silently fall back to
+        # defaults the runbook never chose. `results` is the exception that
+        # also *shrinks*: it is a queue consumed across the run's steps.
+        for key, value in params.items():
+            if key != "results":
+                self.scenario_params[key] = value
+        if "results" in params and self.results_queue is None:
+            self.results_queue = params["results"]
+        params = {**self.scenario_params, **params}
+        if self.results_queue is not None:
+            params["results"] = self.results_queue
         self.turn += 1
         self.last_scenario = scenario
         self.current_prompt_message = message
@@ -592,11 +724,22 @@ class Engine:
 
         if _OUTCOME_HINT in message and scenario not in {
                 "outcome-failed", "no-outcome"}:
-            write_outcome(scenario, turn)
+            if _RESULT_HINT in message:
+                # A format-2 step: satisfy the contract it sent, and declare
+                # the result the scenario asked for.
+                chosen = write_result(scenario, turn, message, params)
+                assistant_text = (
+                    f"{scenario} turn {turn}: result {chosen}"
+                    if chosen
+                    else f"{scenario} turn {turn}: no declared results found")
+            else:
+                write_outcome(scenario, turn)
+                assistant_text = f"{scenario} turn {turn}: outcome written"
             if scenario != "commit":
                 append_work_artifact(scenario, turn)
-            assistant_text = f"{scenario} turn {turn}: outcome written"
 
+        if "results" in params:
+            self.results_queue = params["results"]
         self.message_count += 2
         self._burst(request_id, message, assistant_text,
                     big=scenario == "big", end=scenario != "no-end")
@@ -748,13 +891,21 @@ def resolve_scenario(message: str,
     params: dict[str, str] = {}
     clean_lines: list[str] = []
     for line in message.splitlines():
+        # Directives are stripped per line, and a line may carry several: a
+        # runbook writing "\n" inside double quotes gets one physical line,
+        # and taking only the first marker there would silently drop the rest
+        # — a scenario would then run with parameters nobody applied.
         match = _SCENARIO_RE.search(line)
+        pairs = _PARAM_RE.findall(line)
+        for key, value in pairs:
+            params[key] = value
         if match and scenario is None:
             scenario = match.group(1)
-            continue
-        pmatch = _PARAM_RE.search(line)
-        if pmatch:
-            params[pmatch.group(1)] = pmatch.group(2)
+        if match or pairs:
+            # Keep whatever prose shared the line with the directives.
+            remainder = _PARAM_RE.sub("", _SCENARIO_RE.sub("", line)).strip()
+            if remainder:
+                clean_lines.append(remainder)
             continue
         clean_lines.append(line)
     clean_message = "\n".join(clean_lines)

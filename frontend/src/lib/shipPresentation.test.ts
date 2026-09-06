@@ -29,6 +29,7 @@ function task(overrides: Partial<Task> = {}): Task {
     workflow_sessions: ["main"],
     workflow_status: null,
     workflow_step: null,
+    workflow_result: null,
     created_at: "2026-08-20T00:00:00Z",
     updated_at: "2026-08-20T00:01:00Z",
     ...overrides,

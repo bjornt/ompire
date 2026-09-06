@@ -306,7 +306,7 @@ that identity instead of silently prompting a new conversation.
   and show new launch consumers through the existing preview. Verify the actual
   controls and evidence/session links, including keyboard and narrow layout.
   (R2, R3, R5, R6, R7)
-- [ ] Extend the executable fake and add a focused local workflow scenario through
+- [x] Extend the executable fake and add a focused local workflow scenario through
   the published harness controls, then run isolated browser journeys: initial
   non-reproduction → diagnosis → informed QA → fix → script/QA validation;
   no-root-cause feedback/retry and stop; continued non-reproduction exception and

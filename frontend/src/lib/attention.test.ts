@@ -29,6 +29,7 @@ function task(id: number, state: Task["state"]): Task {
     workflow_sessions: ["main"],
     workflow_status: null,
     workflow_step: null,
+    workflow_result: null,
     created_at: "",
     updated_at: "",
   };

@@ -140,6 +140,7 @@ from ompire_daemon.registry.workflows import (
     WorkflowGateChoiceError,
     WorkflowWaitConflictError,
     latest_step_record,
+    list_step_records,
 )
 from ompire_daemon.review import ReviewAlreadyOpenError, ReviewError, ReviewManager
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
@@ -1187,6 +1188,10 @@ class TaskOut(BaseModel):
     workflow_sessions: list[str] | None
     workflow_status: str | None
     workflow_step: str | None
+    # The declared ending a finished format-2 run reached (ADR-0029). Null
+    # while it runs, and for every format-1 run: those have no name for their
+    # ending, and none is invented for them.
+    workflow_result: str | None
     pr_url: str | None
     pr_state: str | None
     pr_merged_at: str | None
@@ -1205,6 +1210,12 @@ def list_tasks_route(engine: Engine = Depends(_engine)) -> list[dict[str, Any]]:
 class TaskDetailOut(TaskOut):
     # Derived on demand from the workshop CLI, never persisted (design D-3).
     workshop_status: str | None
+    # The run's executed attempts, in order — the same records the snapshot
+    # replays, from the same projection. A gate's question and its answer, an
+    # attempt's frozen evidence, and an uncertainty pause all live here, so a
+    # reader that is not holding a socket open still sees the whole history
+    # rather than only the task row's summary.
+    workflow_steps: list[dict[str, Any]]
 
 
 @router.get("/tasks/{task_id}", response_model=TaskDetailOut)
@@ -1218,7 +1229,11 @@ async def get_task_route(
     derived_status = (
         await workshop_status(task.clone_path) if task.workshop_id else None
     )
-    return TaskDetailOut(**task_payload(task, engine=engine), workshop_status=derived_status)
+    return TaskDetailOut(
+        **task_payload(task, engine=engine),
+        workshop_status=derived_status,
+        workflow_steps=[asdict(record) for record in list_step_records(engine, task_id)],
+    )
 
 
 @router.post("/tasks", response_model=TaskOut, status_code=status.HTTP_202_ACCEPTED)
