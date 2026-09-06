@@ -12,7 +12,7 @@ reasoning levels.
 
 A profile is what a launch selects. Every task chooses one — inherited from
 its project, or picked for that task — and the profile's four bindings are
-what the task's agents, and the workflow engine's judge, actually run.
+what the task's agents actually run.
 
 **Editing a profile changes the next launch, not a task already accepted.** A
 task pins its own copy of the four bindings when it is accepted, so a running
@@ -45,27 +45,26 @@ custom aliases, and no way to leave one out.
 |---|---|---|
 | `default` | The ordinary active agent | Every agent step of the built-in workflows |
 | `smol` | Lightweight work | omp's own auxiliary use inside the container |
-| `slow` | Thorough reasoning | omp's auxiliary use, and the workflow engine's conditional judge |
+| `slow` | Thorough reasoning | omp's own auxiliary use inside the container |
 | `plan` | Planning | omp's own auxiliary use inside the container |
 
 The third column is what a consumer *declares*, not what it is stuck with: any
-of the four roles can be selected for any agent step or for the judge at
-launch. See [Per-consumer
-precedence](#per-consumer-precedence).
+of the four roles can be selected for any agent step at launch. See
+[Per-consumer precedence](#per-consumer-precedence).
 
 All four reach every omp process Ompire starts for a task, each with its own
 thinking level — the active pair as `--model`/`--thinking`, and the other three
-as omp's `--smol`, `--slow`, and `--plan` role flags. There is no separate
-setting for the judge: it is an ordinary model consumer, declaring `slow` and
-shown in the launch preview like every other one.
+as omp's `--smol`, `--slow`, and `--plan` role flags. The engine itself
+consumes no model: every model a run uses belongs to a declared agent step, and
+the launch preview shows all of them.
 
 The same model and level may be used for several roles — the roles are
 distinct bindings, not distinct models.
 
 ## Per-consumer precedence
 
-A profile is chosen per *model consumer*: every declared agent step of the
-workflow, plus the judge. Each consumer resolves two things independently.
+A profile is chosen per *model consumer*, and every model consumer is a
+declared agent step of the workflow. Each resolves two things independently.
 
 | Dimension | Order, narrowest first |
 |---|---|
@@ -80,8 +79,7 @@ the whole native map, so a `/switch smol` inside the container reaches what the
 profile says.
 
 A task-wide profile is required even when every step overrides it: it is what
-unoverridden consumers inherit, and the judge inherits it too unless you say
-otherwise.
+unoverridden steps inherit.
 
 A step you have not touched follows the task-wide choice; one you set stays
 where you put it, even if it happens to equal what it would have inherited.

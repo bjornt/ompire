@@ -173,3 +173,21 @@ a:hover {
   margin: 2px 0 0;
   cursor: pointer;
 }
+
+/* Workflow revision identity and the definition it names. Global because the
+   same component renders in the Spawn preview and in task detail. */
+.revisionId {
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.definitionBlock {
+  max-height: 420px;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  white-space: pre;
+}

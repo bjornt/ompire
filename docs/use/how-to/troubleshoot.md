@@ -192,8 +192,8 @@ audit log path when one exists.
 
 This appears after upgrading from a release that had templates, when the
 upgrade found something it would not decide for you: two templates that
-disagreed about a field, a template that pinned a model, or a `judge_model`
-still set in your `config.toml`. It is separate from checkout setup — a
+disagreed about a field, a template that pinned a model, or a retired
+`judge_model` still set in your `config.toml`. It is separate from checkout setup — a
 perfectly healthy checkout can still be blocked here.
 
 Open the project's card. The panel lists every distinct old value with the
@@ -208,35 +208,109 @@ tasks already running are untouched.
 
 ## A task says it needs a configuration before it can continue
 
-The task was created before Ompire recorded launch inputs. Its workspace,
-branch, sessions, run history, review history and pull-request facts are all
-intact — what was never persisted is the model, thinking level, preamble, and
-any spawn-time overrides it actually used. Today's project and profile settings
-are not evidence of those, so Ompire will not guess them, and there is no
-fallback to `main`.
+Two different gaps produce this, and the panel asks only for what is actually
+missing. In both cases the task's workspace, branch, sessions, run history,
+review history and pull-request facts are intact; reading, stopping, and
+cleaning it up were never blocked.
 
-Open the task. It shows what is known, names what is unknown, and asks you to
-confirm what should happen **from here on**: a model profile, a base branch, an
-additions source, and a preamble. Tick the acknowledgement and confirm. That
-pins future behavior only — it makes no claim about the turns already taken,
-recreates nothing, and changes no recorded branch or session identity.
+**The launch inputs were never recorded.** The task predates them. The model,
+thinking level, preamble, and any spawn-time overrides it actually used were
+never persisted, today's project and profile settings are not evidence of
+those, and there is no fallback to `main`. Confirm a model profile, a base
+branch, an additions source, and a preamble.
+
+**The workflow definition was never recorded.** The task recorded a workflow
+*name*, and a name is not a procedure: what those prompts and routes said at
+the time is gone. Ompire offers the current definition of that task's own
+workflow name as a candidate, with its revision and the definition itself
+readable, and checks that it can account for the steps, kinds and sessions
+already on record.
+
+Tick the acknowledgements and confirm. That pins future behavior only — it
+makes no claim about the turns already taken, recreates nothing, and changes no
+recorded branch or session identity. The record keeps the boundary: attempts up
+to the confirmation ran under a procedure nobody kept, and the panel says so.
+
+Confirming also changes one thing about how the task behaves from here: when a
+step leaves no valid result or a route cannot be decided, the run now stops and
+waits for you instead of asking a model to classify it. The panel states this
+before you confirm.
 
 If the run was interrupted mid-flight, a **Continue** action appears afterwards.
-Review and shipping stay separate, explicit actions. An archived task of this
-vintage needs no confirmation at all, and reading, stopping, and cleaning up
-were never blocked.
+Confirmation itself starts nothing. Review and shipping stay separate, explicit
+actions. An archived task of this vintage needs no confirmation at all.
+
+### It says the current definition cannot explain this task
+
+The compatibility check found something on record the candidate cannot account
+for — a step it does not declare, a step recorded as a different kind, a
+session it does not declare, or a current position it has no step for. The
+problems are listed.
+
+Ompire will not remap steps or point the task at a different workflow: that
+would relabel the run rather than continue it. The task stays exactly as it is
+— readable, stoppable, and cleanable — and is not resumable. Inspect its
+history and its sessions through the escape hatch, or clean it up.
+
+## A run stopped and is waiting for me
+
+There are two kinds of waiting, and the card says which.
+
+A **gate** is the workflow asking you to look at something — the `bugfix`
+escalation, for instance. **Resume** finishes it and the run continues at the
+next step.
+
+A **stopped** run is the engine refusing to guess: a step that had to leave a
+result left none that could be read, or a route could not be decided from what
+was recorded. The card names the step and the reason. **Retry** makes another
+attempt at *that step*. It never continues past it, and it never edits what was
+recorded.
+
+A retried agent step is told its previous attempt left no valid result and that
+files may already have changed, so it inspects the working tree rather than
+redoing work. A retried decision re-reads exactly the same recorded evidence —
+so if it did not decide before, it will not decide now, and it will stop again.
+That is the honest answer; the way forward is to steer the session yourself
+through the escape hatch, or to stop the task.
+
+Retrying does not get you past a limit the workflow set. If the step has used
+up the attempts its definition allows, the retry sends the run to that
+workflow's gate instead of trying again.
+
+Either action names the attempt you were looking at, so a stale browser tab or
+a double click is refused rather than applied to something else. If you get a
+conflict, reload and look again.
+
+## A task says its workflow definition is unavailable
+
+The task pinned a definition revision that cannot be read: the retained
+document is missing, damaged, or written for a format this daemon does not
+implement — the last one usually means a downgrade.
+
+Only that task is blocked. It is not resumed, no prompt is sent, nothing is
+published, and its position and history are untouched. Everything else runs
+normally, and the task stays listed and readable so you can see what happened.
+Ompire will not substitute today's definition of the same name, because running
+a task under a document it never accepted is exactly the failure the pinning
+prevents.
+
+If you downgraded, upgrading again restores it. Otherwise the task can be
+inspected and cleaned up, but not continued.
 
 ## The judge is not using the model I configured
 
-`judge_model` in `config.toml` is retired and configures nothing. The workflow
-engine's judge is an ordinary model consumer: it declares the `slow` role and
-inherits the task's model profile, and the Spawn view shows the result before
-you launch.
+There is no judge. The workflow engine no longer runs a model of its own, and
+`judge_model` in `config.toml` is retired and configures nothing.
 
-Two ways to give it a specific model. Bind that model as `slow` in the profile
-the task uses — which also changes what `slow` means everywhere else — or
-override the judge row itself on the Spawn view, giving it a different profile,
-a different role, or both. An accepted task keeps whichever you chose; editing
-a profile afterwards does not reach it. See
+What used to happen: when a step left no readable result, or a route could not
+be decided, a reserved LLM session was asked to classify it and the run
+continued on the answer. That step was not part of the workflow you reviewed
+and left no record of its own. Now the run stops and tells you what was missing
+— see [A run stopped and is waiting for me](#a-run-stopped-and-is-waiting-for-me).
+
+Your old `judge_model` value and any per-task judge binding are kept as
+upgrade evidence so you can still see what was configured; neither configures
+anything. Every model a run uses now belongs to a declared step you can see in
+the Spawn preview. See
 [Configuration](../reference/configuration.md#retired-keys) and [Spawn a
 task](spawn-a-task.md#override-a-single-step).

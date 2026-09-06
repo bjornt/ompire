@@ -267,7 +267,8 @@ def test_a_retired_judge_model_is_captured_and_acknowledged_per_project(
         "/api/projects/demo/launch-reconciliation", headers=headers
     ).json()
     assert evidence["retired_judge_model"] == "old-judge-model"
-    assert evidence["judge_role"] == "slow"
+    # No role replaces it: the engine runs no implicit model at all now.
+    assert evidence["judge_removed"] is True
 
     body = {
         "evidence_fingerprint": evidence["evidence_fingerprint"],
@@ -440,7 +441,14 @@ def test_a_legacy_task_states_what_is_unknown_and_blocks_until_confirmed(
             "thinking",
             "preamble",
             "workspace_overrides",
+            # The definition itself was never recorded either (ADR-0028).
+            "workflow_definition",
         ]
+        assert configuration["needs_workflow_confirmation"] is True
+        candidate = configuration["workflow_candidate"]
+        assert candidate["workflow_name"] == "single-step"
+        assert candidate["revision"].startswith("sha256:")
+        assert candidate["compatible"] is True
         # The template it came from is attribution, not its contents.
         assert configuration["source_attribution"][0]["source"] == ""
         # The current project's routing is offered as a candidate to confirm.
@@ -468,7 +476,11 @@ def test_a_legacy_task_states_what_is_unknown_and_blocks_until_confirmed(
             json=continuation,
         ).json()
         assert preview["inputs"]["provenance"] == "legacy-confirmed"
-        assert preview["inputs"]["unknown_inputs"] == configuration["unknown_inputs"]
+        assert preview["unknown_inputs"] == configuration["unknown_inputs"]
+        assert (
+            preview["inputs"]["workflow_binding"]["revision"]
+            == preview["workflow"]["revision"]
+        )
         # The branch that exists is stated as the branch, not as a pattern
         # nobody recorded.
         assert preview["inputs"]["branch"] == "ompire/legacy"
@@ -477,10 +489,27 @@ def test_a_legacy_task_states_what_is_unknown_and_blocks_until_confirmed(
         unacknowledged = client.post(
             f"/api/tasks/{task_id}/configuration/confirm",
             headers=headers,
-            json={**continuation, "preview_token": preview["preview_token"]},
+            json={
+                **continuation,
+                "preview_token": preview["preview_token"],
+                "acknowledge_workflow": True,
+            },
         )
         assert unacknowledged.status_code == 422
         assert "acknowledge_unknown" in unacknowledged.json()["detail"]
+
+        # And so is the separate one about the definition.
+        no_workflow_ack = client.post(
+            f"/api/tasks/{task_id}/configuration/confirm",
+            headers=headers,
+            json={
+                **continuation,
+                "preview_token": preview["preview_token"],
+                "acknowledge_unknown": True,
+            },
+        )
+        assert no_workflow_ack.status_code == 422
+        assert "acknowledge_workflow" in no_workflow_ack.json()["detail"]
 
         confirmed = client.post(
             f"/api/tasks/{task_id}/configuration/confirm",
@@ -489,6 +518,7 @@ def test_a_legacy_task_states_what_is_unknown_and_blocks_until_confirmed(
                 **continuation,
                 "preview_token": preview["preview_token"],
                 "acknowledge_unknown": True,
+                "acknowledge_workflow": True,
             },
         )
         assert confirmed.status_code == 200, confirmed.text
@@ -535,6 +565,7 @@ def test_a_stale_continuation_preview_changes_nothing(
                 "preamble": "",
                 "preview_token": "reviewed-something-else",
                 "acknowledge_unknown": True,
+                "acknowledge_workflow": True,
             },
         )
         assert response.status_code == 409
@@ -565,3 +596,155 @@ def test_an_archived_legacy_task_stays_readable_without_confirmation(
         assert client.get(f"/api/tasks/{task_id}", headers=headers).status_code == 200
         # And purging it is still available.
         assert client.delete(f"/api/tasks/{task_id}", headers=headers).status_code == 200
+
+
+def _seed_legacy_bugfix_at_a_synthesized_gate(config: Config, checkout: Path) -> int:
+    """A bugfix task parked exactly as the pre-ADR-0028 engine left one.
+
+    That engine escalated an unresolvable decision by finishing the *decision*
+    record `ok` with the escalation message in its error field, then appending
+    a separate `gate` record under the decision's own name. Resuming it fell
+    through to the step after the decision — the silent "continue as if the
+    evidence had been accepted" this change removes.
+    """
+    engine = make_engine(db_path_for(config.data_dir))
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO tasks (project_name, slug, branch, clone_path, state, "
+                "prompt, workflow_name, workflow_status, workflow_step, "
+                "spawn_completed_at, created_at, updated_at) VALUES "
+                "('demo', 'legacy-gate', 'ompire/legacy-gate', :clone, 'created', "
+                "'fix it', 'bugfix', 'waiting', 'check', "
+                "'2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00', "
+                "'2026-08-01T00:00:00+00:00')"
+            ),
+            {"clone": str(checkout)},
+        )
+        task_id = conn.execute(
+            text("SELECT id FROM tasks WHERE slug = 'legacy-gate'")
+        ).scalar_one()
+        rows = [
+            (1, "reproduce", "agent", "reproducer", "ok",
+             '{"version": 1, "status": "success", "summary": "reproduced"}', None),
+            (2, "triage", "decision", None, "ok", '{"route": "fix"}', None),
+            (3, "fix", "agent", "coder", "ok",
+             '{"version": 1, "status": "success", "summary": "fixed"}', None),
+            (4, "route-validate", "decision", None, "ok",
+             '{"route": "validate-agent"}', None),
+            (5, "validate-agent", "agent", "reproducer", "ok", None, None),
+            # The synthesized pair: decision finished ok with the message in
+            # `error` and no outcome, then a gate record under its own name.
+            (6, "check", "decision", None, "ok", None,
+             "decision 'check' resolved no route (a required outcome is missing?)"),
+            (7, "check", "gate", None, "waiting",
+             '{"message": "the route could not be resolved; resume to continue"}', None),
+        ]
+        for seq, step, kind, session, status, outcome, error in rows:
+            conn.execute(
+                text(
+                    "INSERT INTO workflow_step_records (task_id, seq, step, kind, "
+                    "session, status, outcome_json, error, started_at) VALUES "
+                    "(:t, :s, :step, :kind, :sess, :status, :outcome, :error, "
+                    "'2026-08-01T00:00:00+00:00')"
+                ),
+                {"t": task_id, "s": seq, "step": step, "kind": kind,
+                 "sess": session, "status": status, "outcome": outcome,
+                 "error": error},
+            )
+        for name in ("reproducer", "coder"):
+            conn.execute(
+                text(
+                    "INSERT INTO task_sessions (task_id, name, omp_session_id, "
+                    "spawned_at) VALUES (:t, :n, :sid, '2026-08-01T00:00:00+00:00')"
+                ),
+                {"t": task_id, "n": name, "sid": f"sess-{name}"},
+            )
+    engine.dispose()
+    return task_id
+
+
+def test_an_old_synthesized_escalation_gate_retries_the_decision(
+    daemon_config: Config, git_checkout: Path
+) -> None:
+    """The one legacy record shape a `decision` step is allowed to explain.
+
+    A strict kind check would call this history incompatible, because the
+    persisted kind is `gate` where the definition declares a `decision`. It is
+    admitted only in exactly that shape, both records are preserved, and after
+    confirmation the waiting record becomes an uncertainty pause whose action
+    retries the decision — never the old fall-through to the next step.
+    """
+    _land_at_0012(daemon_config)
+    _seed(daemon_config, git_checkout, [{"name": "t"}])
+    task_id = _seed_legacy_bugfix_at_a_synthesized_gate(daemon_config, git_checkout)
+    app = create_app(daemon_config, frontend_dist=daemon_config.data_dir / "no-dist")
+    from ompire_daemon.registry.model_profiles import create_model_profile
+
+    create_model_profile(app.state.engine, name="chosen", roles=TEST_ROLES)
+    with TestClient(app) as client:
+        headers = {"Authorization": f"Bearer {app.state.auth_token}"}
+
+        configuration = client.get(
+            f"/api/tasks/{task_id}/configuration", headers=headers
+        ).json()
+        candidate = configuration["workflow_candidate"]
+        # The known shape is admitted; nothing else about the history is.
+        assert candidate["compatible"] is True, candidate["problems"]
+        assert candidate["legacy_through_seq"] == 7
+        assert candidate["interrupted_legacy_seq"] == 7
+
+        continuation = {
+            "model_profile": "chosen",
+            "base_branch": "main",
+            "workshop_additions": "project",
+            "preamble": "",
+        }
+        preview = client.post(
+            f"/api/tasks/{task_id}/configuration/preview",
+            headers=headers,
+            json=continuation,
+        ).json()
+        confirmed = client.post(
+            f"/api/tasks/{task_id}/configuration/confirm",
+            headers=headers,
+            json={
+                **continuation,
+                "preview_token": preview["preview_token"],
+                "acknowledge_unknown": True,
+                "acknowledge_workflow": True,
+            },
+        )
+        assert confirmed.status_code == 200, confirmed.text
+
+    from ompire_daemon.registry.workflows import list_step_records
+
+    records = list_step_records(app.state.engine, task_id)
+    # Both records survive: the decision's own evidence and the gate that
+    # stood in for it.
+    assert [(r.seq, r.step, r.kind) for r in records[-2:]] == [
+        (6, "check", "decision"),
+        (7, "check", "gate"),
+    ]
+    waiting = records[-1]
+    assert waiting.status == "waiting"
+    assert waiting.pause is not None
+    assert waiting.pause["reason"] == "unresolved_decision"
+    # The action retries the *decision*, not the step after it.
+    assert waiting.pause["retry_step"] == "check"
+    assert waiting.pause["retry_kind"] == "decision"
+    assert "re-evaluates" in waiting.pause["message"]
+    # The original escalation message is kept, not replaced.
+    assert "the route could not be resolved" in waiting.pause["message"]
+
+    # And the retry really opens a *decision* attempt at `check`, rather than
+    # another gate or the step after it.
+    from ompire_daemon.registry.workflows import retry_paused_step
+
+    opened, updated = retry_paused_step(app.state.engine, task_id, waiting.seq)
+    assert (opened.step, opened.kind, opened.status) == ("check", "decision", "running")
+    assert updated.workflow_status == "running"
+    assert updated.workflow_step == "check"
+    closed = list_step_records(app.state.engine, task_id)[-2]
+    assert closed.seq == waiting.seq and closed.status == "failed"
+    assert "unresolved route recorded before" in closed.error

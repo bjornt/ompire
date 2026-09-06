@@ -26,7 +26,7 @@ relying on it.
 | [0006](0006-give-every-task-a-separate-clone-and-workshop.md) | Give every task a separate clone and Workshop container | Proposed |
 | [0007](0007-use-native-omp-rpc.md) | Integrate agents through supervised native Omp RPC processes | Accepted |
 | [0008](0008-model-tasks-as-workflows-over-named-sessions.md) | Model tasks as workflows over named sessions | Accepted |
-| [0009](0009-use-structured-git-excluded-outcomes.md) | Use structured, Git-excluded files for agent-step outcomes | Proposed |
+| [0009](0009-use-structured-git-excluded-outcomes.md) | Use structured, Git-excluded files for agent-step outcomes | Accepted |
 | [0010](0010-separate-projects-templates-and-task-snapshots.md) | Separate projects, templates, and task snapshots | Superseded by ADR-0026 |
 | [0011](0011-keep-review-and-publishing-authority-outside-agent-sandbox.md) | Keep review and publishing authority outside the agent sandbox | Accepted |
 | [0012](0012-derive-attention-centrally-from-session-state.md) | Derive attention centrally from session state | Accepted |
@@ -35,7 +35,7 @@ relying on it.
 | [0015](0015-keep-agent-credentials-behind-narrow-brokers.md) | Keep agent credentials behind narrow brokers | Accepted |
 | [0016](0016-persist-authority-bearing-task-history-and-provenance.md) | Persist authority-bearing task history and provenance | Proposed |
 | [0017](0017-use-dedicated-bot-as-default-publishing-identity.md) | Use a dedicated bot as the default publishing identity | Proposed |
-| [0018](0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md) | Keep built-in workflows in Python until portable versioning is required | Accepted |
+| [0018](0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md) | Keep built-in workflows in Python until portable versioning is required | Superseded by ADR-0028 |
 | [0019](0019-split-documentation-by-audience-using-diataxis.md) | Split documentation into operator and contributor sets organized by Diátaxis | Proposed |
 | [0020](0020-author-documentation-as-portable-markdown.md) | Author documentation as portable Markdown and treat the site generator as a presentation layer | Proposed |
 | [0021](0021-admit-signing-key-selection-as-bounded-daemon-writable-setting.md) | Admit signing-key selection as a bounded daemon-writable setting | Accepted |
@@ -45,6 +45,7 @@ relying on it.
 | [0025](0025-store-global-model-profiles-separately-from-launch-policy.md) | Store global model profiles separately from launch policy | Accepted |
 | [0026](0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md) | Resolve launch inputs once and pin them to the task | Accepted |
 | [0027](0027-hand-off-model-policy-between-turns.md) | Hand off model policy between turns and record what applied | Accepted |
+| [0028](0028-retain-declarative-workflow-revisions.md) | Retain declarative workflow revisions and pin them to tasks | Accepted |
 
 ## Template
 

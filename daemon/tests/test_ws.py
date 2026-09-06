@@ -44,7 +44,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         }
         assert payload["projects"] == []
         assert payload["model_profiles"] == []
-        # Definitions ship with the daemon (ADR-0018): the catalog is in the
+        # Definitions ship with the daemon (ADR-0028): the catalog is in the
         # snapshot and has no change event, because it cannot change.
         assert [w["name"] for w in payload["workflow_catalog"]] == [
             "bugfix",
@@ -186,8 +186,11 @@ def test_workflow_catalog_rides_the_snapshot_with_no_change_event(
                 "conditional": False,
             }
         ]
-        assert catalog["single-step"]["judge_session"] == "judge"
-        assert catalog["single-step"]["judge_role"] == "slow"
+        # The catalog names the revision a new launch of this name would pin,
+        # so a client can tell "the same workflow" from "the same name"
+        # (ADR-0028).
+        assert catalog["single-step"]["revision"].startswith("sha256:")
+        assert catalog["single-step"]["format"] == 1
 
 
 def test_reconnect_gets_fresh_snapshot(

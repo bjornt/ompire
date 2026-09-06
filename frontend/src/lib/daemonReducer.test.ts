@@ -36,11 +36,11 @@ const singleStep: WorkflowDescriptor = {
   name: "single-step",
   primary_session: "main",
   sessions: ["main"],
+  revision: "sha256:abc",
+  format: 1,
   steps: [
     { name: "work", kind: "agent", session: "main", role: "default", conditional: false },
   ],
-  judge_session: "judge",
-  judge_role: "slow",
 };
 
 describe("applyEnvelope", () => {
@@ -1180,6 +1180,7 @@ describe("applyEnvelope workflow events", () => {
         status: "running",
         outcome: null,
         error: null,
+        pause: null,
         prompted_at: null,
         started_at: "t1",
         finished_at: null,

@@ -24,13 +24,13 @@ Both calls accept:
 | Field | Required | Meaning |
 |---|---|---|
 | `project_name` | yes | The project to work against |
-| `workflow_name` | yes | Any registered built-in workflow |
+| `workflow_name` | yes | Any installed workflow. The launch pins that name's current revision. |
 | `slug` | yes | Task slug; the branch is derived from it |
 | `prompt` | yes | The operator's instruction, including any `@file` mentions |
 | `model_profile` | no | Omitted means "inherit the project default"; a name replaces that inheritance for this task |
 | `workspace_overrides` | no | Task-local overrides of the project's workspace defaults |
 | `step_overrides` | no | Per-agent-step profile and role choices, keyed by declared step name |
-| `auxiliary_overrides` | no | The same, keyed by engine-reserved consumer name (today: `judge`) |
+| `auxiliary_overrides` | no | Retired with the engine's judge. Any entry is `422` rather than dropped. |
 | `preview_token` | on `POST /api/tasks` | The token from the preview that was reviewed |
 
 `workspace_overrides` may carry `base_branch`, `branch_pattern`,
@@ -43,8 +43,8 @@ refused rather than ignored.
 
 ### Per-consumer overrides
 
-Each entry of `step_overrides` and `auxiliary_overrides` is an object with two
-optional fields, `model_profile` and `role`. Omitting a field — or passing
+Each entry of `step_overrides` is an object with two optional fields,
+`model_profile` and `role`. Omitting a field — or passing
 `null` — inherits that dimension; an entry that overrides neither is the same
 launch as no entry at all, and resolves to the same `preview_token`.
 
@@ -54,8 +54,7 @@ launch as no entry at all, and resolves to the same `preview_token`.
     "reproduce": {"model_profile": "economy"},
     "fix": {"role": "plan"},
     "validate-agent": {"model_profile": "thorough", "role": "slow"}
-  },
-  "auxiliary_overrides": {"judge": {"model_profile": "thorough"}}
+  }
 }
 ```
 
@@ -120,9 +119,14 @@ default**. Only the fields you actually changed are sent.
 Beside the form, the preview lists every step the workflow declares, in order,
 with its kind, session, abstract role, concrete model, and thinking policy. A
 command, decision, or gate step is shown with no model, because it never
-reaches one. A step a decision can route past is marked *conditional*, and the
-engine's judge appears as a conditional row on `slow`. The list is what the run
-*may* execute, not a prediction that it will.
+reaches one. A step a route can pass by, or that carries its own condition, is
+marked *conditional*. Every model consumer is one of these rows. The list is
+what the run *may* execute, not a prediction that it will.
+
+The preview also names the **workflow revision** it would pin — the content
+identity of the exact definition — which the `preview_token` covers, so an
+edited prompt or route invalidates the review even though the step list looks
+identical.
 
 Every row that consumes a model carries its own profile and role selectors,
 each with its own reset, and states separately whether its profile and its role
@@ -278,10 +282,11 @@ rendered branch, and the Workshop additions source — in the same transaction
 that created the task row. Editing the project between the `202` and the
 pipeline cannot repoint the fetch or move the branch point.
 
-The same is true of model policy: one complete binding per model consumer is on
-the task, and the workflow engine applies the right one to each session's
-process before every turn, including the judge's. A consumer with no stored
-binding fails the step rather than falling back — neither to a task-wide
+The same is true of the workflow definition and of model policy: the task
+carries the pinned revision and one complete binding per declared model
+consumer, and the workflow engine applies the right one to each session's
+process before every turn. A consumer with no stored binding fails the step
+rather than falling back — neither to a task-wide
 default nor to the agent's own. See [Workflow
 engine](workflow-engine.md#model-policy-per-turn) for how a policy reaches a
 session that is already live.

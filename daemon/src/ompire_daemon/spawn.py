@@ -34,7 +34,11 @@ from ompire_daemon.registry.tasks import (
     require_task_inputs,
     task_payload,
 )
-from ompire_daemon.workflows import UnknownWorkflowNameError, WorkflowRunner
+from ompire_daemon.taskdefinition import (
+    TaskDefinitionUnavailableError,
+    resolve_task_definition,
+)
+from ompire_daemon.workflows import WorkflowRunner
 
 _STDERR_LIMIT = 64 * 1024
 
@@ -213,7 +217,7 @@ async def run_spawn_pipeline(
         # transaction as the row. Kept as a hard stop rather than an assert:
         # if it ever happens, no git command must run against guessed values.
         failed = mark_failed(engine, task_id, str(exc))
-        events.publish("task_updated", task_payload(failed))
+        events.publish("task_updated", task_payload(failed, engine=engine))
         return
 
     if Path(task.clone_path).exists():
@@ -224,7 +228,7 @@ async def run_spawn_pipeline(
             {"task_id": task_id, "step": "clone", "status": "failed", "stderr": stderr},
         )
         failed = mark_failed(engine, task_id, stderr)
-        events.publish("task_updated", task_payload(failed))
+        events.publish("task_updated", task_payload(failed, engine=engine))
         return
 
     async def run_clone_step(step: Step) -> None:
@@ -292,7 +296,7 @@ async def run_spawn_pipeline(
                 {"task_id": task_id, "step": name, "status": "failed", "stderr": exc.stderr},
             )
             failed = mark_failed(engine, task_id, f"step {name!r} failed:\n{exc.stderr}")
-            events.publish("task_updated", task_payload(failed))
+            events.publish("task_updated", task_payload(failed, engine=engine))
             return
         events.publish("spawn_step", {"task_id": task_id, "step": name, "status": "ok"})
 
@@ -300,9 +304,14 @@ async def run_spawn_pipeline(
     # meaning is unchanged), then hand the task to the workflow engine —
     # session spawn and prompt delivery are workflow execution now.
     completed = mark_spawn_completed(engine, task_id)
-    events.publish("task_updated", task_payload(completed))
+    events.publish("task_updated", task_payload(completed, engine=engine))
     try:
-        runner.start_run(completed)
-    except UnknownWorkflowNameError as exc:
-        failed = mark_failed(engine, task_id, str(exc))
-        events.publish("task_updated", task_payload(failed))
+        # The task's own pinned revision, not the catalog's current definition
+        # of the same name (ADR-0028). Acceptance retained it in the same
+        # transaction as the row, so a failure here is a damaged store, not a
+        # race with an edit.
+        revision = resolve_task_definition(engine, completed)
+        runner.start_run(completed, revision)
+    except TaskDefinitionUnavailableError as exc:
+        failed = mark_failed(engine, task_id, exc.detail)
+        events.publish("task_updated", task_payload(failed, engine=engine))

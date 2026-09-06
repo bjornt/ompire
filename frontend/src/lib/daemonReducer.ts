@@ -46,11 +46,13 @@ export interface DaemonState {
    * alone is insufficient: it precedes that first message. */
   snapshotReady: boolean;
   projects: Project[];
-  /** Every registered built-in workflow (ADR-0026). Snapshot-only, with no
-   * change event: definitions ship with the daemon (ADR-0018), so the
-   * catalog is constant for the life of the process. An older snapshot
-   * without the field normalizes to empty — which routes must not read as
-   * "no workflows exist" before `snapshotReady`. */
+  /** Every installed workflow (ADR-0026, ADR-0028). Snapshot-only, with no
+   * change event: definitions ship with the daemon, so the catalog is
+   * constant for the life of the process. Each entry carries the revision its
+   * name currently resolves to, which is not necessarily what an existing
+   * task pinned. An older snapshot without the field normalizes to empty —
+   * which routes must not read as "no workflows exist" before
+   * `snapshotReady`. */
   workflowCatalog: WorkflowDescriptor[];
   /** Global model profiles (ADR-0025), keyed by name like projects: replaced
    * wholesale by the snapshot, upserted by `model_profile_created`/
@@ -598,16 +600,20 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
           status: "running",
           outcome: null,
           error: null,
+          pause: null,
           prompted_at: null,
           started_at: envelope.ts,
           finished_at: null,
         });
       } else {
         // ok/failed/waiting close out the newest record for this step
-        // name+kind (a decision-escalation gate shares the decision's name,
-        // so kind disambiguates). Tolerate a terminal event whose `started`
-        // we never saw (e.g. joined mid-stream).
+        // name+kind (a legacy decision-escalation gate shares the decision's
+        // name, so kind disambiguates). Tolerate a terminal event whose
+        // `started` we never saw (e.g. joined mid-stream).
         const idx = steps.findLastIndex((s) => s.step === p.step && s.kind === p.kind);
+        // A declared gate carries its message as an outcome; an uncertainty
+        // pause carries `pause` instead and keeps its absent outcome, so the
+        // two never read as the same waiting state (ADR-0028).
         const outcome =
           p.status === "waiting" && p.message !== undefined ? { message: p.message } : null;
         const updated: StepRecord = {
@@ -619,6 +625,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
           status: p.status,
           outcome: outcome ?? (idx >= 0 ? steps[idx].outcome : null),
           error: p.status === "failed" ? (p.error ?? null) : idx >= 0 ? steps[idx].error : null,
+          pause: p.status === "waiting" ? (p.pause ?? null) : null,
           prompted_at: idx >= 0 ? steps[idx].prompted_at : null,
           started_at: idx >= 0 ? steps[idx].started_at : envelope.ts,
           finished_at: p.status === "waiting" ? null : envelope.ts,
@@ -720,23 +727,25 @@ export function currentStepRecord(workflow: WorkflowState | undefined): StepReco
   return [...workflow.steps].reverse().find((record) => record.step === workflow.step);
 }
 
-/** Built-in workflow primaries are not part of the current WebSocket payload.
- * Keep the task-scoped selector explicit for those workflows; unknown or
- * legacy workflows retain the first known session fallback. */
-const PRIMARY_SESSION_BY_WORKFLOW: Record<string, string> = {
-  "single-step": "main",
-  bugfix: "coder",
-};
-
-/** The workflow-declared primary session for task-scoped operations such as
- * review and publishing. It deliberately ignores the current workflow step
- * and any UI tab selection. */
+/** The primary session *the task's pinned definition* declares: the target of
+ * task-scoped operations such as review and publishing (ADR-0028).
+ *
+ * The daemon sends it on the task, resolved through that task's own revision.
+ * It is deliberately not derived from the workflow's name: a name means
+ * whatever the installed definition means today, which is not necessarily
+ * what this task accepted. When it is absent — a legacy task whose
+ * continuation nobody has confirmed, or a revision that cannot be read — the
+ * primary is genuinely unknown, and the first known session is a display
+ * fallback rather than a claim.
+ *
+ * It deliberately ignores the current workflow step and any UI tab
+ * selection. */
 export function primarySessionName(
   taskSessions: Record<string, SessionInfo> | undefined,
   workflow: WorkflowState | undefined,
+  task?: Pick<Task, "workflow_primary_session"> | undefined,
 ): string {
-  const configured = workflow === undefined ? undefined : PRIMARY_SESSION_BY_WORKFLOW[workflow.name];
-  return configured ?? taskSessionNames(taskSessions, workflow)[0];
+  return task?.workflow_primary_session ?? taskSessionNames(taskSessions, workflow)[0];
 }
 
 /** The session a task's surfaces focus by default (workflow-engine design
@@ -745,10 +754,11 @@ export function primarySessionName(
 export function defaultSessionName(
   taskSessions: Record<string, SessionInfo> | undefined,
   workflow: WorkflowState | undefined,
+  task?: Pick<Task, "workflow_primary_session"> | undefined,
 ): string {
   if (workflowActive(workflow)) {
     const current = currentStepRecord(workflow);
     if (current?.session) return current.session;
   }
-  return primarySessionName(taskSessions, workflow);
+  return primarySessionName(taskSessions, workflow, task);
 }

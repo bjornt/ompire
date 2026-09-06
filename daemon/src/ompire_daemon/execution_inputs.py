@@ -9,13 +9,20 @@ recovering, under review, or being shipped. That is the whole point of this
 type: reusable defaults are inputs to a decision, not the decision.
 
 Model policy is pinned *per consumer*, not once per task (ADR-0027). Every
-declared agent step and the engine-reserved judge carries its own complete
-binding: which profile it came from, how that profile was chosen, which
-abstract role it consumes, and the whole four-role snapshot that profile
-bound at acceptance. A runtime lookup is exact — a consumer with no stored
-binding is an error, never a fall back to some task-wide default, because
-"the task's model" stopped being a single fact the moment one step could
-differ from another.
+declared agent step carries its own complete binding: which profile it came
+from, how that profile was chosen, which abstract role it consumes, and the
+whole four-role snapshot that profile bound at acceptance. A runtime lookup is
+exact — a consumer with no stored binding is an error, never a fall back to
+some task-wide default, because "the task's model" stopped being a single fact
+the moment one step could differ from another.
+
+The *workflow* is pinned the same way and for the same reason (ADR-0028).
+`workflow_binding` names the exact definition revision this task executes, so
+a later release cannot change an accepted task's prompts, routes, or sessions
+by editing the definition that shares its name. It is nullable only for a task
+that predates retained revisions: NULL is a real state meaning "no definition
+was ever accepted here", and it is filled in by an explicit operator
+confirmation, never by looking up today's catalog.
 
 The document is stored as one version-tagged JSON blob on the task row,
 following the registry's existing JSON-text convention (`model_profiles`).
@@ -28,6 +35,7 @@ configuration, at the moment they are used (ADR-0011, ADR-0015).
 
 ADR-0026 (docs/adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)
 ADR-0027 (docs/adr/0027-hand-off-model-policy-between-turns.md)
+ADR-0028 (docs/adr/0028-retain-declarative-workflow-revisions.md)
 """
 
 from __future__ import annotations
@@ -42,8 +50,10 @@ from ompire_daemon.registry.model_profiles import RoleBinding
 
 # Bumped when the stored shape changes in a way a reader must notice. A task
 # written by a newer daemon is refused rather than half-understood. Version 2
-# replaced the single task-wide role map with per-consumer bindings.
-EXECUTION_INPUTS_VERSION = 2
+# replaced the single task-wide role map with per-consumer bindings; version 3
+# added the pinned workflow revision and retired the engine's auxiliary judge
+# consumer.
+EXECUTION_INPUTS_VERSION = 3
 
 # The workspace/prompt fields a project supplies as defaults and a single task
 # may override. Order is presentation order.
@@ -64,11 +74,17 @@ PROFILE_SOURCE_LEGACY = "legacy-confirmed"
 ROLE_SOURCE_STEP = "step"
 ROLE_SOURCE_WORKFLOW = "workflow"
 
-# The engine-reserved auxiliary consumers, addressed by name. A separate
-# namespace from step names on purpose: a decision step can never become an
-# agent binding by sharing a name with one.
-AUXILIARY_JUDGE = "judge"
-AUXILIARY_CONSUMERS = (AUXILIARY_JUDGE,)
+# How a task came to be bound to a workflow revision.
+WORKFLOW_SOURCE_ACCEPTED = "accepted"
+WORKFLOW_SOURCE_LEGACY_CONFIRMED = "legacy-confirmed"
+
+# The engine used to reserve one auxiliary model consumer, the implicit judge.
+# Version 3 has none: no engine-reserved consumer executes, and a request that
+# still names this one is refused rather than quietly dropped. The name
+# survives only to label the retired binding kept as inert upgrade evidence and
+# the legacy `judge` session still visible in old tasks' history.
+RETIRED_AUXILIARY_JUDGE = "judge"
+AUXILIARY_CONSUMERS: tuple[str, ...] = ()
 
 
 class UnsupportedExecutionInputsVersionError(ValueError):
@@ -135,6 +151,29 @@ class ConsumerBinding:
 
 
 @dataclass(frozen=True)
+class WorkflowBinding:
+    """The exact workflow revision this task executes, and how it got it.
+
+    `legacy_through_seq` is the honest boundary: every step record up to and
+    including that sequence happened under a definition nobody retained, and
+    the projection says so rather than attributing old prompts to the newly
+    confirmed revision. `interrupted_legacy_seq` names the one attempt that
+    spans the boundary — it was opened before confirmation and finishes after
+    it — because pretending it belongs wholly to either side would be a claim
+    about a turn whose beginning is unknown.
+
+    Both are zero/None for a normal acceptance: there is no history to
+    disclaim when the definition was pinned before the first step ran.
+    """
+
+    revision: str
+    source: str
+    bound_at: str
+    legacy_through_seq: int = 0
+    interrupted_legacy_seq: int | None = None
+
+
+@dataclass(frozen=True)
 class TaskExecutionInputs:
     """One task's pinned launch decision.
 
@@ -147,14 +186,16 @@ class TaskExecutionInputs:
     accepted_at: str
     project_name: str
     workflow_name: str
+    # The pinned definition, or None for a task accepted before revisions were
+    # retained. Execution, recovery, session admission, and presentation all
+    # resolve through this — never through `workflow_name` in today's catalog.
+    workflow_binding: WorkflowBinding | None
     model_profile_name: str | None
     model_profile_source: str
     # Agent step name → its complete binding. Populated for *every* declared
     # agent step at acceptance, so a later workflow edit cannot silently
     # rebind a step and a runtime lookup never has to invent one.
     step_bindings: dict[str, ConsumerBinding]
-    # Engine-reserved consumer name → its complete binding (today: `judge`).
-    auxiliary_bindings: dict[str, ConsumerBinding]
     workspace: WorkspaceInputs
     # Which workspace fields the operator overrode for this task rather than
     # inheriting. Kept so task detail can say *why* a value is what it is.
@@ -180,11 +221,9 @@ class TaskExecutionInputs:
         except KeyError:
             raise MissingConsumerBindingError("agent step", step) from None
 
-    def binding_for_auxiliary(self, name: str) -> ConsumerBinding:
-        try:
-            return self.auxiliary_bindings[name]
-        except KeyError:
-            raise MissingConsumerBindingError("auxiliary consumer", name) from None
+    @property
+    def workflow_revision(self) -> str | None:
+        return self.workflow_binding.revision if self.workflow_binding else None
 
 
 def _encode_roles(roles: Mapping[str, RoleBinding]) -> dict[str, dict[str, str]]:
@@ -231,6 +270,26 @@ def _encode_bindings(
     return {name: encode_binding(bindings[name]) for name in sorted(bindings)}
 
 
+def encode_workflow_binding(binding: WorkflowBinding) -> dict[str, Any]:
+    return {
+        "revision": binding.revision,
+        "source": binding.source,
+        "bound_at": binding.bound_at,
+        "legacy_through_seq": binding.legacy_through_seq,
+        "interrupted_legacy_seq": binding.interrupted_legacy_seq,
+    }
+
+
+def decode_workflow_binding(document: Mapping[str, Any]) -> WorkflowBinding:
+    return WorkflowBinding(
+        revision=document["revision"],
+        source=document["source"],
+        bound_at=document["bound_at"],
+        legacy_through_seq=document.get("legacy_through_seq", 0),
+        interrupted_legacy_seq=document.get("interrupted_legacy_seq"),
+    )
+
+
 def execution_inputs_document(inputs: TaskExecutionInputs) -> dict[str, Any]:
     return {
         "version": EXECUTION_INPUTS_VERSION,
@@ -238,10 +297,14 @@ def execution_inputs_document(inputs: TaskExecutionInputs) -> dict[str, Any]:
         "accepted_at": inputs.accepted_at,
         "project_name": inputs.project_name,
         "workflow_name": inputs.workflow_name,
+        "workflow_binding": (
+            encode_workflow_binding(inputs.workflow_binding)
+            if inputs.workflow_binding is not None
+            else None
+        ),
         "model_profile_name": inputs.model_profile_name,
         "model_profile_source": inputs.model_profile_source,
         "step_bindings": _encode_bindings(inputs.step_bindings),
-        "auxiliary_bindings": _encode_bindings(inputs.auxiliary_bindings),
         "workspace": {
             "base_branch": inputs.workspace.base_branch,
             "branch_pattern": inputs.workspace.branch_pattern,
@@ -273,15 +336,16 @@ def decode_execution_inputs(raw: str) -> TaskExecutionInputs:
         accepted_at=document["accepted_at"],
         project_name=document["project_name"],
         workflow_name=document["workflow_name"],
+        workflow_binding=(
+            decode_workflow_binding(document["workflow_binding"])
+            if document.get("workflow_binding") is not None
+            else None
+        ),
         model_profile_name=document["model_profile_name"],
         model_profile_source=document["model_profile_source"],
         step_bindings={
             name: decode_consumer_binding(entry)
             for name, entry in document["step_bindings"].items()
-        },
-        auxiliary_bindings={
-            name: decode_consumer_binding(entry)
-            for name, entry in document["auxiliary_bindings"].items()
         },
         workspace=WorkspaceInputs(
             base_branch=workspace["base_branch"],
@@ -321,9 +385,9 @@ class ModelPolicy:
     """The complete native model configuration one omp process runs under.
 
     `active` is what `--model`/`--thinking` set; the other three are omp's
-    own auxiliary roles, passed on every process (including the judge's) so
-    a `/switch smol` or an internal role use inside the container runs the
-    model the operator chose rather than whatever the host defaults to.
+    own auxiliary roles, passed on every process so a `/switch smol` or an
+    internal role use inside the container runs the model the operator chose
+    rather than whatever the host defaults to.
 
     Every field carries its own thinking level. `off` and `auto` are explicit
     policies here, never "no value".
@@ -357,10 +421,6 @@ class ModelPolicy:
     @classmethod
     def for_step(cls, inputs: TaskExecutionInputs, step: str) -> ModelPolicy:
         return cls.from_binding(inputs.binding_for_step(step))
-
-    @classmethod
-    def for_judge(cls, inputs: TaskExecutionInputs) -> ModelPolicy:
-        return cls.from_binding(inputs.binding_for_auxiliary(AUXILIARY_JUDGE))
 
     def auxiliary_equals(self, other: ModelPolicy) -> bool:
         """True when at most the active pair differs.

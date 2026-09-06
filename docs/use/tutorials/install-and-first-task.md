@@ -123,8 +123,9 @@ would finish in ten minutes.
 
 Beside the form, Ompire lists every step this run may execute and the model
 each one would use. For `single-step` that is one agent step on your profile's
-`default` binding, plus the workflow engine's judge — which only runs if
-something cannot be resolved — on the `slow` binding.
+`default` binding — and nothing else, because every model a run uses belongs to
+a step you can see here. It also names the exact workflow revision the task
+will pin and execute for its whole life.
 
 Submit, and watch the four spawn steps run:
 

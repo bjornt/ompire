@@ -60,6 +60,13 @@ const project = {
  * the detail view renders its accepted-configuration panel rather than the
  * legacy confirmation form. */
 const acceptedInputs: TaskExecutionInputs = {
+  workflow_binding: {
+    revision: "sha256:abc",
+    source: "accepted",
+    bound_at: "2026-09-06T00:00:00Z",
+    legacy_through_seq: 0,
+    interrupted_legacy_seq: null,
+  },
   version: 2,
   provenance: "accepted",
   accepted_at: "2026-07-18T00:00:00Z",
@@ -72,20 +79,6 @@ const acceptedInputs: TaskExecutionInputs = {
       profile_name: "balanced",
       profile_source: "project",
       role: "default",
-      role_source: "workflow",
-      roles: {
-        default: { model: "anthropic/claude-sonnet-4.5", thinking: "medium" },
-        smol: { model: "openai/gpt-4.1-mini", thinking: "off" },
-        slow: { model: "openai/o3", thinking: "high" },
-        plan: { model: "google/gemini-2.5-pro", thinking: "max" },
-      },
-    },
-  },
-  auxiliary_bindings: {
-    judge: {
-      profile_name: "balanced",
-      profile_source: "project",
-      role: "slow",
       role_source: "workflow",
       roles: {
         default: { model: "anthropic/claude-sonnet-4.5", thinking: "medium" },
@@ -128,6 +121,13 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     pr_state: null,
     pr_merged_at: null,
     workflow_name: "single-step",
+    workflow_revision: "sha256:abc",
+    workflow_revision_source: "accepted",
+    workflow_ready: true,
+    workflow_readiness_reason: null,
+    workflow_readiness_detail: null,
+    workflow_primary_session: "main",
+    workflow_sessions: ["main"],
     workflow_status: null,
     workflow_step: null,
     created_at: "2026-07-18T00:00:00Z",
@@ -746,6 +746,7 @@ const twoSessionSnapshots = {
           status: "ok",
           outcome: { summary: "reproduced on vlan-mtu" },
           error: null,
+          pause: null,
           prompted_at: null,
           started_at: "t0",
           finished_at: "t1",
@@ -759,6 +760,7 @@ const twoSessionSnapshots = {
           status: "running",
           outcome: null,
           error: null,
+          pause: null,
           prompted_at: null,
           started_at: "t1",
           finished_at: null,
@@ -924,6 +926,7 @@ describe("gate card", () => {
           status: "waiting",
           outcome: { message: "Review the reproducer output?" },
           error: null,
+          pause: null,
           prompted_at: null,
           started_at: "t1",
           finished_at: null,
@@ -949,7 +952,9 @@ describe("gate card", () => {
       "/api/tasks/1/workflow/resume",
       expect.objectContaining({
         method: "POST",
-        body: JSON.stringify({ note: "looks right" }),
+        // The waiting attempt is named, so a stale tab cannot advance a
+        // different one (ADR-0028).
+        body: JSON.stringify({ expected_seq: 2, note: "looks right" }),
       }),
     );
   });
@@ -963,7 +968,9 @@ describe("gate card", () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/tasks/1/workflow/resume",
-      expect.objectContaining({ body: JSON.stringify({ note: null }) }),
+      expect.objectContaining({
+        body: JSON.stringify({ expected_seq: 2, note: null }),
+      }),
     );
   });
 

@@ -178,9 +178,9 @@ function TaskCard({
   const spawning = isSpawning(task);
   // The card reports on the workflow's relevant session (tasks spec): the
   // current step's session while the run is in flight, else the primary.
-  const sessionName = defaultSessionName(sessions, workflow);
+  const sessionName = defaultSessionName(sessions, workflow, task);
   const session = sessions?.[sessionName];
-  const primarySession = sessions?.[primarySessionName(sessions, workflow)];
+  const primarySession = sessions?.[primarySessionName(sessions, workflow, task)];
   const reviewPresentation = projectReview(review, primarySession);
   const showShipFlow = hasShipFlowHandoff(task, review, ship);
   const runPill = workflowPill(workflow);

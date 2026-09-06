@@ -102,8 +102,8 @@ branch pattern, Workshop additions source, and standing preamble. A project
 whose configuration was carried over from templates and still needs a decision
 shows a **Launch configuration needs a decision** panel listing every distinct
 old value with the template it came from, nothing pre-selected, and requiring
-an explicit acknowledgement of any old model choice or retired judge model it
-supersedes. See [Projects](projects.md#launch-configuration-state).
+an explicit acknowledgement of any old model choice it supersedes and of any
+retired `judge_model` it leaves configuring nothing. See [Projects](projects.md#launch-configuration-state).
 
 ### The Spawn view
 
@@ -112,11 +112,11 @@ a prompt, and an **Advanced** section holding the four workspace overrides.
 Each override shows the project's value until it is changed and then offers its
 own reset; only changed fields are sent.
 
-Beside it, the daemon's resolution of the current draft: every declared step of
-the chosen workflow with its kind, session, abstract role, model, and thinking
-policy. Command, decision, and gate rows carry no model. A step a decision can
-route past is marked conditional, and the engine's judge is a separate
-conditional row on the profile's `slow` binding.
+Beside it, the daemon's resolution of the current draft: the workflow revision
+it would pin, and every declared step of the chosen workflow with its kind,
+session, abstract role, model, and thinking policy. Command, decision, and gate
+rows carry no model. A step a route can pass by, or that carries its own
+condition, is marked conditional. Every model consumer is one of these rows.
 
 The resolution is re-fetched on every change to an effective choice, and a
 slow response for an older draft is discarded rather than shown. Submitting

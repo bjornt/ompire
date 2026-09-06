@@ -52,7 +52,7 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0014"
+    assert version == "0015"
     assert "projects" in tables
     assert "tasks" in tables
     # Templates are retired (ADR-0026): the live table is gone and only inert
@@ -198,7 +198,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0014"
+    assert version == "0015"
     assert row == "demo"
 
 
@@ -1005,6 +1005,14 @@ def _land_at_0013(db_path: Path) -> None:
     command.upgrade(_alembic_cfg(db_path), "0013")
 
 
+def _upgrade_to_0014(db_path: Path) -> None:
+    """Stop at 0014 deliberately: these tests are about *that* conversion, and
+    running past it would be testing two revisions at once."""
+    from alembic import command
+
+    command.upgrade(_alembic_cfg(db_path), "0014")
+
+
 _V1_ROLES = {
     "default": {"model": "vendor/main", "thinking": "medium"},
     "smol": {"model": "vendor/small", "thinking": "off"},
@@ -1092,7 +1100,7 @@ def test_0014_converts_a_pinned_task_to_per_consumer_bindings(tmp_path: Path) ->
         _insert_project(conn, "legacy")
         _insert_pinned_task(conn, "legacy-task", _v1_document())
 
-    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    _upgrade_to_0014(db_path)
 
     with engine.connect() as conn:
         document = _pinned(conn, "legacy-task")
@@ -1138,7 +1146,7 @@ def test_0014_does_not_invent_a_binding_for_a_step_the_task_never_accepted(
             conn, "partial", _v1_document(step_roles={"reproduce": "default"})
         )
 
-    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    _upgrade_to_0014(db_path)
 
     with engine.connect() as conn:
         document = _pinned(conn, "partial")
@@ -1173,7 +1181,7 @@ def test_0014_reads_the_task_document_not_the_live_profile(tmp_path: Path) -> No
         )
         _insert_pinned_task(conn, "snapshot", _v1_document())
 
-    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    _upgrade_to_0014(db_path)
 
     with engine.connect() as conn:
         document = _pinned(conn, "snapshot")
@@ -1202,7 +1210,7 @@ def test_0014_gives_resumable_sessions_a_continuation_policy(tmp_path: Path) -> 
         # there is nothing for a continuation policy to continue.
         _insert_session(conn, task_id, "reproducer", None)
 
-    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    _upgrade_to_0014(db_path)
 
     from ompire_daemon.registry.sessions import list_sessions
 
@@ -1241,7 +1249,7 @@ def test_0014_leaves_an_unpinned_task_unpinned(tmp_path: Path) -> None:
         ).scalar_one()
         _insert_session(conn, task_id, "main", "sess-main")
 
-    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    _upgrade_to_0014(db_path)
 
     with engine.connect() as conn:
         raw = conn.execute(
@@ -1257,12 +1265,12 @@ def test_0014_leaves_an_unpinned_task_unpinned(tmp_path: Path) -> None:
     assert applied is None
 
 
-def test_0014_converted_tasks_decode_and_execute_without_their_source_profile(
+def test_a_migrated_task_decodes_and_executes_without_its_source_profile(
     tmp_path: Path,
 ) -> None:
-    """The point of the conversion: the running daemon can read a migrated
-    task and hand each consumer a complete policy with no profile row in the
-    registry at all."""
+    """The point of the whole conversion chain: a task written by a much older
+    daemon reads, at head, with a complete policy per consumer and no profile
+    row in the registry at all."""
     db_path = tmp_path / "ompire.db"
     _land_at_0013(db_path)
     engine = make_engine(db_path)
@@ -1287,7 +1295,9 @@ def test_0014_converted_tasks_decode_and_execute_without_their_source_profile(
     policy = ModelPolicy.for_step(inputs, "fix")
     assert policy.active.model == "vendor/main"
     assert policy.plan.model == "vendor/planner"
-    assert ModelPolicy.for_judge(inputs).active.model == "vendor/big"
+    # No workflow was ever accepted for this task, and the upgrade did not
+    # invent one.
+    assert inputs.workflow_binding is None
 
 
 def test_0014_downgrade_restores_the_version_1_shape(tmp_path: Path) -> None:
@@ -1303,7 +1313,7 @@ def test_0014_downgrade_restores_the_version_1_shape(tmp_path: Path) -> None:
         _insert_project(conn, "legacy")
         _insert_pinned_task(conn, "uniform", _v1_document())
 
-    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+    _upgrade_to_0014(db_path)
 
     # Give a second task genuinely divergent per-consumer profiles.
     import json as _json
@@ -1341,3 +1351,266 @@ def test_0014_downgrade_restores_the_version_1_shape(tmp_path: Path) -> None:
     assert uniform["judge_role"] == "slow"
     # Refused rather than flattened; a version-1 daemon refuses it explicitly.
     assert divergent_after["version"] == 2
+
+
+# --- 0015: retained workflow revisions and honest continuation (ADR-0028) ----
+
+
+def _land_at_0014(db_path: Path) -> None:
+    from alembic import command
+
+    command.upgrade(_alembic_cfg(db_path), "0014")
+
+
+def _v2_document(**overrides) -> str:
+    """What a task accepted by the previous daemon actually stored: per-consumer
+    bindings including the engine's auxiliary judge, and no definition."""
+    import json as _json
+
+    def binding(role: str) -> dict:
+        return {
+            "profile_name": "retired-profile",
+            "profile_source": "task",
+            "role": role,
+            "role_source": "workflow",
+            "roles": _V1_ROLES,
+        }
+
+    document = {
+        "version": 2,
+        "provenance": "accepted",
+        "accepted_at": "2026-09-01T00:00:00+00:00",
+        "project_name": "legacy",
+        "workflow_name": "bugfix",
+        "model_profile_name": "retired-profile",
+        "model_profile_source": "task",
+        "step_bindings": {
+            name: binding("default")
+            for name in ("reproduce", "fix", "validate-agent")
+        },
+        "auxiliary_bindings": {"judge": binding("slow")},
+        "workspace": {
+            "base_branch": "trunk",
+            "branch_pattern": "ompire/<slug>",
+            "workshop_additions": "project",
+            "preamble": "house style",
+        },
+        "workspace_overrides": ["base_branch"],
+        "branch": "ompire/legacy-task",
+        "checkout_path": "/tmp/legacy",
+        "fetch_remote": "origin",
+        "upstream_url": "https://example.com/legacy.git",
+        "fork_url": None,
+        "unknown_inputs": [],
+    }
+    document.update(overrides)
+    return _json.dumps(document)
+
+
+def test_0015_leaves_the_workflow_binding_null_rather_than_inventing_one(
+    tmp_path: Path,
+) -> None:
+    """The load-bearing refusal.
+
+    Version 2 recorded a workflow *name*. What that name's prompts and routes
+    said when the task ran is gone, so filling the binding in from whatever
+    ships today would claim the task accepted a document it never saw. NULL is
+    the honest value, and the operator confirms a continuation.
+    """
+    db_path = tmp_path / "ompire.db"
+    _land_at_0014(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "upgraded", _v2_document())
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        document = _pinned(conn, "upgraded")
+        retained = conn.execute(
+            text("SELECT count(*) FROM workflow_revisions")
+        ).scalar_one()
+
+    assert document["version"] == 3
+    assert document["workflow_binding"] is None
+    assert document["workflow_name"] == "bugfix"
+    # A migration cannot know what the old definition said, so it retains none.
+    assert retained == 0
+
+
+def test_0015_preserves_the_retired_judge_binding_as_inert_evidence(
+    tmp_path: Path,
+) -> None:
+    """The judge is removed from the live document and kept as history.
+
+    The old model choice stays inspectable — it is the only record of what the
+    task's judge would have run — while nothing can read it back into
+    execution: version 3 has no auxiliary consumers at all.
+    """
+    db_path = tmp_path / "ompire.db"
+    _land_at_0014(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "judged", _v2_document())
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    import json as _json
+
+    with engine.connect() as conn:
+        document = _pinned(conn, "judged")
+        task_id = conn.execute(
+            text("SELECT id FROM tasks WHERE slug = 'judged'")
+        ).scalar_one()
+        rows = conn.execute(
+            text(
+                "SELECT kind, source, payload_json FROM launch_migration_evidence "
+                "WHERE scope_kind = 'task' AND scope = :scope ORDER BY id"
+            ),
+            {"scope": str(task_id)},
+        ).all()
+
+    assert "auxiliary_bindings" not in document
+    kinds = {kind for kind, _source, _payload in rows}
+    assert kinds == {"legacy-execution-inputs", "retired-auxiliary-binding"}
+
+    original = next(
+        _json.loads(payload)
+        for kind, _source, payload in rows
+        if kind == "legacy-execution-inputs"
+    )
+    assert original["version"] == 2
+    assert original["auxiliary_bindings"]["judge"]["role"] == "slow"
+
+    judge = next(
+        _json.loads(payload)
+        for kind, _source, payload in rows
+        if kind == "retired-auxiliary-binding"
+    )
+    assert judge["consumer"] == "judge"
+    assert judge["binding"]["roles"]["slow"]["model"] == "vendor/big"
+
+
+def test_0015_leaves_step_and_session_history_untouched(tmp_path: Path) -> None:
+    """Everything that actually happened stays exactly as recorded, the
+    retired judge session included."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0014(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "historic", _v2_document())
+        task_id = conn.execute(
+            text("SELECT id FROM tasks WHERE slug = 'historic'")
+        ).scalar_one()
+        _insert_session(conn, task_id, "reproducer", "sess-repro")
+        _insert_session(conn, task_id, "judge", "sess-judge")
+        conn.execute(
+            text(
+                "INSERT INTO workflow_step_records "
+                "(task_id, seq, step, kind, session, status, outcome_json, "
+                "error, prompted_at, started_at, finished_at) VALUES "
+                "(:task, 1, 'reproduce', 'agent', 'reproducer', 'ok', "
+                "'{\"status\": \"success\"}', NULL, '2026-09-01T00:00:00+00:00', "
+                "'2026-09-01T00:00:00+00:00', '2026-09-01T00:01:00+00:00')"
+            ),
+            {"task": task_id},
+        )
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        records = conn.execute(
+            text(
+                "SELECT seq, step, status, outcome_json, pause_json FROM "
+                "workflow_step_records WHERE task_id = :task"
+            ),
+            {"task": task_id},
+        ).all()
+        sessions = {
+            row[0]
+            for row in conn.execute(
+                text("SELECT name FROM task_sessions WHERE task_id = :task"),
+                {"task": task_id},
+            )
+        }
+
+    assert sessions == {"reproducer", "judge"}
+    assert records == [(1, "reproduce", "ok", '{"status": "success"}', None)]
+
+
+def test_0015_downgrade_restores_the_judge_binding_from_its_evidence(
+    tmp_path: Path,
+) -> None:
+    """Down is an escape hatch, and it says so by what it cannot do.
+
+    A task upgraded from version 2 round-trips, because its judge binding was
+    kept. A task accepted *after* the upgrade never had one, so there is no
+    honest version-2 shape for it — it is left at version 3 for an older
+    daemon to refuse explicitly rather than run with a fabricated judge.
+    """
+    from alembic import command
+
+    db_path = tmp_path / "ompire.db"
+    _land_at_0014(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "upgraded", _v2_document())
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    import json as _json
+
+    with engine.begin() as conn:
+        native = _json.loads(_pinned_raw(conn, "upgraded"))
+        native.pop("auxiliary_bindings", None)
+        native["workflow_binding"] = {
+            "revision": "sha256:" + "0" * 64,
+            "source": "accepted",
+            "bound_at": "2026-09-06T00:00:00+00:00",
+            "legacy_through_seq": 0,
+            "interrupted_legacy_seq": None,
+        }
+        conn.execute(
+            text(
+                "INSERT INTO tasks (project_name, slug, branch, clone_path, state, "
+                "prompt, workflow_name, execution_inputs_json, created_at, updated_at) "
+                "VALUES ('legacy', 'native', 'ompire/native', '/tmp/n', 'created', "
+                "'p', 'bugfix', :doc, '2026-09-06T00:00:00+00:00', "
+                "'2026-09-06T00:00:00+00:00')"
+            ),
+            {"doc": _json.dumps(native)},
+        )
+
+    command.downgrade(_alembic_cfg(db_path), "0014")
+
+    with engine.connect() as conn:
+        upgraded = _pinned(conn, "upgraded")
+        native_after = _pinned(conn, "native")
+        columns = {
+            row[1]
+            for row in conn.execute(text("PRAGMA table_info(workflow_step_records)"))
+        }
+        tables = {
+            row[0]
+            for row in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type = 'table'")
+            )
+        }
+
+    assert "pause_json" not in columns
+    assert "workflow_revisions" not in tables
+    assert upgraded["version"] == 2
+    assert upgraded["auxiliary_bindings"]["judge"]["role"] == "slow"
+    assert "workflow_binding" not in upgraded
+    assert native_after["version"] == 3
+
+
+def _pinned_raw(conn, slug: str) -> str:
+    return conn.execute(
+        text("SELECT execution_inputs_json FROM tasks WHERE slug = :slug"),
+        {"slug": slug},
+    ).scalar_one()

@@ -76,13 +76,23 @@ check, is in [Model profiles](model-profiles.md).
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/workflows` | Read-only catalog of every registered built-in workflow |
+| `GET` | `/api/workflows` | Read-only catalog of every installed workflow |
+| `GET` | `/api/workflows/revisions/{revision}` | One retained definition, by content identity |
 
-Each entry carries the workflow's sessions, its primary session, every declared
-step with its kind, session, abstract role (agent steps only) and whether a
-decision can route past it, and the engine-reserved judge with the role it
-binds. Definitions ship with the daemon, so there is no CRUD and no change
-event; the same catalog rides in the WebSocket snapshot.
+Each catalog entry carries the workflow's current `revision` and `format`, its
+sessions, its primary session, and every declared step with its kind, session,
+abstract role (agent steps only) and whether a route or its own condition can
+pass it by. Every model consumer is one of those steps. Definitions ship with
+the daemon, so there is no CRUD and no change event; the same catalog rides in
+the WebSocket snapshot.
+
+The revision endpoint returns the identity, the format, the primary session,
+the sessions, and the normalized `definition` document itself. It is addressed
+by content identity, not by name, because a name says what a *new* launch would
+pin and this answers what a given task accepted. An unknown revision is `404`.
+A retained document that cannot be read — damaged, or written for a format this
+daemon does not implement — is `409` with reason `workflow_definition_unavailable`
+and a specific `unavailable_reason`; it is never executed to answer a read.
 
 ## Tasks
 
@@ -92,8 +102,8 @@ event; the same catalog rides in the WebSocket snapshot.
 | `GET` | `/api/tasks/{id}` | Detail, including sessions and step records |
 | `POST` | `/api/tasks/preview` | Resolve the selections without creating anything; returns the resolved bindings, every declared step, the rendered branch, and a `preview_token` |
 | `POST` | `/api/tasks` | Accept the reviewed resolution. `202`; spawning continues in the background. `409` with a `preview_changed` reason and the current resolution when it moved, `422` for an unusable prompt mention or an unknown field |
-| `GET` | `/api/tasks/{id}/configuration` | Known facts, candidates, and unknown inputs for a task created before launch inputs were recorded |
-| `POST` | `/api/tasks/{id}/configuration/preview` | Resolve a proposed continuation configuration |
+| `GET` | `/api/tasks/{id}/configuration` | Known facts, candidates, unknown inputs, and the workflow continuation candidate for a task the upgrade left blocked |
+| `POST` | `/api/tasks/{id}/configuration/preview` | Resolve a proposed continuation without writing it |
 | `POST` | `/api/tasks/{id}/configuration/confirm` | Pin it, once. `409` if already pinned or the token is stale |
 | `POST` | `/api/tasks/{id}/continue` | Resume a confirmed task whose run was left interrupted. `409` unless it is `running` or `waiting` |
 | `POST` | `/api/tasks/{id}/cleanup` | Remove workshop, delete clone, archive |
@@ -104,27 +114,59 @@ optional `model_profile` (omitted inherits the project default), and an
 optional `workspace_overrides` object limited to `base_branch`,
 `branch_pattern`, `workshop_additions`, and `preamble`.
 
-They also take `step_overrides` and `auxiliary_overrides`: maps keyed by
-declared agent-step name and by engine-reserved consumer name (`judge`), whose
+They also take `step_overrides`: a map keyed by declared agent-step name whose
 entries carry an optional `model_profile` and an optional `role`. An omitted or
 null field inherits, and an entry overriding neither resolves to the same
-`preview_token` as no entry. An unknown or non-agent step, an unknown auxiliary
-consumer, a role outside `default`/`smol`/`slow`/`plan`, an unknown profile, and
-any unknown field inside an entry are all `422` at the named field, creating
-nothing.
+`preview_token` as no entry. An unknown or non-agent step, a role outside
+`default`/`smol`/`slow`/`plan`, an unknown profile, and any unknown field
+inside an entry are all `422` at the named field, creating nothing.
 
-Acceptance adds the `preview_token`, which covers every consumer's complete
-four-role map — so an edit to a profile's `slow` binding invalidates the review
-even though no active model changed, while an edit to an unrelated profile does
-not. Unknown top-level fields — including the retired `template_name` and the
-old scalar `model`/`thinking` overrides — are refused, not ignored. See
+`auxiliary_overrides` is retired with the engine's judge. Any entry in it is
+`422` at the named field rather than silently dropped: the model it names no
+longer runs.
+
+The preview also reports `workflow_revision`, `workflow_format`, and the
+definition's primary session and sessions — the exact procedure acceptance
+would pin.
+
+Acceptance adds the `preview_token`, which covers the workflow revision and
+every consumer's complete four-role map — so editing a prompt or a route
+invalidates the review even though the step list is identical, and an edit to a
+profile's `slow` binding invalidates it even though no active model changed,
+while an edit to an unrelated profile or workflow does not. Unknown top-level
+fields — including the retired `template_name` and the old scalar
+`model`/`thinking` overrides — are refused, not ignored. See
 [Task spawn](task-spawn.md).
 
 A preview's step rows carry `declared_role` and a `binding` object — the source
 profile, its source, the effective role, its source, and the full role map —
 identical to what acceptance stores for that consumer, or `null` for a step
-with no model. A task's `execution_inputs` carries `step_bindings` and
-`auxiliary_bindings` in that same shape.
+with no model. A task's `execution_inputs` carries `step_bindings` in that same
+shape, plus a `workflow_binding` naming the pinned `revision`, how it was bound
+(`accepted` or `legacy-confirmed`), and — for a confirmed legacy task — the
+`legacy_through_seq` boundary and any `interrupted_legacy_seq` that spans it.
+
+Every task payload also carries `workflow_revision`, `workflow_ready`, a
+`workflow_readiness_reason` when it is not, and the `workflow_primary_session`
+and `workflow_sessions` *that task's* definition declares. The two session
+fields are `null` rather than a guess whenever the definition cannot be
+resolved.
+
+### Continuation for tasks the upgrade left blocked
+
+`GET /api/tasks/{id}/configuration` reports `needs_configuration`,
+`needs_workflow_confirmation`, a classified `workflow_readiness`, and a
+`workflow_candidate`: the current definition of *that task's own* workflow
+name, its revision, whether it is `compatible` with the steps and sessions
+already on record, the `problems` if not, the `legacy_through_seq` boundary,
+and the `uncertainty_notice` describing how waiting behavior changes.
+
+`preview` and `confirm` take the launch fields only when the task never had
+any; a task that merely predates retained definitions supplies none of them.
+`confirm` requires `acknowledge_workflow`, and `acknowledge_unknown` as well
+when launch inputs are also missing. A stale `preview_token` is `409` before
+anything else is checked; an incompatible candidate is `422` naming the
+problems. Confirmation pins the future only — it starts nothing.
 
 ## Sessions
 
@@ -144,11 +186,20 @@ All paths are under `/api/tasks/{id}/sessions/{session}/agent`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/tasks/{id}/workflow/resume` | Resume a workflow stopped at a gate |
+| `POST` | `/api/tasks/{id}/workflow/resume` | Advance a waiting run: resume a declared gate, or retry a paused step |
 | `POST` | `/api/tasks/{id}/review` | Open a review |
 | `POST` | `/api/tasks/{id}/review/cancel` | Cancel and restore the clone |
 | `POST` | `/api/tasks/{id}/ship/draft` | Ensure one initial agent draft, or explicitly replace it with `{"replace": true}`. A new/replacement request requires a live, `idle` primary agent; an ordinary repeated request returns observed ship state without a second agent turn. |
 | `POST` | `/api/tasks/{id}/ship/commit` | Sign, commit, push, open the PR |
+
+`workflow/resume` takes a required `expected_seq` — the waiting attempt's
+sequence number — and an optional `note`. The daemon decides from the waiting
+record whether that means resuming a declared gate (the note becomes its
+outcome, the run continues at the gate's fall-through) or retrying an
+uncertainty pause (a new attempt of the blocked step opens, and the run never
+continues past it). It returns `409` when the run is not waiting or
+`expected_seq` names an attempt it has moved on from, and `404` for an unknown
+task.
 
 `ship/draft` returns `404` for an unknown task and `409` for an unavailable or
 non-idle primary agent, an archived or already-published task, or an explicit

@@ -106,9 +106,17 @@ def test_accepted_task_pins_the_reviewed_inputs(
     # pair: a `/switch slow` inside the container has to land on the model
     # the operator chose.
     assert work["roles"]["slow"]["model"] == "testing/slow-model"
-    judge = inputs["auxiliary_bindings"]["judge"]
-    assert judge["role"] == "slow"
-    assert judge["roles"]["slow"]["model"] == "testing/slow-model"
+    # Every model consumer is a declared step now: the engine reserves none.
+    assert "auxiliary_bindings" not in inputs
+    # And the exact procedure is pinned, not just its name (ADR-0028).
+    binding = inputs["workflow_binding"]
+    assert binding["revision"].startswith("sha256:")
+    assert binding["source"] == "accepted"
+    assert binding["legacy_through_seq"] == 0
+    assert binding["interrupted_legacy_seq"] is None
+    assert task["workflow_revision"] == binding["revision"]
+    assert task["workflow_ready"] is True
+    assert task["workflow_primary_session"] == "main"
     assert inputs["workspace"]["base_branch"] == "main"
     assert inputs["checkout_path"] == demo_project["checkout_path"]
     _wait_settled(client, auth_headers, task["id"])
@@ -181,14 +189,15 @@ def test_preview_and_acceptance_resolve_identically(
     ).json()
     inputs = accepted["execution_inputs"]
     assert preview["steps"][0]["binding"] == inputs["step_bindings"]["work"]
-    assert preview["steps"][-1]["binding"] == inputs["auxiliary_bindings"]["judge"]
     assert preview["branch"] == inputs["branch"]
     assert preview["workspace"] == inputs["workspace"]
-    # Every declared step is described, plus the conditional judge row.
-    assert [row["step"] for row in preview["steps"]] == ["work", "judge"]
+    # Exactly the declared steps, and nothing standing for work the operator
+    # cannot see in the flow: there is no engine-reserved row any more.
+    assert [row["step"] for row in preview["steps"]] == ["work"]
     assert preview["steps"][0]["model"] == "testing/main-model"
-    assert preview["steps"][-1]["kind"] == "judge"
-    assert preview["steps"][-1]["conditional"] is True
+    # The reviewed procedure is named, and it is what acceptance pinned.
+    assert preview["workflow_revision"] == inputs["workflow_binding"]["revision"]
+    assert preview["workflow_primary_session"] == "main"
     _wait_settled(client, auth_headers, accepted["id"])
 
 
@@ -315,7 +324,7 @@ def test_accepted_inputs_survive_project_and_profile_edits(
         == "testing/main-model"
     )
     assert (
-        inputs["auxiliary_bindings"]["judge"]["roles"]["slow"]["model"]
+        inputs["step_bindings"]["work"]["roles"]["slow"]["model"]
         == "testing/slow-model"
     )
     assert inputs["workspace"]["base_branch"] == "main"
@@ -382,8 +391,13 @@ def test_workflow_catalog_describes_every_declared_step(
     conditional = {step["name"]: step["conditional"] for step in bugfix["steps"]}
     assert conditional["reproduce"] is False
     assert conditional["fix"] is True
-    assert bugfix["judge_session"] == "judge"
-    assert bugfix["judge_role"] == "slow"
+    # The catalog names the exact revision a new launch of this name would
+    # pin, and the semantics version it is read under (ADR-0028).
+    assert bugfix["revision"].startswith("sha256:")
+    assert bugfix["format"] == 1
+    # Nothing describes a model consumer outside the declared steps.
+    assert "judge_session" not in bugfix
+    assert "judge_role" not in bugfix
 
 
 def test_duplicate_live_slug_rejected(
@@ -793,10 +807,7 @@ def test_an_untouched_row_follows_the_task_profile_and_an_explicit_one_does_not(
 
     assert _row(preview, "reproduce")["binding"]["profile_name"] == "thorough"
     assert _row(preview, "fix")["binding"]["profile_name"] == "economy"
-    # The judge inherits the task-wide decision like any other unoverridden
-    # consumer; it is not a hidden exception.
-    assert _row(preview, "judge")["binding"]["profile_name"] == "economy"
-    assert _row(preview, "judge")["binding"]["role"] == "slow"
+    assert _row(preview, "validate-agent")["binding"]["profile_name"] == "economy"
 
 
 def test_an_explicit_choice_equal_to_the_inherited_one_is_still_explicit(
@@ -820,7 +831,7 @@ def test_an_explicit_choice_equal_to_the_inherited_one_is_still_explicit(
         step_overrides={"work": {"model_profile": "demo"}},
     )
     assert _row(moved, "work")["binding"]["profile_name"] == "demo"
-    assert _row(moved, "judge")["binding"]["profile_name"] == "economy"
+    assert moved["model_profile"] == "economy"
 
 
 def test_a_role_only_override_follows_a_task_profile_change(
@@ -856,7 +867,7 @@ def test_a_role_only_override_follows_a_task_profile_change(
         ),
         (
             {"auxiliary_overrides": {"judge": {"model_profile": "ghost"}}},
-            "auxiliary_overrides.judge.model_profile",
+            "auxiliary_overrides.judge",
         ),
     ],
 )

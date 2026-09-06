@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
+import { WorkflowRevision } from "../components/WorkflowRevision";
 import {
   confirmTaskConfiguration,
   continueTask,
@@ -26,7 +27,10 @@ export function TaskConfigurationPanel({
   sessions: Record<string, SessionInfo>;
 }) {
   const inputs = detail.execution_inputs;
-  if (inputs === null) {
+  // Two different gaps reach the same form (ADR-0026, ADR-0028): a task that
+  // was never configured, and one that was — but before definitions were
+  // retained, so the procedure it ran was never recorded.
+  if (inputs === null || inputs.workflow_binding === null) {
     return <LegacyConfiguration detail={detail} />;
   }
   const overridden = new Set(inputs.workspace_overrides);
@@ -41,7 +45,20 @@ export function TaskConfigurationPanel({
       </p>
       <dl className="metaList">
         <dt>workflow</dt>
-        <dd>{inputs.workflow_name}</dd>
+        <dd data-testid="accepted-workflow">
+          {inputs.workflow_name}
+          {inputs.workflow_binding.source === "legacy-confirmed" && (
+            <span className="noForkNote"> · confirmed after upgrade</span>
+          )}
+        </dd>
+        <dt>revision</dt>
+        <dd>
+          <WorkflowRevision
+            revision={inputs.workflow_binding.revision}
+            legacyThroughSeq={inputs.workflow_binding.legacy_through_seq}
+            interruptedLegacySeq={inputs.workflow_binding.interrupted_legacy_seq}
+          />
+        </dd>
         <dt>profile</dt>
         <dd data-testid="accepted-profile">
           {inputs.model_profile_name ?? "—"}
@@ -93,21 +110,9 @@ export function TaskConfigurationPanel({
           </tr>
         </thead>
         <tbody>
-          {[
-            ...Object.entries(inputs.step_bindings).map(
-              ([name, binding]) => [name, binding, false] as const,
-            ),
-            ...Object.entries(inputs.auxiliary_bindings).map(
-              ([name, binding]) => [name, binding, true] as const,
-            ),
-          ].map(([name, binding, auxiliary]) => (
-            <tr key={`${auxiliary ? "aux" : "step"}-${name}`} data-testid={`consumer-${name}`}>
-              <td className="mono">
-                {name}
-                {auxiliary && (
-                  <span className="noForkNote"> · auxiliary, conditional</span>
-                )}
-              </td>
+          {Object.entries(inputs.step_bindings).map(([name, binding]) => (
+            <tr key={`step-${name}`} data-testid={`consumer-${name}`}>
+              <td className="mono">{name}</td>
               <td>
                 {binding.profile_name}
                 <span className="noForkNote">
@@ -151,15 +156,69 @@ export function TaskConfigurationPanel({
         </tbody>
       </table>
       <p className="hint">
-        Each model consumer keeps the policy it was accepted under. Editing or
-        deleting a profile since then changes what the next launch resolves to,
-        never this task.
+        Each model consumer keeps the policy it was accepted under, and every one of
+        them is a step you can see above — the engine runs no model of its own. Editing
+        or deleting a profile since then changes what the next launch resolves to, never
+        this task.
       </p>
 
       <NativeModelState sessions={sessions} />
+      <ContinueRun detail={detail} />
     </div>
   );
 }
+
+/** Resume a run that was left in place while the task was blocked.
+ *
+ * Deliberately separate from confirming a configuration: confirmation records
+ * what the task continues under and starts nothing (ADR-0026, ADR-0028). It
+ * has to remain reachable *after* confirmation too — a task the daemon skipped
+ * during recovery is still parked exactly where it stopped, and nothing else
+ * re-arms it.
+ *
+ * The daemon applies the eligibility rule: only a run that was already
+ * `running` or `waiting` is continued, and it uses the same per-task recovery
+ * routine startup does, so pressing this twice is a no-op rather than a
+ * second run.
+ */
+function ContinueRun({ detail }: { detail: TaskDetail }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (detail.workflow_status !== "running" && detail.workflow_status !== "waiting") {
+    return null;
+  }
+
+  async function onContinue() {
+    setBusy(true);
+    setError(null);
+    try {
+      await continueTask(detail.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => void onContinue()}
+        data-testid="legacy-continue"
+      >
+        Continue the interrupted run
+      </button>
+      {error && (
+        <div className="submitError" role="alert" data-testid="continue-error">
+          {error}
+        </div>
+      )}
+    </>
+  );
+}
+
 
 /** What each live session's omp child reports it is actually running. The
  * accepted policy sits beside it because omp resolves `auto` and `max` to a
@@ -205,6 +264,7 @@ function LegacyConfiguration({ detail }: { detail: TaskDetail }) {
   const [additions, setAdditions] = useState<WorkshopAdditionsSource>("project");
   const [preamble, setPreamble] = useState("");
   const [acknowledged, setAcknowledged] = useState(false);
+  const [workflowAcknowledged, setWorkflowAcknowledged] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -225,34 +285,32 @@ function LegacyConfiguration({ detail }: { detail: TaskDetail }) {
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)));
   }, [detail.id]);
 
+  // A task that already has accepted inputs is only missing its definition;
+  // asking it for a model again would be re-deciding something reviewed once.
+  const needsLaunchFields = configuration?.needs_configuration ?? true;
+
   async function onConfirm() {
     setBusy(true);
     setError(null);
     try {
-      const continuation = {
-        model_profile: profile,
-        base_branch: baseBranch,
-        workshop_additions: additions,
-        preamble,
-      };
+      // Only a task that was never configured supplies launch fields. One
+      // that merely predates retained definitions is confirming a procedure,
+      // not re-deciding a model it already accepted.
+      const continuation = needsLaunchFields
+        ? {
+            model_profile: profile,
+            base_branch: baseBranch,
+            workshop_additions: additions,
+            preamble,
+          }
+        : {};
       const preview = await previewTaskConfiguration(detail.id, continuation);
       await confirmTaskConfiguration(detail.id, {
         ...continuation,
         preview_token: preview.preview_token,
         acknowledge_unknown: acknowledged,
+        acknowledge_workflow: workflowAcknowledged,
       });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function onContinue() {
-    setBusy(true);
-    setError(null);
-    try {
-      await continueTask(detail.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -281,15 +339,18 @@ function LegacyConfiguration({ detail }: { detail: TaskDetail }) {
     );
   }
 
+  const candidate = configuration.workflow_candidate;
+  const blocked = candidate !== null && !candidate.compatible;
+
   return (
     <div className="panel" data-testid="task-inputs">
       <h2 className="panelTitle">Configuration needed</h2>
       <p className="hint" data-testid="legacy-unknown">
-        This task ran before Ompire recorded launch inputs. Its workspace, branch, sessions,
-        workflow history and pull-request facts are intact, but the model, thinking level,
-        preamble and overrides it actually used were never persisted and cannot be
-        recovered. Confirm what should happen <strong>from here on</strong> — that is not a
-        claim about the turns already taken.
+        This task ran before Ompire recorded {needsLaunchFields ? "launch inputs" : "workflow definitions"}.
+        Its workspace, branch, sessions, workflow history and pull-request facts are
+        intact, but what it lists below was never persisted and cannot be recovered.
+        Confirm what should happen <strong>from here on</strong> — that is not a claim
+        about the turns already taken.
       </p>
       <ul className="unknownList">
         {(configuration.unknown_inputs ?? []).map((name) => (
@@ -297,6 +358,53 @@ function LegacyConfiguration({ detail }: { detail: TaskDetail }) {
         ))}
       </ul>
 
+      {candidate !== null && (
+        <div data-testid="workflow-candidate">
+          <h3 className="subheading">Workflow to continue under</h3>
+          {!candidate.available || candidate.revision === null ? (
+            <p className="fieldNote" data-testid="workflow-candidate-blocked">
+              {candidate.problems.join("; ")}
+            </p>
+          ) : (
+            <>
+              <p className="fieldNote">
+                The current <code>{candidate.workflow_name}</code> definition, offered as
+                the one this task continues under. It is the only candidate: this task&apos;s
+                history was produced by something calling itself{" "}
+                <code>{candidate.workflow_name}</code>, and pointing it at anything else
+                would relabel the run rather than continue it.
+              </p>
+              <WorkflowRevision
+                revision={candidate.revision}
+                legacyThroughSeq={candidate.legacy_through_seq}
+                interruptedLegacySeq={candidate.interrupted_legacy_seq}
+              />
+              {blocked && (
+                <div className="submitError" role="alert" data-testid="workflow-incompatible">
+                  <p>
+                    This definition cannot explain what this task already recorded, so it
+                    cannot be confirmed:
+                  </p>
+                  <ul className="unknownList">
+                    {candidate.problems.map((problem) => (
+                      <li key={problem}>{problem}</li>
+                    ))}
+                  </ul>
+                  <p>
+                    The task stays readable, stoppable and cleanable exactly as it is.
+                  </p>
+                </div>
+              )}
+              <p className="fieldNote" data-testid="uncertainty-notice">
+                {candidate.uncertainty_notice}
+              </p>
+            </>
+          )}
+        </div>
+      )}
+
+      {needsLaunchFields && (
+      <>
       <label className="formField">
         <span className="fieldLabel">Model profile</span>
         <select
@@ -352,39 +460,54 @@ function LegacyConfiguration({ detail }: { detail: TaskDetail }) {
           data-testid="legacy-preamble"
         />
       </label>
+      </>
+      )}
+
+      {needsLaunchFields && (
+        <label className="checkboxField">
+          <input
+            type="checkbox"
+            checked={acknowledged}
+            onChange={(e) => setAcknowledged(e.target.checked)}
+            data-testid="legacy-acknowledge"
+          />
+          <span>
+            I understand the original model, thinking level, preamble and overrides are
+            unknown and cannot be recovered.
+          </span>
+        </label>
+      )}
 
       <label className="checkboxField">
         <input
           type="checkbox"
-          checked={acknowledged}
-          onChange={(e) => setAcknowledged(e.target.checked)}
-          data-testid="legacy-acknowledge"
+          checked={workflowAcknowledged}
+          onChange={(e) => setWorkflowAcknowledged(e.target.checked)}
+          data-testid="legacy-acknowledge-workflow"
         />
         <span>
-          I understand the original model, thinking level, preamble and overrides are
-          unknown and cannot be recovered.
+          I understand the exact workflow definition this task already ran was never
+          recorded, and that confirming this one governs only what happens next.
         </span>
       </label>
 
       <button
         type="button"
         className="primary"
-        disabled={busy || !profile || !baseBranch || !acknowledged}
+        disabled={
+          busy ||
+          blocked ||
+          candidate === null ||
+          !candidate.available ||
+          !workflowAcknowledged ||
+          (needsLaunchFields && (!profile || !baseBranch || !acknowledged))
+        }
         onClick={onConfirm}
         data-testid="legacy-confirm"
       >
         Confirm continuation configuration
       </button>
-      {(detail.workflow_status === "running" || detail.workflow_status === "waiting") && (
-        <button
-          type="button"
-          disabled={busy}
-          onClick={onContinue}
-          data-testid="legacy-continue"
-        >
-          Continue the interrupted run
-        </button>
-      )}
+      <ContinueRun detail={detail} />
       {error && (
         <div className="submitError" role="alert" data-testid="legacy-error">
           {error}
