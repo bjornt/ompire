@@ -994,3 +994,350 @@ def test_0013_is_reentrant_across_a_restart_during_reconciliation(
         assert len(_evidence(conn, "template")) == 2
     assert row.base_branch == "release"
     assert row.launch_config_state == "reconciled"
+
+
+# --- 0014: per-consumer bindings and applied session policy (ADR-0027) -------
+
+
+def _land_at_0013(db_path: Path) -> None:
+    from alembic import command
+
+    command.upgrade(_alembic_cfg(db_path), "0013")
+
+
+_V1_ROLES = {
+    "default": {"model": "vendor/main", "thinking": "medium"},
+    "smol": {"model": "vendor/small", "thinking": "off"},
+    "slow": {"model": "vendor/big", "thinking": "high"},
+    "plan": {"model": "vendor/planner", "thinking": "xhigh"},
+}
+
+
+def _v1_document(**overrides) -> str:
+    import json as _json
+
+    document = {
+        "version": 1,
+        "provenance": "accepted",
+        "accepted_at": "2026-09-01T00:00:00+00:00",
+        "project_name": "legacy",
+        "workflow_name": "bugfix",
+        "model_profile_name": "retired-profile",
+        "model_profile_source": "task",
+        "roles": _V1_ROLES,
+        "step_roles": {"reproduce": "default", "fix": "default"},
+        "judge_role": "slow",
+        "workspace": {
+            "base_branch": "trunk",
+            "branch_pattern": "ompire/<slug>",
+            "workshop_additions": "project",
+            "preamble": "house style",
+        },
+        "workspace_overrides": ["base_branch"],
+        "branch": "ompire/legacy-task",
+        "checkout_path": "/tmp/legacy",
+        "fetch_remote": "origin",
+        "upstream_url": "https://example.com/legacy.git",
+        "fork_url": None,
+        "unknown_inputs": [],
+    }
+    document.update(overrides)
+    return _json.dumps(document)
+
+
+def _insert_pinned_task(conn, slug: str, document: str | None) -> None:
+    conn.execute(
+        text(
+            "INSERT INTO tasks (project_name, slug, branch, clone_path, state, prompt, "
+            "workflow_name, execution_inputs_json, created_at, updated_at) VALUES "
+            "('legacy', :slug, :branch, :clone, 'created', 'p', 'bugfix', :doc, "
+            "'2026-09-01T00:00:00+00:00', '2026-09-01T00:00:00+00:00')"
+        ),
+        {
+            "slug": slug,
+            "branch": f"ompire/{slug}",
+            "clone": f"/tmp/tasks/legacy/{slug}",
+            "doc": document,
+        },
+    )
+
+
+def _insert_session(conn, task_id: int, name: str, omp_session_id: str | None) -> None:
+    conn.execute(
+        text(
+            "INSERT INTO task_sessions (task_id, name, omp_session_id, spawned_at) "
+            "VALUES (:task, :name, :sid, '2026-09-01T00:00:00+00:00')"
+        ),
+        {"task": task_id, "name": name, "sid": omp_session_id},
+    )
+
+
+def _pinned(conn, slug: str) -> dict:
+    import json as _json
+
+    raw = conn.execute(
+        text("SELECT execution_inputs_json FROM tasks WHERE slug = :slug"), {"slug": slug}
+    ).scalar_one()
+    return _json.loads(raw)
+
+
+def test_0014_converts_a_pinned_task_to_per_consumer_bindings(tmp_path: Path) -> None:
+    """A version-1 task keeps the execution policy it was accepted with, now
+    expressed per consumer — re-expressed from what the document already
+    stored, not re-resolved from anything current."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0013(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "legacy-task", _v1_document())
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        document = _pinned(conn, "legacy-task")
+
+    assert document["version"] == 2
+    # The retired shape is gone, not left beside the new one.
+    for retired in ("roles", "step_roles", "judge_role"):
+        assert retired not in document
+
+    for step in ("reproduce", "fix"):
+        binding = document["step_bindings"][step]
+        assert binding["profile_name"] == "retired-profile"
+        assert binding["profile_source"] == "task"
+        assert binding["role"] == "default"
+        # Version 1 could not express a per-step role choice, so calling one
+        # an operator override would invent a decision that never happened.
+        assert binding["role_source"] == "workflow"
+        assert binding["roles"] == _V1_ROLES
+
+    judge = document["auxiliary_bindings"]["judge"]
+    assert judge["role"] == "slow"
+    assert judge["roles"] == _V1_ROLES
+
+    # Everything the document already said stays exactly as it was.
+    assert document["workspace"]["base_branch"] == "trunk"
+    assert document["workspace_overrides"] == ["base_branch"]
+    assert document["branch"] == "ompire/legacy-task"
+    assert document["accepted_at"] == "2026-09-01T00:00:00+00:00"
+
+
+def test_0014_does_not_invent_a_binding_for_a_step_the_task_never_accepted(
+    tmp_path: Path,
+) -> None:
+    """`bugfix` declares more agent steps than this document recorded. The
+    migration converts what was accepted and adds nothing: a step introduced
+    since acceptance was never reviewed for this task."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0013(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(
+            conn, "partial", _v1_document(step_roles={"reproduce": "default"})
+        )
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        document = _pinned(conn, "partial")
+
+    assert set(document["step_bindings"]) == {"reproduce"}
+    assert "validate-agent" not in document["step_bindings"]
+
+
+def test_0014_reads_the_task_document_not_the_live_profile(tmp_path: Path) -> None:
+    """A profile row that shares the pinned name must not supply values. The
+    task's own snapshot is what governs it, which is exactly what lets a
+    profile be edited or deleted without touching an accepted task."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0013(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        conn.execute(
+            text(
+                "INSERT INTO model_profiles (name, roles_json, created_at, updated_at) "
+                "VALUES ('retired-profile', :roles, '2026-09-01T00:00:00+00:00', "
+                "'2026-09-01T00:00:00+00:00')"
+            ),
+            {
+                "roles": (
+                    '{"default": {"model": "vendor/EDITED", "thinking": "off"}, '
+                    '"smol": {"model": "vendor/EDITED", "thinking": "off"}, '
+                    '"slow": {"model": "vendor/EDITED", "thinking": "off"}, '
+                    '"plan": {"model": "vendor/EDITED", "thinking": "off"}}'
+                )
+            },
+        )
+        _insert_pinned_task(conn, "snapshot", _v1_document())
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        document = _pinned(conn, "snapshot")
+
+    assert "EDITED" not in str(document)
+    assert document["step_bindings"]["fix"]["roles"]["default"]["model"] == "vendor/main"
+
+
+def test_0014_gives_resumable_sessions_a_continuation_policy(tmp_path: Path) -> None:
+    """A resume needs a complete policy, and nothing recorded what these
+    sessions ran under. The task's own pinned map supplies one — the stored
+    judge role for `judge`, `default` for the rest — labelled as derived
+    rather than as evidence about turns already taken."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0013(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "resumable", _v1_document())
+        task_id = conn.execute(
+            text("SELECT id FROM tasks WHERE slug = 'resumable'")
+        ).scalar_one()
+        _insert_session(conn, task_id, "coder", "sess-coder")
+        _insert_session(conn, task_id, "judge", "sess-judge")
+        # Never captured an identity, so `--resume` cannot bring it back and
+        # there is nothing for a continuation policy to continue.
+        _insert_session(conn, task_id, "reproducer", None)
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    from ompire_daemon.registry.sessions import list_sessions
+
+    sessions = {s.name: s for s in list_sessions(engine, task_id)}
+
+    coder = sessions["coder"].applied_policy
+    assert coder is not None
+    assert coder.origin == "migrated"
+    assert not coder.verified
+    # No declared consumer applied this; the upgrade derived it.
+    assert (coder.consumer_kind, coder.consumer_name) == (None, None)
+    assert coder.policy.active.model == "vendor/main"
+    assert coder.policy.slow.model == "vendor/big"
+
+    judge = sessions["judge"].applied_policy
+    assert judge is not None
+    # The judge's own stored role, not `default` — the bug a single task-wide
+    # policy could not see.
+    assert judge.role == "slow"
+    assert judge.policy.active.model == "vendor/big"
+
+    assert sessions["reproducer"].applied_policy is None
+
+
+def test_0014_leaves_an_unpinned_task_unpinned(tmp_path: Path) -> None:
+    """A task with no recorded inputs gains none. It keeps its existing
+    explicit-reconciliation requirement rather than being handed a policy."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0013(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "unconfirmed", None)
+        task_id = conn.execute(
+            text("SELECT id FROM tasks WHERE slug = 'unconfirmed'")
+        ).scalar_one()
+        _insert_session(conn, task_id, "main", "sess-main")
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        raw = conn.execute(
+            text("SELECT execution_inputs_json FROM tasks WHERE slug = 'unconfirmed'")
+        ).scalar_one()
+        applied = conn.execute(
+            text(
+                "SELECT applied_policy_json FROM task_sessions WHERE task_id = :id"
+            ),
+            {"id": task_id},
+        ).scalar_one()
+    assert raw is None
+    assert applied is None
+
+
+def test_0014_converted_tasks_decode_and_execute_without_their_source_profile(
+    tmp_path: Path,
+) -> None:
+    """The point of the conversion: the running daemon can read a migrated
+    task and hand each consumer a complete policy with no profile row in the
+    registry at all."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0013(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "decodable", _v1_document())
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    from ompire_daemon.execution_inputs import ModelPolicy
+    from ompire_daemon.registry.tasks import get_task
+
+    with engine.connect() as conn:
+        task_id = conn.execute(
+            text("SELECT id FROM tasks WHERE slug = 'decodable'")
+        ).scalar_one()
+        profiles = conn.execute(text("SELECT count(*) FROM model_profiles")).scalar_one()
+    assert profiles == 0
+
+    inputs = get_task(engine, task_id).execution_inputs
+    assert inputs is not None
+    policy = ModelPolicy.for_step(inputs, "fix")
+    assert policy.active.model == "vendor/main"
+    assert policy.plan.model == "vendor/planner"
+    assert ModelPolicy.for_judge(inputs).active.model == "vendor/big"
+
+
+def test_0014_downgrade_restores_the_version_1_shape(tmp_path: Path) -> None:
+    """A task whose consumers all share one profile round-trips. One whose
+    consumers disagree cannot: version 1 has nowhere to put the difference, so
+    it is left alone rather than silently flattened to one of them."""
+    from alembic import command
+
+    db_path = tmp_path / "ompire.db"
+    _land_at_0013(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "uniform", _v1_document())
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    # Give a second task genuinely divergent per-consumer profiles.
+    import json as _json
+
+    with engine.begin() as conn:
+        document = _pinned(conn, "uniform")
+        divergent = _json.loads(_json.dumps(document))
+        divergent["step_bindings"]["fix"]["profile_name"] = "other"
+        divergent["step_bindings"]["fix"]["roles"] = {
+            role: {"model": "other/model", "thinking": "low"}
+            for role in ("default", "smol", "slow", "plan")
+        }
+        conn.execute(
+            text(
+                "INSERT INTO tasks (project_name, slug, branch, clone_path, state, "
+                "prompt, workflow_name, execution_inputs_json, created_at, updated_at) "
+                "VALUES ('legacy', 'divergent', 'ompire/divergent', '/tmp/d', 'created', "
+                "'p', 'bugfix', :doc, '2026-09-01T00:00:00+00:00', "
+                "'2026-09-01T00:00:00+00:00')"
+            ),
+            {"doc": _json.dumps(divergent)},
+        )
+
+    command.downgrade(_alembic_cfg(db_path), "0013")
+
+    with engine.connect() as conn:
+        uniform = _pinned(conn, "uniform")
+        divergent_after = _pinned(conn, "divergent")
+        columns = {row[1] for row in conn.execute(text("PRAGMA table_info(task_sessions)"))}
+
+    assert "applied_policy_json" not in columns
+    assert uniform["version"] == 1
+    assert uniform["roles"] == _V1_ROLES
+    assert uniform["step_roles"] == {"fix": "default", "reproduce": "default"}
+    assert uniform["judge_role"] == "slow"
+    # Refused rather than flattened; a version-1 daemon refuses it explicitly.
+    assert divergent_after["version"] == 2

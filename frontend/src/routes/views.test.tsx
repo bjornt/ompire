@@ -540,9 +540,14 @@ describe("SpawnView", () => {
     await fillDraft(user);
 
     await user.selectOptions(screen.getByTestId("row-profile-work"), "balanced");
+    // The judge is workflow-scoped too: its declared role comes from the
+    // workflow descriptor, so its override cannot survive a workflow change
+    // either.
+    await user.selectOptions(screen.getByTestId("row-role-judge"), "plan");
     await waitFor(() => {
       const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
       expect(body.step_overrides).toEqual({ work: { model_profile: "balanced" } });
+      expect(body.auxiliary_overrides).toEqual({ judge: { role: "plan" } });
     });
 
     await user.selectOptions(screen.getByLabelText("Workflow"), "bugfix");
@@ -554,7 +559,9 @@ describe("SpawnView", () => {
       expect("step_overrides" in body).toBe(false);
       expect("auxiliary_overrides" in body).toBe(false);
     });
-    expect(screen.getByTestId("cleared-overrides")).toHaveTextContent("work");
+    const cleared = screen.getByTestId("cleared-overrides");
+    expect(cleared).toHaveTextContent("work");
+    expect(cleared).toHaveTextContent("judge");
     // The rest of the draft is not workflow-scoped and survives.
     expect(screen.getByLabelText("Task slug")).toHaveValue("fix-bug");
   });
