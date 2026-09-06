@@ -326,7 +326,7 @@ that identity instead of silently prompting a new conversation.
   preserving format-1 distinctions. Write/reconcile the two focused ADRs and
   ADR-0016 progress, index and code backlinks; make no claim to deliver later
   library, publisher or durable-file slices. (R1–R7)
-- [ ] Re-check completed behavior and evidence against `docs/VISION.md` and this
+- [x] Re-check completed behavior and evidence against `docs/VISION.md` and this
   spec: deterministic routing, visible uncertainty, bounded work, durable decisions,
   QA continuity, no fabricated reproduction or authority, and no in-flight revision
   mutation. Keep the vision unchanged. (R1–R7)

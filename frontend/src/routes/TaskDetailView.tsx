@@ -98,6 +98,14 @@ function WorkflowStrip({ workflow, task }: { workflow: WorkflowState; task: Task
         {workflow.name}
         {workflow.status ? ` · ${workflow.status}` : ""}
       </span>
+      {/* The declared ending, when the run named one. `complete` says the run
+          stopped; only this says what stopping meant (ADR-0029). A format-1
+          run has no name for its ending and shows none. */}
+      {task?.workflow_result != null && (
+        <span className="workflowResult" data-testid="workflow-result">
+          {task.workflow_result}
+        </span>
+      )}
       {/* The revision this task accepted, not what the name means today
           (ADR-0028). A short prefix is enough to tell two apart at a glance;
           the whole thing, and the definition itself, are in Configuration. */}
@@ -118,6 +126,13 @@ function WorkflowStrip({ workflow, task }: { workflow: WorkflowState; task: Task
         </span>
       )}
       <div className="workflowChips">
+        {/* An empty chip row is ambiguous — it reads the same as a strip that
+            failed to load. Say which it is. */}
+        {workflow.steps.length === 0 && (
+          <span className="workflowEmpty" data-testid="workflow-not-started">
+            no steps have run yet
+          </span>
+        )}
         {workflow.steps.map((record) => {
           const isCurrent = current !== undefined && record.seq === current.seq;
           return (
@@ -565,9 +580,10 @@ export function TaskDetailView() {
         </Link>
       </div>
 
-      {workflow !== null && workflow.steps.length > 0 && (
-        <WorkflowStrip workflow={workflow} task={liveTask} />
-      )}
+      {/* Shown as soon as the task has a run, even before its first attempt:
+          a strip that appears only once something has happened cannot say
+          that nothing has yet. */}
+      {workflow !== null && <WorkflowStrip workflow={workflow} task={liveTask} />}
 
       <div className="detailGrid">
         <div className="panel" data-testid="task-metadata">

@@ -809,6 +809,23 @@
   resize: vertical;
 }
 
+/* The run's declared ending, and the "nothing yet" state of the strip. */
+
+.workflowResult {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--line) 80%, transparent);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.workflowEmpty {
+  font-size: 11.5px;
+  color: var(--muted);
+  font-style: italic;
+}
+
 /* A format-2 gate's declared choices (ADR-0030). Radios rather than a row of
    buttons: the operator must be able to see every option and what each one
    does before committing, and nothing may be selected for them. Wraps at

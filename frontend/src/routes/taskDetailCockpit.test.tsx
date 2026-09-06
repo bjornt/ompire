@@ -1023,6 +1023,66 @@ describe("gate card", () => {
     expect(screen.queryByTestId("gate-card")).not.toBeInTheDocument();
   });
 
+  it("says the run has not started rather than showing an empty strip", async () => {
+    stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, {
+      "1": { name: "bugfix", status: null, step: null, steps: [] },
+    });
+
+    const strip = screen.getByTestId("workflow-strip");
+    expect(within(strip).getByTestId("workflow-not-started")).toBeInTheDocument();
+    expect(within(strip).queryByTestId("workflow-result")).not.toBeInTheDocument();
+  });
+
+  it("shows the declared ending a finished run reached", async () => {
+    // `complete` says the run stopped; the result says what stopping meant.
+    stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, {
+      "1": {
+        name: "bugfix",
+        status: "complete",
+        step: null,
+        steps: [{ ...twoSessionSnapshots.workflows["1"].steps[0], status: "ok" }],
+      },
+    });
+    act(() => {
+      mainSocket().emit("task_updated", {
+        ...makeTask(),
+        workflow_status: "complete",
+        workflow_step: null,
+        workflow_result: "validated-without-reproduction",
+      });
+    });
+
+    const strip = screen.getByTestId("workflow-strip");
+    expect(within(strip).getByTestId("workflow-result")).toHaveTextContent(
+      "validated-without-reproduction",
+    );
+  });
+
+  it("shows no ending for a run that never named one", async () => {
+    // A format-1 run has no name for its ending, and none is invented for it.
+    stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, {
+      "1": {
+        name: "single-step",
+        status: "complete",
+        step: null,
+        steps: [{ ...twoSessionSnapshots.workflows["1"].steps[0], status: "ok" }],
+      },
+    });
+    act(() => {
+      mainSocket().emit("task_updated", {
+        ...makeTask(),
+        workflow_status: "complete",
+        workflow_step: null,
+      });
+    });
+
+    const strip = screen.getByTestId("workflow-strip");
+    expect(within(strip).queryByTestId("workflow-result")).not.toBeInTheDocument();
+  });
+
   it("renders no gate card while the run is running", async () => {
     stubFetch();
     await renderDetail(twoSessionSnapshots.sessions, twoSessionSnapshots.workflows);
