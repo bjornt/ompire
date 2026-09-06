@@ -175,13 +175,28 @@ Target entries carry the canonical target and the safe host/login/source tuple
 that produced them. A changed or failed identity probe clears earlier targets;
 clients replace this full projection rather than replaying events.
 
-`workflow_step` carries the task id, step name, kind, and status of `started`,
-`ok`, `failed`, or `waiting` — with error text on failure. A `waiting` frame
-carries *either* the operator-facing `message` of a declared gate, *or* a
-`pause` document when the engine stopped rather than deciding: its reason, its
-message, the blocked step, and the step a retry re-enters. Clients must keep
-the two apart, because the operator action differs — resume continues past a
-gate, retry re-enters the blocked step.
+`workflow_step` carries the task id, the attempt's `seq`, the step name, kind,
+and a status of `started`, `ok`, `failed`, or `waiting` — with error text on
+failure. **The sequence identifies the attempt**: a bounded step is visited
+repeatedly under one name, so a client matching on the name alone would fold
+two iterations of `fix` into a single row.
+
+A `waiting` frame says which of three waits this is:
+
+| Frame carries | Meaning | Operator action |
+|---|---|---|
+| `gate` (a versioned snapshot) | A gate with declared choices: its message, the choices offered with their destinations, and the evidence identities it asks about | Answer with one `choice_id` |
+| `message` | A format-1 declared gate | Resume, with an optional note |
+| `pause` | The engine stopped rather than deciding: reason, message, blocked step, and the step a retry re-enters | Retry the blocked step |
+
+Clients must keep them apart, because the action differs — a choice takes a
+declared route, a resume continues past the gate, and a retry re-enters the
+blocked step without continuing past it.
+
+The gate snapshot is **sent rather than looked up**: a client renders the
+question that was actually asked instead of reconstructing choices from
+today's catalog for a definition that may have changed. The `ok` frame for an
+answered gate carries the same snapshot with its `decision` attached.
 
 A task whose pinned definition cannot be resolved still appears in the snapshot
 and still receives `task_updated`. It reports `workflow_ready: false` with a

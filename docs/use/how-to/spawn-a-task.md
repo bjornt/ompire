@@ -72,7 +72,7 @@ another a different role while it stays on the task's profile. Each has its own
 Changing the role changes the model *and* the thinking level together, because
 a role names one complete pair in the profile. On `bugfix`, for example, you
 might put `reproduce` on a cheaper profile, run `fix` on `plan`, and give
-`validate-agent` both a different profile and `slow`.
+`verify` both a different profile and `slow`.
 
 A row you have not touched follows the task profile: change the profile at the
 top and every inherited row moves with it, while rows you chose explicitly stay
@@ -163,7 +163,7 @@ entry takes `model_profile`, `role`, or both; what you leave out is inherited:
   "step_overrides": {
     "reproduce": {"model_profile": "economy"},
     "fix": {"role": "plan"},
-    "validate-agent": {"model_profile": "thorough", "role": "slow"}
+    "verify": {"model_profile": "thorough", "role": "slow"}
   }
 }
 ```
@@ -210,9 +210,13 @@ itself readable there.
 Two workflows ship today, and both are available to every project:
 
 - `single-step` — one agent step. The agent works, you review, you ship.
-- `bugfix` — reproduce, triage, fix, validate, check, escalate. Routing between
-  steps is decided by explicit rules, and an outcome the rules cannot read
-  stops the run and waits for you rather than being guessed.
+- `bugfix` — QA tries to reproduce, a coder diagnoses, QA tries again with
+  those findings if the first attempt failed, then fix and verify. Routing is
+  decided by explicit rules over declared results; where the evidence does not
+  decide, the run stops and asks you, offering the answers the workflow
+  declares rather than a bare Resume. Its five model consumers are `reproduce`,
+  `diagnose`, `reproduce-informed`, `fix`, and `verify`. See
+  [the bugfix workflow](../reference/bugfix-workflow.md).
 
 A workflow's steps name an abstract role — `default`, or one of the auxiliary
 roles — never a model. Which model answers to that role is your profile's

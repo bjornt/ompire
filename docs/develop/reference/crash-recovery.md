@@ -55,10 +55,19 @@ A resumed agent is **not** re-prompted with the task's stored prompt. Whether
 and what to re-deliver is the workflow engine's per-step decision — see
 [restart recovery](../../use/reference/workflow-engine.md#restart-recovery).
 Recovery re-drives the attempt that was already open rather than appending
-another, so a restart never costs a step its declared visit bound; and a run
+another, so a restart never costs a step its declared visit bound and re-binds
+no evidence — an attempt keeps the records it froze when it opened. A run
 stopped on an [uncertainty
 pause](../../use/reference/workflow-engine.md#uncertainty-pauses) is re-armed
 exactly as persisted, with no prompt and no automatic retry.
+
+A run waiting at a **gate** is re-armed as the same question: the stored
+snapshot is re-broadcast, not re-rendered from a history that has since grown.
+An *answered* gate is never re-armed. Because a decision and the successor it
+authorized commit in one transaction, a restart finds either the untouched
+question or the attempt the answer already opened — never a decision to make
+twice, and never one that was made and lost
+([ADR-0030](../../adr/0030-commit-human-decisions-before-advancing.md)).
 
 A recovered session presents as `starting` while its agent is being resumed
 and lands `idle` once ready. The in-flight turn is lost; the session is not.

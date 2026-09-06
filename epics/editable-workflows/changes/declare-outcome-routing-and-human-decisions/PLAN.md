@@ -322,7 +322,7 @@ that identity instead of silently prompting a new conversation.
   behavior. Run project lint/typecheck and both test suites once after integration.
   Keep permanent regressions only for behavioral boundaries, not wording, field
   forwarding or incidental defaults. (R1–R7)
-- [ ] Update every documentation destination in SPEC.md to delivered behavior,
+- [x] Update every documentation destination in SPEC.md to delivered behavior,
   preserving format-1 distinctions. Write/reconcile the two focused ADRs and
   ADR-0016 progress, index and code backlinks; make no claim to deliver later
   library, publisher or durable-file slices. (R1–R7)

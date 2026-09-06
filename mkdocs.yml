@@ -143,3 +143,5 @@ nav:
           - 0026 Pinned launch inputs: adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md
           - 0027 Between-turn model policy: adr/0027-hand-off-model-policy-between-turns.md
           - 0028 Retained workflow revisions: adr/0028-retain-declarative-workflow-revisions.md
+          - 0029 Declared outcomes and evidence: adr/0029-declare-domain-outcomes-and-evidence-handoffs.md
+          - 0030 Committed human decisions: adr/0030-commit-human-decisions-before-advancing.md

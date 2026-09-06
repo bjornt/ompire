@@ -110,7 +110,10 @@ target it.
 
 A workflow definition is a **document**, not code: a bounded YAML subset
 declaring sequential `agent`, `command`, `decision`, and `gate` steps, with a
-content-derived revision as its identity. Workflow state and step records are
+content-derived revision as its identity. The document carries its own
+semantics version, so a change to what a retained document *means* is a new
+format rather than a silent reinterpretation; two versions execute side by
+side. Workflow state and step records are
 durable; in-memory runners re-drive them after a restart.
 
 The definition and the engine are separate on purpose. `workflow_definitions.py`
@@ -123,8 +126,36 @@ needs is missing or unreadable, the run stops at that attempt with the reason
 recorded, rather than asking a model to classify it. An operator retry re-enters
 the blocked step; it never continues past it.
 
-See [ADR-0008](../../adr/0008-model-tasks-as-workflows-over-named-sessions.md)
-and [ADR-0028](../../adr/0028-retain-declarative-workflow-revisions.md).
+### Evidence is bound to the attempt that used it
+
+A step's result is a *declared* one — a name its definition listed, carrying
+the artifact fields that name promised — so a workflow can distinguish "could
+not reproduce" from "something went wrong" instead of encoding both as a
+failure flag. A declared negative is data and follows its own route.
+
+Which prior attempts a step was handed is resolved once, when the attempt
+opens, and recorded on it. That is what makes a finished run explainable: the
+history says which reproduction a fix was given and which fix a verification
+checked, by attempt rather than by recency, so a stale approval is detectable
+rather than merely unlikely.
+
+### A human transition is a committed decision
+
+A gate is a question with declared answers, and the question is persisted
+before anyone can answer it — so a decision stays readable after the definition
+changes. Answering commits the choice, the gate's completion, and either the
+next attempt or the run's named ending in one transaction, and only then wakes
+the run. The alternative, acknowledging first and advancing after, loses a
+decision a person already made to any crash in between.
+
+Human edges are ordinary routes: they pass through the same visit bounds, so a
+loop built out of answers is as finite as one built out of results, and no
+answer grants authority the definition did not declare.
+
+See [ADR-0008](../../adr/0008-model-tasks-as-workflows-over-named-sessions.md),
+[ADR-0028](../../adr/0028-retain-declarative-workflow-revisions.md),
+[ADR-0029](../../adr/0029-declare-domain-outcomes-and-evidence-handoffs.md),
+and [ADR-0030](../../adr/0030-commit-human-decisions-before-advancing.md).
 
 ## A task executes the definition it accepted, not the one deployed today
 

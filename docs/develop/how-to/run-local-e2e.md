@@ -64,6 +64,7 @@ the daemon, and `cleanup` runs last.
 | `happy-path` | Spawn through review, GitHub preflight, signed ship, and pull request |
 | `file-mentions` | Prompt `@file` search, the submit refusals, and literal delivery |
 | `ask-approval` | Agent questions and approval gates |
+| `workflow-decisions` | Declared results, evidence handoffs, and answering a workflow gate |
 | `review-comments` | Feeding review comments back into the session |
 | `ship-retain` | `retain` mode commit rewriting and signature verification |
 | `ship-failures` | GitHub authentication/target refusal, redaction, no-mutation proof, GPG, push, PR, and retain recovery |

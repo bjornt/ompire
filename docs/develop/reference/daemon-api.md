@@ -67,6 +67,21 @@ possible one, filling a null binding while carrying every already-pinned field
 through untouched. Confirmation records the decision but starts nothing; the
 existing explicit Continue action is still what resumes a run.
 
+The compatibility result is a refusal as often as a permission. A candidate
+whose format reads results differently from the ones already on record cannot
+explain that history, so it is reported incompatible with the reasons named
+rather than offered and silently reinterpreting them. There is no automatic
+format upgrade.
+
+`POST /api/tasks/{id}/workflow/resume` carries the same shape of guard for a
+*human* decision. The request names the waiting attempt, the daemon decides
+from that attempt which of three waits it is, and — for a gate with declared
+choices — the decision, the attempt's completion, and either the successor or
+the run's named ending commit in one transaction *before* the response returns.
+The parked run is notified afterwards, so an accepted answer is durable and a
+repeated or stale one advances nothing
+([ADR-0030](../../adr/0030-commit-human-decisions-before-advancing.md)).
+
 ## Observation over WebSocket
 
 `/api/ws` carries an authoritative snapshot followed by deltas — everything a

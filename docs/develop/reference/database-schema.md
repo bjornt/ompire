@@ -143,6 +143,7 @@ quiet across restarts while a *changed* one reopens as new evidence.
 | `workflow_name` | string | Default `single-step` |
 | `workflow_status` | string, nullable | |
 | `workflow_step` | string, nullable | |
+| `workflow_result` | string, nullable | The declared ending a finished format-2 run reached |
 | `pr_url`, `pr_state`, `pr_merged_at` | string, nullable | Publishing state |
 | `spawn_completed_at` | string, nullable | |
 | `created_at`, `updated_at` | string | ISO-8601 |
@@ -245,6 +246,7 @@ version-1 tasks from those tasks' own pinned map.
 | `outcome_json` | text, nullable | Structured step outcome |
 | `error` | text, nullable | |
 | `pause_json` | text, nullable | An uncertainty pause, while this attempt is the one being waited on |
+| `evidence_json` | text, nullable | The prior attempts this one bound when it opened |
 | `prompted_at`, `started_at`, `finished_at` | string | ISO-8601 |
 
 Steps are recorded repeatedly rather than mutated, so a retried step leaves
@@ -252,15 +254,38 @@ both attempts in the history. In-memory runners re-drive workflow state from
 these records after a restart.
 
 Two kinds of `waiting` live here and must not be confused. A **declared gate**
-carries its operator message in `outcome_json`; resuming finishes it `ok` and
-the run continues at its fall-through. An **uncertainty pause** sets
+carries its question in `outcome_json`; an **uncertainty pause** sets
 `pause_json` instead and keeps the attempt's own kind, its absent outcome, and
 the parse or evaluation error that stopped it — nothing is written that could
 later read as a result. The pause document names the reason, the blocked step,
 and the step a retry re-enters.
 
+A format-1 gate's `outcome_json` is just its message, and resuming adds the
+operator's note. A format-2 gate stores a versioned **snapshot** — the rendered
+message, the choices it offered with their destinations, and the evidence
+identities it is asking about — written *before* anyone can answer. Answering
+adds a `decision` (choice id, label as shown, exact feedback, resolved
+destination, server timestamp, actor `operator`) *beside* that snapshot, never
+over it: an answer is meaningless without the question it answered, and the
+definition may have changed since.
+
+`evidence_json` is `{version, bindings: {alias: {step, seq} | null}}` —
+what this attempt froze at entry, with null for an optional selector that
+matched nothing. NULL on the column means the attempt recorded none: a format-1
+attempt, or a step declaring no evidence. That is different from binding
+nothing, and the difference is why the column is nullable rather than defaulted
+to an empty map. Likewise `tasks.workflow_result` is NULL for a run still going
+and for every format-1 run — those have no name for their ending, and none is
+invented for them.
+
 A record and the task's run status are marked waiting in one transaction, so a
-restart cannot find one without the other. An operator retry is likewise one
+restart cannot find one without the other. Answering a format-2 gate is one
+transaction too: the decision, the gate attempt's completion, and either the
+successor attempt with its own frozen bindings or the run's terminal status and
+named result all commit together, and the run is only notified afterwards. A
+crash before that leaves the same unanswered question; a crash after it leaves
+the successor the answer already opened, so a decision is never lost and never
+applied twice. An operator retry is likewise one
 transaction: the paused attempt is finished `failed` with its reason retained,
 a new attempt of the same step is opened `running`, and the current-step
 pointer moves — execution is scheduled only after that commit, so a crash in
@@ -290,6 +315,13 @@ definition nobody could still read. A row is decoded, re-validated, and
 re-hashed back to the key it is filed under before it is executed; reads are
 cached by revision and never by workflow name. Migration `0015` creates the
 table empty — the daemon fills it from its packaged definitions at startup.
+
+Migration `0016` adds `workflow_step_records.evidence_json` and
+`tasks.workflow_result`, both nullable and both left NULL on every existing
+row. NULL means *not recorded*, which is the truthful value: no pre-upgrade
+attempt froze a binding and no pre-upgrade run declared an ending. Backfilling
+an empty binding map, or a terminal result inferred from a `complete` status,
+would manufacture history.
 
 ## `reviews`
 

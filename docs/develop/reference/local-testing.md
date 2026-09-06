@@ -62,6 +62,27 @@ steered mid-run. Behavior scenarios author workflow-visible state in the clone
 — outcome files, repro scripts, commits — so the workflow engine sees real
 artifacts rather than a canned reply.
 
+For a format-2 step the fake **reads the result contract out of the instruction
+the daemon actually sent** and satisfies that: the declared result names, and
+each one's required artifact fields and types. It does not know any workflow,
+so editing a definition changes what the fake produces without anyone editing
+the fake, and a runbook asking for a result a step does not declare fails
+loudly instead of quietly writing something the engine will reject.
+
+Which result it declares comes from an ordered `results` scenario parameter.
+The fake takes the first entry the current step actually declares and consumes
+it, so one parameter drives a whole multi-step run:
+
+```text
+[[scenario-param:results=not-reproduced,candidate-found,reproduced,implemented,validated]]
+```
+
+Parameters are remembered for the life of the session rather than re-read from
+each prompt, because only some steps quote the task prompt that carried them.
+Claiming `script_available` also leaves a real `.ompire/repro.sh` behind that
+fails until a fix lands — a claim without the script would make the engine read
+the shell's "no such file" as the bug still being present.
+
 Sessions persist transcripts, and resume restores context, which is what makes
 crash-recovery testable.
 
@@ -216,6 +237,7 @@ to assertions.
 | `happy-path` | Spawn through shipped |
 | `file-mentions` | Prompt `@file` search, refusal, and delivery |
 | `ask-approval` | Interactive gates |
+| `workflow-decisions` | A bugfix run's declared results, frozen evidence, and human decisions |
 | `review-comments` | Comment loopback through the real reviewer UI |
 | `ship-retain` | Multi-commit re-signing |
 | `ship-failures` | GitHub auth/target denial before clone mutation, redaction, GPG, PR, push, and retain recovery |

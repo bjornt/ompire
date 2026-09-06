@@ -208,12 +208,45 @@ Updates live from `workflow_step` events and task payloads.
 
 ### Gate card
 
-While a run is `waiting` at a gate, a card renders the gate's operator
-message, an optional note field, and a Resume action.
+While a run is `waiting`, a card renders what it is waiting on. Three different
+waits land here and the card keeps them apart.
 
-The card disappears when the run leaves `waiting`. The pending gate state is
-also in the snapshot-driven task payload, so the card survives reloads and
-reconnects — a gate that vanished on refresh would strand the run.
+A **gate with declared choices** shows the question, the evidence it is asking
+about, and every answer the workflow offers with the destination each one
+leads to. Nothing is selected for you, so opening the card authorizes nothing,
+and the submit action stays disabled until you choose. A choice that declares a
+required reason cannot be submitted without one, and the card says which choice
+is asking. There is no generic Resume to bypass the choices with.
+
+A **gate without them** (a format-1 workflow) shows its message, an optional
+note, and a Resume action.
+
+An **uncertainty pause** shows why the engine stopped and offers a retry of the
+step that could not be decided, naming that step — retrying re-enters it rather
+than skipping past it.
+
+What the card renders is the question **as it was asked**, read from the
+attempt's own record rather than from the workflow's current definition. A
+decision answered last month still shows the message, the options, and the
+records it was about, even if the definition has since changed.
+
+The card disappears when the run leaves `waiting`. Anything typed into it
+belongs to the attempt it was typed against: if the run moves on — another tab
+answered, or a restart re-armed something else — the draft is dropped rather
+than carried onto a different question, and a stale submission is refused
+rather than applied. The pending state is also in the snapshot-driven task
+payload, so the card survives reloads and reconnects; a gate that vanished on
+refresh would strand the run.
+
+### Step history
+
+Each attempt records which prior attempts it was handed. A finished run can
+therefore say not just what each step concluded but which reproduction a fix
+was given, and which fix a verification checked — by attempt, not by recency.
+
+A run that ended under a format-2 workflow also carries its declared ending —
+`validated`, `stopped-without-fix`, and so on — beside its `complete` status.
+A format-1 run has no name for its ending and shows none.
 
 ## Interfaces
 
@@ -223,5 +256,7 @@ session's transcript only.
 
 Actions post to the session-addressed endpoints described in [agent
 interaction](agent-interaction.md), to `/api/tasks/{id}/workflow/resume` for
-gates, and to `POST /api/tasks/{id}/review` or
+gates and pauses — carrying the waiting attempt's sequence number and, at a
+gate with declared choices, the chosen `choice_id` — and to
+`POST /api/tasks/{id}/review` or
 `POST /api/tasks/{id}/review/cancel` for the Review panel.

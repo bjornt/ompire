@@ -3378,9 +3378,8 @@ async def test_missing_required_evidence_pauses_instead_of_prompting(
     The attempt is recorded — with the reason — rather than skipped, because
     an attempt that vanished would take the explanation with it.
     """
-    from ompire_daemon.registry.workflows import append_step_record
-    from ompire_daemon.workflows import missing_required_evidence
     from ompire_daemon.workflow_definitions import bindings_from_document
+    from ompire_daemon.workflows import missing_required_evidence
 
     revision = install_test_workflow(engine, F2_YAML)
     step = revision.definition.step_named("fix")

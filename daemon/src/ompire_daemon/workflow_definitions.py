@@ -64,8 +64,8 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
-from types import MappingProxyType
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 import yaml
@@ -2366,8 +2366,10 @@ def validate_result_document(
     if document.get("version") != RESULT_ENVELOPE_VERSION:
         return (
             None,
-            f"result version must be {RESULT_ENVELOPE_VERSION}, got "
-            f"{document.get('version')!r}",
+            (
+                f"result version must be {RESULT_ENVELOPE_VERSION}, got "
+                f"{document.get('version')!r}"
+            ),
         )
     result = document.get("result")
     if not isinstance(result, str):
@@ -2376,8 +2378,10 @@ def validate_result_document(
     if declared is None:
         return (
             None,
-            f"result {result!r} is not declared by this step; it declares "
-            f"{', '.join(contract.names)}",
+            (
+                f"result {result!r} is not declared by this step; it declares "
+                f"{', '.join(contract.names)}"
+            ),
         )
     summary = document.get("summary")
     if not isinstance(summary, str) or not summary.strip():
@@ -2401,8 +2405,10 @@ def validate_result_document(
         if actual != expected and not (expected == "number" and actual == "integer"):
             return (
                 None,
-                f"artifact {field!r} must be {expected}, got "
-                f"{actual if actual is not None else 'nothing'}",
+                (
+                    f"artifact {field!r} must be {expected}, got "
+                    f"{actual if actual is not None else 'nothing'}"
+                ),
             )
         if expected == "string" and not value.strip():
             return None, f"artifact {field!r} must not be blank"

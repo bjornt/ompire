@@ -193,13 +193,29 @@ All paths are under `/api/tasks/{id}/sessions/{session}/agent`.
 | `POST` | `/api/tasks/{id}/ship/commit` | Sign, commit, push, open the PR |
 
 `workflow/resume` takes a required `expected_seq` — the waiting attempt's
-sequence number — and an optional `note`. The daemon decides from the waiting
-record whether that means resuming a declared gate (the note becomes its
-outcome, the run continues at the gate's fall-through) or retrying an
-uncertainty pause (a new attempt of the blocked step opens, and the run never
-continues past it). It returns `409` when the run is not waiting or
-`expected_seq` names an attempt it has moved on from, and `404` for an unknown
-task.
+sequence number — plus an optional `choice_id` and `note`. **The daemon decides
+which kind of wait this is from what the run is actually waiting on, never from
+what the caller sent**, and there are three:
+
+| The run is waiting at | `choice_id` | What happens |
+|---|---|---|
+| A gate with declared choices (format 2) | required | The named choice is recorded and its declared destination taken; `note` is that choice's feedback |
+| A gate without them (format 1) | refused | `note` becomes the gate's outcome and the run continues at its fall-through |
+| An uncertainty pause | refused | A new attempt of the blocked step opens; the run never continues past it |
+
+Refusals separate what the operator can fix from what they cannot:
+
+| Code | When |
+|---|---|
+| `404` | Unknown task |
+| `422` | `choice_id` missing at a gate that needs one, or supplied where none is accepted; a choice this gate does not offer; a required reason left blank; feedback over 16 KiB; an unknown request field. The body names the offending `field`. |
+| `409` | The run is not waiting, `expected_seq` names an attempt it has moved on from, or the gate has already been answered |
+
+A choice answer is committed — the decision, the gate's completion, and either
+the successor attempt or the run's named ending — *before* the response
+returns, so an accepted answer is durable and a repeated or stale one advances
+nothing. Answering a gate never starts review, signs, pushes, or opens a pull
+request.
 
 `ship/draft` returns `404` for an unknown task and `409` for an unavailable or
 non-idle primary agent, an archived or already-published task, or an explicit

@@ -25,14 +25,33 @@ A definition declares:
 
 | Part | Meaning |
 |---|---|
-| `format` | The document format *and* its interpretation. Currently `1`. |
+| `format` | The document format *and* its interpretation: `1` or `2`. |
 | `name` | Unique installed name; a launch selects it |
 | `sessions` | Slug-format session names, declared up front, unique per task |
 | `primary` | Session targeted by task-scoped operations |
 | steps | Ordered, uniquely named, of four kinds. An `agent` step also declares the abstract model role it consumes. |
 
 Steps fall through to the next declared step on success. A `decision` step
-routes explicitly. Falling off the end completes the run.
+routes explicitly, and in format 2 a `gate` step's chosen answer routes too.
+
+Two formats are installed and both execute. **Format 1** is frozen: a
+definition retained under it is always read under its original rules, so a task
+accepted years ago keeps meaning what it meant. **Format 2** adds declared
+results, recorded evidence, and gates with named choices, and removes the two
+places format 1 left meaning implicit. `single-step` is format 1;
+[`bugfix`](bugfix-workflow.md) is format 2.
+
+| | Format 1 | Format 2 |
+|---|---|---|
+| Agent result | `status: "success" \| "failed"` plus an untyped artifact bag | a [declared result](#declared-results-format-2) with required artifact fields |
+| Reading prior attempts | `latest`, re-scanned on every evaluation | [evidence bound once](#evidence-format-2) at attempt entry and recorded |
+| Gate | Resume, with an optional note | [named choices](#gate-steps) with declared destinations |
+| Ending | falling off the last step | `{complete: true, result: <name>}` |
+
+A format-2 definition cannot be offered as a continuation candidate for a task
+whose history was recorded under format 1: those results were written under a
+different contract and cannot be reinterpreted. See
+[Compatibility](#compatibility-across-formats).
 
 ### What a revision pins, and what it does not
 
@@ -113,14 +132,17 @@ session is ready.
 
 The step ends at the session's debounced idle transition.
 
-When a step declares `expects_outcome`, the prompt is suffixed with a fixed
-instruction block naming `.ompire/outcome.json` and its schema, and the daemon
-**unlinks any pre-existing outcome file before sending the prompt**, so a
-stale file from an earlier step can never be mistaken for this one's result.
+When a step asks for a result, the prompt is suffixed with an instruction
+block naming `.ompire/outcome.json` and its schema, and the daemon **unlinks
+any pre-existing outcome file before sending the prompt**, so a stale file from
+an earlier step can never be mistaken for this one's result.
 
 ### The outcome document
 
-`<clone>/.ompire/outcome.json`, read host-side after the turn ends:
+`<clone>/.ompire/outcome.json`, read host-side after the turn ends. Which
+envelope is expected depends on the definition's format.
+
+Format 1 (`expects_outcome: true`):
 
 | Field | Required | Type |
 |---|---|---|
@@ -129,17 +151,79 @@ stale file from an earlier step can never be mistaken for this one's result.
 | `summary` | yes | string |
 | `artifacts` | no | string-keyed map of workflow-defined handoff values |
 
+Format 2 (`outcome.results`):
+
+| Field | Required | Type |
+|---|---|---|
+| `version` | yes | integer, must be `2` |
+| `result` | yes | one of the names this step declares |
+| `summary` | yes | non-blank string |
+| `artifacts` | yes when the result requires fields | object satisfying that result's contract |
+
 A missing file, unreadable JSON, or a schema violation on a step that asked for
 one **pauses the run** — see [Uncertainty pauses](#uncertainty-pauses). The
 attempt keeps its absent outcome and the reason it was rejected. Nothing is
 guessed and nothing is synthesized.
 
-A `"failed"` outcome is not a missing one. It is a real, declared result, and
-it follows the definition's own routes.
+A `"failed"` outcome, or a declared negative result like `not-reproduced`, is
+not a missing one. It is a real, declared result, and it follows the
+definition's own routes.
 
 An outcome-bearing step whose prompt renders empty records a null outcome
-without reading the file and without pausing: no outcome instruction was
-given, so anything on disk is stale by definition, and nothing was asked.
+without reading the file and without pausing *in format 1*: no outcome
+instruction was given, so anything on disk is stale by definition. In format 2
+a step that owes a result and rendered an empty prompt pauses instead — a
+definition that cannot ask for what it requires is not a step that produced
+nothing. An explicit `when: false` remains a deliberate skip in both.
+
+### Declared results (format 2)
+
+A format-2 agent step declares `outcome: null` — no result is asked for — or
+the results it may produce and, per result, the artifact fields that result
+must carry with their JSON types:
+
+```yaml
+outcome:
+  results:
+    reproduced:
+      required: {attempts: string, script_available: boolean}
+    not-reproduced:
+      required: {attempts: string, missing_prerequisites: string}
+```
+
+The prompt is told exactly these names and fields. A result the step does not
+declare, a missing or blank required string, a wrong type, duplicate JSON keys,
+invalid UTF-8, a document over 1 MiB, or nesting deeper than 32 is **not a
+result**: the attempt pauses with a reason naming the field.
+
+What this establishes is structure and attribution — that the step declared
+this result and wrote the evidence it promised. It says nothing about whether
+that evidence is *true*, and nothing in an artifact is ever an instruction.
+
+### Evidence (format 2)
+
+A step declares which prior attempts it needs, by alias:
+
+```yaml
+evidence:
+  reproduction: {steps: [reproduce, reproduce-informed]}
+  rejection: {steps: [verify], after: fix, required: false}
+```
+
+Each selector is resolved **once, when the attempt opens**, and what it
+selected is recorded on that attempt. The prompt, the routing decision, the
+gate message, and recovery after a restart all read those same records, so
+"the evidence this step was given" is a recorded fact rather than a query
+re-run later against a history that has grown. `steps`, `after`, and
+`with_outcome` mean what they mean for format 1's `latest`; `required` (default
+true) says what happens when nothing matches.
+
+A **required** selector that matches nothing pauses the attempt before it
+prompts or routes. An **optional** one binds to explicit absence, which reads
+as missing rather than as an empty value someone wrote.
+
+Format 2 has no `latest` and format 1 has no `evidence`: there is exactly one
+way to read history in each.
 
 ### Command steps
 
@@ -177,18 +261,53 @@ Either way the run [pauses](#uncertainty-pauses) rather than routing.
 A gate parks the run in the persisted `waiting` status with an operator
 message, broadcasts it, and classifies in the `notify` attention tier.
 
-`POST /api/tasks/{id}/workflow/resume` records the operator's optional note as
-the gate's outcome, finishes the gate `ok`, and continues. The request names
-the waiting attempt's sequence number, so a stale browser tab or a double
-submit is refused rather than applied to whatever the run is waiting on now. It
-responds `409` when the run is not waiting or the attempt has moved on, and
-`404` for an unknown task.
+A **format-1 gate** offers one action. `POST
+/api/tasks/{id}/workflow/resume` records the operator's optional note as the
+gate's outcome, finishes the gate `ok`, and continues at the next declared
+step. Resuming a gate that is the last declared step completes the run —
+including when the gate was re-armed by restart recovery.
+
+A **format-2 gate** asks a question with named answers
+([ADR-0030](../../adr/0030-commit-human-decisions-before-advancing.md)):
+
+```yaml
+choices:
+  - id: retry-diagnosis
+    label: Supply information and diagnose again
+    feedback_required: true
+    next: {step: diagnose}
+  - id: stop
+    label: Stop without a fix
+    next: {complete: true, result: stopped-without-fix}
+```
+
+Each choice has a static destination — a declared step or a named completion.
+A choice cannot compute a route and cannot pause, and there is no generic
+Resume to bypass the choices with. The same request carries `choice_id`, and
+`note` becomes that choice's feedback, required when the choice says so.
+
+The question is **persisted before anyone can answer it**: the rendered
+message, the offered choices, and the evidence identities it is asking about.
+That snapshot is what the UI renders and what a submitted choice is checked
+against — not the definition as it stands today — so a decision stays readable
+after the definition changes. The answer is recorded *beside* the question,
+never over it.
+
+An answer commits before the run moves: the decision, the gate attempt's
+completion, and either the successor attempt or the run's named ending land in
+one transaction. A crash before that leaves the same unanswered question; a
+crash after it leaves the successor the answer already opened. A repeated or
+stale submission advances nothing.
+
+Choice edges count as routes. A loop built out of human answers needs a
+declared visit bound like any other, and a retry answer whose target has spent
+its budget goes to that step's exhaustion gate instead of opening another
+attempt. **No answer refills a budget**, and no answer grants authority the
+definition did not declare — answering a gate never starts review, signs,
+pushes, or opens a pull request.
 
 A gate waits indefinitely. Re-notify aging applies to an unanswered gate as it
 does to `waiting-input`.
-
-Resuming a gate that is the last declared step completes the run — including
-when the gate was re-armed by restart recovery.
 
 ### Uncertainty pauses
 
@@ -196,19 +315,20 @@ There is no LLM judge. When the evidence a step or a route needs is missing or
 unreadable, the run stops and says what it was waiting for.
 
 A pause is not a gate, and the UI keeps them apart. A **gate** is the
-definition asking a person to look; resuming finishes it and the run continues
-at the gate's fall-through. A **pause** is the engine refusing to guess; the
-action retries the step that could not be decided, and it never continues past
-it.
+definition asking a person to look — to continue, in format 1, or to choose
+among declared answers, in format 2. A **pause** is the engine refusing to
+guess; the action retries the step that could not be decided, and it never
+continues past it.
 
-Four things pause a run:
+Five things pause a run:
 
 | Reason | What happened |
 |---|---|
 | `missing_outcome` | A prompted step that requires a result left none that could be read |
 | `unresolved_decision` | A route could not be decided from the recorded evidence, or the definition declared a pause for this case |
-| `prompt_unrenderable` | A prompt or gate message referenced a value that is missing and has no declared fallback |
+| `prompt_unrenderable` | A prompt or gate message referenced a value that is missing and has no declared fallback, or a format-2 step that owes a result rendered an empty prompt |
 | `condition_unresolved` | A step's own condition could not be decided |
+| `missing_evidence` | A format-2 step declared a required evidence selector that matched nothing |
 
 None of these is a *negative result*. A `"failed"` outcome, a nonzero command
 exit, and a declared no-match all follow the definition's routes normally.
@@ -241,6 +361,40 @@ set. A retry counts against the step's declared visit bound like any other
 attempt, and once that bound is spent the retry sends the run to the step's
 declared exhaustion gate instead of opening another attempt.
 
+### Compatibility across formats
+
+Both formats execute, side by side, indefinitely. A task runs whatever its
+pinned revision says, and nothing about a new format reaches it.
+
+- A retained format-1 definition keeps its grammar, its canonical bytes and so
+  its revision identity, its outcome protocol, its gate semantics, its routes,
+  and its recovery behavior. Adding format 2 changed none of them.
+- Existing accepted tasks are never rebound. A new `bugfix` launch pins the
+  format-2 revision; a task already running the older one keeps running it.
+- Editing a prompt, a result contract, a gate choice, or a route produces a
+  different revision and invalidates the affected launch preview.
+- A format version this daemon does not implement is refused rather than read
+  under the newest rules it happens to know.
+
+A task created before definitions were retained is offered the current
+definition of its own workflow name as a *continuation candidate*, with a
+compatibility check. Because `bugfix` is now format 2, that check **refuses**:
+its history recorded results under the older success/failed envelope, which a
+contract that reads results by declared name cannot reinterpret, and it ran
+steps the new definition does not declare. The refusal names both reasons. No
+automatic upgrade is offered, the history is left exactly as recorded, and the
+task stays readable, stoppable, and cleanable.
+
+### Terminal work results (format 2)
+
+`workflow_status` says a run stopped. In format 2 the run also records *what
+stopping meant*, as the `result` named by the destination that ended it. The
+packaged bugfix declares `validated`, `validated-without-reproduction`,
+`stopped-without-fix`, and `stopped-unvalidated`.
+
+A format-1 run has no name for its ending and none is invented for it: the
+field is null, which reads as *not recorded* rather than as an empty verdict.
+
 ### The single-step workflow
 
 Sessions `('main',)`, primary `main`. One agent step named `work` on role
@@ -265,12 +419,19 @@ run was `running` or `waiting` resumes at its persisted current step, by kind:
 | `agent`, prompt sent | Send a fixed resume-nudge once, continue to the turn boundary |
 | `command` | Re-run |
 | `decision` | Re-evaluate against persisted records |
-| `gate` | Re-arm the waiting state and re-broadcast |
+| `gate` | Re-arm the waiting state and re-broadcast the persisted question |
 | paused | Re-arm the pause exactly as persisted — no prompt, no automatic retry |
 
 Recovery re-drives the attempt that was already open rather than closing it and
 appending another. A restart is not a work attempt, so it costs nothing against
-a step's declared visit bound.
+a step's declared visit bound, and it re-binds no evidence: an attempt keeps
+the records it froze when it opened.
+
+An unanswered format-2 gate is re-armed as **the same question** — the stored
+snapshot is re-broadcast, not re-rendered from today's history. An answered one
+is never re-armed: because the decision and its successor commit together, a
+restart finds either the untouched question or the successor the answer already
+opened, and never a decision to make twice.
 
 The pinned definition is resolved and validated *before* any session is resumed
 or any step is chosen. A revision that is absent, damaged, or written for a
@@ -285,7 +446,9 @@ its transcript and last applied policy stay on record.
 
 The resume nudge exists because the resumed session retains its context —
 restarting the prompt would duplicate work. For outcome-bearing steps the
-nudge re-states the outcome-file instruction.
+nudge re-states the outcome-file instruction; in format 2 it re-states the
+step's whole result contract, since the interrupted turn may never have been
+told which results it may declare.
 
 Each session is resumed on **the policy it last actually ran**, recorded on the
 session itself — not on the task's first step's policy, and not on today's

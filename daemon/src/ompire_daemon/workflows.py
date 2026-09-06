@@ -172,8 +172,10 @@ def result_instruction(contract: OutcomeContract) -> str:
     is finishing the step, not failing it.
     """
     lines = [
-        "When you have finished the work above, write your result as JSON to "
-        f"`{OUTCOME_PATH}` with exactly this envelope:",
+        (
+            "When you have finished the work above, write your result as JSON "
+            f"to `{OUTCOME_PATH}` with exactly this envelope:"
+        ),
         "{",
         '  "version": 2,',
         '  "result": "<one of the results below>",',
@@ -194,12 +196,14 @@ def result_instruction(contract: OutcomeContract) -> str:
     lines.extend(
         [
             "",
-            "Report the result that is actually true, including a negative "
-            "one: every result listed above has a declared route, and a "
-            "negative result is a real answer rather than a failure. Do not "
-            "use a name that is not listed, and do not leave a required "
-            "artifact empty — the run stops for a person rather than "
-            "continuing on a result it cannot read.",
+            (
+                "Report the result that is actually true, including a "
+                "negative one: every result listed above has a declared "
+                "route, and a negative result is a real answer rather than a "
+                "failure. Do not use a name that is not listed, and do not "
+                "leave a required artifact empty — the run stops for a person "
+                "rather than continuing on a result it cannot read."
+            ),
         ]
     )
     return "\n".join(lines)
@@ -1841,7 +1845,7 @@ __all__ = [
     "read_outcome",
     "read_result",
     "register_catalog",
-    "result_instruction",
     "reset_catalog",
+    "result_instruction",
     "uninstall_definition",
 ]
