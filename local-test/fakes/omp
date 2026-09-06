@@ -24,8 +24,8 @@ captured live from omp 17.0.1 inside the QA workshop container.
 Scenario selection happens at prompt time (the daemon authors the prompts):
   1. a [[scenario:<name>]] line in the prompt text (+ [[scenario-param:k=v]])
   2. a one-shot armed scenario in <state>/omp-scenarios.json (clone, global)
-  3. classification of daemon-authored prompts (ship draft markers, judge
-     preamble, resume nudge, blockquoted review comments)
+  3. classification of daemon-authored prompts (ship draft markers, resume
+     nudge, retry preamble, blockquoted review comments)
   4. default: happy
 Process-level scenarios (silent, crash, exit-after-ready, ignore-term,
 get-state-fails) resolve at launch from the control file's startup slot.
@@ -57,10 +57,12 @@ CAPTURED_VERSION = "17.0.1"
 # --- literals from the daemon source (classification anchors) ---------------
 # ship.py:_DRAFT_PROMPT carries these markers.
 _DRAFT_MARKERS = ("<<<COMMIT_MESSAGE>>>", "<<<PR_TITLE>>>")
-# workflows.py:_run_judge's prompt opener.
-_JUDGE_PREFIX = "You are the fallback judge for the ompire workflow engine"
 # workflows.py:RESUME_NUDGE.
 _NUDGE_PREFIX = "The daemon restarted while you were working; please continue."
+# workflows.py:RETRY_PREFIX — an operator-authorized retry after an
+# uncertainty pause. Deliberately distinct from the restart nudge: the
+# previous turn ran to completion, so this one is told to inspect first.
+_RETRY_PREFIX = "Your previous attempt at this step finished without leaving"
 # review.py:_COMMENTS_PROMPT_PREFIX opens every comment loopback.
 _REVIEW_PREFIX = "The reviewer left the following comments on your changes."
 # workflows.py:OUTCOME_INSTRUCTION names this path inside backticks.
@@ -74,8 +76,8 @@ _PARAM_RE = re.compile(r"\[\[scenario-param:([a-z0-9-]+)=([^\]]*)\]\]")
 
 KNOWN_SCENARIOS = {
     # behavior
-    "happy", "outcome-failed", "ship-draft", "judge", "review-comments",
-    "resume-nudge", "commit",
+    "happy", "outcome-failed", "no-outcome", "ship-draft", "review-comments",
+    "resume-nudge", "retry-prefix", "commit",
     # protocol (promoted from daemon/tests/fake_omp.py)
     "die", "fail", "garbage", "big", "queue", "no-end", "ask", "approve",
     "ask-cancel", "bad-ask", "auto-retry", "auto-retry-hang",
@@ -562,11 +564,7 @@ class Engine:
             emit({"type": "note", "text": "still alive"})
         if scenario == "queue":
             self.queued = 1
-        if scenario == "judge":
-            route = params.get("route", "__complete__")
-            write_outcome(scenario, turn, artifacts={"route": route})
-            assistant_text = f"judged: route {route}"
-        elif scenario == "outcome-failed":
+        if scenario == "outcome-failed":
             write_outcome(scenario, turn, status="failed")
             assistant_text = f"{scenario} turn {turn} failed"
         elif scenario == "ship-draft":
@@ -578,6 +576,12 @@ class Engine:
             subject, error = git_commit(turn)
             assistant_text = (
                 f"committed: {subject}" if subject else f"commit failed: {error}")
+        elif scenario == "no-outcome":
+            # A prompted, outcome-bearing step that leaves nothing readable.
+            # The engine must stop and say so rather than classify it
+            # (ADR-0028); this is the only way to produce that condition
+            # without editing daemon state.
+            assistant_text = f"{scenario} turn {turn}: no outcome written"
         elif scenario == "review-comments":
             assistant_text = (
                 "addressed review comments:\n"
@@ -586,7 +590,8 @@ class Engine:
                     for ln in message.splitlines() if ln.startswith(">"))
             )
 
-        if _OUTCOME_HINT in message and scenario not in {"judge", "outcome-failed"}:
+        if _OUTCOME_HINT in message and scenario not in {
+                "outcome-failed", "no-outcome"}:
             write_outcome(scenario, turn)
             if scenario != "commit":
                 append_work_artifact(scenario, turn)
@@ -764,10 +769,10 @@ def resolve_scenario(message: str,
 def classify_prompt(message: str) -> str:
     if all(marker in message for marker in _DRAFT_MARKERS):
         return "ship-draft"
-    if message.startswith(_JUDGE_PREFIX):
-        return "judge"
     if message.startswith(_NUDGE_PREFIX):
         return "resume-nudge"
+    if message.startswith(_RETRY_PREFIX):
+        return "retry-prefix"
     lines = [ln for ln in message.splitlines() if ln.strip()]
     if message.startswith(_REVIEW_PREFIX) and any(
             ln.lstrip().startswith(">") for ln in lines):
@@ -1023,17 +1028,16 @@ def selfcheck() -> None:
               outcome.get("status") == "failed")
         p.terminate(); p.wait()
 
+        # A prompted, outcome-bearing step that leaves nothing readable —
+        # the condition the engine must stop on rather than classify.
+        (clone / OUTCOME_PATH).unlink(missing_ok=True)
         p = session()
         read_frames(p, 1)
-        send_prompt(p, "[[scenario:judge]]\n[[scenario-param:route=fix]]\n"
-                       "judge it", "r1")
+        send_prompt(p, "[[scenario:no-outcome]]\nwork, and write "
+                       + _OUTCOME_HINT, "r1")
         read_frames(p, 10)
-        try:
-            outcome = json.loads((clone / OUTCOME_PATH).read_text())
-        except (OSError, json.JSONDecodeError):
-            outcome = {}
-        check("judge writes parameterized route",
-              outcome.get("artifacts", {}).get("route") == "fix")
+        check("no-outcome leaves no outcome file",
+              not (clone / OUTCOME_PATH).exists())
         p.terminate(); p.wait()
 
         # git commit scenario (real repo)
@@ -1085,18 +1089,22 @@ Format your reply as:
               text[:60])
         p.terminate(); p.wait()
 
-        judge_prompt = ("You are the fallback judge for the ompire workflow "
-                        "engine: classify this.")
+        # An operator-authorized retry after an uncertainty pause carries the
+        # daemon's retry preamble, and is classified apart from the restart
+        # nudge: one says "continue", the other says "inspect first".
+        retry_prompt = ("Your previous attempt at this step finished without "
+                        "leaving a valid result, so an operator asked for "
+                        "another attempt. The original instruction follows.\n\n"
+                        "do the thing")
         p = session()
         read_frames(p, 1)
-        send_prompt(p, judge_prompt, "r1")
+        send_prompt(p, retry_prompt, "r1")
         read_frames(p, 10)
-        try:
-            outcome = json.loads((clone / OUTCOME_PATH).read_text())
-        except (OSError, json.JSONDecodeError):
-            outcome = {}
-        check("judge prompt classified", outcome.get("artifacts", {})
-              .get("route") == "__complete__")
+        send(p, {"id": "g1", "type": "get_last_assistant_text"})
+        frames = read_frames(p, 1)
+        text = frames[0].get("data", {}).get("text", "") if frames else ""
+        check("retry preamble classified apart from the restart nudge",
+              text.startswith("retry-prefix"), text[:60])
         p.terminate(); p.wait()
 
         p = session()

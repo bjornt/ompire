@@ -158,6 +158,7 @@ describe("review presentation", () => {
           status: "ok",
           outcome: null,
           error: null,
+          pause: null,
           prompted_at: null,
           started_at: "t0",
           finished_at: "t1",
@@ -171,6 +172,7 @@ describe("review presentation", () => {
           status: "running",
           outcome: null,
           error: null,
+          pause: null,
           prompted_at: null,
           started_at: "t2",
           finished_at: null,
@@ -194,12 +196,26 @@ describe("review presentation", () => {
           status: "ok",
           outcome: null,
           error: null,
+          pause: null,
           prompted_at: null,
           started_at: "t0",
           finished_at: "t1",
         },
       ],
     };
-    expect(primarySessionName({ reproducer: idle }, workflow)).toBe("coder");
+    // The daemon resolves the primary through the task's own pinned
+    // definition and sends it on the task; the client never derives it from
+    // the workflow's name (ADR-0028).
+    expect(
+      primarySessionName({ reproducer: idle }, workflow, {
+        workflow_primary_session: "coder",
+      }),
+    ).toBe("coder");
+    // Without it — a legacy task nobody has confirmed — the primary is
+    // genuinely unknown, and the first known session is a display fallback
+    // rather than a claim that review should attach there.
+    expect(primarySessionName({ reproducer: idle }, workflow, undefined)).toBe(
+      "reproducer",
+    );
   });
 });

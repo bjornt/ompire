@@ -120,21 +120,20 @@ configures nothing.
 
 | Key | Retired in favour of |
 |---|---|
-| `judge_model` | The judge's own accepted model binding, chosen at launch |
+| `judge_model` | Nothing. The workflow engine no longer runs a judge at all. |
 
-The workflow engine's judge has no separate model setting any more. It is an
-ordinary model consumer: it declares the `slow` role, inherits the task's model
-profile, is disclosed in the launch preview beside every declared step, and can
-be given a different profile or role there like any agent step (ADR-0026,
-ADR-0027).
+The engine used to ask a reserved LLM session to classify a result it could not
+read, and continue on the answer. That is gone (ADR-0028): when a step leaves
+no valid result, or a route cannot be decided from the recorded evidence, the
+run stops and waits for you with the reason attached. Every model a run uses
+now belongs to a declared step you can see in the launch preview.
 
-Ompire never rewrites your `config.toml`. If it finds `judge_model` set, it
-records the value and asks you to acknowledge, per affected project, that the
-profile's `slow` binding replaces it — see
+So there is no binding to move this value to. Ompire never rewrites your
+`config.toml`; if it finds `judge_model` set, it records the value and asks you
+to acknowledge, per affected project, that it configures nothing — see
 [Projects](projects.md#launch-configuration-state). Acknowledging an unchanged
 value is a one-time step; changing the value later surfaces it again as new
-evidence rather than applying it to anything. If you want that exact model for
-judging, bind it as `slow` in a profile and remove the key.
+evidence rather than applying it to anything. Removing the key is safe.
 
 ## Example
 

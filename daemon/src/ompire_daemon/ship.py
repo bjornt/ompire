@@ -275,7 +275,7 @@ class ShipManager:
         The state claim happens before the first await so concurrent callers
         cannot both prompt the agent.
         """
-        from ompire_daemon.workflows import get_workflow
+        from ompire_daemon.taskdefinition import task_primary_session
 
         existing = self._ships.get(task.id)
         if existing is not None and not replace:
@@ -293,7 +293,9 @@ class ShipManager:
         ):
             raise ShipAlreadyPublishedError(task.id)
 
-        primary = get_workflow(task.workflow_name).primary
+        # The primary session *this task's pinned definition* declares
+        # (ADR-0028), not what the workflow name resolves to today.
+        primary = task_primary_session(self._engine, task)
         # Drafting continues the primary session's conversation on the policy
         # it last applied (ADR-0027), acquired inside that session's boundary.
         handle = await self._agents.acquire(task.id, primary)
@@ -441,7 +443,7 @@ class ShipManager:
             )
 
         updated = mark_pr_url(self._engine, task.id, pr_url)
-        self._hub.publish("task_updated", task_payload(updated))
+        self._hub.publish("task_updated", task_payload(updated, engine=self._engine))
         state = self._set_state(task.id, status="shipped", pr_url=pr_url, error=None)
         self._hub.publish(
             "ship_finished",

@@ -35,9 +35,11 @@ class _RecordingRunner:
 
     def __init__(self) -> None:
         self.started: list[int] = []
+        self.revisions: list[str] = []
 
-    def start_run(self, task) -> None:
+    def start_run(self, task, revision) -> None:
         self.started.append(task.id)
+        self.revisions.append(revision.revision)
 
 LOCAL_MARKER = "additions:\n  - source: project-local\n"
 GLOBAL_MARKER = "additions:\n  - source: operator-global\n"

@@ -44,9 +44,8 @@ never recomputed (ADR-0026). It carries:
 |---|---|
 | `provenance` | `accepted`, or `legacy-confirmed` for a pre-upgrade task the operator confirmed |
 | `model_profile_name` / `model_profile_source` | Which profile, and whether it was inherited from the project or selected for this task |
-| `roles` | All four role bindings, model and thinking level together |
-| `step_roles` | Which abstract role each agent step of the workflow consumes |
-| `judge_role` | The role the conditional judge uses — `slow` |
+| `workflow_binding` | The pinned workflow revision, how it was bound, and — for a confirmed legacy task — the boundary before which history ran under an unretained definition. `null` only for a task that predates retained revisions. |
+| `step_bindings` | One complete binding per declared agent step: its source profile and where that came from, its role and where that came from, and the full four-role map |
 | `workspace` | The effective base branch, branch pattern, Workshop additions source, and preamble |
 | `workspace_overrides` | Which of those four the task overrode rather than inherited |
 | `branch` | The rendered branch name |

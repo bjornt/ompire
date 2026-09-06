@@ -43,7 +43,7 @@ from ompire_daemon.review import ReviewManager, restore_reviews
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import ShipManager
 from ompire_daemon.static import DEFAULT_FRONTEND_DIST, mount_frontend
-from ompire_daemon.workflows import WorkflowRunner
+from ompire_daemon.workflows import WorkflowRunner, register_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -128,14 +128,25 @@ async def _prepare_startup(
     sessions: SessionTracker,
     project_setup: ProjectSetupManager,
 ) -> list[Any]:
-    """Finish the upgrade, resolve interrupted project clones and reviews,
-    restore any parked clone or Workshop staging, then classify startup tasks.
+    """Retain the packaged workflow definitions, finish the upgrade, resolve
+    interrupted project clones and reviews, restore any parked clone or
+    Workshop staging, then classify startup tasks.
 
-    Order matters here. Launch-configuration initialization runs *first*: a
-    project or task the upgrade left blocked has to be blocked before the
+    Order matters here. The packaged definitions are retained *first*: a task
+    accepted in this process will pin one of them, and recovery resolves every
+    existing task through its own retained revision, so neither can run before
+    the rows exist (ADR-0028). Launch-configuration initialization comes next:
+    a project or task the upgrade left blocked has to be blocked before the
     classifier hands it to recovery, or the daemon would try to resume a run
     whose model policy nobody has confirmed.
     """
+    # Every installed definition, retained under its content identity. A
+    # packaged definition that does not parse or validate raises out of here
+    # and stops the daemon: shipping an unexecutable built-in is a build
+    # error, and starting anyway would leave launches silently unavailable.
+    retained = register_catalog(engine)
+    if retained:
+        logger.info("retained %d new workflow revision(s)", len(retained))
     # Finish what migration 0013 could not: seed ordinary defaults for
     # projects that never had a template, and record any retired `judge_model`
     # as evidence to acknowledge (ADR-0026). Idempotent across restarts.

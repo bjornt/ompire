@@ -1,11 +1,16 @@
 """Workflow-engine tests: the runner driving `AgentSupervisor` with the fake
 omp (same monkeypatch pattern as test_sessions.py), fake workshop CLI for
-command steps, and test-registered workflows for multi-step coverage.
+command steps, and test-installed YAML definitions for multi-step coverage.
 
-Covers (tasks.md 2.7): single-step parity (prompt bytes, empty-prompt idle),
-outcome written/missing/malformed, command exit codes and infra failure,
-decision routing + escalation gate, gate resume, and a multi-step run with
-two named sessions.
+Covers single-step parity (prompt bytes, empty-prompt idle), the outcome
+convention, command exit codes and infra failure, decision routing and
+declared gates, restart recovery, and the whole bugfix built-in.
+
+Two things are new here and load-bearing (ADR-0028). Every run executes the
+definition the *task* pinned, so a test can edit the catalog and prove the
+running task is unaffected. And the engine never guesses: a missing required
+outcome or an undecidable route pauses with its reason, and only an explicit
+operator retry opens another attempt.
 """
 
 from __future__ import annotations
@@ -28,28 +33,30 @@ from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.sessions import get_session
 from ompire_daemon.registry.tasks import Task, create_task, get_task
-from ompire_daemon.registry.workflows import list_step_records
+from ompire_daemon.registry.workflows import (
+    WorkflowWaitConflictError,
+    list_step_records,
+)
 from ompire_daemon.sessions import SessionTracker
+from ompire_daemon.taskdefinition import (
+    TaskDefinitionUnavailableError,
+    resolve_task_definition,
+)
 from ompire_daemon.workflows import (
     COMPLETE,
-    JUDGE_SESSION,
-    AgentStep,
-    CommandStep,
-    DecisionStep,
-    GateStep,
-    Workflow,
-    WorkflowDefinitionError,
+    UnknownWorkflowNameError,
     WorkflowNotWaitingError,
     WorkflowRunner,
-    register_workflow,
-    registered_workflows,
-    unregister_workflow,
+    catalog_names,
+    current_revision,
 )
 from tests.conftest import (
     TEST_ROLES,
     fake_argv_builder,
+    install_test_workflow,
     make_execution_inputs,
     make_test_policy,
+    register_builtin_workflows,
 )
 
 DEBOUNCE = 0.1
@@ -62,17 +69,21 @@ def engine(tmp_path: Path) -> Engine:
     db_path = db_path_for(data_dir)
     ensure_db_dir(db_path)
     upgrade_head(db_path)
-    return make_engine(db_path)
+    engine = make_engine(db_path)
+    register_builtin_workflows(engine)
+    return engine
 
 
 @pytest.fixture
 def project(engine: Engine, tmp_path: Path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir(parents=True, exist_ok=True)
     return create_project(
         engine,
         name="demo",
         title="Demo",
         upstream_url="https://example.com/demo.git",
-        checkout_path=str(tmp_path / "checkout"),
+        checkout_path=str(checkout),
         default_checkout_root=tmp_path,
     )
 
@@ -86,11 +97,13 @@ def _make_task(
     preamble: str = "",
     roles: dict | None = None,
     slug: str | None = None,
+    revision=None,
     **bindings,
 ) -> Task:
-    """A task carrying the launch inputs it was accepted under (ADR-0026).
-    The engine reads preamble and role bindings off the task; there is no
-    second object to hand it."""
+    """A task carrying the launch inputs it was accepted under, definition
+    included (ADR-0026, ADR-0028). The engine reads the preamble, the role
+    bindings, and the pinned revision off the task; there is no second object
+    to hand it."""
     name = slug or f"task-{workflow}"
     clone_path = tmp_path / "tasks" / name
     clone_path.mkdir(parents=True, exist_ok=True)
@@ -108,9 +121,20 @@ def _make_task(
             preamble=preamble,
             roles=roles,
             branch="ompire/task",
+            revision=revision,
             **bindings,
         ),
     )
+
+
+def _start(runner: WorkflowRunner, engine: Engine, task: Task) -> None:
+    """Start the run the way the spawn pipeline does: through the task's own
+    pinned definition."""
+    runner.start_run(task, resolve_task_definition(engine, task))
+
+
+def _recover(runner: WorkflowRunner, engine: Engine, task: Task) -> None:
+    runner.recover_run(task, resolve_task_definition(engine, task))
 
 
 @pytest.fixture
@@ -142,6 +166,37 @@ async def rig(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         await supervisor.shutdown()
 
 
+def _restart_rig(engine: Engine, tmp_path: Path):
+    """Fresh in-memory machinery over the same database: what the next daemon
+    process would have."""
+    hub = EventHub()
+    tracker = SessionTracker(hub, idle_debounce=DEBOUNCE, stall_threshold=300)
+    config = Config(
+        data_dir=tmp_path / "data",
+        task_dir_root=tmp_path / "tasks",
+        checkout_root=tmp_path / "proj",
+        session_idle_debounce=DEBOUNCE,
+        spawn_step_timeout=10,
+    )
+    supervisor = AgentSupervisor(config, hub, tracker)
+    return WorkflowRunner(engine, config, hub, supervisor, tracker), supervisor, tracker, hub
+
+
+async def _resume_recorded_sessions(engine, supervisor, tracker, task) -> None:
+    from ompire_daemon.registry.sessions import list_resumable_sessions
+
+    for row in list_resumable_sessions(engine, task.id):
+        tracker.recovering(task.id, row.name)
+        await supervisor.start(
+            task.id,
+            row.name,
+            task.clone_path,
+            resume=row.omp_session_id,
+            policy=make_test_policy(),
+        )
+        tracker.session_recovered(task.id, row.name)
+
+
 async def wait_for_run(engine: Engine, task_id: int, statuses: set[str], timeout: float = 10.0):
     """Poll the registry until the run lands in one of `statuses`."""
     deadline = time.monotonic() + timeout
@@ -170,40 +225,260 @@ def user_prompts(supervisor: AgentSupervisor, task_id: int, session: str) -> lis
     return texts
 
 
-# --- registration validation (2.1) ------------------------------------------
+def waiting_seq(engine: Engine, task_id: int) -> int:
+    """The sequence number of the attempt the run is waiting on."""
+    record = list_step_records(engine, task_id)[-1]
+    assert record.status == "waiting", record
+    return record.seq
 
 
-def test_workflow_definition_validation() -> None:
-    with pytest.raises(WorkflowDefinitionError, match="duplicate step"):
-        Workflow(
-            name="bad",
-            sessions=("main",),
-            steps=(
-                AgentStep(name="a", session="main", prompt=lambda ctx: "x"),
-                AgentStep(name="a", session="main", prompt=lambda ctx: "y"),
-            ),
-        )
-    with pytest.raises(WorkflowDefinitionError, match="undeclared session"):
-        Workflow(
-            name="bad2",
-            sessions=("main",),
-            steps=(AgentStep(name="a", session="ghost", prompt=lambda ctx: "x"),),
-        )
-    with pytest.raises(WorkflowDefinitionError, match="primary"):
-        Workflow(
-            name="bad3",
-            sessions=("main",),
-            steps=(AgentStep(name="a", session="main", prompt=lambda ctx: "x"),),
-            primary="ghost",
-        )
+def resume(runner: WorkflowRunner, engine: Engine, task_id: int, note: str | None = None) -> None:
+    runner.resume_gate(task_id, expected_seq=waiting_seq(engine, task_id), note=note)
 
 
-def test_launch_rejects_an_unregistered_workflow(engine: Engine, project) -> None:
-    """The engine's registry is the only source of valid workflow names, and
-    a launch names one directly now (ADR-0026)."""
+def retry(runner: WorkflowRunner, engine: Engine, task: Task):
+    return runner.retry_step(
+        get_task(engine, task.id),
+        resolve_task_definition(engine, task),
+        expected_seq=waiting_seq(engine, task.id),
+    )
+
+
+# --- test definitions ---------------------------------------------------------
+# Written the way an author writes them: YAML documents installed into the
+# process catalog and retained, exactly as a packaged definition is.
+
+OUTCOME_YAML = """
+format: 1
+name: outcome-wf
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    expects_outcome: true
+    prompt:
+      parts:
+        - value: {op: input, name: task.prompt}
+          format: text
+"""
+
+BRANCH_YAML = """
+format: 1
+name: branch-wf
+sessions: [main]
+primary: main
+steps:
+  - name: probe
+    kind: command
+    argv: ["probe-cmd"]
+    timeout: 5
+    idempotent: true
+  - name: route
+    kind: decision
+    cases:
+      - when:
+          op: eq
+          left:
+            op: get
+            value: {op: latest, steps: [probe]}
+            keys: [outcome, exit_code]
+          right: {op: literal, value: 0}
+        next: {step: fix}
+    otherwise: {step: bail}
+  # Fall-through is linear: the gate sits between the decision and `fix`, so
+  # routing to `fix` skips it, and resuming the gate continues at `fix`.
+  - name: bail
+    kind: gate
+    message:
+      parts:
+        - text: "probe failed; operator call"
+  - name: fix
+    kind: agent
+    session: main
+    prompt:
+      parts:
+        - text: "fix it"
+"""
+
+TWO_SESSION_YAML = """
+format: 1
+name: two-session-wf
+sessions: [coder, reviewer]
+primary: reviewer
+steps:
+  - name: implement
+    kind: agent
+    session: coder
+    prompt:
+      parts:
+        - text: "implement it"
+  - name: inspect
+    kind: agent
+    session: reviewer
+    prompt:
+      separator: ""
+      parts:
+        - text: "records so far: "
+        - value: {op: count, step: implement}
+          format: text
+"""
+
+GATE_YAML = """
+format: 1
+name: gate-wf
+sessions: [main]
+primary: main
+steps:
+  - name: approve
+    kind: gate
+    message:
+      parts:
+        - text: "ship it?"
+  - name: after
+    kind: command
+    argv: ["true"]
+    timeout: 5
+    idempotent: true
+"""
+
+SHARED_SESSION_YAML = """
+format: 1
+name: shared-policy
+sessions: [shared]
+primary: shared
+steps:
+  - name: first
+    kind: agent
+    session: shared
+    prompt:
+      parts:
+        - text: "first turn"
+  - name: second
+    kind: agent
+    session: shared
+    prompt:
+      parts:
+        - text: "second turn"
+"""
+
+LOOP_YAML = """
+format: 1
+name: loop-policy
+sessions: [coder, checker]
+primary: coder
+steps:
+  - name: fix
+    kind: agent
+    session: coder
+    max_visits: 2
+    on_exhausted: {step: stop}
+    prompt:
+      separator: ""
+      parts:
+        - text: "fix "
+        - value: {op: count, step: fix}
+          format: text
+  - name: check
+    kind: agent
+    session: checker
+    prompt:
+      parts:
+        - text: "check"
+  - name: again
+    kind: decision
+    cases:
+      - when:
+          op: lt
+          left: {op: count, step: fix}
+          right: {op: literal, value: 2}
+        next: {step: fix}
+    otherwise: {complete: true}
+  - name: stop
+    kind: gate
+    message:
+      parts:
+        - text: "out of attempts"
+"""
+
+
+@pytest.fixture
+def outcome_workflow(engine: Engine):
+    return install_test_workflow(engine, OUTCOME_YAML)
+
+
+@pytest.fixture
+def branch_workflow(engine: Engine, fake_workshop_cli: Path):
+    """Install the branching definition; the autouse fake workshop exits 0 for
+    any command, so `probe-cmd` records exit_code 0 by default."""
+    return install_test_workflow(engine, BRANCH_YAML)
+
+
+# --- the catalog and the pinned revision (ADR-0028) ---------------------------
+
+
+def test_the_packaged_definitions_are_the_catalog() -> None:
+    assert catalog_names() == ("bugfix", "single-step")
+    revision = current_revision("single-step")
+    assert revision.revision.startswith("sha256:")
+    assert revision.definition.primary == "main"
+    with pytest.raises(UnknownWorkflowNameError):
+        current_revision("no-such-workflow")
+
+
+def test_a_broken_packaged_definition_stops_the_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shipping an unexecutable built-in is a build error.
+
+    Starting anyway would leave launches silently unavailable, and the failure
+    would surface on a task rather than on the release.
+    """
+    from ompire_daemon import workflows as workflows_module
+
+    class _BadResource:
+        def read_text(self, encoding: str = "utf-8") -> str:
+            return "format: 1\nname: single-step\nsessions: []\n"
+
+    class _BadPackage:
+        def __truediv__(self, _name: str) -> _BadResource:
+            return _BadResource()
+
+    monkeypatch.setattr(
+        workflows_module.resources, "files", lambda _package: _BadPackage()
+    )
+    workflows_module.reset_catalog()
+    with pytest.raises(workflows_module.PackagedWorkflowError, match="is invalid"):
+        workflows_module.load_packaged_workflows()
+
+
+def test_a_missing_packaged_resource_stops_the_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ompire_daemon import workflows as workflows_module
+
+    class _AbsentResource:
+        def read_text(self, encoding: str = "utf-8") -> str:
+            raise FileNotFoundError("not packaged")
+
+    class _AbsentPackage:
+        def __truediv__(self, _name: str) -> _AbsentResource:
+            return _AbsentResource()
+
+    monkeypatch.setattr(
+        workflows_module.resources, "files", lambda _package: _AbsentPackage()
+    )
+    workflows_module.reset_catalog()
+    with pytest.raises(workflows_module.PackagedWorkflowError, match="missing"):
+        workflows_module.load_packaged_workflows()
+
+
+def test_launch_rejects_an_uninstalled_workflow(engine: Engine, project) -> None:
+    """The installed catalog is the only source of valid workflow names, and a
+    launch names one directly (ADR-0026)."""
     from ompire_daemon.launch import LaunchInputError, LaunchRequest, resolve_launch
 
-    assert "single-step" in registered_workflows()
     request = LaunchRequest(
         project_name="demo",
         workflow_name="no-such-workflow",
@@ -218,14 +493,151 @@ def test_launch_rejects_an_unregistered_workflow(engine: Engine, project) -> Non
     assert exc_info.value.field == "workflow_name"
 
 
-# --- single-step parity (2.4, D-10) ------------------------------------------
+async def test_a_running_task_keeps_its_revision_when_the_definition_changes(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """The point of pinning, end to end.
+
+    A task is accepted under one definition; the installed definition is then
+    edited. The run still sends the prompt it was accepted with, still resolves
+    to its own revision, and the *new* revision is what a new launch would get.
+    Both revisions stay retained and readable at once.
+    """
+    original = install_test_workflow(
+        engine,
+        """
+format: 1
+name: editable
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    prompt:
+      parts:
+        - text: "the original instruction"
+""",
+    )
+    task = _make_task(engine, tmp_path, workflow="editable")
+
+    edited = install_test_workflow(
+        engine,
+        """
+format: 1
+name: editable
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    prompt:
+      parts:
+        - text: "a completely different instruction"
+""",
+    )
+    assert edited.revision != original.revision
+    assert current_revision("editable").revision == edited.revision
+
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"complete"})
+
+    assert user_prompts(supervisor, task.id, "main") == ["the original instruction"]
+    resolved = resolve_task_definition(engine, get_task(engine, task.id))
+    assert resolved.revision == original.revision
+
+    # Both are retained: the old one is still readable after the edit, which
+    # is what makes an old task's history explainable.
+    from ompire_daemon.registry.workflow_definitions import clear_cache, get_revision
+
+    clear_cache()
+    assert get_revision(engine, original.revision).revision == original.revision
+    assert get_revision(engine, edited.revision).revision == edited.revision
+
+    # And the task survives its workflow *name* leaving the catalog entirely —
+    # a later release that drops a definition. Nothing resolves by name.
+    from ompire_daemon.workflows import uninstall_definition
+
+    uninstall_definition("editable")
+    assert "editable" not in catalog_names()
+    clear_cache()
+    still = resolve_task_definition(engine, get_task(engine, task.id))
+    assert still.revision == original.revision
+    assert still.definition.primary == "main"
+
+
+def test_a_task_whose_revision_is_unavailable_is_refused_not_substituted(
+    engine: Engine, project, tmp_path: Path
+) -> None:
+    """A damaged or absent revision blocks *this* task and says why. It never
+    falls back to the catalog's current definition of the same name."""
+    from sqlalchemy import text as sa_text
+
+    from ompire_daemon.registry.workflow_definitions import clear_cache
+
+    task = _make_task(engine, tmp_path, workflow="single-step")
+    revision = task.execution_inputs.workflow_binding.revision
+    with engine.begin() as conn:
+        conn.execute(
+            sa_text("DELETE FROM workflow_revisions WHERE revision = :rev"),
+            {"rev": revision},
+        )
+    clear_cache()
+
+    with pytest.raises(TaskDefinitionUnavailableError) as exc_info:
+        resolve_task_definition(engine, get_task(engine, task.id))
+    assert exc_info.value.reason == "missing"
+
+    # The task is still listed and still readable: one damaged row must not
+    # take the dashboard with it.
+    from ompire_daemon.registry.tasks import list_tasks, task_payload
+
+    payload = task_payload(get_task(engine, task.id), engine=engine)
+    assert payload["workflow_ready"] is False
+    assert payload["workflow_readiness_reason"] == "missing"
+    assert payload["workflow_primary_session"] is None
+    assert [t.id for t in list_tasks(engine)] == [task.id]
+
+
+def test_a_corrupt_stored_document_fails_its_integrity_check(
+    engine: Engine, project, tmp_path: Path
+) -> None:
+    """Content identity is verified before a retained document is executed, so
+    an edited row cannot masquerade as the revision a task accepted."""
+    from sqlalchemy import text as sa_text
+
+    from ompire_daemon.registry.workflow_definitions import clear_cache
+
+    task = _make_task(engine, tmp_path, workflow="single-step")
+    revision = task.execution_inputs.workflow_binding.revision
+    with engine.begin() as conn:
+        row = conn.execute(
+            sa_text("SELECT document_json FROM workflow_revisions WHERE revision = :r"),
+            {"r": revision},
+        ).scalar_one()
+        tampered = json.loads(row)
+        tampered["steps"][0]["prompt"]["parts"] = [{"text": "do something else"}]
+        conn.execute(
+            sa_text("UPDATE workflow_revisions SET document_json = :d WHERE revision = :r"),
+            {"d": json.dumps(tampered), "r": revision},
+        )
+    clear_cache()
+
+    with pytest.raises(TaskDefinitionUnavailableError) as exc_info:
+        resolve_task_definition(engine, get_task(engine, task.id))
+    assert exc_info.value.reason == "integrity"
+
+
+# --- single-step parity (D-10) ------------------------------------------------
 
 
 async def test_single_step_delivers_preamble_plus_prompt(rig, engine, project, tmp_path: Path) -> None:
     runner, supervisor, tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path, preamble="PRE", prompt="do it")
 
-    runner.start_run(task)
+    _start(runner, engine, task)
     final = await wait_for_run(engine, task.id, {"complete"})
 
     assert final.workflow_status == "complete"
@@ -242,24 +654,28 @@ async def test_single_step_delivers_preamble_plus_prompt(rig, engine, project, t
     assert records[0].outcome is None
     assert records[0].prompted_at is not None
     # The session row carries the captured fake omp identity for --resume.
-    from ompire_daemon.registry.sessions import get_session
-
     session_row = get_session(engine, task.id, "main")
     assert session_row is not None and session_row.omp_session_id == "fake-session-id"
 
 
 async def test_single_step_empty_prompt_sends_nothing(rig, engine, project, tmp_path: Path) -> None:
+    """A rendered-empty prompt spends no turn, and — crucially — does not
+    pause. Nothing was asked, so nothing is missing."""
     runner, supervisor, tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path, preamble="PRE", prompt="")
 
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"complete"})
 
     assert user_prompts(supervisor, task.id, "main") == []
     info = tracker.get(task.id, "main")
     assert info is not None and info.status == "idle"
     assert "no prompt" in info.reason
-    assert list_step_records(engine, task.id)[0].prompted_at is None
+    record = list_step_records(engine, task.id)[0]
+    assert record.prompted_at is None
+    assert record.status == "ok"
+    assert record.pause is None
+    assert "deliberately not prompted" in (record.error or "")
 
 
 async def test_run_fails_when_session_spawn_fails(rig, engine, project, tmp_path: Path) -> None:
@@ -267,7 +683,7 @@ async def test_run_fails_when_session_spawn_fails(rig, engine, project, tmp_path
     scenario["name"] = "crash"
     task = _make_task(engine, tmp_path)
 
-    runner.start_run(task)
+    _start(runner, engine, task)
     final = await wait_for_run(engine, task.id, {"failed"})
 
     assert final.workflow_status == "failed"
@@ -280,27 +696,7 @@ async def test_run_fails_when_session_spawn_fails(rig, engine, project, tmp_path
     assert records[0].error
 
 
-# --- outcome convention (2.4, D-3) -------------------------------------------
-
-OUTCOME_WORKFLOW = Workflow(
-    name="outcome-wf",
-    sessions=("main",),
-    steps=(
-        AgentStep(
-            name="work",
-            session="main",
-            prompt=lambda ctx: ctx.task.prompt,
-            expects_outcome=True,
-        ),
-    ),
-)
-
-
-@pytest.fixture
-def outcome_workflow():
-    register_workflow(OUTCOME_WORKFLOW)
-    yield OUTCOME_WORKFLOW
-    unregister_workflow(OUTCOME_WORKFLOW.name)
+# --- outcome convention (D-3) -------------------------------------------------
 
 
 async def _write_outcome_when_prompted(
@@ -320,12 +716,37 @@ async def _write_outcome_when_prompted(
     raise RuntimeError("prompt never observed")
 
 
+async def _write_outcome_when_session_prompted(
+    supervisor: AgentSupervisor,
+    task_id: int,
+    session: str,
+    clone_path: Path,
+    content: str,
+    *,
+    prompt_count: int = 1,
+) -> None:
+    """Like `_write_outcome_when_prompted`, but for an arbitrary session and
+    waiting for its Nth prompt (loop revisits prompt a session repeatedly)."""
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if supervisor.get(task_id, session) is not None and len(
+            user_prompts(supervisor, task_id, session)
+        ) >= prompt_count:
+            (clone_path / ".ompire").mkdir(exist_ok=True)
+            (clone_path / ".ompire" / "outcome.json").write_text(content)
+            return
+        await asyncio.sleep(0.01)
+    raise RuntimeError(f"prompt {prompt_count} on session {session} never observed")
+
+
 async def test_outcome_written(rig, engine, project, tmp_path: Path, outcome_workflow) -> None:
     runner, supervisor, _tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path, workflow="outcome-wf")
     # A stale file from "an earlier step" must be unlinked before prompting.
     (Path(task.clone_path) / ".ompire").mkdir(parents=True)
-    (Path(task.clone_path) / ".ompire" / "outcome.json").write_text('{"version": 1, "status": "failed", "summary": "stale"}')
+    (Path(task.clone_path) / ".ompire" / "outcome.json").write_text(
+        '{"version": 1, "status": "failed", "summary": "stale"}'
+    )
 
     writer = asyncio.create_task(
         _write_outcome_when_prompted(
@@ -342,7 +763,7 @@ async def test_outcome_written(rig, engine, project, tmp_path: Path, outcome_wor
             ),
         )
     )
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"complete"})
     await writer
 
@@ -357,20 +778,33 @@ async def test_outcome_written(rig, engine, project, tmp_path: Path, outcome_wor
     assert "outcome.json" in user_prompts(supervisor, task.id, "main")[0]
 
 
-async def test_outcome_missing_is_data_not_failure(rig, engine, project, tmp_path: Path, outcome_workflow) -> None:
-    runner, _supervisor, _tracker, _hub, _scenario = rig
+async def test_a_missing_required_outcome_pauses_instead_of_being_judged(
+    rig, engine, project, tmp_path: Path, outcome_workflow
+) -> None:
+    """The engine had a prompt sent and got nothing readable back. It stops
+    and says so; it does not ask a model what the result probably was, and it
+    does not continue as if the missing result had been accepted."""
+    runner, supervisor, _tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path, workflow="outcome-wf")
 
-    runner.start_run(task)
-    await wait_for_run(engine, task.id, {"complete"})
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
 
     record = list_step_records(engine, task.id)[0]
-    assert record.status == "ok"
-    assert record.outcome is None
+    # The attempt keeps its own kind, its absent result, and its reason.
+    assert (record.kind, record.status, record.outcome) == ("agent", "waiting", None)
     assert record.error and "no outcome file" in record.error
+    assert record.pause is not None
+    assert record.pause["reason"] == "missing_outcome"
+    assert record.pause["retry_step"] == "work"
+    assert "no outcome file" in record.pause["message"]
+    # Nothing was spawned to judge it.
+    assert supervisor.get(task.id, "judge") is None
 
 
-async def test_outcome_malformed_recorded_as_null(rig, engine, project, tmp_path: Path, outcome_workflow) -> None:
+async def test_a_malformed_outcome_pauses_with_the_parse_error(
+    rig, engine, project, tmp_path: Path, outcome_workflow
+) -> None:
     runner, supervisor, _tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path, workflow="outcome-wf")
 
@@ -379,52 +813,254 @@ async def test_outcome_malformed_recorded_as_null(rig, engine, project, tmp_path
             supervisor, task.id, Path(task.clone_path), "not json {"
         )
     )
-    runner.start_run(task)
-    await wait_for_run(engine, task.id, {"complete"})
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
     await writer
 
     record = list_step_records(engine, task.id)[0]
-    assert record.status == "ok"
     assert record.outcome is None
     assert record.error and "JSON" in record.error
+    assert record.pause["reason"] == "missing_outcome"
 
 
-# --- command and decision steps (2.5) ----------------------------------------
+async def test_retrying_opens_a_new_attempt_and_keeps_the_original_record(
+    rig, engine, project, tmp_path: Path, outcome_workflow
+) -> None:
+    """Retry is another attempt at the blocked step, never permission to skip
+    it. The paused attempt keeps its evidence, and the new turn is told the
+    working tree may already have changed."""
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
 
-BRANCH_WORKFLOW = Workflow(
-    name="branch-wf",
-    sessions=("main",),
-    steps=(
-        CommandStep(name="probe", argv=("probe-cmd",), timeout=5),
-        DecisionStep(
-            name="route",
-            route=lambda ctx: "fix"
-            if (ctx.outcome("probe") or {}).get("exit_code") == 0
-            else "bail",
-        ),
-        # Fall-through is linear (design D-2): the gate sits between the
-        # decision and `fix`, so routing to `fix` skips it, and resuming the
-        # gate continues at `fix`.
-        GateStep(name="bail", message=lambda ctx: "probe failed; operator call"),
-        AgentStep(name="fix", session="main", prompt=lambda ctx: "fix it"),
-    ),
-)
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    first = list_step_records(engine, task.id)[0]
+
+    # Wait for the *second* prompt: the engine unlinks any stale outcome file
+    # before re-prompting, so a file written against the first turn is
+    # deliberately not this attempt's result.
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor,
+            task.id,
+            "main",
+            Path(task.clone_path),
+            json.dumps({"version": 1, "status": "success", "summary": "second try"}),
+            prompt_count=2,
+        )
+    )
+    retry(runner, engine, task)
+    await wait_for_run(engine, task.id, {"complete"})
+    await writer
+
+    records = list_step_records(engine, task.id)
+    assert [(r.step, r.status) for r in records] == [("work", "failed"), ("work", "ok")]
+    # The original evidence survives, with the retry recorded beside it.
+    assert "no outcome file" in records[0].error
+    assert "retried by the operator" in records[0].error
+    assert records[0].pause is None
+    assert records[0].seq == first.seq
+    assert records[1].outcome["summary"] == "second try"
+
+    prompts = user_prompts(supervisor, task.id, "main")
+    assert len(prompts) == 2
+    assert prompts[1].startswith("Your previous attempt at this step")
+    assert "inspect the working tree first" in prompts[1]
+    # Not the restart nudge: the previous turn ran to completion.
+    assert "daemon restarted" not in prompts[1]
+    # The original instruction travels with the retry.
+    assert "do it" in prompts[1]
 
 
-@pytest.fixture
-def branch_workflow(fake_workshop_cli: Path):
-    """Register the branching workflow; the autouse fake workshop exits 0 for
-    any command, so `probe-cmd` records exit_code 0 by default."""
-    register_workflow(BRANCH_WORKFLOW)
-    yield BRANCH_WORKFLOW
-    unregister_workflow(BRANCH_WORKFLOW.name)
+async def test_a_retry_announces_exactly_one_new_attempt(
+    rig, engine, project, tmp_path: Path, outcome_workflow
+) -> None:
+    """One attempt, one `started`.
+
+    A client that appends a record on `started` would otherwise draw a third
+    attempt that never existed — which is what a browser check caught.
+    """
+    runner, _supervisor, _tracker, hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
+
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+
+    events: list[dict] = []
+    queue = hub.subscribe()
+
+    async def collect() -> None:
+        while True:
+            event = await queue.get()
+            if event.type == "workflow_step":
+                events.append(event.payload)
+
+    collector = asyncio.create_task(collect())
+    retry(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await asyncio.sleep(0.2)
+    collector.cancel()
+
+    assert [e["status"] for e in events] == ["started", "waiting"]
+    assert len(list_step_records(engine, task.id)) == 2
+
+
+async def test_a_repeated_missing_result_pauses_again(
+    rig, engine, project, tmp_path: Path, outcome_workflow
+) -> None:
+    """Retrying is not a second chance at guessing: the same absence stops the
+    run again rather than falling through."""
+    runner, _supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
+
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    retry(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+
+    records = list_step_records(engine, task.id)
+    assert [(r.step, r.status) for r in records] == [("work", "failed"), ("work", "waiting")]
+    assert records[-1].pause["reason"] == "missing_outcome"
+
+
+async def test_a_retry_cannot_walk_past_a_declared_visit_bound(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """An operator retry is a human decision, not a way around a bound.
+
+    Retrying the blocked step is what the action means — right up to the point
+    where the definition says that step has no attempts left. From there the
+    run goes to the declared exhaustion gate, exactly as the engine would have
+    sent it.
+    """
+    install_test_workflow(
+        engine,
+        """
+format: 1
+name: bounded-retry-wf
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    expects_outcome: true
+    max_visits: 2
+    on_exhausted: {step: stop}
+    prompt:
+      parts:
+        - text: "do it"
+  - name: stop
+    kind: gate
+    message:
+      parts:
+        - text: "out of attempts"
+""",
+    )
+    runner, _supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="bounded-retry-wf")
+
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+
+    # Attempt 1 paused. The bound allows a second, so the retry is a retry.
+    retry(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    records = list_step_records(engine, task.id)
+    assert [(r.step, r.status) for r in records] == [
+        ("work", "failed"),
+        ("work", "waiting"),
+    ]
+
+    # Attempt 2 paused, and the bound is now spent: the next retry lands on
+    # the declared gate rather than opening a third attempt.
+    retry(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    records = list_step_records(engine, task.id)
+    assert [(r.step, r.kind, r.status) for r in records] == [
+        ("work", "agent", "failed"),
+        ("work", "agent", "failed"),
+        ("stop", "gate", "waiting"),
+    ]
+    assert records[-1].outcome == {"message": "out of attempts"}
+    assert records[-1].pause is None
+    assert len([r for r in records if r.step == "work"]) == 2
+
+
+async def test_a_stale_or_repeated_retry_cannot_advance_another_attempt(
+    rig, engine, project, tmp_path: Path, outcome_workflow
+) -> None:
+    """A second browser tab and a double submit look identical from here, and
+    both must be refused rather than applied to whatever is waiting now."""
+    runner, _supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
+
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    stale = waiting_seq(engine, task.id)
+
+    retry(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+
+    revision = resolve_task_definition(engine, get_task(engine, task.id))
+    with pytest.raises(WorkflowWaitConflictError):
+        runner.retry_step(get_task(engine, task.id), revision, expected_seq=stale)
+    # And resuming it as if it were a declared gate is refused too.
+    with pytest.raises(WorkflowNotWaitingError):
+        runner.resume_gate(
+            task.id, expected_seq=waiting_seq(engine, task.id), note="carry on"
+        )
+
+
+async def test_a_pause_survives_restart_without_a_new_prompt(
+    rig, engine, project, tmp_path: Path, outcome_workflow
+) -> None:
+    """Recovery re-arms a persisted pause. It does not re-prompt, does not
+    retry automatically, and does not append a second attempt."""
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="outcome-wf")
+
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await runner.shutdown()
+    await supervisor.shutdown()
+
+    runner2, supervisor2, tracker2, hub2 = _restart_rig(engine, tmp_path)
+    events: list[dict] = []
+    queue = hub2.subscribe()
+
+    async def collect() -> None:
+        while True:
+            event = await queue.get()
+            if event.type == "workflow_step":
+                events.append(event.payload)
+
+    collector = asyncio.create_task(collect())
+    await _resume_recorded_sessions(engine, supervisor2, tracker2, task)
+    _recover(runner2, engine, get_task(engine, task.id))
+    await asyncio.sleep(0.3)
+    collector.cancel()
+
+    assert get_task(engine, task.id).workflow_status == "waiting"
+    records = list_step_records(engine, task.id)
+    assert len(records) == 1 and records[0].status == "waiting"
+    assert records[0].pause["reason"] == "missing_outcome"
+    assert [e["status"] for e in events] == ["waiting"]
+    assert events[0]["pause"]["retry_step"] == "work"
+    # No prompt was sent by the recovery itself.
+    assert user_prompts(supervisor2, task.id, "main") == []
+    await runner2.shutdown()
+    await supervisor2.shutdown()
+
+
+# --- command and decision steps -----------------------------------------------
 
 
 async def test_command_and_decision_routing(rig, engine, project, tmp_path: Path, branch_workflow) -> None:
     runner, supervisor, _tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path, workflow="branch-wf")
 
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"complete"})
 
     records = list_step_records(engine, task.id)
@@ -439,7 +1075,8 @@ async def test_command_exit_code_is_outcome_data(
     rig, engine, project, tmp_path: Path, branch_workflow, fake_workshop_cli: Path
 ) -> None:
     """A non-zero command exit finishes the step ok with the code as outcome;
-    the decision then routes on it (here: to the `bail` gate)."""
+    the decision then routes on it (here: to the `bail` gate). A declared
+    negative result is data, not missing evidence — it never pauses."""
     fake_workshop_cli.write_text(
         "#!/bin/sh\n"
         'case "$*" in\n'
@@ -452,7 +1089,7 @@ async def test_command_exit_code_is_outcome_data(
     runner, _supervisor, _tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path, workflow="branch-wf")
 
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"waiting"})
 
     records = list_step_records(engine, task.id)
@@ -461,12 +1098,13 @@ async def test_command_exit_code_is_outcome_data(
     assert records[0].outcome["exit_code"] == 3
     assert "probe output" in records[0].outcome["output"]
     assert records[1].outcome == {"route": "bail"}
-    # The run parked at the declared gate with its message.
+    # The run parked at the declared gate with its message — not a pause.
     gate = records[2]
     assert gate.kind == "gate" and gate.status == "waiting"
     assert gate.outcome == {"message": "probe failed; operator call"}
+    assert gate.pause is None
 
-    runner.resume_gate(task.id, note="looks fine")
+    resume(runner, engine, task.id, note="looks fine")
     await wait_for_run(engine, task.id, {"complete"})
     records = list_step_records(engine, task.id)
     gate = records[2]
@@ -490,136 +1128,193 @@ async def test_command_infra_failure_fails_run(
         '  *) exit 0 ;;\n'
         "esac\n"
     )
-    workflow = Workflow(
-        name="slow-cmd-wf",
-        sessions=("main",),
-        steps=(CommandStep(name="slow", argv=("slow-cmd",), timeout=0.2),),
+    install_test_workflow(
+        engine,
+        """
+format: 1
+name: slow-cmd-wf
+sessions: [main]
+primary: main
+steps:
+  - name: slow
+    kind: command
+    argv: ["slow-cmd"]
+    timeout: 0.2
+    idempotent: true
+""",
     )
-    register_workflow(workflow)
-    try:
-        runner, _supervisor, _tracker, _hub, _scenario = rig
-        task = _make_task(engine, tmp_path, workflow="slow-cmd-wf")
+    runner, _supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="slow-cmd-wf")
 
-        runner.start_run(task)
-        final = await wait_for_run(engine, task.id, {"failed"})
+    _start(runner, engine, task)
+    final = await wait_for_run(engine, task.id, {"failed"})
 
-        assert final.state == "created"
-        records = list_step_records(engine, task.id)
-        assert records[0].status == "failed"
-        assert "timed out" in (records[0].error or "")
-    finally:
-        unregister_workflow(workflow.name)
+    assert final.state == "created"
+    records = list_step_records(engine, task.id)
+    assert records[0].status == "failed"
+    assert "timed out" in (records[0].error or "")
 
 
-async def test_decision_unresolvable_escalates_to_gate(rig, engine, project, tmp_path: Path) -> None:
-    def raise_route(ctx) -> str:
-        raise RuntimeError("missing repro outcome")
-
-    workflow = Workflow(
-        name="raise-wf",
-        sessions=("main",),
-        steps=(
-            DecisionStep(name="triage", route=raise_route),
-            CommandStep(name="after", argv=("true",), timeout=5),
-        ),
+async def test_an_undecidable_route_pauses_with_its_reason(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """A decision whose evidence is missing stops the run and names what it
+    was waiting for. It does not skip to a later case, and it does not fall
+    through to the next step as if the rule had said "no"."""
+    install_test_workflow(
+        engine,
+        """
+format: 1
+name: undecidable-wf
+sessions: [main]
+primary: main
+steps:
+  - name: triage
+    kind: decision
+    cases:
+      - when:
+          op: eq
+          left:
+            op: get
+            value: {op: latest, steps: [after]}
+            keys: [outcome, exit_code]
+          right: {op: literal, value: 0}
+        next: {complete: true}
+    otherwise: {step: after}
+  - name: after
+    kind: command
+    argv: ["true"]
+    timeout: 5
+    idempotent: true
+""",
     )
-    register_workflow(workflow)
-    try:
-        runner, _supervisor, _tracker, _hub, _scenario = rig
-        task = _make_task(engine, tmp_path, workflow="raise-wf")
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="undecidable-wf")
 
-        runner.start_run(task)
-        await wait_for_run(engine, task.id, {"waiting"})
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
 
-        records = list_step_records(engine, task.id)
-        # Decision finishes ok with the escalation note; the synthesized gate
-        # parks under the decision's own name.
-        assert records[0].step == "triage" and records[0].status == "ok"
-        assert "missing repro outcome" in (records[0].error or "")
-        gate = records[1]
-        assert gate.kind == "gate" and gate.step == "triage" and gate.status == "waiting"
-        assert "missing repro outcome" in gate.outcome["message"]
+    records = list_step_records(engine, task.id)
+    assert len(records) == 1
+    paused = records[0]
+    # The decision keeps its own kind and its absent outcome: no synthesized
+    # gate record, and nothing that could later read as a route.
+    assert (paused.step, paused.kind, paused.status) == ("triage", "decision", "waiting")
+    assert paused.outcome is None
+    assert paused.pause["reason"] == "unresolved_decision"
+    assert "is missing" in paused.pause["message"]
+    assert paused.pause["retry_step"] == "triage"
+    assert supervisor.get(task.id, "judge") is None
 
-        # Resuming continues at the step declared after the decision.
-        runner.resume_gate(task.id, note=None)
-        await wait_for_run(engine, task.id, {"complete"})
-        steps = [r.step for r in list_step_records(engine, task.id)]
-        assert steps == ["triage", "triage", "after"]
-    finally:
-        unregister_workflow(workflow.name)
+    # Retrying re-reads exactly the same recorded evidence, so it pauses
+    # again. That is the honest answer, not a repair.
+    retry(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    records = list_step_records(engine, task.id)
+    assert [(r.step, r.status) for r in records] == [
+        ("triage", "failed"),
+        ("triage", "waiting"),
+    ]
 
 
-async def test_resume_gate_rejects_non_waiting_run(rig, engine, project, tmp_path: Path) -> None:
+async def test_a_declared_otherwise_pause_is_a_route_the_author_chose(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    """`otherwise: {pause: true}` is a definition saying "ask a person" rather
+    than inventing a destination."""
+    install_test_workflow(
+        engine,
+        """
+format: 1
+name: declared-pause-wf
+sessions: [main]
+primary: main
+steps:
+  - name: probe
+    kind: command
+    argv: ["true"]
+    timeout: 5
+    idempotent: true
+  - name: pick
+    kind: decision
+    cases:
+      - when:
+          op: eq
+          left:
+            op: get
+            value: {op: latest, steps: [probe]}
+            keys: [outcome, exit_code]
+          right: {op: literal, value: 99}
+        next: {complete: true}
+    otherwise: {pause: true}
+""",
+    )
+    runner, _supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="declared-pause-wf")
+
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+
+    paused = list_step_records(engine, task.id)[-1]
+    assert paused.step == "pick" and paused.kind == "decision"
+    assert paused.pause["reason"] == "unresolved_decision"
+    assert "wait for a person" in paused.pause["message"]
+
+
+async def test_resume_rejects_a_run_that_is_not_waiting(rig, engine, project, tmp_path: Path) -> None:
     runner, _supervisor, _tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path)
 
     with pytest.raises(WorkflowNotWaitingError):
-        runner.resume_gate(task.id, note=None)
+        runner.resume_gate(task.id, expected_seq=1, note=None)
 
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"complete"})
     with pytest.raises(WorkflowNotWaitingError):
-        runner.resume_gate(task.id, note=None)
+        runner.resume_gate(task.id, expected_seq=1, note=None)
 
 
-# --- multi-step, multi-session (2.7) -----------------------------------------
-
-TWO_SESSION_WORKFLOW = Workflow(
-    name="two-session-wf",
-    sessions=("coder", "reviewer"),
-    primary="reviewer",
-    steps=(
-        AgentStep(name="implement", session="coder", prompt=lambda ctx: "implement it"),
-        AgentStep(
-            name="inspect",
-            session="reviewer",
-            prompt=lambda ctx: f"records so far: {len(ctx.records())}",
-        ),
-    ),
-)
+# --- multi-step, multi-session ------------------------------------------------
 
 
 async def test_multi_step_run_with_two_named_sessions(rig, engine, project, tmp_path: Path) -> None:
-    register_workflow(TWO_SESSION_WORKFLOW)
-    try:
-        runner, supervisor, tracker, _hub, _scenario = rig
-        task = _make_task(engine, tmp_path, workflow="two-session-wf")
+    revision = install_test_workflow(engine, TWO_SESSION_YAML)
+    runner, supervisor, tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="two-session-wf")
 
-        runner.start_run(task)
-        await wait_for_run(engine, task.id, {"complete"})
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"complete"})
 
-        # Each session ran exactly its own step, on its own child process.
-        # At the second step's prompt time, history holds the first step's
-        # finished record (its own record is appended after prompt build).
-        assert user_prompts(supervisor, task.id, "coder") == ["implement it"]
-        assert user_prompts(supervisor, task.id, "reviewer") == ["records so far: 1"]
-        records = list_step_records(engine, task.id)
-        assert [(r.step, r.session, r.status) for r in records] == [
-            ("implement", "coder", "ok"),
-            ("inspect", "reviewer", "ok"),
-        ]
-        for session in ("coder", "reviewer"):
-            info = tracker.get(task.id, session)
-            assert info is not None and info.status == "idle"
-        assert TWO_SESSION_WORKFLOW.primary == "reviewer"
-    finally:
-        unregister_workflow(TWO_SESSION_WORKFLOW.name)
+    # Each session ran exactly its own step, on its own child process. At the
+    # second step's prompt time, history holds the first step's finished
+    # record (its own record is excluded by the sequence boundary).
+    assert user_prompts(supervisor, task.id, "coder") == ["implement it"]
+    assert user_prompts(supervisor, task.id, "reviewer") == ["records so far: 1"]
+    records = list_step_records(engine, task.id)
+    assert [(r.step, r.session, r.status) for r in records] == [
+        ("implement", "coder", "ok"),
+        ("inspect", "reviewer", "ok"),
+    ]
+    for session in ("coder", "reviewer"):
+        info = tracker.get(task.id, session)
+        assert info is not None and info.status == "idle"
+    assert revision.definition.primary == "reviewer"
 
 
-# --- restart recovery (5.3, design D-6) ---------------------------------------
+# --- restart recovery (design D-6) --------------------------------------------
 
 
 async def test_interrupted_agent_step_is_nudged_once(
-    rig, engine, project, tmp_path: Path, outcome_workflow, monkeypatch: pytest.MonkeyPatch
+    rig, engine, project, tmp_path: Path, outcome_workflow
 ) -> None:
-    """Restart mid-turn: the interrupted record closes failed, the resumed
-    session gets ONE resume nudge (not the full prompt), and the step
-    completes from the following turn boundary."""
+    """Restart mid-turn: the resumed session gets ONE resume nudge (not the
+    full prompt), on the SAME attempt — a restart is not a work attempt, and a
+    declared visit bound must not count it as one."""
     runner, supervisor, _tracker, _hub, scenario = rig
     scenario["name"] = "no-end"  # burst without agent_end: the turn never ends
     task = _make_task(engine, tmp_path, workflow="outcome-wf")
 
-    runner.start_run(task)
+    _start(runner, engine, task)
     # Wait until the prompt is durably marked sent (the crash window the
     # nudge path exists for).
     deadline = time.monotonic() + 5
@@ -630,167 +1325,127 @@ async def test_interrupted_agent_step_is_nudged_once(
         await asyncio.sleep(0.02)
     assert records[0].prompted_at is not None
 
-    # Simulate the restart: fresh in-memory machinery over the same DB.
     await runner.shutdown()
     await supervisor.shutdown()
     scenario["name"] = "happy"
-    hub2 = EventHub()
-    tracker2 = SessionTracker(hub2, idle_debounce=DEBOUNCE, stall_threshold=300)
-    config2 = Config(
-        data_dir=tmp_path / "data",
-        task_dir_root=tmp_path / "tasks",
-        checkout_root=tmp_path / "proj",
-        session_idle_debounce=DEBOUNCE,
-        spawn_step_timeout=10,
+    runner2, supervisor2, tracker2, _hub2 = _restart_rig(engine, tmp_path)
+    await _resume_recorded_sessions(engine, supervisor2, tracker2, task)
+
+    writer = asyncio.create_task(
+        _write_outcome_when_prompted(
+            supervisor2,
+            task.id,
+            Path(task.clone_path),
+            json.dumps({"version": 1, "status": "success", "summary": "finished"}),
+        )
     )
-    supervisor2 = AgentSupervisor(config2, hub2, tracker2)
-    runner2 = WorkflowRunner(engine, config2, hub2, supervisor2, tracker2)
-
-    # Recovery resumes the recorded session, then re-drives the run.
-    from ompire_daemon.registry.sessions import list_resumable_sessions
-
-    sessions = list_resumable_sessions(engine, task.id)
-    assert len(sessions) == 1
-    tracker2.recovering(task.id, "main")
-    await supervisor2.start(task.id, "main", task.clone_path, resume=sessions[0].omp_session_id, policy=make_test_policy())
-    tracker2.session_recovered(task.id, "main")
-    runner2.recover_run(get_task(engine, task.id))
-
+    _recover(runner2, engine, get_task(engine, task.id))
     await wait_for_run(engine, task.id, {"complete"})
+    await writer
 
     prompts = user_prompts(supervisor2, task.id, "main")
     assert len(prompts) == 1
     assert prompts[0].startswith("The daemon restarted")
     assert "outcome.json" in prompts[0]  # outcome-bearing: instruction re-stated
     records = list_step_records(engine, task.id)
-    assert [(r.step, r.status) for r in records] == [("work", "failed"), ("work", "ok")]
-    assert "interrupted by daemon restart" in (records[0].error or "")
+    assert [(r.step, r.status) for r in records] == [("work", "ok")]
+    await runner2.shutdown()
+    await supervisor2.shutdown()
 
 
 async def test_unsent_agent_step_sends_fresh_after_restart(
-    rig, engine, project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    rig, engine, project, tmp_path: Path
 ) -> None:
-    """Crash after the step record was created but before the prompt went
-    out: recovery sends the step prompt, not a nudge."""
+    """Crash after the attempt was opened but before the prompt went out:
+    recovery sends the step prompt, not a nudge."""
+    from ompire_daemon.registry.workflows import (
+        append_step_record,
+        finish_step_record,
+        set_run_status,
+    )
+
     runner, supervisor, _tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path)
 
-    runner.start_run(task)
-    # Wait for the record to exist, then "restart" before the prompt lands.
-    # (Racy by nature; prompted_at NULL is what matters, and the nudge path
-    # is separately covered — so force the record state deterministically.)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"complete"})
     await runner.shutdown()
     await supervisor.shutdown()
 
     # Reset the persisted history to the pre-prompt state: one running record
     # with no prompted_at.
-    from ompire_daemon.registry.workflows import append_step_record, finish_step_record
-
     records = list_step_records(engine, task.id)
     finish_step_record(engine, task.id, records[0].seq, status="ok")
-    # Undo the completion to re-enter `running` at a fresh unsent step.
-    from ompire_daemon.registry.workflows import set_run_status
-
     append_step_record(engine, task.id, step="work", kind="agent", session="main")
     set_run_status(engine, task.id, "running", "work")
 
-    hub2 = EventHub()
-    tracker2 = SessionTracker(hub2, idle_debounce=DEBOUNCE, stall_threshold=300)
-    config2 = Config(
-        data_dir=tmp_path / "data",
-        task_dir_root=tmp_path / "tasks",
-        checkout_root=tmp_path / "proj",
-        session_idle_debounce=DEBOUNCE,
-        spawn_step_timeout=10,
-    )
-    supervisor2 = AgentSupervisor(config2, hub2, tracker2)
-    runner2 = WorkflowRunner(engine, config2, hub2, supervisor2, tracker2)
-    runner2.recover_run(get_task(engine, task.id))
+    runner2, supervisor2, _tracker2, _hub2 = _restart_rig(engine, tmp_path)
+    _recover(runner2, engine, get_task(engine, task.id))
 
     await wait_for_run(engine, task.id, {"complete"})
-    prompts = user_prompts(supervisor2, task.id, "main")
-    assert prompts == ["do it"]  # the full step prompt, not the nudge
+    assert user_prompts(supervisor2, task.id, "main") == ["do it"]
+    await runner2.shutdown()
+    await supervisor2.shutdown()
 
 
 async def test_gate_survives_restart(rig, engine, project, tmp_path: Path) -> None:
-    """A run waiting at a gate re-arms after a restart: same record, same
-    message, resumable."""
-    workflow = Workflow(
-        name="gate-wf",
-        sessions=("main",),
-        steps=(
-            GateStep(name="approve", message=lambda ctx: "ship it?"),
-            CommandStep(name="after", argv=("true",), timeout=5),
-        ),
-    )
-    register_workflow(workflow)
-    try:
-        runner, _supervisor, _tracker, _hub, _scenario = rig
-        task = _make_task(engine, tmp_path, workflow="gate-wf")
+    """A run waiting at a declared gate re-arms after a restart: same record,
+    same message, resumable."""
+    install_test_workflow(engine, GATE_YAML)
+    runner, _supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="gate-wf")
 
-        runner.start_run(task)
-        await wait_for_run(engine, task.id, {"waiting"})
-        assert list_step_records(engine, task.id)[0].outcome == {"message": "ship it?"}
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    assert list_step_records(engine, task.id)[0].outcome == {"message": "ship it?"}
 
-        # Restart: fresh runner over the same DB re-arms the same record.
-        await runner.shutdown()
-        hub2 = EventHub()
-        tracker2 = SessionTracker(hub2, idle_debounce=DEBOUNCE, stall_threshold=300)
-        config2 = Config(
-            data_dir=tmp_path / "data",
-            task_dir_root=tmp_path / "tasks",
-            checkout_root=tmp_path / "proj",
-            session_idle_debounce=DEBOUNCE,
-            spawn_step_timeout=10,
-        )
-        supervisor2 = AgentSupervisor(config2, hub2, tracker2)
-        runner2 = WorkflowRunner(engine, config2, hub2, supervisor2, tracker2)
-        events: list[dict] = []
-        queue = hub2.subscribe()
+    await runner.shutdown()
+    runner2, supervisor2, _tracker2, hub2 = _restart_rig(engine, tmp_path)
+    events: list[dict] = []
+    queue = hub2.subscribe()
 
-        async def collect() -> None:
-            while True:
-                event = await queue.get()
-                if event.type == "workflow_step":
-                    events.append(event.payload)
+    async def collect() -> None:
+        while True:
+            event = await queue.get()
+            if event.type == "workflow_step":
+                events.append(event.payload)
 
-        collector = asyncio.create_task(collect())
-        runner2.recover_run(get_task(engine, task.id))
-        await asyncio.sleep(0.2)
-        assert get_task(engine, task.id).workflow_status == "waiting"
-        # Exactly one waiting re-broadcast, same record, same message.
-        assert events == [
-            {
-                "task_id": task.id,
-                "step": "approve",
-                "kind": "gate",
-                "session": None,
-                "status": "waiting",
-                "message": "ship it?",
-            }
-        ]
-        assert len(list_step_records(engine, task.id)) == 1
+    collector = asyncio.create_task(collect())
+    _recover(runner2, engine, get_task(engine, task.id))
+    await asyncio.sleep(0.2)
+    assert get_task(engine, task.id).workflow_status == "waiting"
+    # Exactly one waiting re-broadcast, same record, same message.
+    assert events == [
+        {
+            "task_id": task.id,
+            "step": "approve",
+            "kind": "gate",
+            "session": None,
+            "status": "waiting",
+            "message": "ship it?",
+        }
+    ]
+    assert len(list_step_records(engine, task.id)) == 1
 
-        runner2.resume_gate(task.id, note="yes")
-        await wait_for_run(engine, task.id, {"complete"})
-        collector.cancel()
-        records = list_step_records(engine, task.id)
-        assert records[0].status == "ok"
-        assert records[0].outcome == {"message": "ship it?", "note": "yes"}
-        assert [r.step for r in records] == ["approve", "after"]
-    finally:
-        unregister_workflow("gate-wf")
+    resume(runner2, engine, task.id, note="yes")
+    await wait_for_run(engine, task.id, {"complete"})
+    collector.cancel()
+    records = list_step_records(engine, task.id)
+    assert records[0].status == "ok"
+    assert records[0].outcome == {"message": "ship it?", "note": "yes"}
+    assert [r.step for r in records] == ["approve", "after"]
+    await runner2.shutdown()
+    await supervisor2.shutdown()
 
 
-# --- REST surface (2.6) -------------------------------------------------------
+# --- REST surface -------------------------------------------------------------
 
 
 def test_workflow_resume_endpoint_404_and_409(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
     response = client.post(
-        "/api/tasks/999/workflow/resume", headers=auth_headers, json={}
+        "/api/tasks/999/workflow/resume", headers=auth_headers, json={"expected_seq": 1}
     )
     assert response.status_code == 404
 
@@ -820,331 +1475,153 @@ def test_workflow_resume_endpoint_404_and_409(
         execution_inputs=make_execution_inputs(checkout_path=str(checkout)),
     )
     response = client.post(
-        f"/api/tasks/{task.id}/workflow/resume", headers=auth_headers, json={}
+        f"/api/tasks/{task.id}/workflow/resume",
+        headers=auth_headers,
+        json={"expected_seq": 1},
     )
     assert response.status_code == 409
 
+    # The waiting attempt has to be named: advancing "whatever is waiting now"
+    # is not what an operator decided.
+    missing = client.post(
+        f"/api/tasks/{task.id}/workflow/resume", headers=auth_headers, json={}
+    )
+    assert missing.status_code == 422
 
-# --- run-completion sentinel (bugfix-workflow 1.x, design D-3) -----------------
+
+def test_a_retained_revision_is_readable_and_a_damaged_one_is_classified(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """Read-only inspection by content identity: the operator can see exactly
+    what a task accepted, and an unreadable document is reported rather than
+    executed to answer a read."""
+    from sqlalchemy import text as sa_text
+
+    from ompire_daemon.registry.workflow_definitions import clear_cache
+
+    revision = current_revision("bugfix").revision
+    response = client.get(f"/api/workflows/revisions/{revision}", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["name"] == "bugfix"
+    assert body["format"] == 1
+    assert body["primary_session"] == "coder"
+    assert body["definition"]["steps"][0]["name"] == "reproduce"
+
+    assert (
+        client.get(
+            f"/api/workflows/revisions/sha256:{'0' * 64}", headers=auth_headers
+        ).status_code
+        == 404
+    )
+
+    with client.app.state.engine.begin() as conn:
+        conn.execute(
+            sa_text("UPDATE workflow_revisions SET document_json = :d WHERE revision = :r"),
+            {"d": '{"format": 1, "name": "bugfix"}', "r": revision},
+        )
+    clear_cache()
+    damaged = client.get(f"/api/workflows/revisions/{revision}", headers=auth_headers)
+    assert damaged.status_code == 409
+    detail = damaged.json()["detail"]
+    assert detail["reason"] == "workflow_definition_unavailable"
+    assert detail["unavailable_reason"] in ("invalid", "integrity")
+
+
+# --- run completion -----------------------------------------------------------
 
 
 async def test_decision_route_complete_finishes_run_early(
     rig, engine, project, tmp_path: Path
 ) -> None:
-    """A decision returning COMPLETE finishes the run without executing the
+    """A decision routing to `complete` finishes the run without executing the
     remaining declared steps, recording the sentinel as its route outcome."""
-    workflow = Workflow(
-        name="complete-wf",
-        sessions=("main",),
-        steps=(
-            CommandStep(name="probe", argv=("true",), timeout=5),
-            DecisionStep(name="fin", route=lambda ctx: COMPLETE),
-            CommandStep(name="never", argv=("false",), timeout=5),
-        ),
+    install_test_workflow(
+        engine,
+        """
+format: 1
+name: complete-wf
+sessions: [main]
+primary: main
+steps:
+  - name: probe
+    kind: command
+    argv: ["true"]
+    timeout: 5
+    idempotent: true
+  - name: fin
+    kind: decision
+    cases:
+      - when: true
+        next: {complete: true}
+    otherwise: {step: never}
+  - name: never
+    kind: command
+    argv: ["false"]
+    timeout: 5
+    idempotent: true
+""",
     )
-    register_workflow(workflow)
-    try:
-        runner, _supervisor, _tracker, _hub, _scenario = rig
-        task = _make_task(engine, tmp_path, workflow="complete-wf")
+    runner, _supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="complete-wf")
 
-        runner.start_run(task)
-        final = await wait_for_run(engine, task.id, {"complete"})
+    _start(runner, engine, task)
+    final = await wait_for_run(engine, task.id, {"complete"})
 
-        assert final.workflow_status == "complete"
-        records = list_step_records(engine, task.id)
-        assert [r.step for r in records] == ["probe", "fin"]
-        assert records[1].outcome == {"route": COMPLETE}
-        assert records[1].status == "ok"
-    finally:
-        unregister_workflow(workflow.name)
-
-
-def test_complete_sentinel_is_not_a_step_name() -> None:
-    """The sentinel is not slug-format, so no workflow can declare a step it
-    would collide with (and step_named never resolves it)."""
-    workflow = Workflow(
-        name="plain",
-        sessions=("main",),
-        steps=(CommandStep(name="only", argv=("true",), timeout=5),),
-    )
-    assert workflow.step_named(COMPLETE) is None
-
-
-# --- LLM judge fallback (bugfix-workflow 2.x, design D-4/D-5) -------------------
-
-
-def test_judge_session_name_is_reserved() -> None:
-    with pytest.raises(WorkflowDefinitionError, match="engine-reserved"):
-        Workflow(
-            name="bad-judge",
-            sessions=(JUDGE_SESSION,),
-            steps=(AgentStep(name="a", session=JUDGE_SESSION, prompt=lambda ctx: "x"),),
-        )
-
-
-async def _write_outcome_when_session_prompted(
-    supervisor: AgentSupervisor,
-    task_id: int,
-    session: str,
-    clone_path: Path,
-    content: str,
-    *,
-    prompt_count: int = 1,
-) -> None:
-    """Like `_write_outcome_when_prompted`, but for an arbitrary session and
-    waiting for its Nth prompt (loop revisits prompt a session repeatedly)."""
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if supervisor.get(task_id, session) is not None and len(
-            user_prompts(supervisor, task_id, session)
-        ) >= prompt_count:
-            (clone_path / ".ompire").mkdir(exist_ok=True)
-            (clone_path / ".ompire" / "outcome.json").write_text(content)
-            return
-        await asyncio.sleep(0.01)
-    raise RuntimeError(f"prompt {prompt_count} on session {session} never observed")
-
-
-async def test_step_judge_synthesizes_missing_outcome(
-    rig, engine, project, tmp_path: Path, outcome_workflow
-) -> None:
-    """The work step idles with no outcome file; the judge session then
-    classifies the step and its document becomes the step's outcome."""
-    runner, supervisor, _tracker, _hub, _scenario = rig
-    task = _make_task(engine, tmp_path, workflow="outcome-wf")
-
-    judge_write = asyncio.create_task(
-        _write_outcome_when_session_prompted(
-            supervisor,
-            task.id,
-            JUDGE_SESSION,
-            Path(task.clone_path),
-            json.dumps({"version": 1, "status": "success", "summary": "the work is done"}),
-        )
-    )
-    runner.start_run(task)
-    await wait_for_run(engine, task.id, {"complete"})
-    await judge_write
-
+    assert final.workflow_status == "complete"
     records = list_step_records(engine, task.id)
-    # The judgment itself leaves no step record.
-    assert len(records) == 1
-    assert records[0].outcome is not None
-    assert records[0].outcome["summary"] == "the work is done"
-    assert records[0].error and "synthesized by LLM judge" in records[0].error
-    assert "no outcome file" in records[0].error
-    # The judge prompt self-describes and points at the transcript dump.
-    judge_prompts = user_prompts(supervisor, task.id, JUDGE_SESSION)
-    assert len(judge_prompts) == 1
-    assert "fallback judge" in judge_prompts[0]
-    assert "judge-transcript-1.jsonl" in judge_prompts[0]
-    # The judged session's ring buffer was dumped into the clone.
-    dump = Path(task.clone_path) / ".ompire" / "judge-transcript-1.jsonl"
-    assert dump.exists() and "do it" in dump.read_text()
-    # The judge is an ordinary tracked session (UI tab / resume).
-    from ompire_daemon.registry.sessions import get_session
-
-    judge_row = get_session(engine, task.id, JUDGE_SESSION)
-    assert judge_row is not None and judge_row.omp_session_id == "fake-session-id"
+    assert [r.step for r in records] == ["probe", "fin"]
+    assert records[1].outcome == {"route": COMPLETE}
+    assert records[1].status == "ok"
 
 
-async def test_step_judge_uncertain_leaves_null_outcome(
-    rig, engine, project, tmp_path: Path, outcome_workflow
-) -> None:
-    """A judge that writes nothing is uncertain: the null outcome stands with
-    its original note — no guessing."""
-    runner, supervisor, _tracker, _hub, _scenario = rig
-    task = _make_task(engine, tmp_path, workflow="outcome-wf")
-
-    runner.start_run(task)
-    await wait_for_run(engine, task.id, {"complete"})
-
-    record = list_step_records(engine, task.id)[0]
-    assert record.outcome is None
-    assert record.error and "no outcome file" in record.error
-    assert "synthesized" not in record.error
-    # A judgment was attempted (the judge session exists and was prompted).
-    assert user_prompts(supervisor, task.id, JUDGE_SESSION)
-
-
-async def test_decision_judge_resolves_route(rig, engine, project, tmp_path: Path) -> None:
-    """A raising decision defers to the judge; a confident judged route is
-    validated and followed, with provenance noted on the record."""
-
-    def raise_route(ctx) -> str:
-        raise RuntimeError("missing repro outcome")
-
-    workflow = Workflow(
-        name="judge-route-wf",
-        sessions=("main",),
-        steps=(
-            DecisionStep(name="triage", route=raise_route),
-            CommandStep(name="after", argv=("true",), timeout=5),
-        ),
-    )
-    register_workflow(workflow)
-    try:
-        runner, supervisor, _tracker, _hub, _scenario = rig
-        task = _make_task(engine, tmp_path, workflow="judge-route-wf")
-
-        judge_write = asyncio.create_task(
-            _write_outcome_when_session_prompted(
-                supervisor,
-                task.id,
-                JUDGE_SESSION,
-                Path(task.clone_path),
-                json.dumps(
-                    {
-                        "version": 1,
-                        "status": "success",
-                        "summary": "the work clearly needs the follow-up step",
-                        "artifacts": {"route": "after"},
-                    }
-                ),
-            )
-        )
-        runner.start_run(task)
-        await wait_for_run(engine, task.id, {"complete"})
-        await judge_write
-
-        records = list_step_records(engine, task.id)
-        assert [r.step for r in records] == ["triage", "after"]
-        assert records[0].outcome == {"route": "after"}
-        assert "route chosen by LLM judge" in (records[0].error or "")
-        # The prompt offered the legal targets, including the sentinel.
-        judge_prompt = user_prompts(supervisor, task.id, JUDGE_SESSION)[0]
-        assert "'after'" in judge_prompt and COMPLETE in judge_prompt
-    finally:
-        unregister_workflow(workflow.name)
-
-
-async def test_decision_judge_invalid_route_escalates(
+async def test_a_visit_bound_is_enforced_by_the_engine_not_the_route(
     rig, engine, project, tmp_path: Path
 ) -> None:
-    """A judged route naming no declared step is rejected; the run parks at
-    the synthesized gate as if no judgment had happened."""
-
-    def no_route(ctx) -> None:
-        return None
-
-    workflow = Workflow(
-        name="judge-bad-route-wf",
-        sessions=("main",),
-        steps=(
-            DecisionStep(name="pick", route=no_route),
-            CommandStep(name="after", argv=("true",), timeout=5),
-        ),
+    """The bound is counted before a new attempt opens, so a route that keeps
+    saying "go back" still cannot loop forever."""
+    install_test_workflow(
+        engine,
+        """
+format: 1
+name: runaway-wf
+sessions: [main]
+primary: main
+steps:
+  - name: again
+    kind: agent
+    session: main
+    max_visits: 2
+    on_exhausted: {step: stop}
+    prompt:
+      parts:
+        - text: "try again"
+  - name: back
+    kind: decision
+    cases:
+      - when: true
+        next: {step: again}
+    otherwise: {step: stop}
+  - name: stop
+    kind: gate
+    message:
+      parts:
+        - text: "out of attempts"
+""",
     )
-    register_workflow(workflow)
-    try:
-        runner, supervisor, _tracker, _hub, _scenario = rig
-        task = _make_task(engine, tmp_path, workflow="judge-bad-route-wf")
-
-        judge_write = asyncio.create_task(
-            _write_outcome_when_session_prompted(
-                supervisor,
-                task.id,
-                JUDGE_SESSION,
-                Path(task.clone_path),
-                json.dumps(
-                    {
-                        "version": 1,
-                        "status": "success",
-                        "summary": "guess",
-                        "artifacts": {"route": "nonexistent"},
-                    }
-                ),
-            )
-        )
-        runner.start_run(task)
-        await wait_for_run(engine, task.id, {"waiting"})
-        await judge_write
-
-        records = list_step_records(engine, task.id)
-        assert records[0].step == "pick" and records[0].status == "ok"
-        assert records[1].kind == "gate" and records[1].status == "waiting"
-        assert "resolved no route" in records[1].outcome["message"]
-    finally:
-        unregister_workflow(workflow.name)
-
-
-async def test_judge_spawn_failure_degrades_without_judging(
-    engine, project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome_workflow
-) -> None:
-    """The judge session failing to spawn never fails the run: the null
-    outcome stands with its original note."""
-    # The judge alone crashes: it is the only session started on the
-    # profile's `slow` binding (ADR-0026).
-    happy = fake_argv_builder("happy")
-    crash = fake_argv_builder("crash")
-
-    def build(clone, *, policy, resume=None):
-        chosen = crash if policy.active.model == "testing/slow-model" else happy
-        return chosen(clone, policy=policy, resume=resume)
-
-    monkeypatch.setattr(agent_module, "build_agent_argv", build)
-
-    async def no_preflight(clone_path: str) -> None:
-        return None
-
-    monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
-    hub = EventHub()
-    tracker = SessionTracker(hub, idle_debounce=DEBOUNCE, stall_threshold=300)
-    config = Config(
-        data_dir=tmp_path / "data",
-        task_dir_root=tmp_path / "tasks",
-        checkout_root=tmp_path / "proj",
-        session_idle_debounce=DEBOUNCE,
-        spawn_step_timeout=10,
-    )
-    supervisor = AgentSupervisor(config, hub, tracker)
-    runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
-    task = _make_task(engine, tmp_path, workflow="outcome-wf")
-
-    runner.start_run(task)
-    await wait_for_run(engine, task.id, {"complete"})
-
-    record = list_step_records(engine, task.id)[0]
-    assert record.status == "ok"
-    assert record.outcome is None
-    assert record.error and "no outcome file" in record.error
-
-
-async def test_judge_spawn_uses_the_profiles_slow_binding(
-    rig, engine, project, tmp_path: Path, outcome_workflow, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The judge has no model setting of its own (ADR-0026): it runs on the
-    task profile's disclosed `slow` binding, while workflow sessions run the
-    `default` one — and it still carries the full auxiliary role map."""
-    seen: list[tuple[str, str, tuple[str, ...]]] = []
-    build = fake_argv_builder("happy")
-
-    def capture(clone, *, policy, resume=None):
-        seen.append(
-            (
-                policy.active.model,
-                policy.active.thinking,
-                (policy.smol.model, policy.slow.model, policy.plan.model),
-            )
-        )
-        return build(clone, policy=policy, resume=resume)
-
     runner, _supervisor, _tracker, _hub, _scenario = rig
-    monkeypatch.setattr(agent_module, "build_agent_argv", capture)
+    task = _make_task(engine, tmp_path, workflow="runaway-wf")
 
-    task = _make_task(engine, tmp_path, workflow="outcome-wf")
-    runner.start_run(task)
-    final = await wait_for_run(engine, task.id, {"complete", "failed"})
-    assert final.workflow_status == "complete", list_step_records(engine, task.id)
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
 
-    auxiliary = ("testing/smol-model", "testing/slow-model", "testing/plan-model")
-    assert seen == [
-        ("testing/main-model", "medium", auxiliary),
-        ("testing/slow-model", "high", auxiliary),
-    ]
+    records = list_step_records(engine, task.id)
+    assert [r.step for r in records if r.step == "again"] == ["again", "again"]
+    assert records[-1].step == "stop" and records[-1].kind == "gate"
+    assert records[-1].outcome == {"message": "out of attempts"}
 
 
-# --- the bugfix workflow (bugfix-workflow 3.x, design D-1/D-2/D-6) -------------
+# --- the bugfix built-in (design D-1/D-2/D-6) ---------------------------------
 
 
 def _bugfix_outcome(status: str, summary: str, **artifacts: str) -> str:
@@ -1155,10 +1632,12 @@ def _bugfix_outcome(status: str, summary: str, **artifacts: str) -> str:
 
 
 async def test_bugfix_happy_path_script_validates(rig, engine, project, tmp_path: Path) -> None:
-    """reproduce → triage → fix → script validation → COMPLETE, with the
+    """reproduce → triage → fix → script validation → complete, with the
     agent-validation step skipped and the escalate gate never reached."""
     runner, supervisor, tracker, _hub, _scenario = rig
-    task = _make_task(engine, tmp_path, workflow="bugfix", preamble="PRE", prompt="bug: off by one")
+    task = _make_task(
+        engine, tmp_path, workflow="bugfix", preamble="PRE", prompt="bug: off by one"
+    )
 
     async def drive() -> None:
         await _write_outcome_when_session_prompted(
@@ -1175,7 +1654,7 @@ async def test_bugfix_happy_path_script_validates(rig, engine, project, tmp_path
         )
 
     driver = asyncio.create_task(drive())
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"complete"})
     await driver
 
@@ -1192,9 +1671,11 @@ async def test_bugfix_happy_path_script_validates(rig, engine, project, tmp_path
     assert records[1].outcome == {"route": "fix"}
     assert records[3].outcome == {"route": "validate-script"}
     assert records[4].outcome is not None and records[4].outcome["exit_code"] == 0
-    # The agent validation was deliberately inert: no prompt, no outcome, and
-    # the coder's self-report was NOT read as its outcome.
+    # The agent validation was deliberately inert: no prompt, no outcome, no
+    # pause, and the coder's self-report was NOT read as its outcome.
     assert records[5].outcome is None and records[5].prompted_at is None
+    assert records[5].pause is None
+    assert "deliberately not prompted" in (records[5].error or "")
     assert records[6].outcome == {"route": COMPLETE}
 
     repro_prompt = user_prompts(supervisor, task.id, "reproducer")[0]
@@ -1206,14 +1687,16 @@ async def test_bugfix_happy_path_script_validates(rig, engine, project, tmp_path
     assert "bash .ompire/repro.sh" in fix_prompt
     # The ship flow squashes the branch tip's tree: the coder must commit.
     assert "Commit your change" in fix_prompt and "never push" in fix_prompt
-    # The judge never fired: every outcome landed.
-    assert supervisor.get(task.id, JUDGE_SESSION) is None
+    # No engine-reserved session was ever spawned.
+    assert supervisor.get(task.id, "judge") is None
     assert tracker.get(task.id, "coder") is not None
 
 
 async def test_bugfix_unreproducible_bug_escalates_before_fix(
     rig, engine, project, tmp_path: Path
 ) -> None:
+    """A declared `failed` reproduction is a real result and follows the
+    definition's own route — it is not missing evidence, so it never pauses."""
     runner, supervisor, _tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: flaky test")
 
@@ -1223,7 +1706,7 @@ async def test_bugfix_unreproducible_bug_escalates_before_fix(
             _bugfix_outcome("failed", "cannot reproduce: no failing input found"),
         )
     )
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"waiting"})
     await driver
 
@@ -1232,11 +1715,12 @@ async def test_bugfix_unreproducible_bug_escalates_before_fix(
     assert records[1].outcome == {"route": "escalate"}
     gate = records[2]
     assert gate.kind == "gate" and gate.status == "waiting"
+    assert gate.pause is None
     assert "could not be reproduced" in gate.outcome["message"]
     # The coder was never spawned.
     assert supervisor.get(task.id, "coder") is None
 
-    runner.resume_gate(task.id, note=None)
+    resume(runner, engine, task.id)
     await wait_for_run(engine, task.id, {"complete"})
 
 
@@ -1270,7 +1754,7 @@ async def test_bugfix_rejection_loops_then_escalates(
             )
 
     driver = asyncio.create_task(drive())
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"waiting"})
     await driver
 
@@ -1279,11 +1763,15 @@ async def test_bugfix_rejection_loops_then_escalates(
     assert len(fixes) == 3
     checks = [r for r in records if r.step == "check"]
     assert [r.outcome for r in checks] == [
-        {"route": "fix"}, {"route": "fix"}, {"route": "escalate"},
+        {"route": "fix"}, {"route": "fix"}, {"route": "fix"},
     ]
+    # The third `check` still routes to `fix`; the *engine* stops it, because
+    # the bound is counted before an attempt opens rather than trusted to a
+    # route predicate.
     gate = records[-1]
-    assert gate.kind == "gate" and gate.status == "waiting"
+    assert gate.step == "escalate" and gate.kind == "gate" and gate.status == "waiting"
     assert "3 times" in gate.outcome["message"]
+    assert "still broken" in gate.outcome["message"]
 
     coder_prompts = user_prompts(supervisor, task.id, "coder")
     assert len(coder_prompts) == 3
@@ -1292,7 +1780,7 @@ async def test_bugfix_rejection_loops_then_escalates(
         assert "did NOT validate" in prompt
         assert "still broken" in prompt
 
-    runner.resume_gate(task.id, note=None)
+    resume(runner, engine, task.id)
     await wait_for_run(engine, task.id, {"complete"})
 
 
@@ -1318,7 +1806,7 @@ async def test_bugfix_agent_validation_when_no_script(rig, engine, project, tmp_
         )
 
     driver = asyncio.create_task(drive())
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"complete"})
     await driver
 
@@ -1334,48 +1822,53 @@ async def test_bugfix_agent_validation_when_no_script(rig, engine, project, tmp_
     assert "Validate the fix" in validate_prompt
 
 
-async def test_bugfix_judge_fires_on_missing_reproduce_outcome(
+async def test_bugfix_pauses_on_a_missing_reproduce_outcome(
     rig, engine, project, tmp_path: Path
 ) -> None:
-    """The reproducer idles without an outcome file; the judge classifies the
-    step and the run routes on the judged outcome."""
+    """The reproducer idles without an outcome file. Nothing classifies the
+    step for it: the run stops with the reason, and the coder is never
+    spawned on evidence that does not exist."""
     runner, supervisor, _tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: crash")
 
-    async def drive() -> None:
-        # No outcome for the reproduce step: the judge is prompted next.
-        await _write_outcome_when_session_prompted(
-            supervisor, task.id, JUDGE_SESSION, Path(task.clone_path),
-            _bugfix_outcome(
-                "success", "the transcript shows a confirmed reproduction",
-                repro_command="bash .ompire/repro.sh",
-            ),
-        )
-        await _write_outcome_when_session_prompted(
-            supervisor, task.id, "coder", Path(task.clone_path),
-            _bugfix_outcome("success", "fixed it"),
-        )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
 
-    driver = asyncio.create_task(drive())
-    runner.start_run(task)
-    await wait_for_run(engine, task.id, {"complete"})
+    records = list_step_records(engine, task.id)
+    assert len(records) == 1
+    reproduce = records[0]
+    assert reproduce.step == "reproduce" and reproduce.status == "waiting"
+    assert reproduce.outcome is None
+    assert reproduce.pause["reason"] == "missing_outcome"
+    assert supervisor.get(task.id, "coder") is None
+    assert supervisor.get(task.id, "judge") is None
+
+    # Retrying gives the reproducer another attempt in its own session.
+    driver = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor, task.id, "reproducer", Path(task.clone_path),
+            _bugfix_outcome("failed", "still cannot reproduce"),
+            prompt_count=2,
+        )
+    )
+    retry(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
     await driver
 
     records = list_step_records(engine, task.id)
-    reproduce = records[0]
-    assert reproduce.outcome is not None
-    assert reproduce.outcome["summary"] == "the transcript shows a confirmed reproduction"
-    assert "synthesized by LLM judge" in (reproduce.error or "")
-    assert records[1].outcome == {"route": "fix"}
-    # The judged repro_command routed validation to the command step.
-    assert records[3].outcome == {"route": "validate-script"}
+    assert [(r.step, r.status) for r in records] == [
+        ("reproduce", "failed"),
+        ("reproduce", "ok"),
+        ("triage", "ok"),
+        ("escalate", "waiting"),
+    ]
 
 
 async def test_bugfix_restart_mid_loop_nudges_and_continues(
     rig, engine, project, tmp_path: Path, fake_workshop_cli: Path
 ) -> None:
-    """Restart with a fix turn in flight: the coder is resumed and nudged,
-    the loop continues from persisted records, and the run completes."""
+    """Restart with a fix turn in flight: the coder is resumed and nudged, the
+    same attempt is re-driven rather than replaced, and the run completes."""
     fake_workshop_cli.write_text(
         "#!/bin/sh\n"
         'case "$*" in\n'
@@ -1399,7 +1892,7 @@ async def test_bugfix_restart_mid_loop_nudges_and_continues(
         )
 
     driver = asyncio.create_task(drive_first_half())
-    runner.start_run(task)
+    _start(runner, engine, task)
     # Wait until the loop is back at fix #2 with its prompt durably sent.
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
@@ -1412,9 +1905,6 @@ async def test_bugfix_restart_mid_loop_nudges_and_continues(
         raise RuntimeError("second fix prompt never sent")
     await driver
 
-    # Simulate the restart: fresh in-memory machinery over the same DB; the
-    # second fix turn was in flight (fake omp "happy" ends turns, so the
-    # in-flight window is emulated by the persisted prompted_at record).
     await runner.shutdown()
     await supervisor.shutdown()
     # After the restart the reproducer script passes (the "fix" worked).
@@ -1426,24 +1916,8 @@ async def test_bugfix_restart_mid_loop_nudges_and_continues(
         '  *) exit 0 ;;\n'
         "esac\n"
     )
-    hub2 = EventHub()
-    tracker2 = SessionTracker(hub2, idle_debounce=DEBOUNCE, stall_threshold=300)
-    config2 = Config(
-        data_dir=tmp_path / "data",
-        task_dir_root=tmp_path / "tasks",
-        checkout_root=tmp_path / "proj",
-        session_idle_debounce=DEBOUNCE,
-        spawn_step_timeout=10,
-    )
-    supervisor2 = AgentSupervisor(config2, hub2, tracker2)
-    runner2 = WorkflowRunner(engine, config2, hub2, supervisor2, tracker2)
-
-    from ompire_daemon.registry.sessions import list_resumable_sessions
-
-    for row in list_resumable_sessions(engine, task.id):
-        tracker2.recovering(task.id, row.name)
-        await supervisor2.start(task.id, row.name, task.clone_path, resume=row.omp_session_id, policy=make_test_policy())
-        tracker2.session_recovered(task.id, row.name)
+    runner2, supervisor2, tracker2, _hub2 = _restart_rig(engine, tmp_path)
+    await _resume_recorded_sessions(engine, supervisor2, tracker2, task)
 
     async def drive_second_half() -> None:
         # The nudge re-prompts the coder; the fix outcome lands mid-turn.
@@ -1453,7 +1927,7 @@ async def test_bugfix_restart_mid_loop_nudges_and_continues(
         )
 
     driver2 = asyncio.create_task(drive_second_half())
-    runner2.recover_run(get_task(engine, task.id))
+    _recover(runner2, engine, get_task(engine, task.id))
     await wait_for_run(engine, task.id, {"complete"})
     await driver2
 
@@ -1462,16 +1936,18 @@ async def test_bugfix_restart_mid_loop_nudges_and_continues(
     assert "outcome.json" in coder_prompts[0]  # outcome-bearing nudge
     records = list_step_records(engine, task.id)
     fixes = [r for r in records if r.step == "fix"]
-    assert [(r.status,) for r in fixes] == [("ok",), ("failed",), ("ok",)]
-    assert "interrupted by daemon restart" in (fixes[1].error or "")
+    # Two work attempts, not three: the restart re-drove the open one.
+    assert [r.status for r in fixes] == ["ok", "ok"]
     assert records[-1].outcome == {"route": COMPLETE}
+    await runner2.shutdown()
+    await supervisor2.shutdown()
 
 
 async def test_bugfix_escalate_gate_survives_restart(
     rig, engine, project, tmp_path: Path
 ) -> None:
-    """A run parked at the escalate gate re-arms after a restart with the
-    same message and resumes to completion."""
+    """A run parked at the escalate gate re-arms after a restart with the same
+    message and resumes to completion."""
     runner, supervisor, _tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path, workflow="bugfix", prompt="bug: flaky")
 
@@ -1481,41 +1957,28 @@ async def test_bugfix_escalate_gate_survives_restart(
             _bugfix_outcome("failed", "not reproducible"),
         )
     )
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"waiting"})
     await driver
 
     await runner.shutdown()
     await supervisor.shutdown()
-    hub2 = EventHub()
-    tracker2 = SessionTracker(hub2, idle_debounce=DEBOUNCE, stall_threshold=300)
-    config2 = Config(
-        data_dir=tmp_path / "data",
-        task_dir_root=tmp_path / "tasks",
-        checkout_root=tmp_path / "proj",
-        session_idle_debounce=DEBOUNCE,
-        spawn_step_timeout=10,
-    )
-    supervisor2 = AgentSupervisor(config2, hub2, tracker2)
-    runner2 = WorkflowRunner(engine, config2, hub2, supervisor2, tracker2)
-    from ompire_daemon.registry.sessions import list_resumable_sessions
-
-    for row in list_resumable_sessions(engine, task.id):
-        tracker2.recovering(task.id, row.name)
-        await supervisor2.start(task.id, row.name, task.clone_path, resume=row.omp_session_id, policy=make_test_policy())
-        tracker2.session_recovered(task.id, row.name)
-    runner2.recover_run(get_task(engine, task.id))
+    runner2, supervisor2, tracker2, _hub2 = _restart_rig(engine, tmp_path)
+    await _resume_recorded_sessions(engine, supervisor2, tracker2, task)
+    _recover(runner2, engine, get_task(engine, task.id))
     await asyncio.sleep(0.3)
 
     assert get_task(engine, task.id).workflow_status == "waiting"
     gates = [r for r in list_step_records(engine, task.id) if r.kind == "gate"]
     assert len(gates) == 1 and "could not be reproduced" in gates[0].outcome["message"]
 
-    runner2.resume_gate(task.id, note=None)
+    resume(runner2, engine, task.id)
     await wait_for_run(engine, task.id, {"complete"})
+    await runner2.shutdown()
+    await supervisor2.shutdown()
 
 
-# --- prompt file mentions (add-spawn-file-mentions) -------------------------
+# --- prompt file mentions (add-spawn-file-mentions) --------------------------
 
 
 async def test_mention_resolving_in_the_clone_is_delivered_verbatim(
@@ -1527,7 +1990,7 @@ async def test_mention_resolving_in_the_clone_is_delivered_verbatim(
     task = _make_task(engine, tmp_path, prompt="read @notes.md")
     (Path(task.clone_path) / "notes.md").write_text("notes\n")
 
-    runner.start_run(task)
+    _start(runner, engine, task)
     final = await wait_for_run(engine, task.id, {"complete"})
 
     assert final.workflow_status == "complete"
@@ -1542,7 +2005,7 @@ async def test_mention_missing_from_the_clone_fails_the_step_without_prompting(
     runner, supervisor, _tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path, prompt="read @gone.md")
 
-    runner.start_run(task)
+    _start(runner, engine, task)
     final = await wait_for_run(engine, task.id, {"failed"})
 
     assert final.state == "created"
@@ -1562,7 +2025,7 @@ async def test_a_preamble_at_sign_is_prose_and_never_fails_the_step(
     runner, supervisor, _tracker, _hub, _scenario = rig
     task = _make_task(engine, tmp_path, preamble="ping @nobody about this", prompt="do it")
 
-    runner.start_run(task)
+    _start(runner, engine, task)
     final = await wait_for_run(engine, task.id, {"complete"})
 
     assert final.workflow_status == "complete"
@@ -1583,22 +2046,10 @@ OTHER_ROLES = {
 
 
 @pytest.fixture
-def shared_session_workflow():
+def shared_session_workflow(engine: Engine):
     """Two agent steps in one named session — the `reproduce`/`validate-agent`
     shape, reduced to what a policy handoff needs."""
-    workflow = Workflow(
-        name="shared-policy",
-        sessions=("shared",),
-        steps=(
-            AgentStep(name="first", session="shared", prompt=lambda ctx: "first turn"),
-            AgentStep(name="second", session="shared", prompt=lambda ctx: "second turn"),
-        ),
-    )
-    register_workflow(workflow)
-    try:
-        yield workflow
-    finally:
-        unregister_workflow("shared-policy")
+    return install_test_workflow(engine, SHARED_SESSION_YAML)
 
 
 async def test_two_steps_share_a_session_under_different_policies(
@@ -1615,7 +2066,7 @@ async def test_two_steps_share_a_session_under_different_policies(
         step_profiles={"other": _role_bindings(OTHER_ROLES)},
     )
 
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"complete", "failed"})
     assert get_task(engine, task.id).workflow_status == "complete"
 
@@ -1642,43 +2093,25 @@ async def test_a_repeated_step_reuses_its_own_accepted_binding(
 ) -> None:
     """A loop revisit is the same accepted decision again, not whatever the
     session was last put on by the step in between."""
-    visits = {"n": 0}
-
-    def route(ctx):
-        visits["n"] += 1
-        return "fix" if visits["n"] == 1 else COMPLETE
-
-    workflow = Workflow(
-        name="loop-policy",
-        sessions=("coder", "checker"),
-        steps=(
-            AgentStep(name="fix", session="coder", prompt=lambda ctx: f"fix {visits['n']}"),
-            AgentStep(name="check", session="checker", prompt=lambda ctx: "check"),
-            DecisionStep(name="again", route=route),
-        ),
+    install_test_workflow(engine, LOOP_YAML)
+    runner, supervisor, _, _, _ = rig
+    task = _make_task(
+        engine,
+        tmp_path,
+        workflow="loop-policy",
+        step_roles={"fix": "plan"},
     )
-    register_workflow(workflow)
-    try:
-        runner, supervisor, _, _, _ = rig
-        task = _make_task(
-            engine,
-            tmp_path,
-            workflow="loop-policy",
-            step_roles={"fix": "plan"},
-        )
-        runner.start_run(task)
-        await wait_for_run(engine, task.id, {"complete", "failed"})
-        assert get_task(engine, task.id).workflow_status == "complete"
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"complete", "failed"})
+    assert get_task(engine, task.id).workflow_status == "complete"
 
-        prompts = user_prompts(supervisor, task.id, "coder")
-        # Two visits to the same step, each prompted under its own binding.
-        assert "fix 0" in prompts and "fix 1" in prompts
-        applied = get_session(engine, task.id, "coder").applied_policy
-        assert applied.consumer_name == "fix"
-        assert applied.role == "plan"
-        assert applied.policy.active.model == TEST_ROLES["plan"]["model"]
-    finally:
-        unregister_workflow("loop-policy")
+    prompts = user_prompts(supervisor, task.id, "coder")
+    # Two visits to the same step, each prompted under its own binding.
+    assert "fix 0" in prompts and "fix 1" in prompts
+    applied = get_session(engine, task.id, "coder").applied_policy
+    assert applied.consumer_name == "fix"
+    assert applied.role == "plan"
+    assert applied.policy.active.model == TEST_ROLES["plan"]["model"]
 
 
 async def test_a_failed_handoff_fails_the_step_and_keeps_the_previous_record(
@@ -1699,7 +2132,7 @@ async def test_a_failed_handoff_fails_the_step_and_keeps_the_previous_record(
         },
     )
 
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"complete", "failed"})
     assert get_task(engine, task.id).workflow_status == "failed"
 
@@ -1711,37 +2144,6 @@ async def test_a_failed_handoff_fails_the_step_and_keeps_the_previous_record(
     applied = get_session(engine, task.id, "shared").applied_policy
     assert applied.consumer_name == "first"
     assert applied.policy.active.model == TEST_ROLES["default"]["model"]
-
-
-async def test_the_judge_runs_on_its_own_accepted_binding(
-    engine: Engine, project, tmp_path: Path, rig
-) -> None:
-    """The judge is an ordinary model consumer with an overridable binding,
-    not a hidden exception bound to the task profile's `slow`."""
-    workflow = Workflow(
-        name="judge-policy",
-        sessions=("main",),
-        steps=(
-            AgentStep(
-                name="work", session="main", prompt=lambda ctx: "do it", expects_outcome=True
-            ),
-        ),
-    )
-    register_workflow(workflow)
-    try:
-        runner, _, _, _, _ = rig
-        task = _make_task(engine, tmp_path, workflow="judge-policy", judge_role="plan")
-        runner.start_run(task)
-        await wait_for_run(engine, task.id, {"complete", "failed"})
-
-        applied = get_session(engine, task.id, JUDGE_SESSION).applied_policy
-        assert applied is not None
-        assert applied.consumer_kind == "auxiliary"
-        assert applied.consumer_name == "judge"
-        assert applied.role == "plan"
-        assert applied.policy.active.model == TEST_ROLES["plan"]["model"]
-    finally:
-        unregister_workflow("judge-policy")
 
 
 async def test_recovery_restores_the_session_policy_that_actually_applied(
@@ -1757,13 +2159,12 @@ async def test_recovery_restores_the_session_policy_that_actually_applied(
         step_profile_names={"second": "other"},
         step_profiles={"other": _role_bindings(OTHER_ROLES)},
     )
-    runner.start_run(task)
+    _start(runner, engine, task)
     await wait_for_run(engine, task.id, {"complete", "failed"})
 
     # A restart: the live children are gone, the registry is not.
     await supervisor.shutdown()
-    for name in ("shared",):
-        assert supervisor.get(task.id, name) is None
+    assert supervisor.get(task.id, "shared") is None
 
     resumed = _make_task_policy_for_recovery(engine, task.id, "shared")
     assert resumed.policy.active.model == "testing/other-model"

@@ -38,10 +38,18 @@ KIND_MODEL_CANDIDATES = "model-candidates"
 KIND_NEW_DEFAULTS = "new-defaults"
 KIND_RETIRED_JUDGE_MODEL = "retired-judge-model"
 
+# Evidence kinds written by migration 0015 (ADR-0028). The whole pre-upgrade
+# execution-inputs document, and each retired engine auxiliary binding, kept
+# verbatim so the old judge model stays inspectable without staying live.
+KIND_LEGACY_EXECUTION_INPUTS = "legacy-execution-inputs"
+KIND_RETIRED_AUXILIARY_BINDING = "retired-auxiliary-binding"
+
 # Reconciliation kinds: one row per decision the operator has made.
 DECISION_LAUNCH_CONFIG = "launch-config"
 DECISION_NEW_DEFAULTS = "new-defaults"
 DECISION_JUDGE_MODEL = "judge-model"
+# The operator confirmed which retained revision a legacy task continues under.
+DECISION_WORKFLOW_CONTINUATION = "workflow-continuation"
 
 
 @dataclass(frozen=True)

@@ -68,10 +68,12 @@ agent. Creating a pull request, choosing the next step from an exit code,
 enforcing an iteration limit, deciding whether a gate is satisfied — these are
 control-plane responsibilities, and they behave the same way every time.
 
-An agent or an LLM judge may be a *declared* step where semantic judgment is
-genuinely useful. It is never a hidden fallback. Its inputs, output, and
-effect on routing are recorded, and uncertain output stops at a human gate
-rather than being resolved by a guess.
+An agent, or a model asked to judge, may be a *declared* step where semantic
+judgment is genuinely useful — one the workflow routes to explicitly and you
+see before you launch. It is never a hidden fallback: the engine reserves no
+model of its own. When a step leaves no readable result, or a route cannot be
+decided from what was recorded, the run stops and tells you what was missing
+rather than asking something to guess.
 
 ## What Ompire is not
 

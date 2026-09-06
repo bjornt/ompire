@@ -1,0 +1,39 @@
+# The pre-workflow behavior, as a definition: one session, one turn, whatever
+# the operator typed. The prompt reproduces the original concatenation exactly
+# — a preamble alone never prompts, and an empty task prompt spends no turn.
+format: 1
+name: single-step
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    role: default
+    expects_outcome: false
+    prompt:
+      separator: ""
+      parts:
+        - if:
+            op: ne
+            left: {op: input, name: task.prompt}
+            right: {op: literal, value: ""}
+          then:
+            separator: ""
+            parts:
+              - if:
+                  op: ne
+                  left: {op: input, name: workspace.preamble}
+                  right: {op: literal, value: ""}
+                then:
+                  separator: ""
+                  parts:
+                    - value: {op: input, name: workspace.preamble}
+                      format: text
+                    - text: "\n\n"
+                else:
+                  parts: []
+              - value: {op: input, name: task.prompt}
+                format: text
+          else:
+            parts: []

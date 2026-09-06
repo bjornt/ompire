@@ -49,6 +49,10 @@ from ompire_daemon.registry.tasks import (
 )
 from ompire_daemon.registry.workflows import list_step_records
 from ompire_daemon.sessions import SessionTracker
+from ompire_daemon.taskdefinition import (
+    TaskDefinitionUnavailableError,
+    resolve_task_definition,
+)
 from ompire_daemon.workflows import WorkflowRunner
 from ompire_daemon.workshop import workshop_status
 
@@ -66,7 +70,7 @@ async def classify_startup_tasks(
     """
     failed, candidates = reconcile_startup(engine)
     for task in failed:
-        events.publish("task_updated", task_payload(task))
+        events.publish("task_updated", task_payload(task, engine=engine))
 
     recoverable: list[Task] = []
     for task in candidates:
@@ -79,7 +83,7 @@ async def classify_startup_tasks(
             failed_task = mark_failed(
                 engine, task.id, f"workshop container gone (status: {status!r}); cannot resume"
             )
-            events.publish("task_updated", task_payload(failed_task))
+            events.publish("task_updated", task_payload(failed_task, engine=engine))
     return recoverable
 
 
@@ -235,9 +239,35 @@ async def _recover_one(
             task.id,
         )
         return
-    # 1. Resume every recorded session (bounded concurrency across tasks),
-    #    each under its own last applied policy.
-    sessions = list_resumable_sessions(engine, task.id)
+    # 0. Resolve the pinned definition *before* anything else (ADR-0028).
+    #    A revision that is absent, damaged, or written for a newer format
+    #    cannot tell this run where it is, so nothing is resumed, no prompt is
+    #    sent, and no privileged work is published. The task keeps its
+    #    position, its sessions and workspace, and says why in task detail.
+    try:
+        revision = resolve_task_definition(engine, task)
+    except TaskDefinitionUnavailableError as exc:
+        logger.info(
+            "task %d cannot resolve its pinned workflow definition (%s); "
+            "skipping recovery: %s",
+            task.id,
+            exc.reason,
+            exc.detail,
+        )
+        return
+    # 1. Resume every recorded session the pinned definition still declares,
+    #    each under its own last applied policy (bounded concurrency across
+    #    tasks). A session the definition does not declare — the retired
+    #    engine `judge` above all — is deliberately left alone: nothing will
+    #    prompt it again, so starting a process for it would spend a container
+    #    slot on a conversation with no next turn. Its transcript and applied
+    #    policy stay on record.
+    declared = set(revision.definition.sessions)
+    sessions = [
+        session
+        for session in list_resumable_sessions(engine, task.id)
+        if session.name in declared
+    ]
 
     async def bound(name: str, omp_session_id: str) -> bool:
         applied = _continuation_policy(engine, task, name)
@@ -277,13 +307,13 @@ async def _recover_one(
         # fails the task.
         if not all_resumed and sessions:
             failed_task = mark_failed(engine, task.id, "session resume failed")
-            events.publish("task_updated", task_payload(failed_task))
+            events.publish("task_updated", task_payload(failed_task, engine=engine))
         return
 
     # 2. Re-drive the interrupted run from persisted state (design D-6). A
     # session that failed to resume is lazily re-spawned fresh by the engine
     # on first use (its old context is lost; the run's step records persist).
-    runner.recover_run(task)
+    runner.recover_run(task, revision)
 
 
 async def run_recovery(

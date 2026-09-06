@@ -14,7 +14,15 @@ import {
 import { projectReview } from "../lib/reviewPresentation";
 import { hasShipFlowHandoff } from "../lib/shipPresentation";
 import { useDaemonState } from "../lib/useDaemonState";
-import type { ReviewState, SessionInfo, StepRecord, TaskDetail, WorkflowState, WorkshopStatus } from "../types";
+import type {
+  ReviewState,
+  SessionInfo,
+  StepRecord,
+  Task,
+  TaskDetail,
+  WorkflowState,
+  WorkshopStatus,
+} from "../types";
 import { formatElapsed } from "../lib/formatElapsed";
 import { QuestionCard } from "./QuestionCard";
 import { TaskConfigurationPanel } from "./TaskConfigurationPanel";
@@ -47,6 +55,7 @@ function gateMessage(record: StepRecord | undefined): string | null {
 /** One-line summary for a finished step's chip title: the outcome's summary
  * (design D-3 outcome schema) or message, else the error. */
 function chipTitle(record: StepRecord): string | undefined {
+  if (record.pause) return record.pause.message;
   if (record.error) return record.error;
   const summary = record.outcome?.summary;
   if (typeof summary === "string") return summary;
@@ -56,7 +65,7 @@ function chipTitle(record: StepRecord): string | undefined {
 /** Workflow strip (workflow-engine design D-9): one chip per executed step
  * record in order, the in-flight step highlighted, a waiting gate chip
  * pulsing notify-tier. */
-function WorkflowStrip({ workflow }: { workflow: WorkflowState }) {
+function WorkflowStrip({ workflow, task }: { workflow: WorkflowState; task: Task | null }) {
   const current = workflowActive(workflow) ? currentStepRecord(workflow) : undefined;
   return (
     <div className="panel workflowStrip" data-testid="workflow-strip">
@@ -64,6 +73,25 @@ function WorkflowStrip({ workflow }: { workflow: WorkflowState }) {
         {workflow.name}
         {workflow.status ? ` · ${workflow.status}` : ""}
       </span>
+      {/* The revision this task accepted, not what the name means today
+          (ADR-0028). A short prefix is enough to tell two apart at a glance;
+          the whole thing, and the definition itself, are in Configuration. */}
+      {task?.workflow_revision != null && (
+        <span
+          className="workflowRevision mono"
+          title={task.workflow_revision}
+          data-testid="workflow-revision-chip"
+        >
+          {task.workflow_revision.replace(/^sha256:/, "").slice(0, 12)}
+        </span>
+      )}
+      {task?.workflow_ready === false && (
+        <span className="workflowRevision warn" data-testid="workflow-not-ready">
+          {task.workflow_readiness_reason === "needs_workflow_confirmation"
+            ? "definition not recorded"
+            : `definition unavailable (${task.workflow_readiness_reason})`}
+        </span>
+      )}
       <div className="workflowChips">
         {workflow.steps.map((record) => {
           const isCurrent = current !== undefined && record.seq === current.seq;
@@ -73,6 +101,7 @@ function WorkflowStrip({ workflow }: { workflow: WorkflowState }) {
               className={`workflowChip ${record.status}${isCurrent ? " current" : ""}`}
               title={chipTitle(record)}
               data-testid={`workflow-chip-${record.seq}`}
+              data-paused={record.pause !== null ? "true" : undefined}
             >
               <span className={`chipDot ${record.kind}`} />
               {record.step}
@@ -85,23 +114,34 @@ function WorkflowStrip({ workflow }: { workflow: WorkflowState }) {
   );
 }
 
-/** Gate card (workflow-engine design D-9): shown while the run is `waiting`
- * at a gate; the operator message comes from the waiting step record's
- * outcome, and Resume posts to the workflow resume endpoint with an optional
- * note. A 409 (the run already moved on) surfaces inline; the card also
- * disappears by itself once the run leaves `waiting`. */
+/** Gate card (workflow-engine design D-9): shown while the run is `waiting`.
+ *
+ * Two different things park a run here and the card must not conflate them
+ * (ADR-0028). A *declared gate* is the definition asking a person to look;
+ * resuming finishes it and the run continues. An *uncertainty pause* is the
+ * engine refusing to guess; the action retries the step that could not be
+ * decided, and it never continues past it. The verb, the explanation, and the
+ * note field all follow from which one it is.
+ *
+ * Both send the waiting attempt's own sequence number, so a stale tab or a
+ * double submit is refused rather than applied to a different attempt. A 409
+ * surfaces inline; the card also disappears by itself once the run leaves
+ * `waiting`. */
 function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowState }) {
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const waiting = [...workflow.steps].reverse().find((r) => r.status === "waiting");
-  const message = gateMessage(waiting) ?? "Waiting at a workflow gate.";
+  const pause = waiting?.pause ?? null;
+  const message =
+    pause?.message ?? gateMessage(waiting) ?? "Waiting at a workflow gate.";
 
-  async function resume() {
+  async function advance() {
+    if (waiting === undefined) return;
     setBusy(true);
     setError(null);
     try {
-      await resumeWorkflow(taskId, note.trim() || undefined);
+      await resumeWorkflow(taskId, waiting.seq, note.trim() || undefined);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -110,21 +150,38 @@ function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowStat
   }
 
   return (
-    <div className="panel gateCard" data-testid="gate-card">
+    <div
+      className="panel gateCard"
+      data-testid="gate-card"
+      data-waiting-kind={pause === null ? "gate" : "pause"}
+    >
       <h2 className="panelTitle">
-        <span className="gateDot" /> Workflow waiting — {workflow.step}
+        <span className="gateDot" />{" "}
+        {pause === null
+          ? `Workflow waiting — ${workflow.step}`
+          : `Workflow stopped — ${pause.step}`}
       </h2>
       <div className="gateMessage" data-testid="gate-message">
         {message}
       </div>
-      <textarea
-        className="gateNote"
-        aria-label="Resume note"
-        placeholder="Optional note for the workflow (e.g. reviewed, looks good)…"
-        rows={2}
-        value={note}
-        onChange={(e) => setNote(e.target.value)}
-      />
+      {pause !== null && (
+        <p className="fieldHint" data-testid="pause-retry-target">
+          Retrying re-enters <code>{pause.retry_step}</code> rather than skipping it, and
+          it changes nothing that was recorded — if the same evidence is still missing,
+          the run stops here again. A step that has used up the attempts its workflow
+          allows goes to that workflow&apos;s gate instead.
+        </p>
+      )}
+      {pause === null && (
+        <textarea
+          className="gateNote"
+          aria-label="Resume note"
+          placeholder="Optional note for the workflow (e.g. reviewed, looks good)…"
+          rows={2}
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+        />
+      )}
       {error && (
         <div className="composerError" data-testid="gate-error">
           {error}
@@ -134,11 +191,17 @@ function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowStat
         <button
           type="button"
           className="sendButton"
-          disabled={busy}
-          onClick={() => void resume()}
-          data-testid="gate-resume"
+          disabled={busy || waiting === undefined}
+          onClick={() => void advance()}
+          data-testid={pause === null ? "gate-resume" : "pause-retry"}
         >
-          {busy ? "Resuming…" : "Resume"}
+          {pause === null
+            ? busy
+              ? "Resuming…"
+              : "Resume"
+            : busy
+              ? "Retrying…"
+              : `Retry ${pause.retry_step}`}
         </button>
       </div>
     </div>
@@ -319,14 +382,14 @@ export function TaskDetailView() {
   const liveTask = tasks.find((t) => t.id === taskId) ?? null;
   const taskSessions = sessions[taskId] ?? null;
   const workflow = workflows[taskId] ?? null;
-  const primarySession = taskSessions?.[primarySessionName(taskSessions, workflow ?? undefined)];
+  const primarySession = taskSessions?.[primarySessionName(taskSessions, workflow ?? undefined, liveTask ?? undefined)];
   const review = reviews[taskId];
   const ship = ships[taskId];
   const sessionNames = taskSessionNames(taskSessions ?? undefined, workflow ?? undefined);
   const activeName =
     selected !== null && sessionNames.includes(selected)
       ? selected
-      : defaultSessionName(taskSessions ?? undefined, workflow ?? undefined);
+      : defaultSessionName(taskSessions ?? undefined, workflow ?? undefined, liveTask ?? undefined);
   const session = taskSessions?.[activeName] ?? null;
   const live = hasLiveAgent(session);
 
@@ -388,7 +451,9 @@ export function TaskDetailView() {
         </Link>
       </div>
 
-      {workflow !== null && workflow.steps.length > 0 && <WorkflowStrip workflow={workflow} />}
+      {workflow !== null && workflow.steps.length > 0 && (
+        <WorkflowStrip workflow={workflow} task={liveTask} />
+      )}
 
       <div className="detailGrid">
         <div className="panel" data-testid="task-metadata">

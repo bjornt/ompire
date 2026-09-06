@@ -440,22 +440,26 @@ def test_interrupt_clears_pending_question(
     assert client.post(f"/api/tasks/{task_id}/sessions/main/agent/stop", headers=auth_headers).status_code == 200
 
 
-def test_judge_session_admitted_on_session_routes(
+def test_only_sessions_the_pinned_definition_declares_are_addressable(
     client: TestClient, auth_headers: dict, auth_token: str, demo_project: dict
 ) -> None:
-    """The engine-reserved judge session is reachable on session-scoped routes
-    (its transcript is the audit trail), while undeclared names still 404.
+    """Session routes admit exactly what *this task's* definition declares.
 
-    Drives a real bugfix run through the pipeline: fake omp never writes an
-    outcome file, so the reproduce step's judge fires, then triage's judge —
-    both come back empty and the run parks at the synthesized gate with the
-    judge session live."""
+    The retired engine `judge` session is refused like any other undeclared
+    name now: nothing spawns or prompts it, so offering it as a live session
+    would advertise an interaction that cannot happen (ADR-0028). It is not a
+    special case in either direction — it is simply not declared.
+
+    Drives a real bugfix run: fake omp never writes an outcome file, so the
+    reproduce step's required result is missing and the run pauses for the
+    operator instead of asking a model to classify it.
+    """
     import time
 
     response = spawn_task(
         client,
         auth_headers,
-        slug="judge-route",
+        slug="session-routes",
         prompt="fix the bug",
         workflow_name="bugfix",
     )
@@ -469,12 +473,15 @@ def test_judge_session_admitted_on_session_routes(
             break
         time.sleep(0.2)
     assert task["workflow_status"] == "waiting", task
+    assert task["workflow_sessions"] == ["reproducer", "coder"]
 
-    state = client.get(
-        f"/api/tasks/{task_id}/sessions/judge/agent/state", headers=auth_headers
+    declared = client.get(
+        f"/api/tasks/{task_id}/sessions/reproducer/agent/state", headers=auth_headers
     )
-    assert state.status_code == 200, state.text
-    ghost = client.get(
-        f"/api/tasks/{task_id}/sessions/ghost/agent/state", headers=auth_headers
-    )
-    assert ghost.status_code == 404
+    assert declared.status_code == 200, declared.text
+    for undeclared in ("judge", "ghost"):
+        response = client.get(
+            f"/api/tasks/{task_id}/sessions/{undeclared}/agent/state",
+            headers=auth_headers,
+        )
+        assert response.status_code == 404, (undeclared, response.text)

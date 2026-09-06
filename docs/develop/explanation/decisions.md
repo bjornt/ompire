@@ -33,7 +33,7 @@ tool-enforced structure. It also explains the shape of this documentation.
 | State and durability | 0005, 0016 |
 | Isolation and credentials | 0006, 0015, 0022 |
 | Agent integration | 0007 |
-| Work model | 0008, 0009, 0010, 0018 |
+| Work model | 0008, 0009, 0010, 0018, 0028 |
 | Review and publishing | 0011, 0017 |
 | Attention | 0012 |
 | Settings | 0013, 0021, 0023 |
@@ -62,7 +62,7 @@ marks the earlier one `Superseded by ADR-NNNN`.
 
 ## Unreconciled decisions
 
-Four areas remain unreconciled because the implementation and the vision
+Three areas remain unreconciled because the implementation and the vision
 disagree:
 
 - **[Agent credential delivery](../../adr/0015-keep-agent-credentials-behind-narrow-brokers.md)** —
@@ -73,19 +73,25 @@ disagree:
 - **[Publishing identity](../../adr/0017-use-dedicated-bot-as-default-publishing-identity.md)** —
   ADR-0017 proposes a dedicated bot as the default while current shipping
   inherits host identity.
-- **[Workflow format](../../adr/0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md)** —
-  ADR-0018 is `Accepted`: it takes Python definitions for the current system
-  and states the trigger that supersedes them.
+These remain `Proposed` until their implementation conflicts are resolved.
+Changes that touch one should move the ADR forward deliberately rather than
+resolving the gap incidentally — a `Proposed` record is a decision waiting for
+an implementation, not a suggestion.
 
-The credential, durability, and publishing-identity decisions remain
-`Proposed` until their implementation conflicts are resolved. Changes that
-touch one should move the ADR forward deliberately rather than resolving the
-gap incidentally — a `Proposed` record is a decision waiting for an
-implementation, not a suggestion.
+Two were resolved this way rather than incidentally.
+[ADR-0018](../../adr/0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md)
+took Python workflow definitions for the built-in-only phase and named, in
+advance, exactly what would overturn it; when two of those triggers arrived,
+[ADR-0028](../../adr/0028-retain-declarative-workflow-revisions.md) superseded
+it and did what ADR-0018 had required of its successor.
+[ADR-0009](../../adr/0009-use-structured-git-excluded-outcomes.md) stayed
+`Proposed` for one named reason — a hidden LLM judge it could not accept — and
+became `Accepted` only when ADR-0028 removed that judge.
 
 ADR-0018 is the one to copy when a decision is knowingly provisional: it
 commits to the current choice while naming, in advance, what would overturn
-it.
+it, and it made its own succession a short argument rather than an
+archaeology.
 
 ## Adding a record
 

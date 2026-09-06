@@ -33,10 +33,13 @@ driven by the daemon. An agent that could run its own reviewer, edit the
 review input, or write the verdict makes review ceremonial.
 
 **Do not let agent output route control flow unchecked.** A decision step
-routes on validated evidence with explicit rules. An LLM judge is legitimate
-only as a *declared* step whose inputs, output, and routing effect are
-recorded — never as a hidden fallback when parsing fails. Missing, malformed,
-or contradictory output is data: it becomes a gate, not a success.
+routes on validated evidence with explicit rules, and the definition it routes
+by is a document the operator reviewed, pinned to the task by content identity.
+A model asked to judge is legitimate only as a *declared* step whose inputs,
+output, and routing effect are recorded — never as a hidden fallback when
+parsing fails. The engine reserves no model of its own. Missing or malformed
+output is not a result: the run stops and says what was missing, and only an
+explicit human retry re-enters the step.
 
 **Do not widen the sandbox for convenience.** Each task gets its own clone and
 container. Sharing a working tree, an index, refs, or a container between

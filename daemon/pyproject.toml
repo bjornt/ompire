@@ -17,6 +17,10 @@ dependencies = [
     "pydantic>=2.9",
     "sqlalchemy>=2.0",
     "alembic>=1.13",
+    # Workflow definitions are YAML documents (ADR-0028). Loaded through a
+    # restricted event/node walk, never `yaml.load` with an object
+    # constructor, so this is a parser dependency and not a deserializer.
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
@@ -36,6 +40,12 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[[tool.mypy.overrides]]
+# PyYAML ships no type information. Only the parser edge is untyped; every
+# value crossing out of it is validated into the definition model right here.
+module = ["yaml", "yaml.*"]
+ignore_missing_imports = true
 
 [tool.ruff.lint.per-file-ignores]
 "src/**" = ["B008", "S110"]

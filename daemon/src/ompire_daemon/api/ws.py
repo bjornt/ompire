@@ -25,7 +25,7 @@ from ompire_daemon.registry.projects import list_projects
 from ompire_daemon.registry.settings import SettingsStore
 from ompire_daemon.registry.tasks import list_tasks, task_payload
 from ompire_daemon.registry.workflows import list_step_records
-from ompire_daemon.workflows import describe_workflows
+from ompire_daemon.workflows import describe_catalog
 
 router = APIRouter()
 
@@ -74,11 +74,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # Global model profiles (ADR-0025), sorted by name: the same authoritative
     # replacement the projects registry gets.
     model_profiles_payload = [asdict(p) for p in list_model_profiles(engine)]
-    # The workflow catalog (ADR-0026). Definitions ship with the daemon
-    # (ADR-0018), so it rides in the snapshot and has no change event: it
-    # cannot change while the process runs.
-    workflow_catalog_payload = [asdict(d) for d in describe_workflows()]
-    tasks_payload = [task_payload(t) for t in list_tasks(engine)]
+    # The installed workflow catalog (ADR-0026, ADR-0028). Definitions ship
+    # with the daemon, so it rides in the snapshot and has no change event: it
+    # cannot change while the process runs. Each entry names the revision that
+    # name currently resolves to; a *task's* revision is on the task.
+    workflow_catalog_payload = [asdict(d) for d in describe_catalog()]
+    tasks_payload = [task_payload(t, engine=engine) for t in list_tasks(engine)]
     # Session statuses ride separately from task rows (design D-4), nested
     # task → session (workflow-engine design D-7); JSON object keys are
     # strings, so task ids are stringified here.

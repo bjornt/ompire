@@ -13,6 +13,9 @@ import type {
   Project,
   ProjectFiles,
   WorkflowDescriptor,
+  WorkflowReadinessReason,
+  WorkflowRevisionDetail,
+  WorkflowStepDescriptor,
   ReviewState,
   ShipState,
   Task,
@@ -85,10 +88,10 @@ export interface ConsumerOverrideInput {
 /** What the operator selected. `model_profile` omitted means "inherit the
  * project default"; a name replaces that inheritance for this task.
  *
- * `step_overrides` is keyed by declared agent step name and
- * `auxiliary_overrides` by engine-reserved consumer name (today: `judge`).
- * Two namespaces, so a decision step can never become an agent binding by
- * sharing a name with the judge. */
+ * `step_overrides` is keyed by declared agent step name. Every model consumer
+ * is a declared step now; `auxiliary_overrides` is kept only so a request
+ * still naming the retired judge is refused with a field-level error rather
+ * than having its choice silently dropped (ADR-0028). */
 export interface LaunchInput {
   project_name: string;
   workflow_name: string;
@@ -106,7 +109,7 @@ export interface LaunchInput {
  * model-specific level at run time. */
 export interface LaunchPreviewStep {
   step: string;
-  kind: "agent" | "command" | "decision" | "gate" | "judge";
+  kind: "agent" | "command" | "decision" | "gate";
   session: string | null;
   conditional: boolean;
   /** The role the workflow declares, so the form can say what resetting the
@@ -132,9 +135,14 @@ export interface LaunchPreview {
   model_profile: string | null;
   model_profile_source: "task" | "project" | "legacy-confirmed";
   project_default_model_profile: string | null;
-  judge_session: string;
-  judge_role: ModelRole;
-  /** Engine-reserved consumer names an `auxiliary_overrides` map may key. */
+  /** The exact definition this launch would pin, and the semantics version it
+   * is read under. Editing a prompt or a route changes this and invalidates
+   * the preview; an unrelated change does not (ADR-0028). */
+  workflow_revision: string;
+  workflow_format: number;
+  workflow_primary_session: string;
+  workflow_sessions: string[];
+  /** Engine-reserved consumer names. Empty: there are none left. */
   auxiliary_consumers: string[];
   /** The task-wide profile's own map: what a row inheriting both dimensions
    * resolves against. */
@@ -218,13 +226,33 @@ export function answerAgent(
   return request("POST", sessionAgentUrl(id, session, "answer"), answer);
 }
 
-/** Resumes a workflow run parked at a gate (workflow-engine capability);
- * 409 when the run has already moved on. */
+/** Advances a waiting run: resumes a declared gate, or retries the attempt an
+ * uncertainty pause is waiting on (ADR-0028). The daemon picks which from the
+ * waiting record, so the caller never has to guess.
+ *
+ * `expectedSeq` names the attempt the operator was actually looking at. It is
+ * required: a stale tab and a double submit are indistinguishable otherwise,
+ * and both would apply a decision to evidence nobody saw. 409 when the run
+ * has moved on. */
 export function resumeWorkflow(
   id: number,
+  expectedSeq: number,
   note?: string,
-): Promise<{ task_id: number; workflow: string; step: string | null }> {
-  return request("POST", `/api/tasks/${id}/workflow/resume`, { note: note ?? null });
+): Promise<{ task_id: number; workflow: "resumed" | "retried"; step: string | null }> {
+  return request("POST", `/api/tasks/${id}/workflow/resume`, {
+    expected_seq: expectedSeq,
+    note: note ?? null,
+  });
+}
+
+/** Read one retained definition by content identity. Deliberately not
+ * addressable by workflow name: a name says what a *new* launch would get,
+ * and this answers "what did that task accept". */
+export function getWorkflowRevision(revision: string): Promise<WorkflowRevisionDetail> {
+  return request<WorkflowRevisionDetail>(
+    "GET",
+    `/api/workflows/revisions/${encodeURIComponent(revision)}`,
+  );
 }
 
 /** Start an llmvet review for an idle task (review capability). */
@@ -383,7 +411,9 @@ export interface ProjectReconciliation {
    * never turned into a profile. */
   model_candidates: { source: string; model: string | null; thinking: string | null }[];
   retired_judge_model: string | null;
-  judge_role: ModelRole;
+  /** True: nothing replaces it. The engine runs no implicit model at all, so
+   * there is no role to point the operator at as "where it went". */
+  judge_removed: boolean;
   /** Inert history, kept after reconciliation so an unselected preamble or
    * candidate is not lost. */
   source_templates: { source: string; values: Record<string, unknown> }[];
@@ -421,6 +451,16 @@ export function confirmProjectReconciliation(
 export interface TaskConfiguration {
   task_id: number;
   needs_configuration: boolean;
+  /** The task predates retained definitions and has no pinned revision. */
+  needs_workflow_confirmation: boolean;
+  workflow_readiness: {
+    ready: boolean;
+    reason: WorkflowReadinessReason | null;
+    detail: string | null;
+    /** Only a missing legacy binding is something a confirmation can fix. */
+    confirmable: boolean;
+  };
+  workflow_candidate: WorkflowContinuationCandidate | null;
   archived: boolean;
   known: Record<string, unknown>;
   source_attribution: { source: string; values: Record<string, unknown> }[];
@@ -429,11 +469,37 @@ export interface TaskConfiguration {
   accepted?: TaskExecutionInputs;
 }
 
+/** The current definition of *this task's own* workflow name, offered as a
+ * candidate to continue under. `problems` is why it cannot explain the
+ * task's recorded steps and sessions; a non-empty list blocks confirmation
+ * rather than remapping anything. */
+export interface WorkflowContinuationCandidate {
+  workflow_name: string;
+  revision: string | null;
+  format?: number;
+  available: boolean;
+  compatible: boolean;
+  problems: string[];
+  primary_session?: string;
+  sessions?: string[];
+  steps?: WorkflowStepDescriptor[];
+  current_step?: string | null;
+  workflow_status?: string | null;
+  /** Everything through this attempt ran under a definition nobody kept. */
+  legacy_through_seq: number;
+  /** The one attempt that spans the boundary, if a run is in flight. */
+  interrupted_legacy_seq: number | null;
+  uncertainty_notice: string;
+}
+
+/** The launch fields are needed only by a task that was never configured. A
+ * task that merely predates retained definitions supplies none of them: its
+ * model, branch, and preamble were reviewed once and are not re-decided. */
 export interface TaskContinuationInput {
-  model_profile: string;
-  base_branch: string;
-  workshop_additions: WorkshopAdditionsSource;
-  preamble: string;
+  model_profile?: string;
+  base_branch?: string;
+  workshop_additions?: WorkshopAdditionsSource;
+  preamble?: string;
 }
 
 export function getTaskConfiguration(id: number): Promise<TaskConfiguration> {
@@ -443,7 +509,22 @@ export function getTaskConfiguration(id: number): Promise<TaskConfiguration> {
 export function previewTaskConfiguration(
   id: number,
   input: TaskContinuationInput,
-): Promise<{ task_id: number; preview_token: string; inputs: TaskExecutionInputs; unknown_inputs: string[] }> {
+): Promise<{
+  task_id: number;
+  preview_token: string;
+  inputs: TaskExecutionInputs | null;
+  workflow: {
+    name: string;
+    revision: string;
+    format: number;
+    compatible: boolean;
+    problems: string[];
+    legacy_through_seq: number;
+    interrupted_legacy_seq: number | null;
+    uncertainty_notice: string;
+  };
+  unknown_inputs: string[];
+}> {
   return request("POST", `/api/tasks/${id}/configuration/preview`, input);
 }
 
@@ -451,7 +532,11 @@ export function previewTaskConfiguration(
  * these values, and it recreates no workspace, branch, or session identity. */
 export function confirmTaskConfiguration(
   id: number,
-  input: TaskContinuationInput & { preview_token: string; acknowledge_unknown: boolean },
+  input: TaskContinuationInput & {
+    preview_token: string;
+    acknowledge_unknown: boolean;
+    acknowledge_workflow: boolean;
+  },
 ): Promise<Task> {
   return request<Task>("POST", `/api/tasks/${id}/configuration/confirm`, input);
 }

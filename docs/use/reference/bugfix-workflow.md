@@ -12,7 +12,13 @@ bound is deterministic, and every dead end is a human gate.
 
 ## Definition
 
-Sessions `("reproducer", "coder")`, primary `coder` — so review, ship, and
+A packaged YAML document
+(`daemon/src/ompire_daemon/builtin_workflows/bugfix.yaml`). Each task pins the
+revision it was accepted under, so the routes below describe *your task's*
+`bugfix` — a later release that edits this definition does not change a run
+already in flight. See [Workflow engine](workflow-engine.md#definitions-and-revisions).
+
+Sessions `["reproducer", "coder"]`, primary `coder` — so review, ship, and
 task-scoped agent operations target the coder.
 
 | # | Step | Kind | Session |
@@ -67,12 +73,15 @@ when determinable.
 | Latest `reproduce` outcome | Route |
 |---|---|
 | `status: "success"` | `fix` |
-| `status: "failed"` | `escalate` |
-| missing | Unresolvable — judge, then gate |
+| anything else | `escalate` |
 
 A bug that cannot be reproduced is operator triage, not a coding task. Sending
 an agent to fix something nobody has demonstrated is how a plausible,
-unverifiable change gets written.
+unverifiable change gets written. A `"failed"` reproduction is a real, declared
+result and takes the declared route; it does not stop the run.
+
+A `reproduce` attempt that leaves *no* outcome never reaches this decision —
+the step itself pauses on its missing required result.
 
 ### 3. Fix
 
@@ -120,28 +129,38 @@ record.
 | Signal | Result |
 |---|---|
 | Script exit `0`, or agent `status: "success"` | Validated — run completes |
-| Anything else, with fewer than 3 `fix` records | Route back to `fix` |
-| Anything else, with 3 `fix` records | Route to `escalate` |
-| Missing | Unresolvable — judge, then gate |
+| A validation result that is neither | Route back to `fix` |
+| No validation result for this iteration | [Pause](workflow-engine.md#uncertainty-pauses) |
 
-**The bound is three fix attempts.** It is deterministic and enforced by the
-control plane, not by the agent deciding it has tried enough.
+**The bound is three fix attempts.** It is declared on the `fix` step itself
+and enforced by the engine, which counts attempts *before* opening a new one —
+so the third rejection routes to `fix` and the engine sends it to `escalate`
+instead. The route predicate is not what stops the loop, which is why a
+mistake in it cannot make the loop run forever. A daemon restart mid-attempt
+costs no visit.
 
 ### 8. Escalate
 
-The gate message names the cause — bug not reproducible, iteration bound
-exhausted, or an unresolvable decision — and the current state of play. A
-notify-tier attention entry is raised.
+The gate message names the cause — bug not reproducible, or the iteration bound
+exhausted with the latest validation report — and the current state of play. A
+notify-tier attention entry is raised. It is a *declared gate*: resuming closes
+the run out. It never claims the bug was fixed.
 
 As the last declared step, resuming completes the run. The operator then
 reviews and ships the coder's work, or steers the sessions manually.
 
 ## Failures and recovery
 
-Every unresolvable route falls through the engine's judge-then-gate fallback:
-the [LLM judge](workflow-engine.md#the-llm-judge) is consulted, and if it
-cannot classify confidently the run parks at a synthesized gate rather than
-guessing.
+Missing evidence stops the run rather than being classified. A `reproduce` or
+`fix` turn that leaves no readable outcome, and a `check` that has no
+validation result for the current iteration, both raise an
+[uncertainty pause](workflow-engine.md#uncertainty-pauses) naming what was
+missing. Retrying makes another attempt at that same step; it never continues
+past it.
+
+That is different from the `escalate` gate, which is a route the definition
+declares for results it *did* understand — an unreproducible bug, or three
+rejected fixes.
 
 A completed or escalated run leaves the workspace and sessions alive until
 cleanup.
@@ -153,11 +172,11 @@ Choose `bugfix` as the workflow on the Spawn view, or pass
 `POST /api/tasks`. Every project can run it; nothing has to be configured
 first.
 
-Every agent step of this workflow declares the `default` role, and the judge —
-which fires only when a route or an outcome cannot be resolved — declares
-`slow`. That is the starting point, not a fixed one: each of those rows can be
-sent to a different model profile or a different role at launch, independently.
-The Spawn view lists all of it before you submit.
+Every agent step of this workflow declares the `default` role. That is the
+starting point, not a fixed one: each of those rows can be sent to a different
+model profile or a different role at launch, independently. The Spawn view
+lists all of it — every model consumer is one of these steps — before you
+submit.
 
 `reproduce` and `validate-agent` share the `reproducer` session, so they share
 its conversation, and they can still run under different policies. When

@@ -138,6 +138,25 @@ built-in trust boundary, and
 profile ownership are unchanged. No credential, auth profile, or provider
 configuration enters a model policy.
 
+## Extension: every consumer is a declared step
+
+[ADR-0028](0028-retain-declarative-workflow-revisions.md), 2026-09-06.
+
+Per-consumer pinning is unchanged; the *set* of consumers shrank. This record
+described two namespaces — declared agent steps and engine-reserved auxiliary
+consumers, of which the judge was the only one. ADR-0028 removed the implicit
+judge, so the auxiliary namespace is now empty and every model consumer is a
+step the operator can see in the launch preview.
+
+Nothing else moves. A step still carries its own complete four-role snapshot, a
+session still records the policy it last verifiably ran under, a repeated step
+still reuses its own accepted binding rather than whatever the session was last
+put on, and a missing binding is still an error rather than a fall back to a
+task-wide default. Recovery resumes only sessions the task's pinned definition
+declares: the retired `judge` session is left alone rather than resumed, since
+nothing will prompt it again. Its transcript and its last applied policy stay
+on record.
+
 ## Consequences
 
 An operator can put one step on a different profile or a different role without

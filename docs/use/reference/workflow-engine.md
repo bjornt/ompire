@@ -6,33 +6,67 @@ A workflow is an ordered sequence of steps executed over a task's named
 sessions. It is what turns "run an agent" into "run this procedure, collect
 this evidence, and stop for a human when the evidence is missing".
 
-Workflows are trusted Python definitions registered in the daemon by name. The
-current built-in-only representation boundary is recorded in
-[ADR-0018](../../adr/0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md).
-There is no declarative format today — [`VISION.md`](../../VISION.md) calls for
-versioned declarative workflows, and ADR-0018 defines when that direction
-becomes a requirement rather than current behavior.
+A workflow definition is a **document**, not code. It is a bounded YAML
+subset, normalized into one canonical form and identified by the SHA-256 of
+those bytes — its *revision*. A task pins one revision when it is accepted and
+executes that exact revision for the rest of its life
+([ADR-0028](../../adr/0028-retain-declarative-workflow-revisions.md)). The
+exact grammar is a contributor reference:
+[Workflow definitions](../../develop/reference/workflow-definitions.md).
 
-## Definitions
+Two definitions ship with the daemon: [`single-step`](#the-single-step-workflow)
+and [`bugfix`](bugfix-workflow.md). This release installs only packaged
+definitions — there is no library, no import, and no way to add one without a
+daemon release.
 
-A workflow declares:
+## Definitions and revisions
+
+A definition declares:
 
 | Part | Meaning |
 |---|---|
-| `name` | Unique registry name; a launch selects it |
+| `format` | The document format *and* its interpretation. Currently `1`. |
+| `name` | Unique installed name; a launch selects it |
 | `sessions` | Slug-format session names, declared up front, unique per task |
+| `primary` | Session targeted by task-scoped operations |
 | steps | Ordered, uniquely named, of four kinds. An `agent` step also declares the abstract model role it consumes. |
-| `primary` | Session targeted by task-scoped operations. Defaults to the first declared. |
 
 Steps fall through to the next declared step on success. A `decision` step
 routes explicitly. Falling off the end completes the run.
 
-Validation happens **at daemon startup**, not at task runtime: duplicate step
-names, an agent step naming an undeclared session, or a workflow declaring the
-reserved session name `judge` are all rejected before the daemon serves.
+### What a revision pins, and what it does not
 
-Two workflows are registered: [`single-step`](#the-single-step-workflow) and
-[`bugfix`](bugfix-workflow.md).
+The revision covers everything that decides what a run *does*: every prompt and
+gate message, every route, every command and timeout, the declared sessions and
+which one is primary, the outcome contracts, and the visit bounds. Change any
+of them and the revision changes. YAML comments and the order of mapping keys
+do not change it; the exact text of a prompt and the order of a sequence do.
+
+It does **not** pin model responses, binaries, credentials, tool versions, or
+the contents of your working tree. It pins the procedure, not the world.
+
+A retained revision keeps its meaning. `format: 1` fixes both the grammar and
+how it is interpreted, so a document retained today is read under today's rules
+forever. A daemon that meets a format it does not implement refuses it visibly
+rather than reading it under the newest rules.
+
+### Where a revision comes from, and where it is used
+
+New tasks pin the currently installed revision of the name they select.
+Everything afterwards — execution, restart recovery, which sessions are
+addressable, which session review and shipping attach to, and what task detail
+shows — resolves through *that task's* revision. The workflow's name is looked
+up in the installed catalog for exactly two prospective questions: what a new
+launch would pin, and what an old task is offered as a continuation candidate.
+
+So a daemon release that edits `bugfix` does not change a `bugfix` task that is
+already running. Both revisions execute at once, and both stay readable: the
+retained document is kept whole, not just its identifier, and stays available
+after the packaged definition changes and after the workflow name disappears
+from a later release's catalog.
+
+Packaged definitions are validated at **daemon startup**. A malformed built-in
+prevents the daemon from serving rather than failing a task later.
 
 ## States and behavior
 
@@ -43,10 +77,10 @@ accepted with executes as a single sequential run — one step at a time, in
 declaration order, with `decision` routes as the only jumps. At most one step
 runs at a time per task.
 
-Persisted per task: the workflow name, the run status (`running`, `waiting`,
-`complete`, `failed`), the current step name, and one history row per executed
-step carrying its sequence number, name, kind, session, status, parsed
-outcome, error text, and timestamps.
+Persisted per task: the workflow name and its pinned revision, the run status
+(`running`, `waiting`, `complete`, `failed`), the current step name, and one
+history row per attempt carrying its sequence number, name, kind, session,
+status, parsed outcome, error text, any uncertainty pause, and timestamps.
 
 A completed or failed run **keeps the workspace alive**. The task stays
 `created` and its sessions stay live until cleanup, so the operator can
@@ -95,17 +129,17 @@ stale file from an earlier step can never be mistaken for this one's result.
 | `summary` | yes | string |
 | `artifacts` | no | string-keyed map of workflow-defined handoff values |
 
-A missing file, unreadable JSON, or a schema violation first triggers the
-[LLM judge](#the-llm-judge). If the judge does not classify confidently, the
-outcome is recorded as **null with a note** — never guessed — and that by
-itself does not fail the step.
+A missing file, unreadable JSON, or a schema violation on a step that asked for
+one **pauses the run** — see [Uncertainty pauses](#uncertainty-pauses). The
+attempt keeps its absent outcome and the reason it was rejected. Nothing is
+guessed and nothing is synthesized.
 
-Missing evidence is data. Routing decisions downstream see the absence and can
-act on it.
+A `"failed"` outcome is not a missing one. It is a real, declared result, and
+it follows the definition's own routes.
 
-An outcome-bearing step that built an empty prompt records a null outcome
-without reading the file and without invoking the judge: no outcome
-instruction was given, so anything on disk is stale by definition.
+An outcome-bearing step whose prompt renders empty records a null outcome
+without reading the file and without pausing: no outcome instruction was
+given, so anything on disk is stale by definition, and nothing was asked.
 
 ### Command steps
 
@@ -123,16 +157,20 @@ re-run on recovery.
 
 ### Decision steps
 
-A decision step evaluates a deterministic route function against the run
-context. A returned declared step name continues the run there; a returned
-completion sentinel finishes the run `complete`. The chosen route is recorded
-as the step's outcome.
+A decision step chooses where the run goes next from the evidence already
+recorded. A case naming a declared step continues the run there; a case naming
+completion finishes the run `complete`. The chosen route is recorded as the
+step's outcome.
 
-If the route function returns `None`, raises, or names a step that does not
-exist, the [judge](#the-llm-judge) is invoked. If that does not confidently
-resolve a route, **the daemon does not guess**: the run parks in a synthesized
-gate naming the decision step and the resolution failure. Resuming continues
-at the step declared after the decision.
+It evaluates its declared cases in order and takes the first that
+is **true**. Predicates are three-valued: a missing operand or a type mismatch
+is *unresolved*, not false. An unresolved case stops the run right there — it is
+deliberately not skipped in favour of a later case, because "this rule could
+not be applied" is not "this rule does not apply". A definition may also
+declare `otherwise` as a pause, which is the author saying "ask a person"
+rather than inventing a destination.
+
+Either way the run [pauses](#uncertainty-pauses) rather than routing.
 
 ### Gate steps
 
@@ -140,8 +178,11 @@ A gate parks the run in the persisted `waiting` status with an operator
 message, broadcasts it, and classifies in the `notify` attention tier.
 
 `POST /api/tasks/{id}/workflow/resume` records the operator's optional note as
-the gate's outcome, finishes the gate `ok`, and continues. It responds `409`
-when the run is not waiting and `404` for an unknown task.
+the gate's outcome, finishes the gate `ok`, and continues. The request names
+the waiting attempt's sequence number, so a stale browser tab or a double
+submit is refused rather than applied to whatever the run is waiting on now. It
+responds `409` when the run is not waiting or the attempt has moved on, and
+`404` for an unknown task.
 
 A gate waits indefinitely. Re-notify aging applies to an unanswered gate as it
 does to `waiting-input`.
@@ -149,48 +190,56 @@ does to `waiting-input`.
 Resuming a gate that is the last declared step completes the run — including
 when the gate was re-armed by restart recovery.
 
-### The LLM judge
+### Uncertainty pauses
 
-The judge is a **fallback, never the router**, invoked at exactly two points:
-an outcome-bearing agent step ending with a missing or malformed outcome file,
-and a decision step whose route cannot resolve.
+There is no LLM judge. When the evidence a step or a route needs is missing or
+unreadable, the run stops and says what it was waiting for.
 
-It runs as an engine-reserved session named `judge` in the task's container
-and clone, spawned lazily through the normal supervised-start path and
-surfaced in the session tracker, snapshot, and UI like any other session.
+A pause is not a gate, and the UI keeps them apart. A **gate** is the
+definition asking a person to look; resuming finishes it and the run continues
+at the gate's fall-through. A **pause** is the engine refusing to guess; the
+action retries the step that could not be decided, and it never continues past
+it.
 
-It has no model setting of its own and no hidden exception from per-consumer
-choice: it is an ordinary model consumer with its own accepted binding. It
-declares `slow`, inherits the task's profile, is disclosed in the launch
-preview beside every declared step, and can have its profile and role
-overridden there like any agent step. It carries the same full auxiliary role
-map as any other session. The retired `judge_model` config key configures
-nothing; see [Configuration](configuration.md#retired-keys).
+Four things pause a run:
 
-A judge whose accepted binding cannot be applied produces no judgment — the
-existing no-judgment path. The null outcome or the escalation gate stands; it
-never fails the run and never falls back to another model.
+| Reason | What happened |
+|---|---|
+| `missing_outcome` | A prompted step that requires a result left none that could be read |
+| `unresolved_decision` | A route could not be decided from the recorded evidence, or the definition declared a pause for this case |
+| `prompt_unrenderable` | A prompt or gate message referenced a value that is missing and has no declared fallback |
+| `condition_unresolved` | A step's own condition could not be decided |
 
-Each judgment is self-contained: the prompt names the step and its purpose,
-references a daemon-written transcript tail at
-`.ompire/judge-transcript-<seq>.jsonl` dumped best-effort from the judged
-session's ring buffer, and instructs the judge to inspect the working tree.
+None of these is a *negative result*. A `"failed"` outcome, a nonzero command
+exit, and a declared no-match all follow the definition's routes normally.
 
-The judge writes a standard outcome document — carrying `artifacts.route` for
-a route judgment — and is instructed to **write no file at all when it cannot
-classify with confidence**.
+The paused attempt keeps everything it had: its own kind, its absent outcome,
+and the parse or evaluation error. Nothing is written that could later read as
+a result. The run status is `waiting`, and the record and the run are marked
+together so a restart cannot find one without the other.
 
-A judged outcome is recorded with an error-field note marking it
-judge-synthesized. A judged route is validated against the declared steps plus
-the sentinel before being accepted.
+**Retrying** opens a *new attempt of the blocked step*. It never falls through
+as if the missing evidence had been accepted, and it never edits what was
+recorded. If the evidence is still unreadable, the run pauses again — that is
+the honest answer, not a failure of the retry.
 
-Judgments produce no step records of their own. A judge that fails to start,
-crashes, or stays uncertain degrades to the no-judgment path — the null
-outcome stands, or gate escalation proceeds. **Judging never fails a run.**
+A retried agent step is told, before its original instruction, that the
+previous attempt left no valid result and that files may already have changed:
+inspect the working tree and finish what is missing rather than repeat it. That
+is deliberately not the restart nudge — the previous turn ran to completion.
 
-The `judge` session is admitted by session-scoped endpoints like a declared
-one, because its transcript is the audit trail for judge-synthesized
-outcomes. Arbitrary undeclared session names still return `404`.
+A retried decision re-reads exactly the same recorded evidence. There is no way
+to edit an outcome or a transcript to make it resolve; if it did not decide
+before, it will not decide now, and the UI says so.
+
+A pause survives a restart. Recovery re-arms it exactly as persisted: no
+prompt, no automatic retry, no second attempt. Leaving it waiting indefinitely
+is fine, and so is stopping the task or cleaning it up instead.
+
+Retrying is a human decision, but it is not a way past a bound the definition
+set. A retry counts against the step's declared visit bound like any other
+attempt, and once that bound is spent the retry sends the run to the step's
+declared exhaustion gate instead of opening another attempt.
 
 ### The single-step workflow
 
@@ -217,6 +266,22 @@ run was `running` or `waiting` resumes at its persisted current step, by kind:
 | `command` | Re-run |
 | `decision` | Re-evaluate against persisted records |
 | `gate` | Re-arm the waiting state and re-broadcast |
+| paused | Re-arm the pause exactly as persisted — no prompt, no automatic retry |
+
+Recovery re-drives the attempt that was already open rather than closing it and
+appending another. A restart is not a work attempt, so it costs nothing against
+a step's declared visit bound.
+
+The pinned definition is resolved and validated *before* any session is resumed
+or any step is chosen. A revision that is absent, damaged, or written for a
+format this daemon does not implement stops recovery for that task alone: no
+session is resumed, no prompt is sent, and nothing is published. The task keeps
+its position, its workspace, and its history, and task detail says why. Other
+tasks are unaffected.
+
+Only sessions the pinned definition declares are resumed. The retired `judge`
+session in an older task is left alone — nothing will prompt it again — while
+its transcript and last applied policy stay on record.
 
 The resume nudge exists because the resumed session retains its context —
 restarting the prompt would duplicate work. For outcome-bearing steps the
@@ -238,43 +303,62 @@ review feedback, or ship drafting then continues with.
 ### Git exclusion
 
 The clone step appends `.ompire/` to the clone's `.git/info/exclude`,
-idempotently, so outcome files and judge transcripts never appear in `git
-status`, diffs, reviews, or pull requests.
+idempotently, so outcome files never appear in `git status`, diffs, reviews, or
+pull requests. Transcripts left by the retired judge in older clones are
+covered by the same exclusion.
 
 ## Configuration
 
-The engine has no model configuration of its own. Every model a run uses comes
-from the task's accepted bindings; the retired `judge_model` key configures
-nothing (see [Configuration](configuration.md#retired-keys)).
+The engine has no model configuration of its own, and no model consumer of its
+own. Every model a run uses belongs to a declared agent step and comes from the
+task's accepted bindings. The retired `judge_model` key configures nothing —
+there is no judge to configure (see
+[Configuration](configuration.md#retired-keys)).
 
 ## Interfaces
 
 | Method | Path |
 |---|---|
 | `POST` | `/api/tasks/{id}/workflow/resume` |
+| `GET` | `/api/workflows` |
+| `GET` | `/api/workflows/revisions/{revision}` |
+
+`resume` advances a waiting run. It names the waiting attempt's sequence
+number, and the daemon decides from the waiting record whether that means
+resuming a declared gate or retrying a paused step.
 
 Each step start and finish broadcasts `workflow_step` carrying the task id,
-step name, kind, and status, with error text on failure.
+step name, kind, and status, with error text on failure and the pause document
+when the run stopped rather than deciding.
 
 The snapshot carries each task's workflow state, so reconnecting clients see
-current runs without replaying events.
+current runs without replaying events. Each task also carries its pinned
+revision, whether that revision can currently be resolved, and the primary
+session *its* definition declares.
 
-`GET /api/workflows` returns the registry as a read-only catalog — each
-workflow's sessions, every declared step with its kind, session, abstract role,
-and whether a decision can route past it, plus the conditional judge and the
-role it binds. The same catalog rides in the WebSocket snapshot. There is no
-CRUD and no change event: definitions ship with the daemon (ADR-0018), so the
-catalog cannot change while the process runs.
+`GET /api/workflows` returns the installed catalog — each definition's current
+revision and format, its sessions, and every declared step with its kind,
+session, abstract role, and whether a route or its own condition can pass it
+by. Every model consumer is one of those steps; nothing is described outside
+them. The same catalog rides in the WebSocket snapshot. There is no CRUD and no
+change event: installed definitions change only when the daemon does.
 
-A launch validates its `workflow_name` against this registry; an unregistered
-name is rejected with `422`.
+`GET /api/workflows/revisions/{revision}` reads one retained definition by
+content identity — deliberately not by name, because a name says what a *new*
+launch would get and this answers "what did that task accept". An unknown
+revision is `404`; a stored document that cannot be read comes back as a
+classified `409` rather than being executed to answer a read.
+
+A launch validates its `workflow_name` against the installed catalog; an
+unknown name is rejected with `422`.
 
 ### Model policy per turn
 
 A step declares an abstract role, never a model. Which model answers to that
 role is the launch's choice, pinned onto the task at acceptance — one complete
-binding for every agent step and for the judge — and read from there, including
-after a restart and after the source profile is edited or deleted. Overriding a
+binding for every declared agent step, and none for anything else — and read
+from there, including after a restart and after the source profile is edited or
+deleted. Overriding a
 step's profile or role is a launch-time choice; an accepted task's policy does
 not change.
 

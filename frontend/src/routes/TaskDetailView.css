@@ -588,6 +588,27 @@
   color: var(--cyan);
 }
 
+/* The pinned revision, beside the run status: enough of the digest to tell
+   two definitions apart at a glance, with the whole thing on hover. */
+.workflowRevision {
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+.workflowRevision.warn {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+/* A step the engine stopped on rather than deciding. Distinct from a declared
+   gate: the chip says the run is stuck, not that it is asking. */
+.workflowChip[data-paused="true"] {
+  border-style: dashed;
+}
+
 .workflowChips {
   display: flex;
   align-items: center;

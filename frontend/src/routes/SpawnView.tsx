@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
+import { WorkflowRevision } from "../components/WorkflowRevision";
 import { previewTask, spawnTask } from "../lib/api";
 import type {
   ConsumerOverrideInput,
@@ -32,7 +33,7 @@ const MODEL_ROLES: ModelRole[] = ["default", "smol", "slow", "plan"];
 /** Which override map a row belongs to. `null` marks a row with no model at
  * all — a command, decision, or gate — which gets no controls rather than
  * disabled ones for a binding it will never have. */
-type ConsumerNamespace = "step" | "auxiliary" | null;
+type ConsumerNamespace = "step" | null;
 
 /** One row of the preview, whether or not resolution succeeded. Controls are
  * rendered from the daemon's workflow catalog, so a row whose selected
@@ -138,12 +139,9 @@ export function SpawnView() {
     (workflow: string) => {
       setDraft((current) => {
         if (workflow === current.workflow) return current;
-        const cleared = [
-          ...Object.keys(current.stepOverrides),
-          ...Object.keys(current.auxiliaryOverrides),
-        ];
+        const cleared = Object.keys(current.stepOverrides);
         setClearedRows(cleared.length > 0 ? cleared.sort() : null);
-        return { ...current, workflow, stepOverrides: {}, auxiliaryOverrides: {} };
+        return { ...current, workflow, stepOverrides: {} };
       });
     },
     [],
@@ -152,9 +150,9 @@ export function SpawnView() {
   /** Change one dimension of one row. `undefined` resets that dimension
    * alone and leaves the other exactly as it was. */
   const setRowOverride = useCallback(
-    (namespace: Exclude<ConsumerNamespace, null>, name: string, patch: { profile?: string | undefined; role?: ModelRole | undefined }) => {
+    (name: string, patch: { profile?: string | undefined; role?: ModelRole | undefined }) => {
       setDraft((current) => {
-        const key = namespace === "step" ? "stepOverrides" : "auxiliaryOverrides";
+        const key = "stepOverrides" as const;
         const next: DraftConsumerOverrides = {
           ...current[key],
           [name]: { ...(current[key][name] ?? {}), ...patch },
@@ -194,7 +192,6 @@ export function SpawnView() {
       return out;
     };
     const stepOverrides = consumers(draft.stepOverrides);
-    const auxiliaryOverrides = consumers(draft.auxiliaryOverrides);
     return {
       project_name: draft.project,
       workflow_name: draft.workflow,
@@ -203,9 +200,6 @@ export function SpawnView() {
       ...(draft.profile ? { model_profile: draft.profile } : {}),
       ...(Object.keys(overrides).length > 0 ? { workspace_overrides: overrides } : {}),
       ...(Object.keys(stepOverrides).length > 0 ? { step_overrides: stepOverrides } : {}),
-      ...(Object.keys(auxiliaryOverrides).length > 0
-        ? { auxiliary_overrides: auxiliaryOverrides }
-        : {}),
     };
   }, [draft]);
 
@@ -222,32 +216,20 @@ export function SpawnView() {
         session: step.session,
         conditional: step.conditional,
         declaredRole: step.declared_role,
-        namespace:
-          step.kind === "judge" ? "auxiliary" : step.kind === "agent" ? "step" : null,
+        namespace: step.kind === "agent" ? "step" : null,
         binding: step.binding,
       }));
     }
     if (workflow === null) return [];
-    return [
-      ...workflow.steps.map((step) => ({
-        name: step.name,
-        kind: step.kind,
-        session: step.session,
-        conditional: step.conditional,
-        declaredRole: step.role,
-        namespace: (step.kind === "agent" ? "step" : null) as ConsumerNamespace,
-        binding: null,
-      })),
-      {
-        name: workflow.judge_session,
-        kind: "judge",
-        session: workflow.judge_session,
-        conditional: true,
-        declaredRole: workflow.judge_role,
-        namespace: "auxiliary" as ConsumerNamespace,
-        binding: null,
-      },
-    ];
+    return workflow.steps.map((step) => ({
+      name: step.name,
+      kind: step.kind,
+      session: step.session,
+      conditional: step.conditional,
+      declaredRole: step.role,
+      namespace: (step.kind === "agent" ? "step" : null) as ConsumerNamespace,
+      binding: null,
+    }));
   }, [preview, workflow]);
 
   /** A profile a row still names but the registry no longer offers: kept as a
@@ -659,6 +641,15 @@ export function SpawnView() {
                         : "— inherited from the project"}
                     </div>
                   )}
+                  {preview !== null && (
+                    // The exact procedure being accepted, not just its name.
+                    // It is part of what the preview token covers, so an
+                    // edited prompt or route invalidates this review even
+                    // though the step list looks unchanged (ADR-0028).
+                    <div className="hint" data-testid="preview-revision">
+                      Revision <WorkflowRevision revision={preview.workflow_revision} />
+                    </div>
+                  )}
                   <table className="stepTable" data-testid="step-preview">
                     <thead>
                       <tr>
@@ -674,11 +665,7 @@ export function SpawnView() {
                     <tbody>
                       {rows.map((row) => {
                         const chosen =
-                          row.namespace === "step"
-                            ? draft.stepOverrides[row.name]
-                            : row.namespace === "auxiliary"
-                              ? draft.auxiliaryOverrides[row.name]
-                              : undefined;
+                          row.namespace === "step" ? draft.stepOverrides[row.name] : undefined;
                         const binding = row.binding;
                         const missingProfile =
                           chosen?.profile !== undefined && !profileNames.has(chosen.profile);
@@ -716,7 +703,7 @@ export function SpawnView() {
                                     disabled={locked}
                                     data-testid={`row-profile-${row.name}`}
                                     onChange={(e) =>
-                                      setRowOverride(row.namespace as "step" | "auxiliary", row.name, {
+                                      setRowOverride(row.name, {
                                         profile: e.target.value || undefined,
                                       })
                                     }
@@ -743,7 +730,6 @@ export function SpawnView() {
                                       data-testid={`reset-row-profile-${row.name}`}
                                       onClick={() =>
                                         setRowOverride(
-                                          row.namespace as "step" | "auxiliary",
                                           row.name,
                                           { profile: undefined },
                                         )
@@ -773,7 +759,7 @@ export function SpawnView() {
                                     disabled={locked}
                                     data-testid={`row-role-${row.name}`}
                                     onChange={(e) =>
-                                      setRowOverride(row.namespace as "step" | "auxiliary", row.name, {
+                                      setRowOverride(row.name, {
                                         role: (e.target.value || undefined) as
                                           | ModelRole
                                           | undefined,
@@ -797,7 +783,6 @@ export function SpawnView() {
                                       data-testid={`reset-row-role-${row.name}`}
                                       onClick={() =>
                                         setRowOverride(
-                                          row.namespace as "step" | "auxiliary",
                                           row.name,
                                           { role: undefined },
                                         )
@@ -839,11 +824,10 @@ export function SpawnView() {
                     </tbody>
                   </table>
                   <p className="hint">
-                    Every step this workflow declares, in order. A conditional step may be
-                    routed past; the judge runs only when a route or outcome cannot be
-                    resolved — it is an auxiliary model consumer, not a step you can route
-                    to. Each row&apos;s profile and role can be set independently, and
-                    every process carries the whole native <code>smol</code>/
+                    Every step this workflow declares, in order — there are no hidden
+                    model consumers. A conditional step may be routed past or held back by
+                    its own condition. Each row&apos;s profile and role can be set
+                    independently, and every process carries the whole native <code>smol</code>/
                     <code>slow</code>/<code>plan</code> map shown under its thinking level.
                     Thinking is the policy you chose — omp may resolve <code>auto</code>{" "}
                     and <code>max</code> to a model-specific level.

@@ -17,16 +17,23 @@ creation time, and elapsed time.
 
 ### Accepted configuration panel
 
-The launch decision this task was accepted under: its workflow, the task-wide
-model profile and where it came from, the effective base branch, Workshop
-additions source and preamble with any task-local override marked, and one row
-per model consumer.
+The launch decision this task was accepted under: its workflow and the exact
+**revision** it executes, the task-wide model profile and where it came from,
+the effective base branch, Workshop additions source and preamble with any
+task-local override marked, and one row per model consumer.
 
-Each consumer row — every declared agent step, plus the judge, marked auxiliary
-and conditional — names its source profile, its role, the concrete model and
-thinking policy those resolve to, and, separately for the profile and the role,
-whether that value was inherited or set for this step. Expanding a row shows
-the complete `smol`/`slow`/`plan` map that consumer's process carries.
+The revision is the content identity of the definition itself, and the panel
+offers the normalized document for reading. That is the only honest answer to
+"what procedure did this task run" once the installed definition has moved on.
+A task whose continuation was confirmed after the upgrade also states its
+boundary: which attempts ran under a definition that was never retained, and
+which single attempt spans it.
+
+Each consumer row — every declared agent step, and there are no others — names
+its source profile, its role, the concrete model and thinking policy those
+resolve to, and, separately for the profile and the role, whether that value
+was inherited or set for this step. Expanding a row shows the complete
+`smol`/`slow`/`plan` map that consumer's process carries.
 
 These are the stored values, not a recomputation — a project or profile edited
 or deleted since acceptance does not change what this panel shows or what the

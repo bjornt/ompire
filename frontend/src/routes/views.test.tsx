@@ -87,8 +87,8 @@ const singleStep: WorkflowDescriptor = {
   steps: [
     { name: "work", kind: "agent", session: "main", role: "default", conditional: false },
   ],
-  judge_session: "judge",
-  judge_role: "slow",
+  revision: "sha256:abc",
+  format: 1,
 };
 
 const bugfix: WorkflowDescriptor = {
@@ -101,18 +101,25 @@ const bugfix: WorkflowDescriptor = {
     { name: "fix", kind: "agent", session: "coder", role: "default", conditional: true },
     { name: "validate-script", kind: "command", session: null, role: null, conditional: true },
   ],
-  judge_session: "judge",
-  judge_role: "slow",
+  revision: "sha256:abc",
+  format: 1,
 };
 
 /** The launch decision an accepted task carries (ADR-0026). */
 function makeInputs(overrides: Partial<TaskExecutionInputs> = {}): TaskExecutionInputs {
   return {
-    version: 2,
+    version: 3,
     provenance: "accepted",
     accepted_at: "2026-07-18T00:00:00Z",
     project_name: "maas",
     workflow_name: "single-step",
+    workflow_binding: {
+      revision: "sha256:abc",
+      source: "accepted",
+      bound_at: "2026-07-18T00:00:00Z",
+      legacy_through_seq: 0,
+      interrupted_legacy_seq: null,
+    },
     model_profile_name: "balanced",
     model_profile_source: "project",
     step_bindings: {
@@ -120,15 +127,6 @@ function makeInputs(overrides: Partial<TaskExecutionInputs> = {}): TaskExecution
         profile_name: "balanced",
         profile_source: "project",
         role: "default",
-        role_source: "workflow",
-        roles: balanced.roles,
-      },
-    },
-    auxiliary_bindings: {
-      judge: {
-        profile_name: "balanced",
-        profile_source: "project",
-        role: "slow",
         role_source: "workflow",
         roles: balanced.roles,
       },
@@ -159,9 +157,11 @@ function previewResponse(overrides: Record<string, unknown> = {}) {
     model_profile: "balanced",
     model_profile_source: "project",
     project_default_model_profile: "balanced",
-    judge_session: "judge",
-    judge_role: "slow",
-    auxiliary_consumers: ["judge"],
+    workflow_revision: "sha256:abc",
+    workflow_format: 1,
+    workflow_primary_session: "main",
+    workflow_sessions: ["main"],
+    auxiliary_consumers: [],
     roles: balanced.roles,
     workspace: {
       base_branch: "master",
@@ -196,9 +196,9 @@ function previewResponse(overrides: Record<string, unknown> = {}) {
         thinking: "medium",
       },
       {
-        step: "judge",
-        kind: "judge",
-        session: "judge",
+        step: "review",
+        kind: "agent",
+        session: "main",
         conditional: true,
         declared_role: "slow",
         binding: {
@@ -262,6 +262,13 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     pr_state: null,
     pr_merged_at: null,
     workflow_name: "single-step",
+    workflow_revision: "sha256:abc",
+    workflow_revision_source: "accepted",
+    workflow_ready: true,
+    workflow_readiness_reason: null,
+    workflow_readiness_detail: null,
+    workflow_primary_session: "main",
+    workflow_sessions: ["main"],
     workflow_status: null,
     workflow_step: null,
     created_at: "2026-07-18T00:00:00Z",
@@ -397,10 +404,12 @@ describe("SpawnView", () => {
       "anthropic/claude-sonnet-4.5",
     );
     expect(within(preview).getByTestId("step-work")).toHaveTextContent("medium");
-    // The judge is described separately and binds `slow`, not the step role.
-    const judge = within(preview).getByTestId("step-judge");
-    expect(judge).toHaveTextContent("openai/o3");
-    expect(judge).toHaveTextContent("conditional");
+    // A step a route can pass by is shown as conditional, and it is an
+    // ordinary declared step — there is no row for a model that runs outside
+    // the flow (ADR-0028).
+    const conditional = within(preview).getByTestId("step-review");
+    expect(conditional).toHaveTextContent("openai/o3");
+    expect(conditional).toHaveTextContent("conditional");
     expect(screen.getByTestId("branch-preview")).toHaveTextContent(
       "branch: bjornt/fix-bug · off origin/master",
     );
@@ -492,14 +501,16 @@ describe("SpawnView", () => {
     await fillDraft(user);
 
     await user.selectOptions(screen.getByTestId("row-profile-work"), "balanced");
-    await user.selectOptions(screen.getByTestId("row-role-judge"), "plan");
+    await user.selectOptions(screen.getByTestId("row-role-review"), "plan");
 
     await waitFor(() => {
       const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
-      // Two namespaces, and each row carries only the dimension that was
-      // actually chosen — the other stays inherited.
-      expect(body.step_overrides).toEqual({ work: { model_profile: "balanced" } });
-      expect(body.auxiliary_overrides).toEqual({ judge: { role: "plan" } });
+      // Each row carries only the dimension that was actually chosen — the
+      // other stays inherited.
+      expect(body.step_overrides).toEqual({
+        work: { model_profile: "balanced" },
+        review: { role: "plan" },
+      });
     });
   });
 
@@ -540,14 +551,13 @@ describe("SpawnView", () => {
     await fillDraft(user);
 
     await user.selectOptions(screen.getByTestId("row-profile-work"), "balanced");
-    // The judge is workflow-scoped too: its declared role comes from the
-    // workflow descriptor, so its override cannot survive a workflow change
-    // either.
-    await user.selectOptions(screen.getByTestId("row-role-judge"), "plan");
+    await user.selectOptions(screen.getByTestId("row-role-review"), "plan");
     await waitFor(() => {
       const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
-      expect(body.step_overrides).toEqual({ work: { model_profile: "balanced" } });
-      expect(body.auxiliary_overrides).toEqual({ judge: { role: "plan" } });
+      expect(body.step_overrides).toEqual({
+        work: { model_profile: "balanced" },
+        review: { role: "plan" },
+      });
     });
 
     await user.selectOptions(screen.getByLabelText("Workflow"), "bugfix");
@@ -557,11 +567,10 @@ describe("SpawnView", () => {
       const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
       expect(body.workflow_name).toBe("bugfix");
       expect("step_overrides" in body).toBe(false);
-      expect("auxiliary_overrides" in body).toBe(false);
     });
     const cleared = screen.getByTestId("cleared-overrides");
     expect(cleared).toHaveTextContent("work");
-    expect(cleared).toHaveTextContent("judge");
+    expect(cleared).toHaveTextContent("review");
     // The rest of the draft is not workflow-scoped and survives.
     expect(screen.getByLabelText("Task slug")).toHaveValue("fix-bug");
   });
@@ -1254,6 +1263,7 @@ describe("TasksView workflow pills", () => {
       status: "running",
       outcome: null,
       error: null,
+      pause: null,
       prompted_at: null,
       started_at: "t0",
       finished_at: null,
@@ -1468,15 +1478,17 @@ describe("TaskDetailView", () => {
     );
     // The project now says `trunk`; the task keeps what it was accepted with.
     expect(panel).toHaveTextContent("master");
-    // Per consumer, with its own attribution — the judge is an ordinary
-    // model consumer with an accepted binding, not a hidden exception.
+    // Per consumer, with its own attribution. Every consumer is a declared
+    // step; there is no row for a model that runs outside the flow.
     const work = within(panel).getByTestId("consumer-work");
     expect(work).toHaveTextContent("anthropic/claude-sonnet-4.5");
     expect(work).toHaveTextContent("inherited from the project");
     expect(work).toHaveTextContent("declared by the workflow");
-    const judge = within(panel).getByTestId("consumer-judge");
-    expect(judge).toHaveTextContent("openai/o3");
-    expect(judge).toHaveTextContent("auxiliary, conditional");
+    expect(within(panel).queryByTestId("consumer-judge")).toBeNull();
+    // The exact procedure is named, not just the workflow's name.
+    expect(within(panel).getByTestId("workflow-revision")).toHaveTextContent(
+      "sha256:abc",
+    );
   });
 
   it("shows a per-step override as overridden and the rest as inherited", async () => {
@@ -1507,9 +1519,6 @@ describe("TaskDetailView", () => {
     // The task-wide decision is still shown: it is what the other rows
     // inherited, and what the operator chose at the top of the form.
     expect(within(panel).getByTestId("accepted-profile")).toHaveTextContent("balanced");
-    expect(within(panel).getByTestId("consumer-judge")).toHaveTextContent(
-      "inherited from the project",
-    );
   });
 
   it("asks a task that predates pinned inputs to confirm a continuation", async () => {
@@ -1527,7 +1536,33 @@ describe("TaskDetailView", () => {
                 archived: false,
                 known: { branch: "bjornt/fix-bug" },
                 source_attribution: [],
-                unknown_inputs: ["model_profile", "thinking", "preamble"],
+                needs_workflow_confirmation: true,
+                workflow_readiness: {
+                  ready: false,
+                  reason: "needs_configuration",
+                  detail: "no confirmed launch configuration",
+                  confirmable: false,
+                },
+                workflow_candidate: {
+                  workflow_name: "single-step",
+                  revision: "sha256:abc",
+                  format: 1,
+                  available: true,
+                  compatible: true,
+                  problems: [],
+                  primary_session: "main",
+                  sessions: ["main"],
+                  legacy_through_seq: 0,
+                  interrupted_legacy_seq: null,
+                  uncertainty_notice:
+                    "This task will no longer ask a model to classify a result it cannot read.",
+                },
+                unknown_inputs: [
+                  "model_profile",
+                  "thinking",
+                  "preamble",
+                  "workflow_definition",
+                ],
                 candidates: {
                   base_branch: "master",
                   workshop_additions: "project",
@@ -1555,8 +1590,113 @@ describe("TaskDetailView", () => {
     expect(await screen.findByTestId("legacy-unknown")).toHaveTextContent(
       "cannot be recovered",
     );
-    // The acknowledgement gates confirmation; nothing is pre-ticked.
+    // The acknowledgements gate confirmation; nothing is pre-ticked. There
+    // are two, because there are two different things the daemon cannot
+    // recover: the launch inputs, and the definition itself (ADR-0028).
     expect(screen.getByTestId("legacy-acknowledge")).not.toBeChecked();
+    expect(screen.getByTestId("legacy-acknowledge-workflow")).not.toBeChecked();
+    expect(screen.getByTestId("legacy-confirm")).toBeDisabled();
+    // The candidate definition is named and readable, and the changed
+    // uncertainty policy is stated before anything is confirmed.
+    expect(screen.getByTestId("workflow-candidate")).toHaveTextContent("sha256:abc");
+    expect(screen.getByTestId("uncertainty-notice")).toHaveTextContent(
+      "no longer ask a model to classify",
+    );
+  });
+
+  it("keeps Continue reachable after the configuration is confirmed", async () => {
+    // Confirming records what the task continues under and starts nothing, so
+    // the only control that re-arms an interrupted run has to outlive the
+    // confirmation panel — otherwise a confirmed task is stranded (ADR-0028).
+    const task = makeTask({ workflow_status: "waiting", workflow_step: "escalate" });
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", {
+      projects: [project],
+      model_profiles: [balanced],
+      tasks: [task],
+    });
+
+    const panel = await screen.findByTestId("task-inputs");
+    expect(within(panel).getByTestId("legacy-continue")).toHaveTextContent(
+      "Continue the interrupted run",
+    );
+  });
+
+  it("offers no Continue for a run that is not interrupted", async () => {
+    const task = makeTask({ workflow_status: "complete", workflow_step: null });
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", {
+      projects: [project],
+      model_profiles: [balanced],
+      tasks: [task],
+    });
+
+    const panel = await screen.findByTestId("task-inputs");
+    expect(within(panel).queryByTestId("legacy-continue")).toBeNull();
+  });
+
+  it("blocks confirmation when the current definition cannot explain the history", async () => {
+    const task = makeTask({ execution_inputs: null, needs_configuration: true });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (typeof url === "string" && url.endsWith("/configuration")) {
+          return Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                task_id: 1,
+                needs_configuration: true,
+                needs_workflow_confirmation: true,
+                archived: false,
+                known: { branch: "bjornt/fix-bug" },
+                source_attribution: [],
+                workflow_readiness: {
+                  ready: false,
+                  reason: "needs_configuration",
+                  detail: "no confirmed launch configuration",
+                  confirmable: false,
+                },
+                workflow_candidate: {
+                  workflow_name: "single-step",
+                  revision: "sha256:abc",
+                  format: 1,
+                  available: true,
+                  compatible: false,
+                  problems: [
+                    "attempt #3 ran a step 'triage' that the current 'single-step' definition does not declare",
+                  ],
+                  legacy_through_seq: 3,
+                  interrupted_legacy_seq: null,
+                  uncertainty_notice: "Unresolved evidence now waits for you.",
+                },
+                unknown_inputs: ["workflow_definition"],
+                candidates: {
+                  base_branch: "master",
+                  workshop_additions: "project",
+                  preamble: "",
+                  default_model_profile: "balanced",
+                },
+              }),
+          });
+        }
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ ...task, workshop_status: "present" }),
+        });
+      }),
+    );
+    await renderAt("/tasks/1", {
+      projects: [project],
+      model_profiles: [balanced],
+      tasks: [task],
+    });
+
+    // Named, with the reason — and not remapped onto a definition that
+    // cannot account for what already ran.
+    expect(await screen.findByTestId("workflow-incompatible")).toHaveTextContent(
+      "does not declare",
+    );
     expect(screen.getByTestId("legacy-confirm")).toBeDisabled();
   });
 
@@ -2007,6 +2147,7 @@ describe("Review capability (TasksView)", () => {
               status: "ok",
               outcome: null,
               error: null,
+              pause: null,
               prompted_at: null,
               started_at: "t0",
               finished_at: "t1",
@@ -2020,6 +2161,7 @@ describe("Review capability (TasksView)", () => {
               status: "running",
               outcome: null,
               error: null,
+              pause: null,
               prompted_at: null,
               started_at: "t2",
               finished_at: null,
@@ -2057,6 +2199,7 @@ describe("Review capability (TasksView)", () => {
               status: "ok",
               outcome: null,
               error: null,
+              pause: null,
               prompted_at: null,
               started_at: "t0",
               finished_at: "t1",

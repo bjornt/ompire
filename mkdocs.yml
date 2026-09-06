@@ -100,6 +100,7 @@ nav:
           - Repository layout: develop/reference/repository-layout.md
           - Daemon module map: develop/reference/daemon-modules.md
           - Database schema: develop/reference/database-schema.md
+          - Workflow definitions: develop/reference/workflow-definitions.md
           - Daemon core: develop/reference/daemon-core.md
           - Daemon API: develop/reference/daemon-api.md
           - WebSocket protocol: develop/reference/websocket-protocol.md
@@ -141,3 +142,4 @@ nav:
           - 0025 Global model profiles: adr/0025-store-global-model-profiles-separately-from-launch-policy.md
           - 0026 Pinned launch inputs: adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md
           - 0027 Between-turn model policy: adr/0027-hand-off-model-policy-between-turns.md
+          - 0028 Retained workflow revisions: adr/0028-retain-declarative-workflow-revisions.md

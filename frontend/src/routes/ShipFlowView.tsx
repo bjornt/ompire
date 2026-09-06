@@ -673,7 +673,10 @@ export function ShipFlowView() {
   // Ship is task-scoped: review and publishing always use the workflow's
   // primary session, never an in-flight step's focused session.
   const taskSessions = taskId === null ? undefined : sessions[taskId];
-  const session = taskSessions?.[primarySessionName(taskSessions, taskId === null ? undefined : workflows[taskId])];
+  const session =
+    taskSessions?.[
+      primarySessionName(taskSessions, taskId === null ? undefined : workflows[taskId], task)
+    ];
   const review = taskId === null ? undefined : reviews[taskId];
   const ship = taskId === null ? undefined : ships[taskId];
 

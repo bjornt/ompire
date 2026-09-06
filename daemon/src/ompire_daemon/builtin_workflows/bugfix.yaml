@@ -1,0 +1,761 @@
+# The bugfix workflow: a reproducer session proves the bug and later verifies
+# the fix in that same conversation, while a separate coder session owns the
+# change. Routing is data — an outcome document or a script's exit code — and
+# where the data does not decide, the run pauses for the operator rather than
+# guessing.
+#
+# `fix` is the only bounded step: three attempts, then the `escalate` gate.
+# Every other loop edge passes through it, which is what keeps the graph
+# finite. See docs/use/reference/bugfix-workflow.md.
+format: 1
+name: bugfix
+sessions: [reproducer, coder]
+primary: coder
+steps:
+  # 1. Prove the bug, and leave behind a runnable reproducer when one is
+  #    possible. A "failed" outcome here is a real, declared result: the bug
+  #    could not be reproduced, which is operator triage rather than a
+  #    coding task.
+  - name: reproduce
+    kind: agent
+    session: reproducer
+    role: default
+    expects_outcome: true
+    prompt:
+      separator: ""
+      parts:
+        - if:
+            op: ne
+            left: {op: input, name: workspace.preamble}
+            right: {op: literal, value: ""}
+          then:
+            separator: ""
+            parts:
+              - value: {op: input, name: workspace.preamble}
+                format: text
+              - text: "\n\n"
+          else:
+            parts: []
+        - text: "You are the reproducer on a bugfix task. The reported issue:\n\n"
+        - value: {op: input, name: task.prompt}
+          format: text
+        - text: "\n\n"
+        - text: |-
+            Work in the clone (your current directory). Your job:
+            1. Investigate the issue and find a reliable way to reproduce it.
+            2. Write an executable reproducer script at `.ompire/repro.sh` such that
+               `bash .ompire/repro.sh` exits non-zero while the bug is present and
+               exits 0 once the behavior is fixed. Keep it self-contained and fast.
+            3. Run it and confirm it currently fails (non-zero exit).
+            4. If the bug genuinely cannot be reproduced (missing information, not a
+               real bug, …), finish with status "failed" and explain why — do not fake
+               a reproduction.
+
+            Do NOT fix the bug, do not modify the code under test, and do not commit
+            anything — a separate coder session owns the fix. Your job ends at a
+            confirmed, failing reproduction.
+
+            Include these outcome artifacts when determinable:
+            - "repro_command": the exact command that runs the reproducer. Omit it only
+              when the bug cannot be expressed as a runnable script (e.g. a purely
+              visual defect) — validation then falls back to an agent turn.
+            - "expected_behavior": what should happen.
+            - "observed_behavior": what actually happens.
+
+  # 2. A reproduced bug goes to the coder. Anything else — including a
+  #    declared "failed" reproduction — is escalated. A reproduce attempt
+  #    that left no outcome at all never reaches here: the step itself
+  #    pauses on its missing required result.
+  - name: triage
+    kind: decision
+    cases:
+      - when:
+          op: eq
+          left:
+            op: get
+            value: {op: latest, steps: [reproduce]}
+            keys: [outcome, status]
+          right: {op: literal, value: "success"}
+        next: {step: fix}
+    otherwise: {step: escalate}
+
+  # 3. Fix it. Three attempts, then the gate: the prompt of attempt two and
+  #    three carries the previous attempt's validation report, because the
+  #    history reference is evaluated before this attempt's own record exists.
+  - name: fix
+    kind: agent
+    session: coder
+    role: default
+    expects_outcome: true
+    max_visits: 3
+    on_exhausted: {step: escalate}
+    prompt:
+      separator: ""
+      parts:
+        - if:
+            op: ne
+            left: {op: input, name: workspace.preamble}
+            right: {op: literal, value: ""}
+          then:
+            separator: ""
+            parts:
+              - value: {op: input, name: workspace.preamble}
+                format: text
+              - text: "\n\n"
+          else:
+            parts: []
+        - text: "You are the coder on a bugfix task. The reported issue:\n\n"
+        - value: {op: input, name: task.prompt}
+          format: text
+        - text: "\n\n"
+        - if:
+            op: exists
+            value:
+              op: get
+              value: {op: latest, steps: [reproduce]}
+              keys: [outcome]
+          then:
+            separator: ""
+            parts:
+              - text: "Reproduction report: "
+              - value:
+                  op: coalesce
+                  values:
+                    - op: get
+                      value: {op: latest, steps: [reproduce]}
+                      keys: [outcome, summary]
+                    - {op: literal, value: ""}
+                format: text
+              - if:
+                  op: all
+                  of:
+                    - op: is_type
+                      value:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, repro_command]
+                      type: string
+                    - op: ne
+                      left:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, repro_command]
+                      right: {op: literal, value: ""}
+                then:
+                  separator: ""
+                  parts:
+                    - text: "\n- repro_command: "
+                    - value:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, repro_command]
+                      format: text
+                else:
+                  parts: []
+              - if:
+                  op: all
+                  of:
+                    - op: is_type
+                      value:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, expected_behavior]
+                      type: string
+                    - op: ne
+                      left:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, expected_behavior]
+                      right: {op: literal, value: ""}
+                then:
+                  separator: ""
+                  parts:
+                    - text: "\n- expected_behavior: "
+                    - value:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, expected_behavior]
+                      format: text
+                else:
+                  parts: []
+              - if:
+                  op: all
+                  of:
+                    - op: is_type
+                      value:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, observed_behavior]
+                      type: string
+                    - op: ne
+                      left:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, observed_behavior]
+                      right: {op: literal, value: ""}
+                then:
+                  separator: ""
+                  parts:
+                    - text: "\n- observed_behavior: "
+                    - value:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, observed_behavior]
+                      format: text
+                else:
+                  parts: []
+          else:
+            separator: ""
+            parts:
+              - text: |-
+                  No structured reproduction handoff is available; inspect `.ompire/` and the working tree for what the reproducer left behind.
+        # The previous iteration's rejection, if this is a retry. `after: fix`
+        # anchors on the newest earlier fix attempt, so one iteration's
+        # validation can never answer for another.
+        - if:
+            op: all
+            of:
+              - op: exists
+                value:
+                  op: latest
+                  steps: [validate-script, validate-agent]
+                  after: fix
+                  with_outcome: true
+              - op: any
+                of:
+                  - op: all
+                    of:
+                      - op: eq
+                        left:
+                          op: get
+                          value:
+                            op: latest
+                            steps: [validate-script, validate-agent]
+                            after: fix
+                            with_outcome: true
+                          keys: [step]
+                        right: {op: literal, value: "validate-script"}
+                      - op: ne
+                        left:
+                          op: get
+                          value:
+                            op: latest
+                            steps: [validate-script, validate-agent]
+                            after: fix
+                            with_outcome: true
+                          keys: [outcome, exit_code]
+                        right: {op: literal, value: 0}
+                  - op: all
+                    of:
+                      - op: eq
+                        left:
+                          op: get
+                          value:
+                            op: latest
+                            steps: [validate-script, validate-agent]
+                            after: fix
+                            with_outcome: true
+                          keys: [step]
+                        right: {op: literal, value: "validate-agent"}
+                      - op: ne
+                        left:
+                          op: get
+                          value:
+                            op: latest
+                            steps: [validate-script, validate-agent]
+                            after: fix
+                            with_outcome: true
+                          keys: [outcome, status]
+                        right: {op: literal, value: "success"}
+          then:
+            separator: ""
+            parts:
+              - text: "\n\nYour previous fix did NOT validate. Validation report:\n"
+              - if:
+                  op: eq
+                  left:
+                    op: get
+                    value:
+                      op: latest
+                      steps: [validate-script, validate-agent]
+                      after: fix
+                      with_outcome: true
+                    keys: [step]
+                  right: {op: literal, value: "validate-script"}
+                then:
+                  separator: ""
+                  parts:
+                    - text: "the reproducer still fails (exit "
+                    - value:
+                        op: coalesce
+                        values:
+                          - op: get
+                            value:
+                              op: latest
+                              steps: [validate-script, validate-agent]
+                              after: fix
+                              with_outcome: true
+                            keys: [outcome, exit_code]
+                          - {op: literal, value: ""}
+                      format: text
+                    - text: "):\n"
+                    - value:
+                        op: coalesce
+                        values:
+                          - op: get
+                            value:
+                              op: latest
+                              steps: [validate-script, validate-agent]
+                              after: fix
+                              with_outcome: true
+                            keys: [outcome, output]
+                          - {op: literal, value: ""}
+                      format: text
+                else:
+                  separator: ""
+                  parts:
+                    - value:
+                        op: coalesce
+                        values:
+                          - op: get
+                            value:
+                              op: latest
+                              steps: [validate-script, validate-agent]
+                              after: fix
+                              with_outcome: true
+                            keys: [outcome, summary]
+                          - {op: literal, value: "validation rejected the fix"}
+                      format: text
+              - text: "\n\nRevise the fix."
+          else:
+            parts: []
+        - text: "\n\n"
+        - text: |-
+            Fix the bug in the working tree. Do not edit anything under `.ompire/` and do not weaken or delete the reproducer script. Commit your change on the current branch when done (the review flow unstages everything for review and the ship flow squashes later — but never push). Then write your outcome: a summary of the root cause and the fix.
+
+  # 4. A runnable reproducer validates deterministically; otherwise the
+  #    reproducer session judges its own bug by hand.
+  - name: route-validate
+    kind: decision
+    cases:
+      - when:
+          op: all
+          of:
+            - op: is_type
+              value:
+                op: get
+                value: {op: latest, steps: [reproduce]}
+                keys: [outcome, artifacts, repro_command]
+              type: string
+            - op: ne
+              left:
+                op: get
+                value: {op: latest, steps: [reproduce]}
+                keys: [outcome, artifacts, repro_command]
+              right: {op: literal, value: ""}
+        next: {step: validate-script}
+    otherwise: {step: validate-agent}
+
+  - name: validate-script
+    kind: command
+    argv: ["bash", ".ompire/repro.sh"]
+    timeout: 600
+    idempotent: true
+
+  # Skipped — deliberately, with no turn spent — when the script already
+  # answered for this iteration. An unprompted attempt records no outcome, and
+  # `with_outcome` keeps it from masking the script's real evidence.
+  - name: validate-agent
+    kind: agent
+    session: reproducer
+    role: default
+    expects_outcome: true
+    when:
+      op: not
+      of:
+        op: exists
+        value: {op: latest, steps: [validate-script], after: fix}
+    prompt:
+      separator: ""
+      parts:
+        - if:
+            op: ne
+            left: {op: input, name: workspace.preamble}
+            right: {op: literal, value: ""}
+          then:
+            separator: ""
+            parts:
+              - value: {op: input, name: workspace.preamble}
+                format: text
+              - text: "\n\n"
+          else:
+            parts: []
+        - text: "Validate the fix for the bug you reproduced earlier."
+        - if:
+            op: exists
+            value:
+              op: get
+              value: {op: latest, steps: [reproduce]}
+              keys: [outcome]
+          then:
+            separator: ""
+            parts:
+              - text: "\n\nReproduction report: "
+              - value:
+                  op: coalesce
+                  values:
+                    - op: get
+                      value: {op: latest, steps: [reproduce]}
+                      keys: [outcome, summary]
+                    - {op: literal, value: ""}
+                format: text
+              - if:
+                  op: all
+                  of:
+                    - op: is_type
+                      value:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, repro_command]
+                      type: string
+                    - op: ne
+                      left:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, repro_command]
+                      right: {op: literal, value: ""}
+                then:
+                  separator: ""
+                  parts:
+                    - text: "\n- repro_command: "
+                    - value:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, repro_command]
+                      format: text
+                else:
+                  parts: []
+              - if:
+                  op: all
+                  of:
+                    - op: is_type
+                      value:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, expected_behavior]
+                      type: string
+                    - op: ne
+                      left:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, expected_behavior]
+                      right: {op: literal, value: ""}
+                then:
+                  separator: ""
+                  parts:
+                    - text: "\n- expected_behavior: "
+                    - value:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, expected_behavior]
+                      format: text
+                else:
+                  parts: []
+              - if:
+                  op: all
+                  of:
+                    - op: is_type
+                      value:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, observed_behavior]
+                      type: string
+                    - op: ne
+                      left:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, observed_behavior]
+                      right: {op: literal, value: ""}
+                then:
+                  separator: ""
+                  parts:
+                    - text: "\n- observed_behavior: "
+                    - value:
+                        op: get
+                        value: {op: latest, steps: [reproduce]}
+                        keys: [outcome, artifacts, observed_behavior]
+                      format: text
+                else:
+                  parts: []
+          else:
+            parts: []
+        - text: "\n\n"
+        - text: |-
+            The coder has edited the working tree since your reproduction. Re-run the
+            reproduction and check the behavior rigorously; do not trust the coder's
+            report. Do not modify the code and do not commit anything. Finish with
+            status "success" only if the bug is genuinely fixed —
+            otherwise status "failed" with a summary describing exactly what still
+            misbehaves (that report goes back to the coder).
+
+  # 5. Validated finishes the run; rejected goes back to the coder within the
+  #    bound. Evidence that says neither is an uncertainty pause, not a guess.
+  - name: check
+    kind: decision
+    cases:
+      - when:
+          op: any
+          of:
+            - op: all
+              of:
+                - op: eq
+                  left:
+                    op: get
+                    value:
+                      op: latest
+                      steps: [validate-script, validate-agent]
+                      after: fix
+                      with_outcome: true
+                    keys: [step]
+                  right: {op: literal, value: "validate-script"}
+                - op: eq
+                  left:
+                    op: get
+                    value:
+                      op: latest
+                      steps: [validate-script, validate-agent]
+                      after: fix
+                      with_outcome: true
+                    keys: [outcome, exit_code]
+                  right: {op: literal, value: 0}
+            - op: all
+              of:
+                - op: eq
+                  left:
+                    op: get
+                    value:
+                      op: latest
+                      steps: [validate-script, validate-agent]
+                      after: fix
+                      with_outcome: true
+                    keys: [step]
+                  right: {op: literal, value: "validate-agent"}
+                - op: eq
+                  left:
+                    op: get
+                    value:
+                      op: latest
+                      steps: [validate-script, validate-agent]
+                      after: fix
+                      with_outcome: true
+                    keys: [outcome, status]
+                  right: {op: literal, value: "success"}
+        next: {complete: true}
+      - when:
+          op: any
+          of:
+            - op: all
+              of:
+                - op: eq
+                  left:
+                    op: get
+                    value:
+                      op: latest
+                      steps: [validate-script, validate-agent]
+                      after: fix
+                      with_outcome: true
+                    keys: [step]
+                  right: {op: literal, value: "validate-script"}
+                - op: ne
+                  left:
+                    op: get
+                    value:
+                      op: latest
+                      steps: [validate-script, validate-agent]
+                      after: fix
+                      with_outcome: true
+                    keys: [outcome, exit_code]
+                  right: {op: literal, value: 0}
+            - op: all
+              of:
+                - op: eq
+                  left:
+                    op: get
+                    value:
+                      op: latest
+                      steps: [validate-script, validate-agent]
+                      after: fix
+                      with_outcome: true
+                    keys: [step]
+                  right: {op: literal, value: "validate-agent"}
+                - op: ne
+                  left:
+                    op: get
+                    value:
+                      op: latest
+                      steps: [validate-script, validate-agent]
+                      after: fix
+                      with_outcome: true
+                    keys: [outcome, status]
+                  right: {op: literal, value: "success"}
+        next: {step: fix}
+    otherwise: {pause: true}
+
+  # 6. The one declared human gate: the run stops with the evidence it has,
+  #    and resuming closes it out. It never claims the bug was fixed. Every
+  #    branch is guarded by `exists`, so absent evidence reaches the generic
+  #    message instead of pausing a gate that is already waiting for a human.
+  - name: escalate
+    kind: gate
+    message:
+      separator: ""
+      parts:
+        - if:
+            op: all
+            of:
+              - op: exists
+                value:
+                  op: get
+                  value: {op: latest, steps: [reproduce]}
+                  keys: [outcome, status]
+              - op: eq
+                left:
+                  op: get
+                  value: {op: latest, steps: [reproduce]}
+                  keys: [outcome, status]
+                right: {op: literal, value: "failed"}
+          then:
+            separator: ""
+            parts:
+              - text: "The bug could not be reproduced: "
+              - value:
+                  op: coalesce
+                  values:
+                    - op: get
+                      value: {op: latest, steps: [reproduce]}
+                      keys: [outcome, summary]
+                    - {op: literal, value: "(no summary)"}
+                format: text
+              - text: " Resume to close out the run, then triage the issue manually."
+          else:
+            separator: ""
+            parts:
+              - if:
+                  op: all
+                  of:
+                    - op: exists
+                      value:
+                        op: latest
+                        steps: [validate-script, validate-agent]
+                        after: fix
+                        with_outcome: true
+                    - op: any
+                      of:
+                        - op: all
+                          of:
+                            - op: eq
+                              left:
+                                op: get
+                                value:
+                                  op: latest
+                                  steps: [validate-script, validate-agent]
+                                  after: fix
+                                  with_outcome: true
+                                keys: [step]
+                              right: {op: literal, value: "validate-script"}
+                            - op: ne
+                              left:
+                                op: get
+                                value:
+                                  op: latest
+                                  steps: [validate-script, validate-agent]
+                                  after: fix
+                                  with_outcome: true
+                                keys: [outcome, exit_code]
+                              right: {op: literal, value: 0}
+                        - op: all
+                          of:
+                            - op: eq
+                              left:
+                                op: get
+                                value:
+                                  op: latest
+                                  steps: [validate-script, validate-agent]
+                                  after: fix
+                                  with_outcome: true
+                                keys: [step]
+                              right: {op: literal, value: "validate-agent"}
+                            - op: ne
+                              left:
+                                op: get
+                                value:
+                                  op: latest
+                                  steps: [validate-script, validate-agent]
+                                  after: fix
+                                  with_outcome: true
+                                keys: [outcome, status]
+                              right: {op: literal, value: "success"}
+                then:
+                  separator: ""
+                  parts:
+                    - text: "The coder attempted a fix 3 times and the reproducer still fails. Latest validation report: "
+                    - if:
+                        op: eq
+                        left:
+                          op: get
+                          value:
+                            op: latest
+                            steps: [validate-script, validate-agent]
+                            after: fix
+                            with_outcome: true
+                          keys: [step]
+                        right: {op: literal, value: "validate-script"}
+                      then:
+                        separator: ""
+                        parts:
+                          - text: "the reproducer still fails (exit "
+                          - value:
+                              op: coalesce
+                              values:
+                                - op: get
+                                  value:
+                                    op: latest
+                                    steps: [validate-script, validate-agent]
+                                    after: fix
+                                    with_outcome: true
+                                  keys: [outcome, exit_code]
+                                - {op: literal, value: ""}
+                            format: text
+                          - text: "):\n"
+                          - value:
+                              op: coalesce
+                              values:
+                                - op: get
+                                  value:
+                                    op: latest
+                                    steps: [validate-script, validate-agent]
+                                    after: fix
+                                    with_outcome: true
+                                  keys: [outcome, output]
+                                - {op: literal, value: ""}
+                            format: text
+                      else:
+                        separator: ""
+                        parts:
+                          - value:
+                              op: coalesce
+                              values:
+                                - op: get
+                                  value:
+                                    op: latest
+                                    steps: [validate-script, validate-agent]
+                                    after: fix
+                                    with_outcome: true
+                                  keys: [outcome, summary]
+                                - {op: literal, value: "validation rejected the fix"}
+                            format: text
+                    - text: " Resume to close out the run, then review the working tree and steer the sessions manually."
+                else:
+                  separator: ""
+                  parts:
+                    - text: "The bugfix workflow could not resolve its route deterministically. Resume to close out the run; inspect the step history and sessions."

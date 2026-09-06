@@ -51,8 +51,21 @@ followed by the insert before the lock is released. Nothing is awaited,
 spawned, or published inside that reservation. A token that no longer matches
 is a `409` carrying the current preview for review, and creates no task,
 workspace, or background job — the operator re-reviews rather than the daemon
-retrying under settings they never saw. What this pins is configuration, not
-the future contents of a Git branch.
+retrying under settings they never saw. What this pins is configuration and
+the procedure, not the future contents of a Git branch, model output, or tool
+versions.
+
+Task detail's configuration routes carry a second, structurally identical
+boundary for the tasks an upgrade left blocked.
+`POST /api/tasks/{id}/configuration/preview` resolves a continuation without
+writing it and returns a token covering the candidate revision, the inputs a
+confirmation would write, the run's position and history boundary, and the
+compatibility result; `confirm` re-resolves under the reservation and compares.
+A task that only lacks a workflow revision supplies no launch fields — its
+model, branch, and preamble were reviewed once — and the write is the narrowest
+possible one, filling a null binding while carrying every already-pinned field
+through untouched. Confirmation records the decision but starts nothing; the
+existing explicit Continue action is still what resumes a run.
 
 ## Observation over WebSocket
 
