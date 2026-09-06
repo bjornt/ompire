@@ -3,6 +3,14 @@
 - Status: Accepted
 - Date: 2026-08-22
 
+Superseded for workflow format 2 by
+[ADR-0029](0029-declare-domain-outcomes-and-evidence-handoffs.md), which keeps
+the fresh-file, Git-excluded, untrusted-data boundary below unchanged and
+replaces only the envelope: format 2 names a *declared* result instead of
+`success`/`failed`, and records which prior attempts a consuming attempt was
+handed. This record remains the governing contract for every retained format-1
+definition, which continues to execute under exactly these rules.
+
 Reconciled and accepted on 2026-09-06 by
 [ADR-0028](0028-retain-declarative-workflow-revisions.md). The one thing this
 record named as blocking its own acceptance — an engine-reserved judge acting

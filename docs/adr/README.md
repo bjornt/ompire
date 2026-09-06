@@ -46,6 +46,8 @@ relying on it.
 | [0026](0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md) | Resolve launch inputs once and pin them to the task | Accepted |
 | [0027](0027-hand-off-model-policy-between-turns.md) | Hand off model policy between turns and record what applied | Accepted |
 | [0028](0028-retain-declarative-workflow-revisions.md) | Retain declarative workflow revisions and pin them to tasks | Accepted |
+| [0029](0029-declare-domain-outcomes-and-evidence-handoffs.md) | Declare domain outcomes and bind evidence to the attempt that used it | Accepted |
+| [0030](0030-commit-human-decisions-before-advancing.md) | Commit a human decision before the run advances | Accepted |
 
 ## Template
 
