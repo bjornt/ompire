@@ -135,13 +135,18 @@ class ReviewManager:
         self._port_lock = asyncio.Lock()
         self._event_task: asyncio.Task | None = None
 
-    @staticmethod
-    def _primary_session(task: Task) -> str:
-        """Review attaches to the task's workflow-declared primary session
-        (workflow-engine design D-8)."""
-        from ompire_daemon.workflows import get_workflow
+    def _primary_session(self, task: Task) -> str:
+        """Review attaches to the primary session *this task's pinned
+        definition* declares (workflow-engine design D-8, ADR-0028).
 
-        return get_workflow(task.workflow_name).primary
+        Resolved through the task's own revision, never through the catalog's
+        current definition of the same name: reviewing whatever "the primary
+        session" means today would attach the reviewer to a conversation this
+        task may never have had.
+        """
+        from ompire_daemon.taskdefinition import task_primary_session
+
+        return task_primary_session(self._engine, task)
 
     def start(self) -> None:
         """Start the hub event consumer; idempotent. Must be called from a

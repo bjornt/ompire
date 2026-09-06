@@ -59,11 +59,11 @@ full current registry state:
 | Key | Contents |
 |---|---|
 | `projects` | All projects |
-| `workflow_catalog` | Every registered built-in workflow: sessions, each declared step with its kind, session, abstract role and conditional flag, and the reserved judge with its role. Snapshot-only — definitions ship with the daemon, so there is no change event |
+| `workflow_catalog` | Every installed workflow: its current revision and format, its sessions, and each declared step with its kind, session, abstract role and conditional flag. Every model consumer is one of those steps. Snapshot-only — installed definitions change only when the daemon does, so there is no change event |
 | `model_profiles` | All model profiles, sorted by name, each with its four role bindings |
-| `tasks` | All non-purged tasks, each carrying its workflow fields, its accepted `execution_inputs`, and `needs_configuration` |
+| `tasks` | All non-purged tasks, each carrying its workflow fields, its pinned `workflow_revision` and readiness, the primary session *its* definition declares, its accepted `execution_inputs`, and `needs_configuration` |
 | `sessions` | Per task, a per-session map of current status, plus the native model a live session reports |
-| workflow state | Per-task run status, current step, and gate message |
+| workflow state | Per-task run status, current step, gate message, and any uncertainty pause |
 | `settings` | The effective settings map |
 | `gpg` | Current signing status: `state`, `selected` key, `candidates`, `cache_ttl`, `detail`, `checked_at` — public identifiers only |
 | `gh` | Current in-memory GitHub CLI identity plus canonical target eligibility map; no credential value or token fragment |
@@ -176,8 +176,17 @@ that produced them. A changed or failed identity probe clears earlier targets;
 clients replace this full projection rather than replaying events.
 
 `workflow_step` carries the task id, step name, kind, and status of `started`,
-`ok`, `failed`, or `waiting` — with error text on failure and the
-operator-facing gate message on waiting.
+`ok`, `failed`, or `waiting` — with error text on failure. A `waiting` frame
+carries *either* the operator-facing `message` of a declared gate, *or* a
+`pause` document when the engine stopped rather than deciding: its reason, its
+message, the blocked step, and the step a retry re-enters. Clients must keep
+the two apart, because the operator action differs — resume continues past a
+gate, retry re-enters the blocked step.
+
+A task whose pinned definition cannot be resolved still appears in the snapshot
+and still receives `task_updated`. It reports `workflow_ready: false` with a
+classified reason, and its `workflow_primary_session` is `null` rather than a
+guess.
 
 `stats` is throttled to at most one frame per task per
 `stats_throttle_interval`, so a chatty agent cannot flood a dashboard.
@@ -194,8 +203,11 @@ other sessions' frames. Sessions of the same task have independent channels; a
 client interested in two opens two.
 
 Connecting to a session with no live agent closes with code `4404`.
-Connecting with a session name the task's workflow does not declare closes
-with an error and sends no events.
+Connecting with a session name the task's *pinned* definition does not declare
+closes with an error and sends no events. That includes the retired `judge`
+session on an older task: nothing prompts it any more, so it is not addressable
+as a live session, and its transcript is read through the task's step history
+instead.
 
 A channel whose child is being replaced to apply a different model policy
 closes with `4409` rather than `1000`

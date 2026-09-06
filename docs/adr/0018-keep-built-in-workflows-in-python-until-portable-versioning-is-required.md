@@ -1,7 +1,19 @@
 # ADR 0018: Keep built-in workflows in Python until portable versioning is required
 
-- Status: Accepted
+- Status: Superseded by ADR-0028
 - Date: 2026-08-23
+
+Superseded by
+[ADR-0028](0028-retain-declarative-workflow-revisions.md) on 2026-09-06. This
+record accepted Python definitions for a built-in-only phase and named the
+triggers that would end it. Two of them arrived together: operator authoring
+without a daemon release, and tasks that must keep their accepted semantics
+across upgrades. ADR-0028 does what this record required of its successor —
+immutable content identity recorded on every run, a constrained non-executable
+document, and a defined migration for active runs and persisted history rather
+than resolving an old name to whichever code happens to be deployed. Its
+reasoning about the trust boundary is unchanged and carried forward; only the
+representation is superseded.
 
 ## Context
 

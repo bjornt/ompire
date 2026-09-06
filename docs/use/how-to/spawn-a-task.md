@@ -46,10 +46,16 @@ the prompt, and submit.
 
 Beside the form, Ompire lists every step the workflow declares with the model
 and thinking level each one would use. Steps that never reach a model — a
-command, a decision, a human gate — are shown without one. A step a decision
-can route past is marked *conditional*, and the workflow engine's judge appears
-as a conditional row on `slow`. It is a list of what the run *may* do, not a
-promise about the path it will take.
+command, a decision, a human gate — are shown without one. A step a route can
+pass by, or that has its own condition, is marked *conditional*. It is a list
+of what the run *may* do, not a promise about the path it will take. Every
+model consumer is one of these rows; nothing runs a model outside them.
+
+The preview also names the workflow **revision** it would pin: the content
+identity of the exact definition, which the task then executes for its whole
+life. If a definition changes between your preview and your submission — a
+daemon upgrade, say — submission is refused with the current resolution rather
+than accepted under a procedure you did not review. Your draft is kept.
 
 The profile selector starts on "inherit from project". Choosing a profile
 replaces that for this task, and **Reset to project default** puts it back. Your
@@ -57,7 +63,7 @@ explicit choice survives changing the project.
 
 ### Override a single step
 
-Every row that consumes a model — each agent step, and the judge — has its own
+Every row that consumes a model — that is, each agent step — has its own
 profile and role selectors. They are independent: you can send one step to a
 different profile while it keeps the role its workflow declares, and give
 another a different role while it stays on the task's profile. Each has its own
@@ -149,9 +155,8 @@ curl -sS -X POST http://127.0.0.1:4173/api/tasks \
 `branch_pattern`, `workshop_additions`, and `preamble`; what you leave out is
 inherited.
 
-`step_overrides` and `auxiliary_overrides` carry the per-row choices, keyed by
-declared step name and by auxiliary consumer name. Each entry takes
-`model_profile`, `role`, or both; what you leave out is inherited:
+`step_overrides` carries the per-row choices, keyed by declared step name. Each
+entry takes `model_profile`, `role`, or both; what you leave out is inherited:
 
 ```json
 {
@@ -159,16 +164,20 @@ declared step name and by auxiliary consumer name. Each entry takes
     "reproduce": {"model_profile": "economy"},
     "fix": {"role": "plan"},
     "validate-agent": {"model_profile": "thorough", "role": "slow"}
-  },
-  "auxiliary_overrides": {"judge": {"model_profile": "thorough"}}
+  }
 }
 ```
 
-Send both maps to the preview and to acceptance. An unknown step, a step with
-no model, an unknown auxiliary consumer, an invalid role, or a profile that
-does not exist is refused with the offending field named, and creates nothing.
+Send the same map to the preview and to acceptance. An unknown step, a step
+with no model, an invalid role, or a profile that does not exist is refused
+with the offending field named, and creates nothing.
 
-`GET /api/workflows` lists what you can pass as `workflow_name`.
+`auxiliary_overrides` is retired along with the engine's judge. A request that
+still names it is refused with a field-level `422` rather than having the
+choice silently dropped — the model it named no longer runs at all.
+
+`GET /api/workflows` lists what you can pass as `workflow_name`, along with the
+revision each name currently resolves to.
 
 The prompt may contain `@relative/path` mentions. List the paths a project
 offers with `GET /api/projects/{name}/files?q=<query>`. A mention that cannot
@@ -182,16 +191,19 @@ poll `GET /api/tasks/{id}`.
 
 ## What a task keeps
 
-Acceptance pins the whole decision onto the task: one complete binding for
-every model consumer — its source profile, its role, which of the two you set
-and which was inherited, and the full four-role map that profile bound — plus
-the effective base branch and preamble, the rendered branch, and the project's
-checkout and publishing routing.
+Acceptance pins the whole decision onto the task: the **workflow revision**,
+one complete binding for every model consumer — its source profile, its role,
+which of the two you set and which was inherited, and the full four-role map
+that profile bound — plus the effective base branch and preamble, the rendered
+branch, and the project's checkout and publishing routing.
 
 That is what the task runs — through the pipeline, the workflow, a restart,
 review, and shipping. Editing a profile afterwards, or deleting one, changes
-your next launch and nothing about this one. You can see exactly what a task
-was accepted with, per consumer, on its detail view.
+your next launch and nothing about this one. The same is true of the workflow
+itself: upgrading Ompire changes what your *next* `bugfix` task runs, not one
+already in flight. You can see exactly what a task was accepted with, per
+consumer, on its detail view — including the revision, with the definition
+itself readable there.
 
 ## Workflows
 
@@ -199,8 +211,8 @@ Two workflows ship today, and both are available to every project:
 
 - `single-step` — one agent step. The agent works, you review, you ship.
 - `bugfix` — reproduce, triage, fix, validate, check, escalate. Routing between
-  steps is decided by explicit rules, and an unresolved outcome stops at a
-  human gate rather than being guessed.
+  steps is decided by explicit rules, and an outcome the rules cannot read
+  stops the run and waits for you rather than being guessed.
 
 A workflow's steps name an abstract role — `default`, or one of the auxiliary
 roles — never a model. Which model answers to that role is your profile's

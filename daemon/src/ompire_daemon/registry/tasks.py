@@ -6,6 +6,7 @@ state machine arrives with add-session-states.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -127,7 +128,7 @@ class TaskConfigurationRequiredError(Exception):
         self.task_id = task_id
 
 
-def task_payload(task: Task) -> dict:
+def task_payload(task: Task, *, engine: Engine) -> dict:
     """The one wire shape of a task row, used by both REST responses and
     `task_updated` events so a client cannot see two different shapes for the
     same row.
@@ -136,7 +137,17 @@ def task_payload(task: Task) -> dict:
     execution reads — and `null` means the task predates pinned inputs, which
     `needs_configuration` states outright so a client does not have to infer
     a blocker from an absent field.
+
+    The workflow fields describe the definition *this task* pinned, resolved
+    through `taskdefinition` (ADR-0028). `workflow_primary_session` is null
+    rather than a guess whenever the definition cannot be resolved: a client
+    that substituted a plausible default would point review and shipping at a
+    session this task may never have declared. A task whose revision is
+    damaged or unsupported still serializes — it reports why, and stays
+    readable, stoppable, and cleanable.
     """
+    from ompire_daemon.taskdefinition import workflow_readiness
+
     payload = asdict(task)
     payload["execution_inputs"] = (
         execution_inputs_payload(task.execution_inputs)
@@ -144,6 +155,25 @@ def task_payload(task: Task) -> dict:
         else None
     )
     payload["needs_configuration"] = task.execution_inputs is None
+    binding = (
+        task.execution_inputs.workflow_binding
+        if task.execution_inputs is not None
+        else None
+    )
+    readiness = workflow_readiness(engine, task)
+    payload["workflow_revision"] = binding.revision if binding else None
+    payload["workflow_revision_source"] = binding.source if binding else None
+    payload["workflow_ready"] = readiness.ready
+    payload["workflow_readiness_reason"] = readiness.reason
+    payload["workflow_readiness_detail"] = readiness.detail
+    payload["workflow_primary_session"] = None
+    payload["workflow_sessions"] = None
+    if readiness.ready:
+        from ompire_daemon.taskdefinition import resolve_task_definition
+
+        definition = resolve_task_definition(engine, task).definition
+        payload["workflow_primary_session"] = definition.primary
+        payload["workflow_sessions"] = list(definition.sessions)
     return payload
 
 
@@ -350,6 +380,50 @@ def pin_execution_inputs(engine: Engine, task_id: int, inputs: TaskExecutionInpu
             .values(
                 execution_inputs_json=encode_execution_inputs(inputs),
                 updated_at=_now_iso(),
+            )
+        )
+    return get_task(engine, task_id)
+
+
+def pin_workflow_binding(engine: Engine, task_id: int, binding) -> Task:
+    """Fill in a task's *null* workflow binding, once, preserving everything
+    else the task already accepted (ADR-0028).
+
+    Deliberately the narrowest possible write. A task accepted after retained
+    revisions existed already has a binding and is refused here; every other
+    pinned field — the model bindings, the workspace values, the branch, the
+    provenance — is carried through untouched, because none of them is being
+    decided again. The read and the write share one reservation so two
+    confirmations racing cannot both believe they were first.
+    """
+    from ompire_daemon.execution_inputs import (
+        decode_execution_inputs,
+        execution_inputs_document,
+    )
+    from ompire_daemon.registry.model_profiles import reserved_write
+
+    with reserved_write(engine) as conn:
+        row = conn.execute(
+            tasks.select()
+            .with_only_columns(tasks.c.id, tasks.c.execution_inputs_json)
+            .where(tasks.c.id == task_id)
+        ).first()
+        if row is None:
+            raise TaskNotFoundError(task_id)
+        if row.execution_inputs_json is None:
+            raise TaskConfigurationRequiredError(task_id)
+        existing = decode_execution_inputs(row.execution_inputs_json)
+        if existing.workflow_binding is not None:
+            raise TaskInputsAlreadyPinnedError(task_id)
+        document = execution_inputs_document(existing)
+        from ompire_daemon.execution_inputs import encode_workflow_binding
+
+        document["workflow_binding"] = encode_workflow_binding(binding)
+        conn.execute(
+            tasks.update()
+            .where(tasks.c.id == task_id)
+            .values(
+                execution_inputs_json=json.dumps(document), updated_at=_now_iso()
             )
         )
     return get_task(engine, task_id)

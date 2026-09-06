@@ -119,7 +119,7 @@ class PrWatcher:
             mark_pr_state, self._engine, task.id, pr_state, merged_at
         )
         logger.info("task %d pr_state -> %s", task.id, pr_state)
-        self._hub.publish("task_updated", task_payload(updated))
+        self._hub.publish("task_updated", task_payload(updated, engine=self._engine))
 
 
 def _parse_pr_view(stdout: str) -> tuple[str | None, str | None]:

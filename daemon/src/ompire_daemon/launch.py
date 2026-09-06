@@ -11,7 +11,15 @@ no filesystem, runs no git, spawns nothing, and publishes no event, so it can
 be run inside `BEGIN IMMEDIATE` without holding the write lock across
 anything slow. Git and mention validation happen outside the lock, before it.
 
+What is resolved now includes the *workflow definition itself* (ADR-0028).
+The preview names an exact revision, acceptance re-checks that same revision
+under the write reservation, and the task stores it. Editing a prompt or a
+route therefore invalidates a reviewed preview — the operator reviews a
+procedure, not a workflow's name — while an unrelated workflow or profile
+change leaves it valid.
+
 ADR-0026 (docs/adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)
+ADR-0028 (docs/adr/0028-retain-declarative-workflow-revisions.md)
 """
 
 from __future__ import annotations
@@ -29,32 +37,29 @@ from ompire_daemon.db import model_profiles as model_profiles_table
 from ompire_daemon.db import projects as projects_table
 from ompire_daemon.execution_inputs import (
     AUXILIARY_CONSUMERS,
-    AUXILIARY_JUDGE,
     PROFILE_SOURCE_PROJECT,
     PROFILE_SOURCE_STEP,
     PROFILE_SOURCE_TASK,
     PROVENANCE_ACCEPTED,
     ROLE_SOURCE_STEP,
     ROLE_SOURCE_WORKFLOW,
+    WORKFLOW_SOURCE_ACCEPTED,
     WORKSPACE_FIELDS,
     ConsumerBinding,
     TaskExecutionInputs,
+    WorkflowBinding,
     WorkspaceInputs,
     decode_roles,
     encode_binding,
 )
-from ompire_daemon.model_config import JUDGE_ROLE, MODEL_ROLES, validate_model_role
+from ompire_daemon.model_config import MODEL_ROLES, validate_model_role
 from ompire_daemon.registry.model_profiles import RoleBinding
 from ompire_daemon.registry.projects import (
     validate_branch_pattern,
     validate_workshop_additions,
 )
-from ompire_daemon.workflows import (
-    JUDGE_SESSION,
-    UnknownWorkflowNameError,
-    describe_workflow,
-    get_workflow,
-)
+from ompire_daemon.workflow_definitions import WorkflowRevision, describe
+from ompire_daemon.workflows import UnknownWorkflowNameError, current_revision
 
 
 class LaunchInputError(ValueError):
@@ -124,9 +129,10 @@ class LaunchRequest:
     preamble", not an absence.
 
     `step_overrides` and `auxiliary_overrides` are separate namespaces on
-    purpose: a decision step can never become an agent binding by sharing a
-    name with the judge, and an unknown key in either is refused rather than
-    quietly resolved against the other.
+    purpose, and an unknown key in either is refused rather than quietly
+    resolved against the other. There are no auxiliary consumers left, so the
+    second namespace is now only how a request naming the *retired* judge is
+    refused explicitly instead of being dropped.
     """
 
     project_name: str
@@ -153,9 +159,9 @@ class PreviewRow:
     kind: str
     session: str | None
     conditional: bool
-    # The role the *workflow* declares for this step (or the judge's fixed
-    # auxiliary role). Kept beside the effective role so the form can say what
-    # resetting the role override would restore.
+    # The role the *definition* declares for this step. Kept beside the
+    # effective role so the form can say what resetting the role override
+    # would restore.
     declared_role: str | None
     binding: ConsumerBinding | None
 
@@ -179,6 +185,9 @@ class PreviewRow:
 @dataclass(frozen=True)
 class ResolvedLaunch:
     inputs: TaskExecutionInputs
+    # The exact definition this launch would pin. Held whole, not just named,
+    # so acceptance retains the same document the preview was built from.
+    revision: WorkflowRevision
     rows: tuple[PreviewRow, ...]
     fingerprint: str
     # Display facts the form shows beside the rows.
@@ -321,16 +330,21 @@ def _resolve_binding(
 def _resolve_consumers(
     reader: _ProfileReader,
     request: LaunchRequest,
-    workflow_name: str,
+    revision: WorkflowRevision,
     *,
     task_profile: str,
     task_profile_source: str,
-) -> tuple[
-    dict[str, ConsumerBinding], dict[str, ConsumerBinding], tuple[PreviewRow, ...]
-]:
+) -> tuple[dict[str, ConsumerBinding], tuple[PreviewRow, ...]]:
     """Resolve every declared consumer and build the preview in one pass, so
-    what the operator reviews and what the task stores cannot drift apart."""
-    descriptor = describe_workflow(get_workflow(workflow_name))
+    what the operator reviews and what the task stores cannot drift apart.
+
+    Every model consumer is now a *declared step*. The engine reserves none:
+    with the implicit judge gone there is no row for a model that runs outside
+    the definition, and nothing in the preview stands for work the operator
+    cannot see in the flow.
+    """
+    workflow_name = revision.name
+    descriptor = describe(revision)
     agent_steps = {
         step.name: step.role for step in descriptor.steps if step.role is not None
     }
@@ -351,10 +365,18 @@ def _resolve_consumers(
             raise LaunchInputError(f"step_overrides.{name}", detail)
     unknown_auxiliary = sorted(set(request.auxiliary_overrides) - set(AUXILIARY_CONSUMERS))
     if unknown_auxiliary:
-        raise LaunchInputError(
-            f"auxiliary_overrides.{unknown_auxiliary[0]}",
-            f"unknown auxiliary model consumer {unknown_auxiliary[0]!r}",
+        # There are no engine-reserved consumers left. A request still naming
+        # the retired judge is refused with the field, not silently dropped:
+        # dropping it would accept a launch the operator believes configures
+        # a model that no longer runs at all.
+        name = unknown_auxiliary[0]
+        detail = (
+            "the engine-reserved judge was removed; workflows no longer run an "
+            "implicit model, and unresolved evidence pauses for you instead"
+            if name == "judge"
+            else f"unknown auxiliary model consumer {name!r}"
         )
+        raise LaunchInputError(f"auxiliary_overrides.{name}", detail)
 
     step_bindings = {
         name: _resolve_binding(
@@ -367,17 +389,6 @@ def _resolve_consumers(
         )
         for name, declared_role in agent_steps.items()
     }
-    auxiliary_bindings = {
-        AUXILIARY_JUDGE: _resolve_binding(
-            reader,
-            request.auxiliary_overrides.get(AUXILIARY_JUDGE),
-            field=f"auxiliary_overrides.{AUXILIARY_JUDGE}",
-            declared_role=descriptor.judge_role,
-            task_profile=task_profile,
-            task_profile_source=task_profile_source,
-        )
-    }
-
     rows = [
         PreviewRow(
             step=step.name,
@@ -392,21 +403,14 @@ def _resolve_consumers(
         )
         for step in descriptor.steps
     ]
-    rows.append(
-        PreviewRow(
-            step=descriptor.judge_session,
-            kind="judge",
-            session=descriptor.judge_session,
-            conditional=True,  # only when a deterministic route or outcome fails
-            declared_role=descriptor.judge_role,
-            binding=auxiliary_bindings[AUXILIARY_JUDGE],
-        )
-    )
-    return step_bindings, auxiliary_bindings, tuple(rows)
+    return step_bindings, tuple(rows)
 
 
 def launch_fingerprint(
-    request: LaunchRequest, inputs: TaskExecutionInputs, rows: tuple[PreviewRow, ...]
+    request: LaunchRequest,
+    inputs: TaskExecutionInputs,
+    revision: WorkflowRevision,
+    rows: tuple[PreviewRow, ...],
 ) -> str:
     """A deterministic value over the submitted selections, everything they
     resolved to, and the workflow descriptor they were resolved against.
@@ -420,6 +424,11 @@ def launch_fingerprint(
     `/switch slow` in the container would run, so it changes the launch the
     operator reviewed — even though every model shown in the summary line is
     still the same string.
+
+    The workflow's *revision* is covered for the same reason (ADR-0028). It is
+    a content identity, so editing a prompt or a route — anything that changes
+    what the run would do — changes the fingerprint and invalidates the
+    preview, while the step list stayed identical.
     """
     digest = hashlib.sha256()
 
@@ -464,10 +473,6 @@ def launch_fingerprint(
                         name: binding_digest(binding)
                         for name, binding in sorted(inputs.step_bindings.items())
                     },
-                    "auxiliary_bindings": {
-                        name: binding_digest(binding)
-                        for name, binding in sorted(inputs.auxiliary_bindings.items())
-                    },
                     "workspace": [
                         inputs.workspace.base_branch,
                         inputs.workspace.branch_pattern,
@@ -479,6 +484,11 @@ def launch_fingerprint(
                     "fetch_remote": inputs.fetch_remote,
                     "upstream_url": inputs.upstream_url,
                     "fork_url": inputs.fork_url,
+                },
+                "workflow": {
+                    "name": revision.name,
+                    "revision": revision.revision,
+                    "format": revision.format,
                 },
                 "catalog": [
                     [
@@ -517,7 +527,7 @@ def resolve_launch(conn: Connection, request: LaunchRequest) -> ResolvedLaunch:
         )
 
     try:
-        workflow = get_workflow(request.workflow_name)
+        revision = current_revision(request.workflow_name)
     except UnknownWorkflowNameError as exc:
         raise LaunchInputError("workflow_name", str(exc)) from exc
 
@@ -541,10 +551,10 @@ def resolve_launch(conn: Connection, request: LaunchRequest) -> ResolvedLaunch:
             "select a model profile for this task",
         )
 
-    step_bindings, auxiliary_bindings, rows = _resolve_consumers(
+    step_bindings, rows = _resolve_consumers(
         reader,
         request,
-        workflow.name,
+        revision,
         task_profile=profile_name,
         task_profile_source=profile_source,
     )
@@ -552,15 +562,22 @@ def resolve_launch(conn: Connection, request: LaunchRequest) -> ResolvedLaunch:
     workspace, applied = _resolve_workspace(project_row, request.workspace_overrides)
     branch = workspace.branch_pattern.replace("<slug>", request.slug)
 
+    now = _now_iso()
     inputs = TaskExecutionInputs(
         provenance=PROVENANCE_ACCEPTED,
-        accepted_at=_now_iso(),
+        accepted_at=now,
         project_name=project_row.name,
-        workflow_name=workflow.name,
+        workflow_name=revision.name,
+        # Pinned before the first step runs, so there is no history to
+        # disclaim: this task's whole run belongs to this revision.
+        workflow_binding=WorkflowBinding(
+            revision=revision.revision,
+            source=WORKFLOW_SOURCE_ACCEPTED,
+            bound_at=now,
+        ),
         model_profile_name=profile_name,
         model_profile_source=profile_source,
         step_bindings=step_bindings,
-        auxiliary_bindings=auxiliary_bindings,
         workspace=workspace,
         workspace_overrides=applied,
         branch=branch,
@@ -571,8 +588,9 @@ def resolve_launch(conn: Connection, request: LaunchRequest) -> ResolvedLaunch:
     )
     return ResolvedLaunch(
         inputs=inputs,
+        revision=revision,
         rows=rows,
-        fingerprint=launch_fingerprint(request, inputs, rows),
+        fingerprint=launch_fingerprint(request, inputs, revision, rows),
         profile_source=profile_source,
         project_default_profile=project_row.default_model_profile,
         inherited_workspace=WorkspaceInputs(
@@ -603,11 +621,15 @@ def resolution_payload(resolved: ResolvedLaunch) -> dict[str, Any]:
         "preview_token": resolved.fingerprint,
         "project_name": inputs.project_name,
         "workflow_name": inputs.workflow_name,
+        # The exact procedure being accepted, not just its name. The UI shows
+        # it beside the flow and offers the definition itself for reading.
+        "workflow_revision": resolved.revision.revision,
+        "workflow_format": resolved.revision.format,
+        "workflow_primary_session": resolved.revision.definition.primary,
+        "workflow_sessions": list(resolved.revision.definition.sessions),
         "model_profile": inputs.model_profile_name,
         "model_profile_source": inputs.model_profile_source,
         "project_default_model_profile": resolved.project_default_profile,
-        "judge_session": JUDGE_SESSION,
-        "judge_role": JUDGE_ROLE,
         "auxiliary_consumers": list(AUXILIARY_CONSUMERS),
         # The task-wide profile's own map: what a row inheriting both
         # dimensions resolves against.

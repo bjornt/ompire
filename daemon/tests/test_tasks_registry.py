@@ -38,7 +38,9 @@ from ompire_daemon.registry.workflows import (
 def engine(tmp_path: Path) -> Engine:
     db_path = tmp_path / "ompire.db"
     upgrade_head(db_path)
-    return make_engine(db_path)
+    engine = make_engine(db_path)
+    register_builtin_workflows(engine)
+    return engine
 
 
 @pytest.fixture
@@ -78,7 +80,7 @@ def test_task_carries_workflow_fields(engine: Engine, project, tmp_path: Path) -
     assert updated.workflow_status == "running"
     assert updated.workflow_step == "work"
     assert get_task(engine, task.id).workflow_status == "running"
-from tests.conftest import make_execution_inputs
+from tests.conftest import make_execution_inputs, register_builtin_workflows
 
 
 def test_session_rows_round_trip(engine: Engine, project, tmp_path: Path) -> None:

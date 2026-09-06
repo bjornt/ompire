@@ -126,6 +126,26 @@ launch_reconciliations = Table(
     Column("decided_at", String, nullable=False),
 )
 
+# Retained workflow definitions, keyed by the content identity of their
+# canonical document (ADR-0028). A row is written when a definition first
+# enters the catalog and is never updated or deleted: a task pins a revision,
+# and that revision has to keep meaning what it meant for as long as the task
+# is inspectable — including after the packaged definition changes, and after
+# the workflow name disappears from a later release's catalog.
+#
+# `document_json` is the whole executable document, not a summary: the
+# identifier alone would name a definition nobody could still read.
+workflow_revisions = Table(
+    "workflow_revisions",
+    metadata,
+    Column("revision", String, primary_key=True),
+    Column("workflow_name", String, nullable=False),
+    Column("format", Integer, nullable=False),
+    Column("document_json", Text, nullable=False),
+    Column("created_at", String, nullable=False),
+    Index("ix_workflow_revisions_workflow_name", "workflow_name"),
+)
+
 tasks = Table(
     "tasks",
     metadata,
@@ -203,6 +223,13 @@ workflow_step_records = Table(
     Column("status", String, nullable=False),
     Column("outcome_json", Text, nullable=True),
     Column("error", Text, nullable=True),
+    # An uncertainty pause (ADR-0028), distinct from a declared gate's message
+    # in `outcome_json`. The attempt keeps its own kind, its absent outcome,
+    # and the parse or evaluation error that stopped it; this column adds why
+    # the run is waiting and which step an operator retry re-enters. Replacing
+    # the attempt's evidence with a synthetic success is exactly what this
+    # column exists to avoid.
+    Column("pause_json", Text, nullable=True),
     Column("prompted_at", String, nullable=True),
     Column("started_at", String, nullable=False),
     Column("finished_at", String, nullable=True),

@@ -837,10 +837,10 @@ function LaunchReconciliationPanel({ project }: { project: Project }) {
         <div data-testid={`reconcile-judge-${project.name}`}>
           <p className="fieldNote">
             <code>judge_model = {evidence.retired_judge_model}</code> is still set in your{" "}
-            <code>config.toml</code>. It configures nothing now: the workflow judge runs on
-            the selected profile&apos;s <code>{evidence.judge_role}</code> binding. Your
-            file is not modified — if you want that exact model, bind it as{" "}
-            <code>{evidence.judge_role}</code> in a profile.
+            <code>config.toml</code>. It configures nothing: the workflow engine no longer
+            runs an implicit judge at all. When a step leaves no valid result, or a route
+            cannot be decided from the recorded evidence, the run stops and waits for you
+            instead of asking a model to guess. Your file is not modified.
           </p>
           <label className="checkboxField">
             <input
@@ -849,9 +849,7 @@ function LaunchReconciliationPanel({ project }: { project: Project }) {
               onChange={(e) => setAckJudge(e.target.checked)}
               data-testid={`ack-judge-${project.name}`}
             />
-            <span>
-              The profile&apos;s <code>{evidence.judge_role}</code> binding replaces it.
-            </span>
+            <span>Nothing replaces it; unresolved evidence now waits for me.</span>
           </label>
         </div>
       )}

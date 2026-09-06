@@ -18,10 +18,28 @@ history, review history, and PR facts are all intact and stay untouched. What
 is missing is stated as missing, and the operator confirms a configuration for
 what happens *next* — which is not a claim about what already happened.
 
+The same is true, one layer up, of the *workflow definition* (ADR-0028). Every
+task that existed before definitions were retained recorded a workflow name,
+and a name is not a procedure: what those prompts and routes actually said is
+gone. So no such task is assigned today's definition behind the operator's
+back. It is offered the current definition of its own workflow name as a
+*candidate*, with the compatibility check that says whether that candidate can
+even explain the steps and sessions already on record, and it executes nothing
+further until a person confirms it. The confirmation records exactly what was
+confirmed and where the honest boundary lies: everything through
+`legacy_through_seq` happened under a definition nobody kept, and one attempt
+may span the boundary, having been opened before the confirmation and finished
+after it.
+
+A task that needs both decisions gets one confirmation, not two: they are the
+same question — "what does this task continue under" — asked about different
+parts of the same launch.
+
 Startup runs `initialize` before task classification and recovery, so a
 blocked task is blocked before anything tries to resume it.
 
 ADR-0026 (docs/adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)
+ADR-0028 (docs/adr/0028-retain-declarative-workflow-revisions.md)
 """
 
 from __future__ import annotations
@@ -39,23 +57,26 @@ from ompire_daemon.config import Config
 from ompire_daemon.db import launch_migration_evidence
 from ompire_daemon.db import projects as projects_table
 from ompire_daemon.execution_inputs import (
-    AUXILIARY_JUDGE,
     PROFILE_SOURCE_LEGACY,
     PROVENANCE_LEGACY_CONFIRMED,
+    RETIRED_AUXILIARY_JUDGE,
     ROLE_SOURCE_WORKFLOW,
+    WORKFLOW_SOURCE_LEGACY_CONFIRMED,
     ConsumerBinding,
+    MissingConsumerBindingError,
     ModelPolicy,
     TaskExecutionInputs,
+    WorkflowBinding,
     WorkspaceInputs,
     encode_execution_inputs,
     execution_inputs_payload,
 )
 from ompire_daemon.launch import LaunchInputError, _read_profile_roles
-from ompire_daemon.model_config import JUDGE_ROLE
 from ompire_daemon.registry.launch import (
     DECISION_JUDGE_MODEL,
     DECISION_LAUNCH_CONFIG,
     DECISION_NEW_DEFAULTS,
+    DECISION_WORKFLOW_CONTINUATION,
     KIND_MODEL_CANDIDATES,
     KIND_NEW_DEFAULTS,
     KIND_RETIRED_JUDGE_MODEL,
@@ -92,8 +113,24 @@ from ompire_daemon.registry.tasks import (
     get_task,
     list_unconfigured_tasks,
     pin_execution_inputs,
+    pin_workflow_binding,
 )
-from ompire_daemon.workflows import agent_steps, get_workflow
+from ompire_daemon.registry.workflows import (
+    PAUSE_UNRESOLVED_DECISION,
+    build_pause,
+    list_step_records,
+    pause_step,
+)
+from ompire_daemon.taskdefinition import (
+    READINESS_NEEDS_WORKFLOW_CONFIRMATION,
+    workflow_readiness,
+)
+from ompire_daemon.workflow_definitions import (
+    DecisionStep,
+    WorkflowRevision,
+    describe,
+)
+from ompire_daemon.workflows import UnknownWorkflowNameError, current_revision
 
 logger = logging.getLogger(__name__)
 
@@ -155,10 +192,13 @@ def _capture_retired_judge_model(engine: Engine, config: Config) -> None:
     """Record an explicitly configured, now-retired `judge_model`.
 
     The daemon never rewrites `config.toml`. It records what it found, and
-    every project that carries legacy template evidence has to acknowledge
-    that this model is replaced by its profile's `slow` binding before it can
-    launch again. An unchanged value that has already been acknowledged stays
-    quiet across restarts; a *changed* one is new evidence and reopens the
+    every project that carries legacy template evidence has to acknowledge the
+    setting before it can launch again. The acknowledgement history itself is
+    preserved across the judge's removal: what changed is what the operator is
+    acknowledging. The value configured no model even before — and now there
+    is no engine-reserved model consumer at all, so it configures nothing that
+    exists. An unchanged value that has already been acknowledged stays quiet
+    across restarts; a *changed* one is new evidence and reopens the
     acknowledgement rather than being applied to anything.
     """
     value = config.retired.get(RETIRED_JUDGE_KEY)
@@ -181,11 +221,11 @@ def _capture_retired_judge_model(engine: Engine, config: Config) -> None:
                 payload={"key": RETIRED_JUDGE_KEY, "value": recorded},
             )
             logger.warning(
-                "config key %r is retired: the workflow judge now runs on the "
-                "task profile's %r binding. The value %r configures nothing; "
+                "config key %r is retired: the workflow engine no longer runs "
+                "an implicit judge at all, and unresolved evidence pauses for "
+                "the operator instead. The value %r configures nothing; "
                 "acknowledge it per project to clear the launch block.",
                 RETIRED_JUDGE_KEY,
-                JUDGE_ROLE,
                 recorded,
             )
         for name in _projects_with_legacy_templates(conn):
@@ -289,7 +329,9 @@ def project_reconciliation(engine: Engine, name: str) -> dict[str, Any]:
         # role binding at most; they are never turned into a profile.
         "model_candidates": model_candidates,
         "retired_judge_model": judge_value,
-        "judge_role": JUDGE_ROLE,
+        # No role replaces it. The engine has no reserved model consumer, so
+        # there is nothing to point the operator at as "where it went".
+        "judge_removed": True,
         # Inert history, kept after reconciliation so an unselected preamble
         # or candidate is not lost.
         "source_templates": templates,
@@ -351,8 +393,9 @@ def confirm_project_reconciliation(
         if pending_judge is not None and not decision.acknowledge_judge_model:
             raise LaunchInputError(
                 "acknowledge_judge_model",
-                f"acknowledge that the retired judge model {pending_judge!r} is "
-                f"replaced by the profile's {JUDGE_ROLE!r} binding",
+                f"acknowledge that the retired judge model {pending_judge!r} "
+                "configures nothing: the workflow engine no longer runs an "
+                "implicit judge, and unresolved evidence pauses for you",
             )
         if decision.default_model_profile is not None:
             # Reuses the normal profile lookup: reconciliation never bypasses
@@ -390,7 +433,7 @@ def confirm_project_reconciliation(
     return get_project(engine, name)
 
 
-# --- legacy task confirmation -------------------------------------------------
+# --- legacy task continuation -------------------------------------------------
 
 # Inputs a task created before ADR-0026 simply does not have. They are listed
 # as unknown on the task and carried into the confirmed document, so the
@@ -402,6 +445,201 @@ LEGACY_UNKNOWN_INPUTS = (
     "workspace_overrides",
 )
 
+# What a task upgraded across ADR-0028 does not have: the definition itself.
+LEGACY_UNKNOWN_WORKFLOW = ("workflow_definition",)
+
+# The one uncertainty-policy change a confirming operator is told about, in
+# their own terms. Kept beside the confirmation because it is the only way the
+# task's *future* behavior differs from its past for reasons unrelated to the
+# candidate definition's own content.
+UNCERTAINTY_NOTICE = (
+    "This task will no longer ask a model to classify a result it cannot read. "
+    "When a step produces no valid outcome, or a route cannot be decided from "
+    "the recorded evidence, the run stops and waits for you with the reason "
+    "attached, and you decide whether to retry the step."
+)
+
+
+def _candidate_revision(task: Task) -> WorkflowRevision | None:
+    """The current definition of *this task's own* workflow name, or None.
+
+    Only that one name is offered. There is no revision picker and no way to
+    switch a task to a different workflow: the task's history was produced by
+    something calling itself `bugfix`, and offering anything else would be
+    inviting the operator to relabel a run rather than continue it.
+    """
+    try:
+        return current_revision(task.workflow_name)
+    except UnknownWorkflowNameError:
+        return None
+
+
+def _legacy_gate_pair(records: list[Any], index: int) -> bool:
+    """The one known pre-ADR-0028 record shape a `decision` step can explain.
+
+    The old engine escalated an unresolvable decision by finishing the
+    decision record `ok` with the escalation message in its error field, then
+    appending a *separate* `gate` record under the same name. That gate is not
+    a declared gate, so a strict kind check would call this history
+    incompatible. It is admitted only in exactly that shape — immediately
+    preceded by a same-name decision record with no outcome and a recorded
+    message — and never as a general "kinds may differ".
+    """
+    if index == 0:
+        return False
+    previous = records[index - 1]
+    current = records[index]
+    return (
+        previous.step == current.step
+        and previous.kind == "decision"
+        and previous.outcome is None
+        and bool(previous.error)
+    )
+
+
+def _compatibility_problems(
+    engine: Engine, task: Task, revision: WorkflowRevision
+) -> list[str]:
+    """Whether this candidate can explain what is already on record.
+
+    Confirmation is allowed only when the answer is "yes, entirely". A
+    definition that cannot account for a step name, a step's kind, a session,
+    or the run's current position is not a continuation of this task — it is a
+    different procedure being pointed at somebody else's history.
+    """
+    definition = revision.definition
+    problems: list[str] = []
+    records = list_step_records(engine, task.id)
+    for index, record in enumerate(records):
+        step = definition.step_named(record.step)
+        if step is None:
+            problems.append(
+                f"attempt #{record.seq} ran a step {record.step!r} that the "
+                f"current {revision.name!r} definition does not declare"
+            )
+            continue
+        if step.kind != record.kind and not (
+            record.kind == "gate"
+            and isinstance(step, DecisionStep)
+            and _legacy_gate_pair(records, index)
+        ):
+            problems.append(
+                f"attempt #{record.seq} recorded step {record.step!r} as a "
+                f"{record.kind}, but the current definition declares it as a "
+                f"{step.kind}"
+            )
+        if record.session is not None and record.session not in definition.sessions:
+            problems.append(
+                f"attempt #{record.seq} ran in session {record.session!r}, "
+                "which the current definition does not declare"
+            )
+    for session in list_resumable_sessions(engine, task.id):
+        if session.name == RETIRED_AUXILIARY_JUDGE:
+            # The retired engine session. It is not declared by any definition
+            # and is deliberately not resumed; its transcript stays readable.
+            continue
+        if session.name not in definition.sessions:
+            problems.append(
+                f"session {session.name!r} exists on this task but the current "
+                "definition does not declare it"
+            )
+    if task.workflow_step is not None and definition.step_named(task.workflow_step) is None:
+        problems.append(
+            f"the run is currently at step {task.workflow_step!r}, which the "
+            "current definition does not declare"
+        )
+    inputs = task.execution_inputs
+    if inputs is not None:
+        # A task that already has accepted inputs cannot be given new model
+        # policy here: that would be a launch decision, made for turns that
+        # may already be under way. Missing bindings block instead.
+        for step in definition.agent_steps():
+            try:
+                inputs.binding_for_step(step.name)
+            except MissingConsumerBindingError:
+                problems.append(
+                    f"step {step.name!r} needs an accepted model binding and "
+                    "this task has none; it cannot be added by a continuation"
+                )
+    return problems
+
+
+def _history_boundary(engine: Engine, task: Task) -> tuple[int, int | None]:
+    """Where the retained definition's authority starts.
+
+    Everything up to `legacy_through_seq` was produced by a definition nobody
+    kept. An attempt still open at confirmation time is named separately: it
+    began under the old definition and will finish under the confirmed one, and
+    calling it either would be a claim about a turn whose beginning is unknown.
+    """
+    records = list_step_records(engine, task.id)
+    if not records:
+        return 0, None
+    last = records[-1]
+    interrupted = last.seq if last.status in ("running", "waiting") else None
+    return last.seq, interrupted
+
+
+def workflow_continuation(engine: Engine, task: Task) -> dict[str, Any] | None:
+    """The candidate this task would continue under, and whether it fits.
+
+    None when the task already has a pinned revision: there is nothing to
+    decide, and offering a choice would imply the accepted one is negotiable.
+    """
+    readiness = workflow_readiness(engine, task)
+    if readiness.reason != READINESS_NEEDS_WORKFLOW_CONFIRMATION and (
+        task.execution_inputs is not None
+    ):
+        return None
+    if task.execution_inputs is not None and task.execution_inputs.workflow_binding:
+        return None
+    revision = _candidate_revision(task)
+    legacy_through, interrupted = _history_boundary(engine, task)
+    if revision is None:
+        return {
+            "workflow_name": task.workflow_name,
+            "revision": None,
+            "available": False,
+            "compatible": False,
+            "problems": [
+                (
+                    f"this daemon installs no workflow named "
+                    f"{task.workflow_name!r}, so there is no candidate "
+                    "definition to continue under"
+                )
+            ],
+            "legacy_through_seq": legacy_through,
+            "interrupted_legacy_seq": interrupted,
+            "uncertainty_notice": UNCERTAINTY_NOTICE,
+        }
+    problems = _compatibility_problems(engine, task, revision)
+    descriptor = describe(revision)
+    return {
+        "workflow_name": revision.name,
+        "revision": revision.revision,
+        "format": revision.format,
+        "available": True,
+        "compatible": not problems,
+        "problems": problems,
+        "primary_session": descriptor.primary_session,
+        "sessions": list(descriptor.sessions),
+        "steps": [
+            {
+                "name": step.name,
+                "kind": step.kind,
+                "session": step.session,
+                "role": step.role,
+                "conditional": step.conditional,
+            }
+            for step in descriptor.steps
+        ],
+        "current_step": task.workflow_step,
+        "workflow_status": task.workflow_status,
+        "legacy_through_seq": legacy_through,
+        "interrupted_legacy_seq": interrupted,
+        "uncertainty_notice": UNCERTAINTY_NOTICE,
+    }
+
 
 def task_configuration(engine: Engine, task_id: int) -> dict[str, Any]:
     """What is known, what was reconstructed, and what is simply unknown."""
@@ -412,9 +650,23 @@ def task_configuration(engine: Engine, task_id: int) -> dict[str, Any]:
         project = get_project(engine, task.project_name)
     except ProjectNotFoundError:
         project = None
+    readiness = workflow_readiness(engine, task)
+    continuation = workflow_continuation(engine, task)
     payload: dict[str, Any] = {
         "task_id": task_id,
         "needs_configuration": task.execution_inputs is None,
+        "needs_workflow_confirmation": continuation is not None,
+        # Distinguishable on purpose: "never configured", "no retained
+        # definition", "the stored definition is damaged", and "this daemon
+        # cannot read that format" call for different actions, and only the
+        # second is something the operator can confirm away.
+        "workflow_readiness": {
+            "ready": readiness.ready,
+            "reason": readiness.reason,
+            "detail": readiness.detail,
+            "confirmable": readiness.confirmable,
+        },
+        "workflow_candidate": continuation,
         "archived": task.state == "archived",
         # Facts the registry actually holds. These are never recreated or
         # discarded by a confirmation.
@@ -424,6 +676,11 @@ def task_configuration(engine: Engine, task_id: int) -> dict[str, Any]:
             "branch": task.branch,
             "clone_path": task.clone_path,
             "workflow_name": task.workflow_name,
+            "workflow_revision": (
+                task.execution_inputs.workflow_revision
+                if task.execution_inputs is not None
+                else None
+            ),
             "workflow_status": task.workflow_status,
             "workflow_step": task.workflow_step,
             "pr_url": task.pr_url,
@@ -435,7 +692,10 @@ def task_configuration(engine: Engine, task_id: int) -> dict[str, Any]:
         "source_attribution": [
             {"source": row.source, "values": row.payload} for row in evidence
         ],
-        "unknown_inputs": list(LEGACY_UNKNOWN_INPUTS),
+        "unknown_inputs": list(
+            LEGACY_UNKNOWN_INPUTS if task.execution_inputs is None else ()
+        )
+        + list(LEGACY_UNKNOWN_WORKFLOW if continuation is not None else ()),
         "candidates": {
             "checkout_path": project.checkout_path if project else None,
             "fetch_remote": project.fetch_remote if project else None,
@@ -454,19 +714,43 @@ def task_configuration(engine: Engine, task_id: int) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class TaskContinuation:
-    """What the operator supplies to pin a legacy task's *future* behavior."""
+    """What the operator supplies to pin a legacy task's *future* behavior.
 
-    model_profile: str
-    base_branch: str
-    workshop_additions: str
-    preamble: str
+    The launch fields are required only when the task has no accepted inputs
+    at all. A task that was accepted normally and merely predates retained
+    definitions supplies none of them: its model, branch, and preamble were
+    reviewed once and are not re-decided here.
+    """
+
+    model_profile: str | None = None
+    base_branch: str | None = None
+    workshop_additions: str | None = None
+    preamble: str | None = None
+
+
+def _require_launch_fields(continuation: TaskContinuation) -> None:
+    if not continuation.model_profile:
+        raise LaunchInputError(
+            "model_profile", "select a model profile for this task to continue under"
+        )
+    if not (continuation.base_branch or "").strip():
+        raise LaunchInputError("base_branch", "base branch must not be empty")
+    validate_workshop_additions(continuation.workshop_additions or "")
 
 
 def _legacy_inputs(
-    conn: Connection, task: Task, project: Project, continuation: TaskContinuation
+    conn: Connection,
+    task: Task,
+    project: Project,
+    continuation: TaskContinuation,
+    revision: WorkflowRevision,
+    *,
+    legacy_through_seq: int,
+    interrupted_legacy_seq: int | None,
 ) -> TaskExecutionInputs:
+    assert continuation.model_profile is not None
     roles = _read_profile_roles(conn, continuation.model_profile, field="model_profile")
-    workflow = get_workflow(task.workflow_name)
+    now = _now_iso()
 
     def binding(role: str) -> ConsumerBinding:
         # Every consumer inherits the one confirmed profile and its declared
@@ -475,7 +759,7 @@ def _legacy_inputs(
         # per-step choices for a run already in progress would be a claim
         # about turns that already happened.
         return ConsumerBinding(
-            profile_name=continuation.model_profile,
+            profile_name=continuation.model_profile or "",
             profile_source=PROFILE_SOURCE_LEGACY,
             role=role,
             role_source=ROLE_SOURCE_WORKFLOW,
@@ -484,23 +768,29 @@ def _legacy_inputs(
 
     return TaskExecutionInputs(
         provenance=PROVENANCE_LEGACY_CONFIRMED,
-        accepted_at=_now_iso(),
+        accepted_at=now,
         project_name=task.project_name,
-        workflow_name=task.workflow_name,
+        workflow_name=revision.name,
+        workflow_binding=WorkflowBinding(
+            revision=revision.revision,
+            source=WORKFLOW_SOURCE_LEGACY_CONFIRMED,
+            bound_at=now,
+            legacy_through_seq=legacy_through_seq,
+            interrupted_legacy_seq=interrupted_legacy_seq,
+        ),
         model_profile_name=continuation.model_profile,
         model_profile_source=PROFILE_SOURCE_LEGACY,
         step_bindings={
-            step.name: binding(step.role) for step in agent_steps(workflow)
+            step.name: binding(step.role) for step in revision.definition.agent_steps()
         },
-        auxiliary_bindings={AUXILIARY_JUDGE: binding(JUDGE_ROLE)},
         workspace=WorkspaceInputs(
-            base_branch=continuation.base_branch,
+            base_branch=continuation.base_branch or "",
             # The branch already exists on this task; the pattern that made it
             # is history nobody recorded. Storing the rendered branch as the
             # pattern would be a lie, so it is stated as the literal name.
             branch_pattern=task.branch,
-            workshop_additions=continuation.workshop_additions,
-            preamble=continuation.preamble,
+            workshop_additions=continuation.workshop_additions or "",
+            preamble=continuation.preamble or "",
         ),
         workspace_overrides=(),
         branch=task.branch,
@@ -512,44 +802,140 @@ def _legacy_inputs(
     )
 
 
+@dataclass(frozen=True)
+class _Resolution:
+    """One prospective continuation, before anything is written."""
+
+    task: Task
+    revision: WorkflowRevision
+    inputs: TaskExecutionInputs | None  # None when only the binding is missing
+    binding: WorkflowBinding
+    problems: list[str]
+    legacy_through_seq: int
+    interrupted_legacy_seq: int | None
+
+
+def _resolve_continuation(
+    engine: Engine, task_id: int, continuation: TaskContinuation
+) -> _Resolution:
+    """Work out what confirming would pin, without writing any of it."""
+    task = get_task(engine, task_id)
+    readiness = workflow_readiness(engine, task)
+    if readiness.ready:
+        raise ReconciliationConflictError(
+            f"task {task_id} already has a pinned workflow revision and "
+            "accepted launch inputs"
+        )
+    if not readiness.confirmable and task.execution_inputs is not None:
+        raise ReconciliationConflictError(
+            f"task {task_id} cannot be confirmed: {readiness.detail}"
+        )
+    revision = _candidate_revision(task)
+    if revision is None:
+        raise ReconciliationConflictError(
+            f"this daemon installs no workflow named {task.workflow_name!r}, so "
+            f"task {task_id} has no candidate definition to continue under"
+        )
+    problems = _compatibility_problems(engine, task, revision)
+    legacy_through, interrupted = _history_boundary(engine, task)
+    now = _now_iso()
+    binding = WorkflowBinding(
+        revision=revision.revision,
+        source=WORKFLOW_SOURCE_LEGACY_CONFIRMED,
+        bound_at=now,
+        legacy_through_seq=legacy_through,
+        interrupted_legacy_seq=interrupted,
+    )
+    inputs: TaskExecutionInputs | None = None
+    if task.execution_inputs is None:
+        _require_launch_fields(continuation)
+        project = get_project(engine, task.project_name)
+        with engine.connect() as conn:
+            inputs = _legacy_inputs(
+                conn,
+                task,
+                project,
+                continuation,
+                revision,
+                legacy_through_seq=legacy_through,
+                interrupted_legacy_seq=interrupted,
+            )
+        binding = inputs.workflow_binding or binding
+    return _Resolution(
+        task=task,
+        revision=revision,
+        inputs=inputs,
+        binding=binding,
+        problems=problems,
+        legacy_through_seq=legacy_through,
+        interrupted_legacy_seq=interrupted,
+    )
+
+
+def _continuation_token(resolution: _Resolution) -> str:
+    """Names exactly what the operator reviewed.
+
+    Covers the candidate revision, the persisted inputs the confirmation would
+    write, the run's position and history boundary, and the compatibility
+    result — so a confirmation cannot be applied after the candidate changed,
+    after the run moved on, or after a problem appeared that the operator
+    never saw.
+    """
+    document: dict[str, Any] = {
+        "revision": resolution.revision.revision,
+        "legacy_through_seq": resolution.legacy_through_seq,
+        "interrupted_legacy_seq": resolution.interrupted_legacy_seq,
+        "workflow_status": resolution.task.workflow_status,
+        "workflow_step": resolution.task.workflow_step,
+        "problems": resolution.problems,
+    }
+    if resolution.inputs is not None:
+        inputs_document = json.loads(encode_execution_inputs(resolution.inputs))
+        # Timestamps are what make two otherwise identical previews differ,
+        # and they are not part of what the operator reviewed.
+        inputs_document.pop("accepted_at", None)
+        if isinstance(inputs_document.get("workflow_binding"), dict):
+            inputs_document["workflow_binding"].pop("bound_at", None)
+        document["inputs"] = inputs_document
+    return hashlib.sha256(
+        json.dumps(document, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:32]
+
+
 def preview_task_configuration(
     engine: Engine, task_id: int, continuation: TaskContinuation
 ) -> dict[str, Any]:
     """Resolve a continuation configuration without writing it.
 
-    Task identity, branch, clone, workflow, and session ids are fixed facts
-    here — they are shown, never chosen. The current project's routing is
+    Task identity, branch, clone, workflow name, and session ids are fixed
+    facts here — they are shown, never chosen. The current project's routing is
     offered as a candidate, because it is the only routing that exists, and
     confirming it is the operator saying so rather than the daemon assuming.
     """
-    task = get_task(engine, task_id)
-    if task.execution_inputs is not None:
-        raise ReconciliationConflictError(
-            f"task {task_id} already has pinned execution inputs"
-        )
-    validate_workshop_additions(continuation.workshop_additions)
-    if not continuation.base_branch.strip():
-        raise LaunchInputError("base_branch", "base branch must not be empty")
-    project = get_project(engine, task.project_name)
-    with engine.connect() as conn:
-        inputs = _legacy_inputs(conn, task, project, continuation)
-    payload = execution_inputs_payload(inputs)
+    resolution = _resolve_continuation(engine, task_id, continuation)
     return {
         "task_id": task_id,
-        "preview_token": _continuation_token(inputs),
-        "inputs": payload,
-        "unknown_inputs": list(LEGACY_UNKNOWN_INPUTS),
+        "preview_token": _continuation_token(resolution),
+        "inputs": (
+            execution_inputs_payload(resolution.inputs)
+            if resolution.inputs is not None
+            else None
+        ),
+        "workflow": {
+            "name": resolution.revision.name,
+            "revision": resolution.revision.revision,
+            "format": resolution.revision.format,
+            "compatible": not resolution.problems,
+            "problems": resolution.problems,
+            "legacy_through_seq": resolution.legacy_through_seq,
+            "interrupted_legacy_seq": resolution.interrupted_legacy_seq,
+            "uncertainty_notice": UNCERTAINTY_NOTICE,
+        },
+        "unknown_inputs": list(
+            LEGACY_UNKNOWN_INPUTS if resolution.inputs is not None else ()
+        )
+        + list(LEGACY_UNKNOWN_WORKFLOW),
     }
-
-
-def _continuation_token(inputs: TaskExecutionInputs) -> str:
-    document = json.loads(encode_execution_inputs(inputs))
-    # The timestamp is what makes two otherwise identical previews differ, and
-    # it is not part of what the operator reviewed.
-    document.pop("accepted_at", None)
-    return hashlib.sha256(
-        json.dumps(document, sort_keys=True).encode("utf-8")
-    ).hexdigest()[:32]
 
 
 def confirm_task_configuration(
@@ -559,66 +945,154 @@ def confirm_task_configuration(
     *,
     preview_token: str,
     acknowledge_unknown: bool,
+    acknowledge_workflow: bool = False,
 ) -> Task:
     """Pin a legacy task's continuation configuration, once.
 
     This changes what happens from here on. It does not respawn the workspace,
-    replay a privileged operation, or alter the recorded branch, session
-    identities, workflow history, review history, or PR facts — and it does
-    not claim the turns already taken used these values.
+    replay a privileged operation, start execution, or alter the recorded
+    branch, session identities, workflow history, review history, or PR facts
+    — and it does not claim the turns already taken used these values. The
+    existing explicit Continue action is still what resumes the run, and it
+    still applies the normal recovery checks.
     """
-    if not acknowledge_unknown:
+    resolution = _resolve_continuation(engine, task_id, continuation)
+    # Staleness first. An acknowledgement of something the operator did not
+    # actually review is not worth validating, and the fix is the same either
+    # way: read the current continuation and decide again.
+    if _continuation_token(resolution) != preview_token:
+        raise ReconciliationConflictError(
+            "the continuation changed since it was previewed; review it "
+            "again before confirming"
+        )
+    if resolution.inputs is not None and not acknowledge_unknown:
         raise LaunchInputError(
             "acknowledge_unknown",
             "acknowledge that the original model, thinking level, preamble, and "
             "overrides for this task are unknown and cannot be recovered",
         )
-    task = get_task(engine, task_id)
-    if task.execution_inputs is not None:
-        raise ReconciliationConflictError(
-            f"task {task_id} already has pinned execution inputs"
+    if not acknowledge_workflow:
+        raise LaunchInputError(
+            "acknowledge_workflow",
+            "acknowledge that the exact workflow definition this task already "
+            "ran was never recorded, and that the current definition governs "
+            "only what happens next",
         )
-    project = get_project(engine, task.project_name)
-    validate_workshop_additions(continuation.workshop_additions)
-    with engine.connect() as conn:
-        inputs = _legacy_inputs(conn, task, project, continuation)
-    if _continuation_token(inputs) != preview_token:
-        raise ReconciliationConflictError(
-            "the continuation configuration changed since it was previewed; "
-            "review it again before confirming"
+    if resolution.problems:
+        raise LaunchInputError(
+            "workflow_candidate",
+            "the current definition cannot explain this task's recorded steps "
+            "and sessions: " + "; ".join(resolution.problems),
         )
-    pinned = pin_execution_inputs(engine, task_id, inputs)
-    _seed_session_continuation(engine, task_id, inputs)
-    return pinned
+    # Re-resolved under the reservation and compared, so a confirmation made
+    # against a preview that has since changed is refused rather than applied.
+    with reserved_write(engine) as conn:
+        fresh = _resolve_continuation(engine, task_id, continuation)
+        if _continuation_token(fresh) != preview_token:
+            raise ReconciliationConflictError(
+                "the continuation changed since it was previewed; review it "
+                "again before confirming"
+            )
+        record_decision(
+            conn,
+            scope_kind=SCOPE_TASK,
+            scope=str(task_id),
+            kind=DECISION_WORKFLOW_CONTINUATION,
+            acknowledged_value=json.dumps(
+                {
+                    "revision": fresh.binding.revision,
+                    "legacy_through_seq": fresh.binding.legacy_through_seq,
+                    "interrupted_legacy_seq": fresh.binding.interrupted_legacy_seq,
+                },
+                sort_keys=True,
+            ),
+        )
+    if fresh.inputs is not None:
+        pinned = pin_execution_inputs(engine, task_id, fresh.inputs)
+        _seed_session_continuation(engine, task_id, fresh.inputs, fresh.revision)
+    else:
+        pinned = pin_workflow_binding(engine, task_id, fresh.binding)
+    _convert_legacy_escalation_gate(engine, pinned, fresh.revision)
+    return get_task(engine, task_id)
+
+
+def _convert_legacy_escalation_gate(
+    engine: Engine, task: Task, revision: WorkflowRevision
+) -> None:
+    """Re-label an old synthesized escalation gate as what it always was.
+
+    The pre-ADR-0028 engine parked an unresolvable decision on a *synthesized*
+    gate under the decision's own name, and resuming it fell through to the
+    step after the decision — which is exactly the silent "continue as if the
+    evidence had been accepted" this change removes. After confirmation, that
+    waiting record becomes an uncertainty pause whose operator action retries
+    the decision. Both records are preserved; only what the button does
+    changes.
+    """
+    records = list_step_records(engine, task.id)
+    if not records:
+        return
+    last = records[-1]
+    if last.status != "waiting" or last.pause is not None or last.kind != "gate":
+        return
+    step = revision.definition.step_named(last.step)
+    if not isinstance(step, DecisionStep):
+        return
+    if not _legacy_gate_pair(records, len(records) - 1):
+        return
+    message = (last.outcome or {}).get("message") or "the route could not be decided"
+    pause_step(
+        engine,
+        task.id,
+        last.seq,
+        pause=build_pause(
+            reason=PAUSE_UNRESOLVED_DECISION,
+            message=(
+                f"{message}\n\n"
+                "This run stopped here before workflow definitions were "
+                "retained, when an unresolved route fell through to the next "
+                "step. Retrying now re-evaluates the "
+                f"{last.step!r} decision against the recorded evidence; if "
+                "that evidence still does not decide, it will stop here again."
+            ),
+            step=last.step,
+            retry_step=last.step,
+            retry_kind=step.kind,
+        ),
+        error="unresolved route recorded before workflow revisions were retained",
+    )
 
 
 def _seed_session_continuation(
-    engine: Engine, task_id: int, inputs: TaskExecutionInputs
+    engine: Engine,
+    task_id: int,
+    inputs: TaskExecutionInputs,
+    revision: WorkflowRevision,
 ) -> None:
     """Give this task's already-existing sessions a continuation policy.
 
     Those sessions were spawned before anything was pinned, so nothing
     records what they actually ran under, and a resume needs *some* complete
-    policy. The confirmed inputs are that policy — for the judge session its
-    own auxiliary binding, for every other session the primary agent
-    binding of the same session. It is stored as `migrated`, because it says
-    what these sessions continue under and makes no claim about the turns
-    they have already taken (ADR-0027).
+    policy. The confirmed inputs are that policy — for each declared session,
+    the binding of the first declared step that uses it. It is stored as
+    `migrated`, because it says what these sessions continue under and makes
+    no claim about the turns they have already taken (ADR-0027).
+
+    The retired `judge` session gets nothing. It is not declared by any
+    definition, nothing will prompt it again, and writing it a continuation
+    policy would suggest otherwise. Its transcript and its old applied policy
+    stay exactly as they are.
     """
+    session_step = {
+        step.session: step.name for step in reversed(revision.definition.agent_steps())
+    }
     for session in list_resumable_sessions(engine, task_id):
-        if session.name == AUXILIARY_JUDGE:
-            binding = inputs.auxiliary_bindings[AUXILIARY_JUDGE]
-            kind, name = "auxiliary", AUXILIARY_JUDGE
-        else:
-            named = [
-                (step, bound)
-                for step, bound in sorted(inputs.step_bindings.items())
-                if _step_session(inputs, step) == session.name
-            ]
-            if not named:
-                continue
-            name, binding = named[0]
-            kind = "step"
+        step_name = session_step.get(session.name)
+        if step_name is None:
+            continue
+        binding = inputs.step_bindings.get(step_name)
+        if binding is None:
+            continue
         record_applied_policy(
             engine,
             task_id,
@@ -627,19 +1101,11 @@ def _seed_session_continuation(
                 ModelPolicy.from_binding(binding),
                 profile_name=binding.profile_name,
                 role=binding.role,
-                consumer_kind=kind,
-                consumer_name=name,
+                consumer_kind="step",
+                consumer_name=step_name,
                 origin=APPLIED_ORIGIN_MIGRATED,
             ),
         )
-
-
-def _step_session(inputs: TaskExecutionInputs, step_name: str) -> str | None:
-    workflow = get_workflow(inputs.workflow_name)
-    for step in agent_steps(workflow):
-        if step.name == step_name:
-            return step.session
-    return None
 
 
 def unconfigured_task_ids(engine: Engine) -> list[int]:
@@ -648,6 +1114,8 @@ def unconfigured_task_ids(engine: Engine) -> list[int]:
 
 __all__ = [
     "LEGACY_UNKNOWN_INPUTS",
+    "LEGACY_UNKNOWN_WORKFLOW",
+    "UNCERTAINTY_NOTICE",
     "ProjectDecision",
     "ReconciliationConflictError",
     "TaskContinuation",
@@ -659,4 +1127,5 @@ __all__ = [
     "project_reconciliation",
     "task_configuration",
     "unconfigured_task_ids",
+    "workflow_continuation",
 ]

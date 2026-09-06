@@ -96,22 +96,38 @@ export interface WorkflowStepDescriptor {
   kind: "agent" | "command" | "decision" | "gate";
   session: string | null;
   role: ModelRole | null;
+  /** A declared route can pass this step by, or its own condition can hold
+   * it back, so it may not run. */
   conditional: boolean;
 }
 
-/** A registered built-in workflow. Definitions ship with the daemon
- * (ADR-0018), so this catalog arrives in the snapshot and never changes while
- * the daemon runs — there is no CRUD and no change event. */
+/** An installed workflow. Definitions ship with the daemon (ADR-0028), so
+ * this catalog arrives in the snapshot and never changes while the daemon
+ * runs — there is no CRUD and no change event.
+ *
+ * `revision` is the content identity a *new* launch of this name would pin.
+ * A task's own revision is on the task, and the two can differ: that is the
+ * whole point of pinning. */
 export interface WorkflowDescriptor {
   name: string;
+  revision: string;
+  format: number;
   primary_session: string;
   sessions: string[];
   steps: WorkflowStepDescriptor[];
-  /** The engine-reserved judge, described apart from the declared steps: it
-   * runs only when a route or outcome cannot be resolved, and it binds
-   * `slow` rather than a step's role. */
-  judge_session: string;
-  judge_role: ModelRole;
+}
+
+/** One retained definition, read by content identity
+ * (`GET /api/workflows/revisions/:revision`). `definition` is the normalized
+ * document itself — the same bytes the revision is taken over — so what the
+ * operator reads is literally what executes. */
+export interface WorkflowRevisionDetail {
+  revision: string;
+  name: string;
+  format: number;
+  primary_session: string;
+  sessions: string[];
+  definition: Record<string, unknown>;
 }
 
 /** The workspace and prompt inputs one task actually runs under. */
@@ -148,6 +164,18 @@ export interface ConsumerBinding {
   roles: Record<ModelRole, ModelRoleBinding>;
 }
 
+/** The definition a task is pinned to, and the honest boundary of its
+ * authority. Everything up to `legacy_through_seq` happened under a
+ * definition nobody retained; `interrupted_legacy_seq` names the one attempt
+ * that spans the boundary. Both are 0/null for a normal acceptance. */
+export interface WorkflowBinding {
+  revision: string;
+  source: "accepted" | "legacy-confirmed";
+  bound_at: string;
+  legacy_through_seq: number;
+  interrupted_legacy_seq: number | null;
+}
+
 export interface TaskExecutionInputs {
   version: number;
   provenance: "accepted" | "legacy-confirmed";
@@ -158,10 +186,14 @@ export interface TaskExecutionInputs {
    * always a binding below. */
   model_profile_name: string | null;
   model_profile_source: "task" | "project" | "legacy-confirmed";
-  /** Every declared agent step, keyed by step name. */
+  /** The exact definition this task executes (ADR-0028), or null for a task
+   * accepted before revisions were retained. Null is a real state: it is
+   * filled in by an explicit operator confirmation, never by looking up
+   * what the workflow name means today. */
+  workflow_binding: WorkflowBinding | null;
+  /** Every declared agent step, keyed by step name. Every model consumer is a
+   * declared step: the engine reserves none. */
   step_bindings: Record<string, ConsumerBinding>;
-  /** Engine-reserved model consumers, keyed by name (today: `judge`). */
-  auxiliary_bindings: Record<string, ConsumerBinding>;
   workspace: WorkspaceInputs;
   /** Which workspace fields this task overrode rather than inheriting. */
   workspace_overrides: string[];
@@ -204,6 +236,21 @@ export interface Task {
   pr_merged_at: string | null;
   /** The workflow chosen at creation (workflow-engine capability). */
   workflow_name: string;
+  /** The pinned definition's content identity, or null for a task that
+   * predates retained revisions (ADR-0028). */
+  workflow_revision: string | null;
+  workflow_revision_source: "accepted" | "legacy-confirmed" | null;
+  /** Whether that definition can currently be resolved. A task whose
+   * definition is missing, damaged, or written for a newer format stays
+   * listed and readable and says why. */
+  workflow_ready: boolean;
+  workflow_readiness_reason: WorkflowReadinessReason | null;
+  workflow_readiness_detail: string | null;
+  /** From the *pinned* definition. Null rather than a guess whenever the
+   * definition cannot be resolved: substituting a plausible default would
+   * point review and shipping at a session this task may never declare. */
+  workflow_primary_session: string | null;
+  workflow_sessions: string[] | null;
   /** Run status; null for tasks whose run hasn't started (or that predate
    * workflows). */
   workflow_status: WorkflowRunStatus | null;
@@ -212,6 +259,17 @@ export interface Task {
   created_at: string;
   updated_at: string;
 }
+
+/** Why a task's pinned definition cannot be resolved. Only
+ * `needs_workflow_confirmation` is something the operator can confirm away;
+ * the rest describe a store or a daemon that cannot read it. */
+export type WorkflowReadinessReason =
+  | "needs_configuration"
+  | "needs_workflow_confirmation"
+  | "missing"
+  | "unsupported_format"
+  | "integrity"
+  | "invalid";
 
 export type WorkshopStatus = "present" | "absent" | "unknown";
 
@@ -238,9 +296,32 @@ export type StepKind = "agent" | "command" | "decision" | "gate";
  * `running` on the record. */
 export type StepRecordStatus = "running" | "waiting" | "ok" | "failed";
 
+/** Why the engine stopped rather than choosing (ADR-0028). Each names
+ * evidence that is absent or unreadable — never a declared negative result,
+ * which is data and follows the definition's own routes. */
+export type PauseReason =
+  | "missing_outcome"
+  | "unresolved_decision"
+  | "prompt_unrenderable"
+  | "condition_unresolved";
+
+/** An uncertainty pause on one attempt. Distinct from a declared gate: the
+ * attempt keeps its own kind, its absent outcome, and the error that stopped
+ * it, and `retry_step` is what an operator retry re-enters — always the
+ * blocked step, never the step after it. */
+export interface StepPause {
+  version: number;
+  reason: PauseReason;
+  message: string;
+  step: string;
+  retry_step: string;
+  retry_kind: StepKind | null;
+}
+
 /** One executed workflow step (workflow-engine capability), as persisted by
  * the daemon and replayed in the snapshot's `workflows` map. A waiting gate
- * carries its operator message in `outcome.message`; the outcome schema
+ * carries its operator message in `outcome.message`; a waiting *pause*
+ * carries `pause` instead. The outcome schema
  * (version/status/summary/artifacts, design D-3) is read defensively. */
 export interface StepRecord {
   task_id: number;
@@ -251,6 +332,8 @@ export interface StepRecord {
   status: StepRecordStatus;
   outcome: Record<string, unknown> | null;
   error: string | null;
+  /** Set only while this attempt is the one the run is waiting on. */
+  pause: StepPause | null;
   prompted_at: string | null;
   started_at: string;
   finished_at: string | null;
@@ -275,7 +358,10 @@ export interface WorkflowStepPayload {
   session: string | null;
   status: "started" | "ok" | "failed" | "waiting";
   error?: string;
+  /** A declared gate's operator message. */
   message?: string;
+  /** An uncertainty pause, when the run stopped rather than guessing. */
+  pause?: StepPause;
 }
 
 /** SPEC Decision 4: core subset plus the `ask-approvals` waiting states,

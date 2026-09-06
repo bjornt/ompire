@@ -29,14 +29,16 @@ from ompire_daemon.registry.tasks import (
     mark_pr_url,
     mark_spawn_completed,
 )
-from tests.conftest import make_execution_inputs
+from tests.conftest import make_execution_inputs, register_builtin_workflows
 
 
 @pytest.fixture
 def engine(tmp_path: Path) -> Engine:
     db_path = tmp_path / "ompire.db"
     upgrade_head(db_path)
-    return make_engine(db_path)
+    engine = make_engine(db_path)
+    register_builtin_workflows(engine)
+    return engine
 
 
 @pytest.fixture

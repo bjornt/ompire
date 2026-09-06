@@ -131,19 +131,28 @@ from ompire_daemon.registry.tasks import (
     task_payload,
     validate_task_slug,
 )
+from ompire_daemon.registry.workflow_definitions import (
+    WorkflowRevisionUnavailableError,
+    get_revision,
+)
+from ompire_daemon.registry.workflows import (
+    WorkflowWaitConflictError,
+    latest_step_record,
+)
 from ompire_daemon.review import ReviewAlreadyOpenError, ReviewError, ReviewManager
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import GitHubPreflightError, ShipError, ShipManager
 from ompire_daemon.spawn import run_spawn_pipeline
+from ompire_daemon.taskdefinition import (
+    TaskDefinitionUnavailableError,
+    resolve_task_definition,
+)
+from ompire_daemon.workflow_definitions import WorkflowDefinition
 from ompire_daemon.workflows import (
-    JUDGE_SESSION,
-    UnknownWorkflowNameError,
-    Workflow,
     WorkflowNotWaitingError,
     WorkflowRunner,
-    describe_workflows,
-    get_workflow,
+    describe_catalog,
 )
 from ompire_daemon.workshop import WorkshopRemoveError, remove_workshop, workshop_status
 
@@ -875,10 +884,12 @@ def delete_model_profile_route(
     return {"deleted": name}
 
 
-# --- Workflow catalog ---------------------------------------------------------
-# Workflow definitions ship with the daemon (ADR-0018), so this is read-only:
-# there is no CRUD and no change event, because the catalog cannot change while
-# the process runs.
+# --- Workflow catalog and retained revisions ----------------------------------
+# Definitions ship with the daemon (ADR-0028), so the catalog is read-only:
+# there is no CRUD and no change event, because installed definitions change
+# only when the daemon does. Retained revisions are separate and larger than
+# the catalog — a revision no longer installed is still readable, which is what
+# lets an old task show the exact procedure it accepted.
 
 
 class StepDescriptorOut(BaseModel):
@@ -888,22 +899,73 @@ class StepDescriptorOut(BaseModel):
     # Agent steps declare an abstract role; commands, decisions, and gates
     # have none and never reach a model.
     role: str | None
-    # A decision declared earlier can route past this step, so it may not run.
+    # A declared route can pass this step by, or its own `when` can hold it
+    # back, so it may not run.
     conditional: bool
 
 
 class WorkflowOut(BaseModel):
     name: str
+    # What a *new* launch of this name would pin, and the semantics version it
+    # is read under.
+    revision: str
+    format: int
     primary_session: str
     sessions: list[str]
     steps: list[StepDescriptorOut]
-    judge_session: str
-    judge_role: str
 
 
 @router.get("/workflows", response_model=list[WorkflowOut])
 def list_workflows_route() -> list[dict[str, Any]]:
-    return [asdict(descriptor) for descriptor in describe_workflows()]
+    return [asdict(descriptor) for descriptor in describe_catalog()]
+
+
+class WorkflowRevisionOut(BaseModel):
+    revision: str
+    name: str
+    format: int
+    primary_session: str
+    sessions: list[str]
+    # The whole normalized document. Read-only, and the same bytes the
+    # revision identity is taken over, so what an operator inspects is
+    # literally what executes.
+    definition: dict[str, Any]
+
+
+@router.get("/workflows/revisions/{revision}", response_model=WorkflowRevisionOut)
+def get_workflow_revision_route(
+    revision: str, engine: Engine = Depends(_engine)
+) -> dict[str, Any]:
+    """One retained definition, by content identity.
+
+    Deliberately not addressable by workflow name: a name says what a new
+    launch would get, and this endpoint exists to answer "what did *that* task
+    accept". A stored document that cannot be read comes back as a classified
+    409 rather than a silent substitution — it is never executed to answer a
+    read.
+    """
+    try:
+        retained = get_revision(engine, revision)
+    except WorkflowRevisionUnavailableError as exc:
+        if exc.reason == "missing":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, exc.detail) from exc
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "reason": "workflow_definition_unavailable",
+                "unavailable_reason": exc.reason,
+                "message": exc.detail,
+                "revision": revision,
+            },
+        ) from exc
+    return {
+        "revision": retained.revision,
+        "name": retained.name,
+        "format": retained.format,
+        "primary_session": retained.definition.primary,
+        "sessions": list(retained.definition.sessions),
+        "definition": retained.document,
+    }
 
 
 # --- Task launch --------------------------------------------------------------
@@ -961,10 +1023,10 @@ class TaskCreate(BaseModel):
     # profile for this task and replaces the inheritance.
     model_profile: str | None = None
     workspace_overrides: WorkspaceOverridesIn | None = None
-    # Per-consumer overrides, keyed by declared agent step name and by
-    # engine-reserved auxiliary consumer name. Two namespaces so a decision
-    # step can never become an agent binding by sharing a name with the
-    # judge. Absent maps mean "everything inherits".
+    # Per-consumer overrides, keyed by declared agent step name. Absent means
+    # "everything inherits". `auxiliary_overrides` is kept only so a caller
+    # still naming the retired judge is refused with a field-level error
+    # rather than having its choice silently dropped (ADR-0028).
     step_overrides: dict[str, ConsumerOverrideIn] = Field(default_factory=dict)
     auxiliary_overrides: dict[str, ConsumerOverrideIn] = Field(default_factory=dict)
 
@@ -1013,9 +1075,15 @@ def _launch_request(body: TaskCreate) -> LaunchRequest:
         ),
         workspace_overrides=overrides,
         step_overrides=_consumer_overrides(body.step_overrides, "step_overrides"),
-        auxiliary_overrides=_consumer_overrides(
-            body.auxiliary_overrides, "auxiliary_overrides"
-        ),
+        # Not normalized: an empty override for a consumer that no longer
+        # exists is still a caller believing it configures something, and it
+        # is refused with the field rather than dropped as a no-op.
+        auxiliary_overrides={
+            name: ConsumerOverride(
+                model_profile=entry.model_profile, role=entry.role
+            )
+            for name, entry in body.auxiliary_overrides.items()
+        },
     )
 
 
@@ -1104,6 +1172,17 @@ class TaskOut(BaseModel):
     error: str | None
     workshop_id: str | None
     workflow_name: str
+    # The pinned definition (ADR-0028). `workflow_revision` is null only for a
+    # task that predates retained revisions; `workflow_primary_session` and
+    # `workflow_sessions` are null whenever the definition cannot be resolved,
+    # rather than a plausible-looking guess.
+    workflow_revision: str | None
+    workflow_revision_source: str | None
+    workflow_ready: bool
+    workflow_readiness_reason: str | None
+    workflow_readiness_detail: str | None
+    workflow_primary_session: str | None
+    workflow_sessions: list[str] | None
     workflow_status: str | None
     workflow_step: str | None
     pr_url: str | None
@@ -1118,7 +1197,7 @@ class TaskOut(BaseModel):
 
 @router.get("/tasks", response_model=list[TaskOut])
 def list_tasks_route(engine: Engine = Depends(_engine)) -> list[dict[str, Any]]:
-    return [task_payload(task) for task in list_tasks(engine)]
+    return [task_payload(task, engine=engine) for task in list_tasks(engine)]
 
 
 class TaskDetailOut(TaskOut):
@@ -1137,7 +1216,7 @@ async def get_task_route(
     derived_status = (
         await workshop_status(task.clone_path) if task.workshop_id else None
     )
-    return TaskDetailOut(**task_payload(task), workshop_status=derived_status)
+    return TaskDetailOut(**task_payload(task, engine=engine), workshop_status=derived_status)
 
 
 @router.post("/tasks", response_model=TaskOut, status_code=status.HTTP_202_ACCEPTED)
@@ -1224,7 +1303,7 @@ async def spawn_task_route(
         except DuplicateTaskError as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
 
-    payload = task_payload(task)
+    payload = task_payload(task, engine=engine)
     events.publish("task_created", payload)
     job = asyncio.create_task(
         run_spawn_pipeline(
@@ -1308,10 +1387,20 @@ def confirm_project_reconciliation_route(
 
 
 class TaskContinuationIn(BaseModel):
+    """What the operator supplies to continue a task the upgrade left blocked.
+
+    Every field is optional at the schema level because two different gaps
+    share this route (ADR-0026, ADR-0028): a task that was never configured
+    needs all of them, while a task that merely predates retained workflow
+    definitions needs none — its model, branch, and preamble were reviewed
+    once and are not re-decided. Which are actually required is decided
+    against the task, and a missing one comes back as a field-level error.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
-    model_profile: str
-    base_branch: str
+    model_profile: str | None = None
+    base_branch: str | None = None
     workshop_additions: str = DEFAULT_WORKSHOP_ADDITIONS
     preamble: str = ""
 
@@ -1322,6 +1411,10 @@ class TaskContinuationConfirmIn(TaskContinuationIn):
     # level, preamble, and overrides are unrecoverable. Confirmation pins what
     # happens next; it never claims the past turns used these values.
     acknowledge_unknown: bool = False
+    # And, separately, that the exact procedure this task already ran was
+    # never recorded. Two acknowledgements because they are two different
+    # things the daemon cannot recover, and a task can need only one of them.
+    acknowledge_workflow: bool = False
 
 
 def _continuation(body: TaskContinuationIn) -> launchconfig.TaskContinuation:
@@ -1377,6 +1470,7 @@ def confirm_task_configuration_route(
             _continuation(body),
             preview_token=body.preview_token,
             acknowledge_unknown=body.acknowledge_unknown,
+            acknowledge_workflow=body.acknowledge_workflow,
         )
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
@@ -1386,7 +1480,7 @@ def confirm_task_configuration_route(
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except (LaunchInputError, InvalidWorkshopAdditionsError) as exc:
         raise _launch_error(exc) from exc
-    payload = task_payload(task)
+    payload = task_payload(task, engine=engine)
     events.publish("task_updated", payload)
     return payload
 
@@ -1418,7 +1512,7 @@ async def continue_task_route(
             "only an interrupted run can be continued",
         )
     await request.app.state.continue_task(task)
-    return task_payload(task)
+    return task_payload(task, engine=engine)
 
 
 @router.post("/tasks/{task_id}/cleanup", response_model=TaskOut)
@@ -1466,7 +1560,7 @@ async def cleanup_task_route(
     sessions.discard(task_id)
     advisories.clear_task(task_id)
     notifications.clear_task(task_id)
-    payload = task_payload(archived)
+    payload = task_payload(archived, engine=engine)
     events.publish("task_updated", payload)
     return payload
 
@@ -1489,32 +1583,48 @@ def _require_task(engine: Engine, task_id: int) -> Task:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
 
-def _workflow_for(task: Task) -> Workflow:
-    """The task's registered workflow definition; 409 if its name is no
-    longer registered (e.g. a workflow removed while tasks reference it)."""
+def _task_definition(engine: Engine, task: Task) -> WorkflowDefinition:
+    """The definition *this task pinned* (ADR-0028), or a 409 saying why not.
+
+    Never the catalog's current definition of the same name: admitting a
+    session, or picking a primary, from today's meaning of a workflow name is
+    exactly the substitution pinning exists to prevent.
+    """
     try:
-        return get_workflow(task.workflow_name)
-    except UnknownWorkflowNameError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        return resolve_task_definition(engine, task).definition
+    except TaskDefinitionUnavailableError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "reason": "workflow_definition_unavailable",
+                "unavailable_reason": exc.reason,
+                "message": exc.detail,
+                "task_id": task.id,
+            },
+        ) from exc
 
 
-def _require_declared_session(task: Task, session: str) -> None:
-    """404 on a session the task's workflow does not declare (design D-1).
-    The engine-reserved judge session (bugfix-workflow design D-4) is
-    admitted: it is spawned by the engine itself, never addressable in
-    advance, and its transcript must stay inspectable."""
-    workflow = _workflow_for(task)
-    if session != JUDGE_SESSION and session not in workflow.sessions:
+def _require_declared_session(engine: Engine, task: Task, session: str) -> None:
+    """404 on a session the task's pinned definition does not declare
+    (design D-1).
+
+    The retired engine-reserved `judge` session is no longer admitted: nothing
+    spawns or prompts it any more, so treating it as a live workflow session
+    would offer an interaction that cannot happen. Its transcript stays
+    readable through the task's step history.
+    """
+    definition = _task_definition(engine, task)
+    if session not in definition.sessions:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
-            f"task {task.id} workflow {workflow.name!r} declares no session {session!r}",
+            f"task {task.id} workflow {definition.name!r} declares no session {session!r}",
         )
 
 
-def _primary_session(task: Task) -> str:
-    """The workflow-declared primary session (design D-8): the target of
+def _primary_session(engine: Engine, task: Task) -> str:
+    """The pinned definition's primary session (design D-8): the target of
     task-scoped operations that mean "the agent" (review, ship)."""
-    return _workflow_for(task).primary
+    return _task_definition(engine, task).primary
 
 
 @router.post("/tasks/{task_id}/sessions/{session}/agent/stop")
@@ -1526,7 +1636,7 @@ async def stop_agent_route(
     sessions: SessionTracker = Depends(_sessions),
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
-    _require_declared_session(task, session)
+    _require_declared_session(engine, task, session)
     # Flag before the kill so the exit lands as "stopped by operator", not a
     # crash (design D-2); cleared again if there was nothing to stop.
     sessions.expect_operator_stop(task_id, session)
@@ -1593,7 +1703,7 @@ async def steer_agent_route(
     supervisor: AgentSupervisor = Depends(_supervisor),
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
-    _require_declared_session(task, session)
+    _require_declared_session(engine, task, session)
     handle = await _require_live_agent(supervisor, task_id, session)
     return await _agent_request(handle, "steer", message=body.message)
 
@@ -1607,7 +1717,7 @@ async def follow_up_agent_route(
     supervisor: AgentSupervisor = Depends(_supervisor),
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
-    _require_declared_session(task, session)
+    _require_declared_session(engine, task, session)
     handle = await _require_live_agent(supervisor, task_id, session)
     return await _agent_request(handle, "follow_up", message=body.message)
 
@@ -1622,7 +1732,7 @@ async def interrupt_agent_route(
     sessions: SessionTracker = Depends(_sessions),
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
-    _require_declared_session(task, session)
+    _require_declared_session(engine, task, session)
     handle = await _require_live_agent(supervisor, task_id, session)
     # Any pending question is moot once the turn is aborted (design D-6); the
     # abort's own agent_start/agent_end then drives state normally.
@@ -1671,7 +1781,7 @@ async def answer_agent_route(
     sessions: SessionTracker = Depends(_sessions),
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
-    _require_declared_session(task, session)
+    _require_declared_session(engine, task, session)
     handle = await _require_live_agent(supervisor, task_id, session)
     pending = sessions.pending(task_id, session)
     if pending is None or pending.id != body.question_id:
@@ -1700,7 +1810,7 @@ async def agent_state_route(
     supervisor: AgentSupervisor = Depends(_supervisor),
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
-    _require_declared_session(task, session)
+    _require_declared_session(engine, task, session)
     handle = await _require_live_agent(supervisor, task_id, session)
     # Pass the agent's `data` through untouched (isStreaming, queuedMessageCount,
     # todos, context usage, model); the daemon never reinterprets its meaning.
@@ -1717,17 +1827,29 @@ async def agent_stats_route(
     supervisor: AgentSupervisor = Depends(_supervisor),
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
-    _require_declared_session(task, session)
+    _require_declared_session(engine, task, session)
     handle = await _require_live_agent(supervisor, task_id, session)
     response = await _agent_request(handle, "get_session_stats")
     data = response.get("data")
     return data if isinstance(data, dict) else {}
 
 
-# --- Workflow gates (workflow-engine capability) ----------------------------
+# --- Workflow gates and uncertainty pauses ------------------------------------
+# One route, two distinct things a run can be waiting on (ADR-0028). A declared
+# gate is the definition asking a person to look; resuming finishes it and
+# continues. An uncertainty pause is the engine refusing to guess; retrying
+# opens another attempt at the step that could not be decided. `expected_seq`
+# names the attempt the operator was actually looking at, so a stale tab or a
+# double submit is refused rather than applied to a different attempt.
 
 
 class WorkflowResumeBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # The waiting attempt's sequence number, as shown. Required: without it a
+    # resume is a request to advance "whatever is waiting now", which is not
+    # what the operator decided.
+    expected_seq: int
     note: str | None = None
 
 
@@ -1740,10 +1862,28 @@ async def resume_workflow_route(
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     runner: WorkflowRunner = request.app.state.workflow_runner
+    waiting = latest_step_record(engine, task_id)
+    paused = waiting is not None and waiting.status == "waiting" and waiting.pause is not None
     try:
-        runner.resume_gate(task.id, note=body.note)
+        if paused:
+            # A retry re-enters the blocked step. It never continues past it,
+            # and it never edits the recorded evidence: if the same evidence
+            # is still unreadable the run pauses again, which is the honest
+            # answer rather than a second chance at guessing.
+            revision = resolve_task_definition(engine, task)
+            updated = runner.retry_step(task, revision, expected_seq=body.expected_seq)
+            return {
+                "task_id": task.id,
+                "workflow": "retried",
+                "step": updated.workflow_step,
+            }
+        runner.resume_gate(task.id, expected_seq=body.expected_seq, note=body.note)
+    except WorkflowWaitConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except WorkflowNotWaitingError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except TaskDefinitionUnavailableError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail) from exc
     return {"task_id": task.id, "workflow": "resumed", "step": task.workflow_step}
 
 
@@ -1761,7 +1901,7 @@ async def start_review_route(
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
     # Review gates on the workflow's primary session (workflow-engine D-8).
-    primary = _primary_session(task)
+    primary = _primary_session(engine, task)
     session_info = sessions.get(task_id, primary)
     if session_info is None or session_info.status != "idle":
         raise HTTPException(

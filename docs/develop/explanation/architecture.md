@@ -108,14 +108,43 @@ resources a workflow uses, addressed as `(task_id, session_name)` and spawned
 lazily. One is declared primary, and task-scoped operations — review, ship —
 target it.
 
-Workflows are startup-validated Python definitions with sequential `agent`,
-`command`, `decision`, and `gate` steps. Workflow state and step records are
+A workflow definition is a **document**, not code: a bounded YAML subset
+declaring sequential `agent`, `command`, `decision`, and `gate` steps, with a
+content-derived revision as its identity. Workflow state and step records are
 durable; in-memory runners re-drive them after a restart.
 
-Python definitions are the current form, not the intended end state.
-[`VISION.md`](../../VISION.md) calls for versioned declarative workflows.
+The definition and the engine are separate on purpose. `workflow_definitions.py`
+answers "what does this document mean" — data model, loader, canonical
+identity, bounded evaluator — and imports nothing from the registry or the task
+model. `workflows.py` answers "how is that carried out".
 
-See [ADR-0008](../../adr/0008-model-tasks-as-workflows-over-named-sessions.md).
+The engine consumes no model of its own. When the evidence a step or a route
+needs is missing or unreadable, the run stops at that attempt with the reason
+recorded, rather than asking a model to classify it. An operator retry re-enters
+the blocked step; it never continues past it.
+
+See [ADR-0008](../../adr/0008-model-tasks-as-workflows-over-named-sessions.md)
+and [ADR-0028](../../adr/0028-retain-declarative-workflow-revisions.md).
+
+## A task executes the definition it accepted, not the one deployed today
+
+The task's pinned revision is the *only* way a runtime consumer resolves its
+workflow: the runner, recovery, session admission, the primary session behind
+review and shipping, and the REST and WebSocket projections all go through
+`taskdefinition.py`. Looking the workflow's name up in the installed catalog is
+reserved for two prospective questions — what a new launch would pin, and what
+an old task is offered as a continuation candidate.
+
+Retained revisions are append-only and hold the whole document, not just its
+identifier: a definition nobody could still read would not explain anything. A
+stored row is decoded, re-validated, and re-hashed back to its key before it is
+executed, and a row that fails is reported as unavailable rather than run.
+Blocking is per task — one damaged row must not take the dashboard with it.
+
+The migration is deliberately incomplete by itself. Every pre-upgrade task
+recorded a workflow *name*, and no honest value exists for its revision, so the
+binding is null until a person confirms a continuation against a compatibility
+check.
 
 ## A launch is resolved once and pinned to the task
 
@@ -131,11 +160,11 @@ task, and every later stage — the spawn pipeline, the engine, recovery, review
 shipping — reads it instead of re-reading mutable configuration. Editing a
 project or a profile changes the next launch and nothing already accepted.
 
-The document pins one complete binding per *model consumer* — every declared
-agent step, plus the engine's judge — rather than one policy per task, so a
-step can be sent to a different profile or role without touching the workflow
-or anything else. Runtime lookup is exact and fails closed; there is no
-task-wide fallback to substitute.
+The document pins the workflow revision and one complete binding per *model
+consumer* — every declared agent step, and there are no others — rather than one
+policy per task, so a step can be sent to a different profile or role without
+touching the workflow or anything else. Runtime lookup is exact and fails
+closed; there is no task-wide fallback to substitute.
 
 Templates were the previous form. Retiring them meant an upgrade that
 preserves every old value as inert evidence and asks the operator wherever it
@@ -206,8 +235,10 @@ Shipping currently inherits the host identity and is documented as producing
 operator-authored signed commits. ADR-0017 proposes a dedicated bot as the
 default automation identity.
 
-**Workflow format.** Python definitions are unversioned by design. The vision
-calls for versioned declarative workflows.
+**Workflow authoring.** Definitions are versioned declarative documents
+(ADR-0028), but the catalog is still daemon-packaged only. The vision calls for
+operator authoring: a library, editing, import and export. That boundary — where
+a definition arrives from outside a daemon release — is the next decision.
 
 Each needs an explicit decision rather than a silent choice. Do not resolve one
 incidentally while implementing something else.

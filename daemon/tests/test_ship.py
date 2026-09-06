@@ -51,7 +51,7 @@ from ompire_daemon.ship import (
     _parse_draft,
 )
 from ompire_daemon.spawn import StepFailedError
-from tests.conftest import make_execution_inputs
+from tests.conftest import make_execution_inputs, register_builtin_workflows
 
 
 @pytest.fixture
@@ -97,6 +97,7 @@ def engine(config: Config):
     from ompire_daemon.migrate import upgrade_head
 
     upgrade_head(db_path)
+    register_builtin_workflows(eng)
     return eng
 
 

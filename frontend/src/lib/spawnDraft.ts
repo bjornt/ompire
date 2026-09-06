@@ -49,7 +49,6 @@ export interface SpawnDraft {
   stepOverrides: DraftConsumerOverrides;
   /** Keyed by engine-reserved consumer name (today: `judge`). Also
    * workflow-scoped — its declared role comes from the workflow descriptor. */
-  auxiliaryOverrides: DraftConsumerOverrides;
 }
 
 /** Drop rows that override nothing, so an opened-and-reset selector leaves
@@ -75,7 +74,6 @@ export const emptySpawnDraft: SpawnDraft = {
   prompt: "",
   overrides: {},
   stepOverrides: {},
-  auxiliaryOverrides: {},
 };
 
 /** Restore the draft a Settings round trip interrupted.
@@ -97,7 +95,6 @@ export function loadSpawnDraft(preselectedProject?: string): SpawnDraft {
         overrides: { ...(parsed.overrides ?? {}) },
         // A draft written before row overrides existed simply has none.
         stepOverrides: pruneConsumerOverrides(parsed.stepOverrides ?? {}),
-        auxiliaryOverrides: pruneConsumerOverrides(parsed.auxiliaryOverrides ?? {}),
       };
     }
   } catch {

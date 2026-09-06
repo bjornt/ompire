@@ -36,6 +36,7 @@ Repository and schema:
 - [Repository layout](reference/repository-layout.md)
 - [Daemon module map](reference/daemon-modules.md)
 - [Database schema](reference/database-schema.md)
+- [Workflow definitions](reference/workflow-definitions.md)
 
 Daemon internals:
 

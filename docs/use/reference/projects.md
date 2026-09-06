@@ -159,16 +159,16 @@ reported so the UI can say which one is blocking.
 A project is `needs-reconciliation` only after upgrading from a release that
 had templates, and only when the upgrade found something it refused to decide:
 templates that disagreed about a field, a template that pinned a model, or a
-still-configured `judge_model`. A newly registered project is always
-`reconciled`. A launch against an unreconciled project is refused with `409`.
+still-configured `judge_model` — a key that is retired and configures nothing.
+A newly registered project is always `reconciled`. A launch against an unreconciled project is refused with `409`.
 
 `GET /api/projects/{name}/launch-reconciliation` returns every distinct old
 value with the template it came from, and `POST` to the same path records the
 operator's final values. The submission carries the fingerprint of the evidence
 that was read, so a decision made against a stale reading is refused rather
-than applied, and it must explicitly acknowledge any old model choice or
-retired judge model it supersedes. The evidence is kept afterwards, so an
-unselected preamble or candidate is not lost.
+than applied, and it must explicitly acknowledge any old model choice it
+supersedes and any retired `judge_model` it leaves inert. The evidence is kept
+afterwards, so an unselected preamble or candidate is not lost.
 
 ## Fork routing
 

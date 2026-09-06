@@ -54,6 +54,11 @@ derivation the moment a child has been put on it.
 A resumed agent is **not** re-prompted with the task's stored prompt. Whether
 and what to re-deliver is the workflow engine's per-step decision — see
 [restart recovery](../../use/reference/workflow-engine.md#restart-recovery).
+Recovery re-drives the attempt that was already open rather than appending
+another, so a restart never costs a step its declared visit bound; and a run
+stopped on an [uncertainty
+pause](../../use/reference/workflow-engine.md#uncertainty-pauses) is re-armed
+exactly as persisted, with no prompt and no automatic retry.
 
 A recovered session presents as `starting` while its agent is being resumed
 and lands `idle` once ready. The in-flight turn is lost; the session is not.
@@ -62,8 +67,23 @@ A task with a present container but no recorded sessions is recovered with
 zero resumes. That is not an error: sessions are spawned lazily, and a
 command-only workflow may never create one.
 
-A task carrying no confirmed launch configuration is skipped instead. These
-are tasks accepted before launch inputs were pinned to the task
+A task whose **pinned workflow definition cannot be resolved** is skipped
+before anything else happens — before any session is resumed and before any
+step is chosen. That covers a revision that is absent, a stored document that
+fails its integrity check, and one written for a format this daemon does not
+implement, which usually means a downgrade
+([ADR-0028](../../adr/0028-retain-declarative-workflow-revisions.md)). A
+definition that cannot be read cannot say where the run is, so nothing is
+resumed, no prompt is sent, and nothing is published. The skip is per task: one
+damaged row does not stop the fan-out or hide anything from the snapshot.
+
+Only sessions the pinned definition declares are resumed. The retired `judge`
+session on an older task is left alone — nothing will prompt it again — while
+its transcript and its last applied policy stay on record.
+
+A task carrying no confirmed launch configuration is skipped for the same
+reason, one layer down. These are tasks accepted before launch inputs were
+pinned to the task
 ([ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)):
 resuming one would need a model policy nobody recorded, and the project's
 settings today are not evidence of what it ran under. Skipping keeps the run

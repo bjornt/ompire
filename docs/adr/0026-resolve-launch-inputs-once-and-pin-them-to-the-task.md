@@ -115,6 +115,31 @@ execution handoff it deferred. [ADR-0013](0013-layer-daemon-writable-settings-ov
 boundary holds — `judge_model` is retired by being read and reported, never by
 the daemon rewriting the operator's TOML.
 
+## Extension: the workflow definition is a pinned input too
+
+[ADR-0028](0028-retain-declarative-workflow-revisions.md), 2026-09-06.
+
+This record pinned everything a launch resolves *except* the procedure itself:
+the accepted document named a workflow, and a name resolves to whatever is
+deployed. ADR-0028 closes that hole without changing the boundary here. The
+resolved inputs now carry a workflow *revision* — the content identity of the
+exact definition — resolved by the same `resolve_launch`, compared under the
+same write reservation, and stored in the same document. It is covered by the
+launch fingerprint, so editing a prompt or a route invalidates a reviewed
+preview exactly as editing a profile does, while an unrelated change does not.
+
+The nullable-inputs rule extends the same way. A task accepted before revisions
+were retained has a null workflow binding, and that null is a real state — the
+definition it ran was never recorded and cannot be reconstructed — filled in
+only by an explicit operator confirmation through this record's existing
+task-configuration path, never by looking the name up in today's catalog.
+
+The engine-reserved auxiliary consumer this record described is gone. There is
+no implicit judge, so there is no consumer outside the declared steps; a launch
+request still naming it is refused with a field-level error rather than having
+its choice dropped, and the retired `judge_model` evidence and acknowledgement
+history are preserved as the record of what used to be configured.
+
 ## Consequences
 
 Launching is three explicit choices and nothing else, and the same project

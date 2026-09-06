@@ -91,15 +91,17 @@ legacy inconsistencies.
 
 ## `launch_migration_evidence`
 
-Inert upgrade history from the template retirement. Every old template row,
-every task's template attribution, and any explicitly configured `judge_model`
-is copied here — nulls, empty strings and timestamps included — before the live
+Inert upgrade history from the template retirement and, since migration `0015`,
+from the judge's removal. Every old template row, every task's template
+attribution, any explicitly configured `judge_model`, each task's whole
+pre-upgrade execution-inputs document, and each retired auxiliary binding is
+copied here — nulls, empty strings and timestamps included — before the live
 storage goes away.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | integer | Primary key, autoincrement |
-| `kind` | string | `template`, `task-template`, `workspace-conflict`, `model-candidates`, `new-defaults`, `retired-judge-model` |
+| `kind` | string | `template`, `task-template`, `workspace-conflict`, `model-candidates`, `new-defaults`, `retired-judge-model`, `legacy-execution-inputs`, `retired-auxiliary-binding` |
 | `scope_kind` | string | `project`, `task`, or `daemon` |
 | `scope` | string | Project name, task id, or empty |
 | `source` | string | Template name, or `config.toml` |
@@ -154,20 +156,37 @@ references, changes the next launch and not this task
 ([ADR-0026](../../adr/0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md),
 [ADR-0027](../../adr/0027-hand-off-model-policy-between-turns.md)).
 
-`step_bindings` is keyed by declared agent-step name and `auxiliary_bindings`
-by engine-reserved consumer name (today `judge`). Each entry holds the source
-profile name, that profile's source (`step`, `task`, `project`, or
+`step_bindings` is keyed by declared agent-step name, and since version 3 that
+is the whole set: the engine reserves no model consumer. Each entry holds the
+source profile name, that profile's source (`step`, `task`, `project`, or
 `legacy-confirmed`), the effective role, the role's source (`step` or
 `workflow`), and the full four-role snapshot the profile bound. Runtime lookup
 is exact and fails closed: a consumer with no entry is an error, never a fall
 back to the task-wide profile. `model_profile_name` remains as the task-wide
 decision unoverridden consumers inherited, not as an executable fallback.
 
+`workflow_binding` — version 3 — names the definition revision this task
+executes, whether it was `accepted` or `legacy-confirmed`, and, for a confirmed
+legacy task, the `legacy_through_seq` boundary before which history ran under a
+definition nobody retained plus any `interrupted_legacy_seq` that spans it. It
+is **NULL** for every task that predates retained revisions, and that null is
+load-bearing: see below
+([ADR-0028](../../adr/0028-retain-declarative-workflow-revisions.md)).
+
 Migration `0014` converted version-1 documents — which carried one `roles` map,
 a `step_roles` map, and a `judge_role` — into version 2, using only what those
 documents already stored. It re-read no profile and consulted no current
 workflow definition, and it attributed every binding to the workflow, because
 version 1 had no way to express a per-step choice.
+
+Migration `0015` converted version 2 into version 3: it copied each document
+verbatim, and each `auxiliary_bindings` entry separately, into
+`launch_migration_evidence`, dropped the auxiliary map, and set
+`workflow_binding` to NULL. It could not do otherwise — version 2 recorded a
+workflow *name*, and what that name's prompts and routes said at the time is
+gone, so filling the binding in from whatever ships today would claim the task
+accepted a document it never saw. It retained no revision, because a migration
+cannot know what the code it is upgrading from actually executed.
 
 It follows the registry's existing JSON-text convention rather than a dozen
 columns: nothing queries a task by a nested binding, and a partial update would
@@ -225,11 +244,52 @@ version-1 tasks from those tasks' own pinned map.
 | `status` | string | |
 | `outcome_json` | text, nullable | Structured step outcome |
 | `error` | text, nullable | |
+| `pause_json` | text, nullable | An uncertainty pause, while this attempt is the one being waited on |
 | `prompted_at`, `started_at`, `finished_at` | string | ISO-8601 |
 
 Steps are recorded repeatedly rather than mutated, so a retried step leaves
 both attempts in the history. In-memory runners re-drive workflow state from
 these records after a restart.
+
+Two kinds of `waiting` live here and must not be confused. A **declared gate**
+carries its operator message in `outcome_json`; resuming finishes it `ok` and
+the run continues at its fall-through. An **uncertainty pause** sets
+`pause_json` instead and keeps the attempt's own kind, its absent outcome, and
+the parse or evaluation error that stopped it — nothing is written that could
+later read as a result. The pause document names the reason, the blocked step,
+and the step a retry re-enters.
+
+A record and the task's run status are marked waiting in one transaction, so a
+restart cannot find one without the other. An operator retry is likewise one
+transaction: the paused attempt is finished `failed` with its reason retained,
+a new attempt of the same step is opened `running`, and the current-step
+pointer moves — execution is scheduled only after that commit, so a crash in
+between leaves an ordinary interrupted attempt rather than a lost
+authorization.
+
+## `workflow_revisions`
+
+Retained workflow definitions, keyed by the content identity of their canonical
+document ([ADR-0028](../../adr/0028-retain-declarative-workflow-revisions.md)).
+
+| Column | Type | Notes |
+|---|---|---|
+| `revision` | string | Primary key: `sha256:<digest>` of the canonical bytes |
+| `workflow_name` | string | Indexed; several revisions share a name |
+| `format` | integer | The document format *and* its interpretation |
+| `document_json` | text | The whole normalized document |
+| `created_at` | string | ISO-8601 |
+
+Append-only: there is no update, no delete, and no garbage collection. A task
+points at a revision, and that revision must keep meaning what it meant for as
+long as the task is inspectable — including after the packaged definition
+changes and after the name leaves a later release's catalog.
+
+The whole document is stored, not a summary: an identifier alone would name a
+definition nobody could still read. A row is decoded, re-validated, and
+re-hashed back to the key it is filed under before it is executed; reads are
+cached by revision and never by workflow name. Migration `0015` creates the
+table empty — the daemon fills it from its packaged definitions at startup.
 
 ## `reviews`
 

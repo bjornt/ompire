@@ -44,6 +44,49 @@ esac
 
 
 @pytest.fixture(autouse=True)
+def isolated_workflow_catalog():
+    """Every test starts from the packaged catalog and an empty revision cache.
+
+    Both are process-local (ADR-0028), so a definition one test installs, or a
+    revision one test decoded, would otherwise resolve inside another test
+    whose database has never heard of it — and a coexistence test would pass
+    for the wrong reason.
+    """
+    from ompire_daemon.registry.workflow_definitions import clear_cache
+    from ompire_daemon.workflows import reset_catalog
+
+    reset_catalog()
+    clear_cache()
+    yield
+    reset_catalog()
+    clear_cache()
+
+
+def register_builtin_workflows(engine):
+    """Retain the installed definitions, exactly as daemon startup does.
+
+    Tests that build an engine directly instead of going through `create_app`
+    have to do this themselves: a task cannot resolve a revision the store
+    does not hold, which is the behavior under test everywhere else.
+    """
+    from ompire_daemon.workflows import register_catalog
+
+    return register_catalog(engine)
+
+
+def install_test_workflow(engine, document: str):
+    """Install and retain one definition written for a single test."""
+    from ompire_daemon.registry.workflow_definitions import register_revisions
+    from ompire_daemon.workflow_definitions import load_definition
+    from ompire_daemon.workflows import install_definition
+
+    revision = load_definition(document)
+    install_definition(revision)
+    register_revisions(engine, [revision])
+    return revision
+
+
+@pytest.fixture(autouse=True)
 def fake_workshop_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Shadow any real `workshop` binary with a fake on PATH.
 
@@ -267,7 +310,7 @@ def make_execution_inputs(
     step_roles: dict | None = None,
     step_profile_names: dict | None = None,
     step_profiles: dict | None = None,
-    judge_role: str | None = None,
+    revision=None,
 ):
     """A complete accepted-input document for tests that build a task row
     directly instead of going through preview/accept.
@@ -276,19 +319,26 @@ def make_execution_inputs(
     way a launch would: a step named in either gets `step` attribution on
     that dimension. `step_profiles` supplies the role maps those named
     profiles bind, so a test can give two steps genuinely different models.
+
+    `revision` pins the definition, defaulting to the installed one of
+    `workflow_name` — the same thing acceptance would have pinned. Pass a
+    revision explicitly to build a task on a definition that is *not* the
+    current one, which is how coexistence across an edit is exercised.
     """
     from ompire_daemon.execution_inputs import (
-        AUXILIARY_JUDGE,
         PROFILE_SOURCE_PROJECT,
         PROVENANCE_ACCEPTED,
         ROLE_SOURCE_WORKFLOW,
+        WORKFLOW_SOURCE_ACCEPTED,
         ConsumerBinding,
         TaskExecutionInputs,
+        WorkflowBinding,
         WorkspaceInputs,
     )
-    from ompire_daemon.model_config import JUDGE_ROLE
     from ompire_daemon.registry.model_profiles import RoleBinding
-    from ompire_daemon.workflows import agent_steps, get_workflow
+    from ompire_daemon.workflows import current_revision
+
+    pinned = revision if revision is not None else current_revision(workflow_name)
 
     source = roles or TEST_ROLES
     decoded = {
@@ -314,7 +364,12 @@ def make_execution_inputs(
         provenance=PROVENANCE_ACCEPTED,
         accepted_at="2026-09-05T00:00:00+00:00",
         project_name=project_name,
-        workflow_name=workflow_name,
+        workflow_name=pinned.name,
+        workflow_binding=WorkflowBinding(
+            revision=pinned.revision,
+            source=WORKFLOW_SOURCE_ACCEPTED,
+            bound_at="2026-09-05T00:00:00+00:00",
+        ),
         model_profile_name=model_profile,
         model_profile_source=PROFILE_SOURCE_PROJECT,
         step_bindings={
@@ -326,9 +381,8 @@ def make_execution_inputs(
                 ),
                 role_source="step" if step.name in (step_roles or {}) else None,
             )
-            for step in agent_steps(get_workflow(workflow_name))
+            for step in pinned.definition.agent_steps()
         },
-        auxiliary_bindings={AUXILIARY_JUDGE: binding(judge_role or JUDGE_ROLE)},
         workspace=WorkspaceInputs(
             base_branch=base_branch,
             branch_pattern=branch_pattern,

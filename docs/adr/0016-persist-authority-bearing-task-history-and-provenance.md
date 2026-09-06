@@ -37,6 +37,28 @@ Task cleanup may remove the clone, Workshop, and native session storage only aft
 
 The invariant is that a daemon restart or task-workspace cleanup cannot erase a fact needed to decide whether an authority-bearing action is safe to perform, identify who authorized and executed it, or trace its inputs and outputs to the resulting external state.
 
+## Progress: workflow semantics are now durable
+
+[ADR-0028](0028-retain-declarative-workflow-revisions.md), 2026-09-06. This
+record stays **Proposed**; one narrow slice of it is delivered.
+
+A task's *procedure* is now durable evidence rather than a name. The exact
+definition it was accepted under is retained by content identity and resolved
+from the task, so an old run stays explainable after the packaged definition
+changes and after the workspace is cleaned up. Where a definition was never
+recorded — every task predating this — the record says so explicitly, with the
+sequence boundary marking which attempts ran under an unretained procedure,
+instead of attributing them to a definition that never produced them.
+
+The gaps this record names are otherwise untouched. Ship drafts and progress,
+the rewritten commit identity, publishing errors, and most attention state
+remain transient; a successful commit, push, or PR creation can still land
+before the durable task update, so restart recovery still cannot always
+distinguish "not attempted" from "completed but not recorded". Raw agent events
+still have a bounded live buffer and native session material is still removed
+with the task environment. Nothing here claims exactly-once agent or tool
+execution, transcript retention, or full commit lineage.
+
 ## Consequences
 
 Recovery becomes evidence-driven. Completed step attempts and privileged effects are not replayed merely because their in-memory manager disappeared. An interrupted operation can be reconciled against a durable intent and external identifier, while an ambiguous operation stops visibly. This reduces duplicate commits, pushes, comments, and pull requests and makes crash behavior independent of whether a browser observed the original events.
