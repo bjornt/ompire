@@ -173,7 +173,7 @@ behavior. Supersede ADR-0018 and reconcile the relevant ADR-0026 boundary.
   harness; preserve meaningful `daemon/tests/test_workflows.py` and launch
   reconciliation coverage. Prove a definition edit cannot alter an accepted run.
 
-### [~] 2. declare-outcome-routing-and-human-decisions
+### [x] 2. declare-outcome-routing-and-human-decisions
 
 Make domain outcomes, data handoffs, bounded loops, and structured gates fully
 expressible and inspectable. Extend task detail to answer gates with explicit
