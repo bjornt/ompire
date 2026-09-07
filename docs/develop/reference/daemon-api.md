@@ -21,7 +21,7 @@ reference](../../use/reference/api.md); the generated OpenAPI schema at
 profile contract, including its identifier grammar and status codes, is in
 [Model profiles](../../use/reference/model-profiles.md).
 
-Three mutation boundaries are worth knowing before adding routes near them.
+Four mutation boundaries are worth knowing before adding routes near them.
 
 Profile input schemas forbid unknown fields at every nesting level, so a
 misspelled role or binding key is a `422` rather than silently ignored
@@ -44,6 +44,13 @@ source attribution, and the workflow descriptor — not a timestamp — so an
 unrelated profile or project edit does not invalidate a launch, and a relevant
 one does. It is a comparison value, not a credential.
 
+The workflow the token names is resolved through the *library*, on the caller's
+own connection (ADR-0031). During acceptance that is the connection holding the
+write reservation, so an executable save or an archive committing alongside
+cannot land between the check and the pin. An archived, draft-only, or
+unreadable entry is a `workflow_name` refusal rather than a fallback to any
+other revision.
+
 Acceptance then resolves twice. The first resolution validates and is what the
 Git and file-mention work runs against; the authoritative one is taken again
 inside a `BEGIN IMMEDIATE` reservation, compared against the same token, and
@@ -54,6 +61,21 @@ workspace, or background job — the operator re-reviews rather than the daemon
 retrying under settings they never saw. What this pins is configuration and
 the procedure, not the future contents of a Git branch, model output, or tool
 versions.
+
+Workflow authoring is the fourth. `/api/workflow-library` routes separate three
+operations that a single "save" would conflate: a draft save persists inert
+text, a validate parses text and persists nothing, and an executable save
+validates the exact text submitted to it and then — inside one reservation —
+compares the entry's edit version, retains the document, and moves the current
+selection. Parsing happens outside the reservation; the lock covers only the
+version check, the insert, and the update. The response is the committed row
+read back inside that same transaction, never a later unreserved read.
+
+The version compared is the entry's **edit** version, not its content revision:
+a revision is a digest of normalized semantics, so two tabs whose YAML differs
+only in comments would produce the same revision and the second save would
+silently overwrite the first. A stale submission is a `409` carrying the
+entry's actual version, and writes nothing. There is no force parameter.
 
 Task detail's configuration routes carry a second, structurally identical
 boundary for the tasks an upgrade left blocked.

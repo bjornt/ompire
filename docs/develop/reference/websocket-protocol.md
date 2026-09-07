@@ -59,7 +59,8 @@ full current registry state:
 | Key | Contents |
 |---|---|
 | `projects` | All projects |
-| `workflow_catalog` | Every installed workflow: its current revision and format, its sessions, and each declared step with its kind, session, abstract role and conditional flag. Every model consumer is one of those steps. Snapshot-only — installed definitions change only when the daemon does, so there is no change event |
+| `workflow_library` | Every library entry (ADR-0031): `name`, `origin`, `archived`, edit `version`, `has_draft`, `current_revision`/`current_format`, `available` with `unavailable_reason`/`unavailable_detail`, timestamps, and a `descriptor` present exactly when the entry is a valid launch choice. Raw draft text and revision history are fetched over REST, never carried here |
+| `workflow_catalog` | Only the workflows a new launch may select: each one's current revision and format, its sessions, and each declared step with its kind, session, abstract role and conditional flag. Every model consumer is one of those steps. Derived from the same library read as `workflow_library`, so the two cannot disagree |
 | `model_profiles` | All model profiles, sorted by name, each with its four role bindings |
 | `tasks` | All non-purged tasks, each carrying its workflow fields, its pinned `workflow_revision` and readiness, the primary session *its* definition declares, its accepted `execution_inputs`, and `needs_configuration` |
 | `sessions` | Per task, a per-session map of current status, plus the native model a live session reports |
@@ -77,6 +78,20 @@ A reconnect produces a fresh snapshot. This is the whole recovery story: a
 client that missed frames does not reconcile or replay, it re-reads. That is
 why the frontend can be stateless with respect to the daemon, and why
 restarting the browser cannot corrupt anything.
+
+The main socket subscribes to the event hub **before** it reads the snapshot,
+and releases the subscription on every exit path. The library is editable, so a
+mutation committing while the snapshot is being assembled would otherwise fall
+into the gap between the read and the subscription and never arrive.
+
+What queued up during that overlap is then filtered: only deltas carrying a
+version the client orders by — today `workflow_library_updated` alone — are
+forwarded. Re-delivering an entry the snapshot already holds is a no-op, so
+nothing is lost. Every other delta is unversioned, and one published *before*
+the snapshot read but delivered after it would move the client backwards; those
+are dropped, exactly as the pre-subscription gap dropped them, because the
+snapshot is already newer than all of them. Adding a version to another payload
+is what would let it join that set.
 
 ## Delivery
 
@@ -131,6 +146,7 @@ Published on the dashboard channel:
 |---|---|
 | `project_created`, `project_updated`, `project_renamed`, `project_deleted` | Project mutations |
 | `model_profile_created`, `model_profile_updated`, `model_profile_deleted` | Model profile mutations |
+| `workflow_library_updated` | One committed library mutation — create, draft save, executable save, archive, or restore — as the **whole** entry, in the snapshot's own shape. There is no delete: archiving is an update. Ordering is carried by the entry's edit `version` rather than by delivery order, so a receiver drops an older version and treats an equal one as already applied. The launch catalog follows from the same payload: an entry arriving with `descriptor: null` leaves the catalog in the same step |
 | `task_created`, `task_updated`, `task_deleted` | Task mutations |
 | `project_setup_step` | A clone-mode project setup step starts, succeeds, or fails |
 | `spawn_step` | A spawn step starts, succeeds, or fails |

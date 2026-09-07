@@ -35,6 +35,7 @@ class MockWebSocket {
     projects: unknown[];
     model_profiles?: unknown[];
     workflow_catalog?: unknown[];
+    workflow_library?: unknown[];
     tasks: unknown[];
     sessions?: unknown;
     workflows?: unknown;
@@ -288,6 +289,7 @@ async function renderAt(
     projects: unknown[];
     model_profiles?: unknown[];
     workflow_catalog?: unknown[];
+    workflow_library?: unknown[];
     tasks: unknown[];
     sessions?: unknown;
     workflows?: unknown;
@@ -363,10 +365,43 @@ function stubLaunchFetch(options: {
   return fetchMock;
 }
 
+/** One library entry standing behind a catalog descriptor. Spawn reads the
+ * library for entries the catalog cannot carry — an archived or damaged
+ * selection has no descriptor, and the operator still has to see it. */
+function libraryEntry(name: string, revision: string) {
+  const descriptor = name === "bugfix" ? bugfix : singleStep;
+  return {
+    name,
+    origin: "custom" as const,
+    archived: false,
+    version: 3,
+    has_draft: true,
+    current_revision: revision,
+    current_format: 1,
+    available: true,
+    unavailable_reason: null,
+    unavailable_detail: null,
+    created_at: "2026-09-07T00:00:00Z",
+    updated_at: "2026-09-07T00:00:00Z",
+    descriptor: { ...descriptor, revision },
+  };
+}
+
+const emptyDraft = {
+  workflow: "",
+  project: "",
+  profile: "",
+  slug: "",
+  prompt: "",
+  overrides: {},
+  stepOverrides: {},
+};
+
 const launchSnapshot = {
   projects: [project],
   model_profiles: [balanced],
   workflow_catalog: [bugfix, singleStep],
+  workflow_library: [libraryEntry("bugfix", "sha256:abc"), libraryEntry("single-step", "sha256:abc")],
   tasks: [],
 };
 
@@ -574,6 +609,165 @@ describe("SpawnView", () => {
     expect(cleared).toHaveTextContent("review");
     // The rest of the draft is not workflow-scoped and survives.
     expect(screen.getByLabelText("Task slug")).toHaveValue("fix-bug");
+  });
+
+  it("clears row overrides when the selected workflow gets a new revision", async () => {
+    // Editing the definition can move, rename, or drop a step, so a per-step
+    // model choice cannot be reattached by name — it is dropped, and said so.
+    const fetchMock = stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+    await user.selectOptions(screen.getByTestId("row-profile-work"), "balanced");
+    await waitFor(() => {
+      const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
+      expect(body.step_overrides).toEqual({ work: { model_profile: "balanced" } });
+    });
+
+    act(() => {
+      socket().emit("workflow_library_updated", {
+        ...libraryEntry("single-step", "sha256:new"),
+        version: 12,
+      });
+    });
+
+    await waitFor(() => {
+      const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
+      expect("step_overrides" in body).toBe(false);
+    });
+    expect(screen.getByTestId("cleared-overrides")).toHaveTextContent("new revision");
+    // Everything that is not workflow-scoped is still there.
+    expect(screen.getByLabelText("Task slug")).toHaveValue("fix-bug");
+    expect(screen.getByLabelText("Project")).toHaveValue("maas");
+  });
+
+  it("re-resolves a revision change even when there was nothing to clear", async () => {
+    // The notice and the refetch are independent. A draft with no per-step
+    // overrides has nothing to clear, and must still end up with a resolution
+    // it can submit rather than an emptied preview and a dead button.
+    const fetchMock = stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
+    await fillDraft(userEvent.setup());
+    const before = fetchMock.mock.calls.length;
+
+    act(() => {
+      socket().emit("workflow_library_updated", {
+        ...libraryEntry("single-step", "sha256:new"),
+        version: 12,
+      });
+    });
+
+    await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(before));
+    await screen.findByTestId("step-preview");
+    expect(screen.queryByTestId("cleared-overrides")).toBeNull();
+    expect(screen.getByRole("button", { name: "Spawn task" })).not.toBeDisabled();
+  });
+
+  it("leaves a draft-only edit of the selected workflow alone", async () => {
+    // Editing a draft changes nothing about what Spawn would execute, so it
+    // must not reset the row overrides or re-resolve an unchanged preview.
+    const fetchMock = stubLaunchFetch();
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+    await user.selectOptions(screen.getByTestId("row-profile-work"), "balanced");
+    await waitFor(() => {
+      const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
+      expect(body.step_overrides).toEqual({ work: { model_profile: "balanced" } });
+    });
+    const before = fetchMock.mock.calls.length;
+
+    act(() => {
+      // A new edit version, the same executable revision: a saved draft.
+      socket().emit("workflow_library_updated", {
+        ...libraryEntry("single-step", "sha256:abc"),
+        version: 12,
+      });
+    });
+
+    expect(fetchMock.mock.calls.length).toBe(before);
+    expect(screen.queryByTestId("cleared-overrides")).toBeNull();
+    expect(screen.getByTestId("row-profile-work")).toHaveValue("balanced");
+  });
+
+  it("keeps an archived selection visible and unsubmittable instead of picking another", async () => {
+    stubLaunchFetch({ previewStatus: 422 });
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await user.selectOptions(screen.getByLabelText("Workflow"), "single-step");
+    await user.selectOptions(screen.getByLabelText("Project"), "maas");
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+
+    act(() => {
+      socket().emit("workflow_library_updated", {
+        ...libraryEntry("single-step", "sha256:abc"),
+        version: 12,
+        archived: true,
+        available: false,
+        unavailable_reason: "archived",
+        unavailable_detail: "archived; restore it to launch it again",
+        descriptor: null,
+      });
+    });
+
+    // Still the selection, still named, with the reason and a way back.
+    expect(screen.getByLabelText("Workflow")).toHaveValue("single-step");
+    expect(screen.getByTestId("spawn-workflow-unavailable")).toHaveTextContent("archived");
+    expect(screen.getByRole("button", { name: "Spawn task" })).toBeDisabled();
+    expect(screen.getByLabelText("Task slug")).toHaveValue("fix-bug");
+  });
+
+  it("preselects the workflow the library handed it, keeping the rest of the draft", async () => {
+    stubLaunchFetch();
+    window.sessionStorage.setItem(
+      "ompire.spawnDraft",
+      JSON.stringify({ ...emptyDraft, project: "maas", slug: "fix-bug", prompt: "typed" }),
+    );
+    window.history.pushState({ usr: { workflow: "bugfix" } }, "", "/spawn");
+    render(<App />);
+    act(() => {
+      socket().emitSnapshot(launchSnapshot);
+    });
+
+    await waitFor(() => expect(screen.getByLabelText("Workflow")).toHaveValue("bugfix"));
+    expect(screen.getByLabelText("Project")).toHaveValue("maas");
+    expect(screen.getByLabelText("Prompt")).toHaveValue("typed");
+  });
+
+  it("applies the handoff once, so a later choice survives coming back to it", async () => {
+    // The handoff lives on the history entry. Re-applying it on every mount
+    // would discard the workflow the operator chose afterwards — and their
+    // per-step overrides with it — without even saying so.
+    const fetchMock = stubLaunchFetch();
+    window.history.pushState({ usr: { workflow: "bugfix" } }, "", "/spawn");
+    render(<App />);
+    act(() => {
+      socket().emitSnapshot(launchSnapshot);
+    });
+    const user = userEvent.setup();
+    await waitFor(() => expect(screen.getByLabelText("Workflow")).toHaveValue("bugfix"));
+
+    await user.selectOptions(screen.getByLabelText("Workflow"), "single-step");
+    await user.selectOptions(screen.getByLabelText("Project"), "maas");
+    await user.type(screen.getByLabelText("Task slug"), "fix-bug");
+    await screen.findByTestId("step-preview");
+    await user.selectOptions(screen.getByTestId("row-profile-work"), "balanced");
+    await waitFor(() => {
+      const body = JSON.parse((fetchMock.mock.calls.at(-1)![1] as { body: string }).body);
+      expect(body.step_overrides).toEqual({ work: { model_profile: "balanced" } });
+    });
+
+    // Leave, then come *back* to the same history entry — which still carries
+    // the handoff state, unlike a fresh link to /spawn.
+    await user.click(screen.getByRole("link", { name: "Settings" }));
+    await screen.findByTestId("tier-matrix");
+    act(() => {
+      window.history.back();
+    });
+
+    await screen.findByTestId("spawn-form");
+    expect(screen.getByLabelText("Workflow")).toHaveValue("single-step");
+    expect(screen.getByTestId("row-profile-work")).toHaveValue("balanced");
   });
 
   it("keeps a row correctable when its resolution fails", async () => {

@@ -43,7 +43,7 @@ custom aliases, and no way to leave one out.
 
 | Role | Intended use | Declared by |
 |---|---|---|
-| `default` | The ordinary active agent | Every agent step of the built-in workflows |
+| `default` | The ordinary active agent | Any agent step that does not declare another role |
 | `smol` | Lightweight work | omp's own auxiliary use inside the container |
 | `slow` | Thorough reasoning | omp's own auxiliary use inside the container |
 | `plan` | Planning | omp's own auxiliary use inside the container |

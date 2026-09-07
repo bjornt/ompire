@@ -14,10 +14,10 @@ executes that exact revision for the rest of its life
 exact grammar is a contributor reference:
 [Workflow definitions](../../develop/reference/workflow-definitions.md).
 
-Two definitions ship with the daemon: [`single-step`](#the-single-step-workflow)
-and [`bugfix`](bugfix-workflow.md). This release installs only packaged
-definitions — there is no library, no import, and no way to add one without a
-daemon release.
+Two definitions ship with the daemon as read-only examples:
+[`single-step`](#the-single-step-workflow) and [`bugfix`](bugfix-workflow.md).
+You add your own in the [workflow library](#the-workflow-library) — no daemon
+release, and no restart.
 
 ## Definitions and revisions
 
@@ -26,7 +26,7 @@ A definition declares:
 | Part | Meaning |
 |---|---|
 | `format` | The document format *and* its interpretation: `1` or `2`. |
-| `name` | Unique installed name; a launch selects it |
+| `name` | The library entry's name; a launch selects it. Permanent — renaming means creating a separate workflow |
 | `sessions` | Slug-format session names, declared up front, unique per task |
 | `primary` | Session targeted by task-scoped operations |
 | steps | Ordered, uniquely named, of four kinds. An `agent` step also declares the abstract model role it consumes. |
@@ -71,21 +71,145 @@ rather than reading it under the newest rules.
 
 ### Where a revision comes from, and where it is used
 
-New tasks pin the currently installed revision of the name they select.
+New tasks pin the library's *current* revision of the name they select.
 Everything afterwards — execution, restart recovery, which sessions are
 addressable, which session review and shipping attach to, and what task detail
 shows — resolves through *that task's* revision. The workflow's name is looked
-up in the installed catalog for exactly two prospective questions: what a new
-launch would pin, and what an old task is offered as a continuation candidate.
+up in the library for exactly two prospective questions: what a new launch
+would pin, and what an old task is offered as a continuation candidate.
 
-So a daemon release that edits `bugfix` does not change a `bugfix` task that is
-already running. Both revisions execute at once, and both stay readable: the
+So saving a new revision of `bugfix-of-my-own` does not change a task already
+running under it. Both revisions execute at once, and both stay readable: the
 retained document is kept whole, not just its identifier, and stays available
-after the packaged definition changes and after the workflow name disappears
-from a later release's catalog.
+after the library moves on, after the entry is archived, and after a later
+release stops shipping a built-in.
 
 Packaged definitions are validated at **daemon startup**. A malformed built-in
-prevents the daemon from serving rather than failing a task later.
+prevents the daemon from serving rather than failing a task later. Your own
+drafts are never parsed at startup, so a half-finished one cannot keep the
+daemon from starting.
+
+## The workflow library
+
+**Workflows** in the navigation is the library: every workflow that exists,
+which is not the same as every workflow you can launch. For the procedure —
+start one, edit it, validate it, save it, launch it — see
+[Write your own workflow](../how-to/spawn-a-task.md#write-your-own-workflow).
+
+| Origin | What it is |
+|---|---|
+| `builtin` | A packaged example. Read-only — [duplicate](#creating-a-workflow) it to make a version you can edit |
+| `custom` | Yours: a draft, an executable revision, or both |
+
+Each entry carries three independent facts.
+
+**Draft text** is whatever you last saved in the editor. It is inert: any UTF-8
+up to 1 MiB is accepted — empty, half-finished, or invalid YAML alike — and
+nothing parses or executes it. Saving a draft never changes what the workflow
+would launch. Drafts survive a refresh and a daemon restart. Built-ins have no
+draft; their text comes from the package.
+
+**The current revision** is the entry's executable choice — what a new launch of
+this name pins. It changes only when an executable save succeeds. An entry that
+has never had one is *draft only* and cannot be launched at all.
+
+**The edit version** is a counter that advances on every successful change,
+including a comment-only draft save. It is what stops two browser tabs from
+overwriting each other, and it is deliberately not the revision: comments do
+not change a revision, but they are still a real edit.
+
+### The three save operations
+
+They are separate on purpose, and only the third changes what runs.
+
+| Operation | What it does | What it does not do |
+|---|---|---|
+| **Save draft** | Persists the text as-is | Never validates, never changes the current revision |
+| **Validate** | Checks that exact text and shows either a read-only reading of it or a located error | Saves nothing, and authorizes nothing later |
+| **Save executable revision** | Validates the text again, retains it, makes it the current revision, and saves it as the draft | Never starts a task |
+
+Editing after a validation marks that result out of date; validate again.
+Validation is *structural*: it says the daemon can read the definition, not that
+the commands it names are installed, that a model will comply, or that the run
+will succeed. A failed executable save leaves the last one exactly where it was.
+
+### Creating a workflow
+
+Four ways in, all of which produce a draft and nothing else:
+
+- **New workflow** opens a minimal format-2 example with one agent step and a
+  named ending.
+- **Duplicate** copies a saved revision into a new entry under a name you
+  choose. This is how you customize a built-in.
+- **Import YAML** reads a local file into the editor. The file is read by your
+  browser; the daemon never receives a path and never opens one.
+- **Paste** into the editor.
+
+A name is permanent and globally unique. Built-in names are refused, and an
+archived name stays reserved — the tasks that ran under it are still filed
+there.
+
+### Export and import
+
+Exporting a saved revision gives you a standalone YAML definition, verified to
+load back to the same revision before it is handed to you. Comments and
+formatting are not preserved: a revision is a normalized document, and your text
+lives in the entry's draft, which downloads separately and is labelled a draft.
+
+Re-importing an unchanged export under the same name is the same procedure and
+reuses the same revision. Importing it under a *different* name is a different
+document, so it gets its own revision. An import whose name collides is refused
+— pick another name, or edit the existing entry.
+
+### Archive and restore
+
+Archiving removes a workflow from launch choices. Nothing is deleted: the draft,
+every saved revision, and every task that ran one stay exactly as they are, and
+archived entries are still readable behind an explicit filter. An archived entry
+is read-only until you restore it; restoring makes its retained current revision
+eligible again, and a draft-only entry comes back draft-only.
+
+### When an entry cannot be launched
+
+The library shows what exists; the Spawn form offers only what can run. An entry
+is unlaunchable for one of these reasons, and it says which:
+
+| Reason | What happened | What to do |
+|---|---|---|
+| `draft_only` | No executable revision has ever been saved | Validate and save one |
+| `archived` | You archived it | Restore it |
+| `missing`, `integrity`, `invalid`, `unsupported_format` | Its current revision cannot be read back as an executable definition | Save a corrected executable revision — its draft and history are still there |
+| `not_packaged` | A built-in this daemon version no longer ships | Nothing; old tasks that ran it are unaffected |
+
+One unlaunchable entry costs you that workflow and nothing else. The rest of the
+library, the launch form, and the daemon carry on.
+
+### Editing while something is running
+
+Editing a library entry never reaches a task that has already been accepted: it
+runs the revision it pinned, across your edits, an archive, a browser reconnect,
+a daemon restart, and a package upgrade.
+
+Between a launch preview and submitting it, a *new executable revision* of the
+selected workflow invalidates the preview — you reviewed a procedure, not a name
+— and archiving it refuses the launch outright. Everything else you typed is
+kept. Editing only the draft changes nothing about the launch. Because the steps
+may have moved, a revision change clears any per-step model overrides and says
+so, rather than reattaching your choices to steps you never looked at.
+
+### Two tabs, and losing a connection
+
+Every save submits the edit version it loaded. If someone else — or another tab
+— committed a change first, the save is refused, **nothing is written**, and you
+are told the entry's current version. There is no automatic merge and no way to
+force an overwrite: copy or download your text, reload the saved version, and
+reapply your changes.
+
+An edit committed elsewhere updates the saved library everywhere, but never
+overwrites an open editor. If the connection drops, unsaved text stays on screen
+and stays marked unsaved; operations whose response never arrived are not
+retried automatically. Reconnecting reloads the saved state so you can see what
+committed.
 
 ## States and behavior
 
@@ -389,7 +513,7 @@ task stays readable, stoppable, and cleanable.
 
 `workflow_status` says a run stopped. In format 2 the run also records *what
 stopping meant*, as the `result` named by the destination that ended it. The
-packaged bugfix declares `validated`, `validated-without-reproduction`,
+packaged `bugfix` declares `validated`, `validated-without-reproduction`,
 `stopped-without-fix`, and `stopped-unvalidated`.
 
 A format-1 run has no name for its ending and none is invented for it: the
@@ -501,21 +625,28 @@ current runs without replaying events. Each task also carries its pinned
 revision, whether that revision can currently be resolved, and the primary
 session *its* definition declares.
 
-`GET /api/workflows` returns the installed catalog — each definition's current
-revision and format, its sessions, and every declared step with its kind,
-session, abstract role, and whether a route or its own condition can pass it
-by. Every model consumer is one of those steps; nothing is described outside
-them. The same catalog rides in the WebSocket snapshot. There is no CRUD and no
-change event: installed definitions change only when the daemon does.
+`GET /api/workflows` returns the *launchable* catalog — each eligible entry's
+current revision and format, its sessions, and every declared step with its
+kind, session, abstract role, and whether a route or its own condition can pass
+it by. Every model consumer is one of those steps; nothing is described outside
+them. `GET /api/workflow-library` returns every entry instead, archived and
+draft-only included. Both ride in the WebSocket snapshot, derived from one read,
+and every committed change publishes one `workflow_library_updated` entry from
+which the launch catalog follows.
 
 `GET /api/workflows/revisions/{revision}` reads one retained definition by
 content identity — deliberately not by name, because a name says what a *new*
 launch would get and this answers "what did that task accept". An unknown
 revision is `404`; a stored document that cannot be read comes back as a
-classified `409` rather than being executed to answer a read.
+classified `409` rather than being executed to answer a read. Adding `/yaml`
+returns the same revision as a standalone YAML definition.
 
-A launch validates its `workflow_name` against the installed catalog; an
-unknown name is rejected with `422`.
+A launch validates its `workflow_name` against the library; an unknown,
+archived, draft-only, or unreadable entry is rejected with `422` naming the
+`workflow_name` field and the reason.
+
+The full endpoint map, including the authoring routes and their conflict and
+validation errors, is in the [API reference](api.md#workflow-library).
 
 ### Model policy per turn
 

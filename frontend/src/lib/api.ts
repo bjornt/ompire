@@ -13,9 +13,12 @@ import type {
   Project,
   ProjectFiles,
   WorkflowDescriptor,
+  WorkflowLibraryDetail,
+  WorkflowLibraryEntry,
   WorkflowReadinessReason,
   WorkflowRevisionDetail,
   WorkflowStepDescriptor,
+  WorkflowValidation,
   ReviewState,
   ShipState,
   Task,
@@ -46,6 +49,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   });
   if (!response.ok) {
     let detail = `${response.status}`;
+    let structured: Record<string, unknown> | null = null;
     try {
       const data = (await response.json()) as { detail?: unknown };
       if (typeof data.detail === "string") detail = data.detail;
@@ -56,13 +60,39 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
         typeof data.detail.message === "string"
       ) {
         detail = data.detail.message;
+        structured = data.detail as Record<string, unknown>;
       }
     } catch {
       /* non-JSON error body; keep the status code */
     }
-    throw new Error(detail);
+    throw new DaemonError(detail, response.status, structured);
   }
   return (await response.json()) as T;
+}
+
+/** A refused command, with the daemon's structured reason kept alongside the
+ * message.
+ *
+ * Still an `Error` with a readable `message`, so every existing caller is
+ * unchanged. The extra fields exist for refusals a view has to *act* on
+ * rather than only display — an edit conflict carrying the entry's current
+ * version, or a validation error carrying the location in the document. */
+export class DaemonError extends Error {
+  readonly status: number;
+  readonly detail: Record<string, unknown> | null;
+
+  constructor(message: string, status: number, detail: Record<string, unknown> | null) {
+    super(message);
+    this.name = "DaemonError";
+    this.status = status;
+    this.detail = detail;
+  }
+
+  /** The daemon's machine-readable refusal reason, when it gave one. */
+  get reason(): string | null {
+    const value = this.detail?.reason;
+    return typeof value === "string" ? value : null;
+  }
 }
 
 /** Task-local overrides of the project's workspace defaults (ADR-0026).
@@ -268,6 +298,94 @@ export function getWorkflowRevision(revision: string): Promise<WorkflowRevisionD
   return request<WorkflowRevisionDetail>(
     "GET",
     `/api/workflows/revisions/${encodeURIComponent(revision)}`,
+  );
+}
+
+/** Export one retained revision as a standalone YAML definition.
+ *
+ * Emitted from the retained document and verified to load back to the same
+ * identity, so an export and a re-import are the same procedure. It is not the
+ * text anybody typed — formatting and comments live in the entry's draft. */
+export function exportWorkflowRevision(
+  revision: string,
+): Promise<{ revision: string; name: string; format: number; yaml: string }> {
+  return request("GET", `/api/workflows/revisions/${encodeURIComponent(revision)}/yaml`);
+}
+
+/** Every library entry, archived and draft-only included (ADR-0031). */
+export function listWorkflowLibrary(): Promise<WorkflowLibraryEntry[]> {
+  return request<WorkflowLibraryEntry[]>("GET", "/api/workflow-library");
+}
+
+/** One entry with its raw draft text and retained revision history. */
+export function getWorkflowEntry(name: string): Promise<WorkflowLibraryDetail> {
+  return request<WorkflowLibraryDetail>(
+    "GET",
+    `/api/workflow-library/${encodeURIComponent(name)}`,
+  );
+}
+
+/** Create a custom entry: from pasted or imported text, by duplicating a
+ * retained revision, or — supplying neither — from the starter.
+ *
+ * None of the three validates or selects a revision. What is created is a
+ * draft, and a draft cannot launch. */
+export function createWorkflowEntry(input: {
+  name: string;
+  yaml?: string;
+  source_revision?: string;
+}): Promise<WorkflowLibraryDetail> {
+  return request<WorkflowLibraryDetail>("POST", "/api/workflow-library", input);
+}
+
+/** Persist the editor's text as it stands — valid or not. Never changes what
+ * the entry would launch. */
+export function saveWorkflowDraft(
+  name: string,
+  yaml: string,
+  expectedVersion: number,
+): Promise<WorkflowLibraryDetail> {
+  return request<WorkflowLibraryDetail>(
+    "PUT",
+    `/api/workflow-library/${encodeURIComponent(name)}/draft`,
+    { yaml, expected_version: expectedVersion },
+  );
+}
+
+/** Check this exact text. Nothing is saved, and the answer authorizes
+ * nothing: an executable save re-validates what it is given. */
+export function validateWorkflow(yaml: string, name?: string): Promise<WorkflowValidation> {
+  return request<WorkflowValidation>("POST", "/api/workflow-library/validate", {
+    yaml,
+    ...(name !== undefined ? { name } : {}),
+  });
+}
+
+/** Validate this text, retain it, and make it the entry's current choice —
+ * atomically, and without starting anything. */
+export function saveWorkflowRevision(
+  name: string,
+  yaml: string,
+  expectedVersion: number,
+): Promise<WorkflowLibraryDetail> {
+  return request<WorkflowLibraryDetail>(
+    "POST",
+    `/api/workflow-library/${encodeURIComponent(name)}/revisions`,
+    { yaml, expected_version: expectedVersion },
+  );
+}
+
+/** Take an entry out of future launch choices, or put it back. Nothing is
+ * deleted either way. */
+export function setWorkflowArchived(
+  name: string,
+  archived: boolean,
+  expectedVersion: number,
+): Promise<WorkflowLibraryDetail> {
+  return request<WorkflowLibraryDetail>(
+    "POST",
+    `/api/workflow-library/${encodeURIComponent(name)}/${archived ? "archive" : "restore"}`,
+    { expected_version: expectedVersion },
   );
 }
 

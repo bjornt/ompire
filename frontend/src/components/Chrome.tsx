@@ -11,6 +11,7 @@ import "./Chrome.css";
 const NAV_ITEMS = [
   { to: "/tasks", label: "Tasks" },
   { to: "/projects", label: "Projects" },
+  { to: "/workflows", label: "Workflows" },
   { to: "/spawn", label: "Spawn task" },
   { to: "/ship", label: "Ship flow" },
   { to: "/settings", label: "Settings" },

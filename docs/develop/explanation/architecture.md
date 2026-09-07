@@ -162,9 +162,9 @@ and [ADR-0030](../../adr/0030-commit-human-decisions-before-advancing.md).
 The task's pinned revision is the *only* way a runtime consumer resolves its
 workflow: the runner, recovery, session admission, the primary session behind
 review and shipping, and the REST and WebSocket projections all go through
-`taskdefinition.py`. Looking the workflow's name up in the installed catalog is
-reserved for two prospective questions — what a new launch would pin, and what
-an old task is offered as a continuation candidate.
+`taskdefinition.py`. Looking the workflow's name up in the library is reserved
+for two prospective questions — what a new launch would pin, and what an old
+task is offered as a continuation candidate.
 
 Retained revisions are append-only and hold the whole document, not just its
 identifier: a definition nobody could still read would not explain anything. A
@@ -176,6 +176,40 @@ The migration is deliberately incomplete by itself. Every pre-upgrade task
 recorded a workflow *name*, and no honest value exists for its revision, so the
 binding is null until a person confirms a continuation against a compatibility
 check.
+
+## Operators own the library; the daemon owns the revisions
+
+Above those append-only revisions sits one mutable row per workflow name: the
+raw draft text an operator is editing, the current revision a new launch would
+pin, an archive flag, and an edit version
+([ADR-0031](../../adr/0031-let-operators-own-a-workflow-library-above-retained-revisions.md)).
+Packaged definitions are read-only entries in that same table, synchronized at
+startup; duplication is how they are customized.
+
+Three properties are what the split buys, and each is easy to lose by
+collapsing it back:
+
+**A draft is inert.** Any text is stored, nothing parses it, and only an
+explicit executable save validates — the exact text it was handed, not one an
+earlier validation blessed. So a bad paste cannot reach the catalog, cannot
+displace a launchable revision, and cannot keep the daemon from starting.
+
+**The edit version is not the content revision.** A revision is a digest of
+normalized semantics, so a comment-only change does not move it; concurrency
+safety has to be about edits. Every mutation submits the version it loaded, the
+comparison happens inside the write reservation that performs the write, and a
+conflict changes nothing. There is no force and no automatic merge.
+
+**Selection is transactional.** There is no process-local catalog. A launch
+resolves the name through the connection it was given, which at acceptance is
+the one holding the write reservation, so an archive or a save committing
+alongside cannot land between the check and the pin. An archived, draft-only,
+or unreadable entry refuses the launch and says which — it never substitutes
+another revision.
+
+Clients receive the library the way they receive every other registry: a
+snapshot plus one full-entry upsert per committed change, ordered by the edit
+version, with the launch catalog derived from the same payload.
 
 ## A launch is resolved once and pinned to the task
 
@@ -252,7 +286,7 @@ See [Why the control plane is trusted and the agent is not](trust-model.md).
 
 ## Where the design is unsettled
 
-Documentation that only described the intended architecture would mislead. Three
+Documentation that only described the intended architecture would mislead. Two
 areas are known-unreconciled and tracked in `ADR.PLAN.md`:
 
 **[The durability boundary](../../adr/0016-persist-authority-bearing-task-history-and-provenance.md).**
@@ -265,11 +299,6 @@ side effects.
 Shipping currently inherits the host identity and is documented as producing
 operator-authored signed commits. ADR-0017 proposes a dedicated bot as the
 default automation identity.
-
-**Workflow authoring.** Definitions are versioned declarative documents
-(ADR-0028), but the catalog is still daemon-packaged only. The vision calls for
-operator authoring: a library, editing, import and export. That boundary — where
-a definition arrives from outside a daemon release — is the next decision.
 
 Each needs an explicit decision rather than a silent choice. Do not resolve one
 incidentally while implementing something else.

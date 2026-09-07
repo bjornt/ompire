@@ -135,6 +135,28 @@ from ompire_daemon.registry.workflow_definitions import (
     WorkflowRevisionUnavailableError,
     get_revision,
 )
+from ompire_daemon.registry.workflow_library import (
+    ORIGIN_BUILTIN,
+    ArchivedWorkflowError,
+    BuiltinWorkflowReadOnlyError,
+    DuplicateWorkflowNameError,
+    InvalidWorkflowNameError,
+    LibraryDetail,
+    LibraryEntry,
+    UnknownWorkflowNameError,
+    WorkflowDraftTooLargeError,
+    WorkflowEntryNotFoundError,
+    WorkflowNameMismatchError,
+    WorkflowVersionConflictError,
+    check_draft_size,
+    create_entry,
+    get_detail,
+    launchable_descriptors,
+    list_entries,
+    save_draft,
+    save_revision,
+    set_archived,
+)
 from ompire_daemon.registry.workflows import (
     GATE_SNAPSHOT_VERSION,
     WorkflowGateChoiceError,
@@ -151,11 +173,21 @@ from ompire_daemon.taskdefinition import (
     TaskDefinitionUnavailableError,
     resolve_task_definition,
 )
-from ompire_daemon.workflow_definitions import WorkflowDefinition
+from ompire_daemon.workflow_definitions import (
+    UnsupportedWorkflowFormatError,
+    WorkflowDefinition,
+    WorkflowDocumentError,
+    WorkflowRevision,
+    describe,
+    export_yaml,
+    load_canonical_document,
+    load_definition,
+    make_revision,
+)
 from ompire_daemon.workflows import (
     WorkflowNotWaitingError,
     WorkflowRunner,
-    describe_catalog,
+    packaged_yaml,
 )
 from ompire_daemon.workshop import WorkshopRemoveError, remove_workshop, workshop_status
 
@@ -887,12 +919,18 @@ def delete_model_profile_route(
     return {"deleted": name}
 
 
-# --- Workflow catalog and retained revisions ----------------------------------
-# Definitions ship with the daemon (ADR-0028), so the catalog is read-only:
-# there is no CRUD and no change event, because installed definitions change
-# only when the daemon does. Retained revisions are separate and larger than
-# the catalog — a revision no longer installed is still readable, which is what
-# lets an old task show the exact procedure it accepted.
+# --- The workflow library, its revisions, and authoring ------------------------
+# An operator owns which procedures exist (ADR-0031). `GET /workflows` stays the
+# *launchable* descriptor collection and `GET /workflows/revisions/{revision}`
+# stays immutable inspection; everything under `/workflow-library` is the
+# mutable part: entries, inert drafts, validation, executable saves, and
+# archive/restore.
+#
+# Three operations that are easy to conflate are deliberately three routes.
+# Saving a draft persists text and promises nothing. Validating checks text and
+# saves nothing — and its response is informative, never an authorization to
+# save later. Saving an executable revision re-validates the exact submitted
+# text and only then retains and selects it. Nothing here starts a task.
 
 
 class StepDescriptorOut(BaseModel):
@@ -919,8 +957,16 @@ class WorkflowOut(BaseModel):
 
 
 @router.get("/workflows", response_model=list[WorkflowOut])
-def list_workflows_route() -> list[dict[str, Any]]:
-    return [asdict(descriptor) for descriptor in describe_catalog()]
+def list_workflows_route(engine: Engine = Depends(_engine)) -> list[dict[str, Any]]:
+    """Only what a new launch may select: non-archived, present, readable.
+
+    Derived from the same library read the WebSocket snapshot uses, so the two
+    cannot offer different catalogs.
+    """
+    return [
+        asdict(descriptor)
+        for descriptor in launchable_descriptors(list_entries(engine))
+    ]
 
 
 class WorkflowRevisionOut(BaseModel):
@@ -935,20 +981,9 @@ class WorkflowRevisionOut(BaseModel):
     definition: dict[str, Any]
 
 
-@router.get("/workflows/revisions/{revision}", response_model=WorkflowRevisionOut)
-def get_workflow_revision_route(
-    revision: str, engine: Engine = Depends(_engine)
-) -> dict[str, Any]:
-    """One retained definition, by content identity.
-
-    Deliberately not addressable by workflow name: a name says what a new
-    launch would get, and this endpoint exists to answer "what did *that* task
-    accept". A stored document that cannot be read comes back as a classified
-    409 rather than a silent substitution — it is never executed to answer a
-    read.
-    """
+def _revision_or_error(engine: Engine, revision: str) -> WorkflowRevision:
     try:
-        retained = get_revision(engine, revision)
+        return get_revision(engine, revision)
     except WorkflowRevisionUnavailableError as exc:
         if exc.reason == "missing":
             raise HTTPException(status.HTTP_404_NOT_FOUND, exc.detail) from exc
@@ -961,6 +996,21 @@ def get_workflow_revision_route(
                 "revision": revision,
             },
         ) from exc
+
+
+@router.get("/workflows/revisions/{revision}", response_model=WorkflowRevisionOut)
+def get_workflow_revision_route(
+    revision: str, engine: Engine = Depends(_engine)
+) -> dict[str, Any]:
+    """One retained definition, by content identity.
+
+    Deliberately not addressable by workflow name: a name says what a new
+    launch would get, and this endpoint exists to answer "what did *that* task
+    accept". A stored document that cannot be read comes back as a classified
+    409 rather than a silent substitution — it is never executed to answer a
+    read.
+    """
+    retained = _revision_or_error(engine, revision)
     return {
         "revision": retained.revision,
         "name": retained.name,
@@ -969,6 +1019,484 @@ def get_workflow_revision_route(
         "sessions": list(retained.definition.sessions),
         "definition": retained.document,
     }
+
+
+class WorkflowYamlOut(BaseModel):
+    revision: str
+    name: str
+    format: int
+    yaml: str
+
+
+@router.get("/workflows/revisions/{revision}/yaml", response_model=WorkflowYamlOut)
+def export_workflow_revision_route(
+    revision: str, engine: Engine = Depends(_engine)
+) -> dict[str, Any]:
+    """One retained revision as a standalone YAML definition.
+
+    Emitted from the integrity-checked document, not from any draft, and
+    verified to load back to this same identity before it is returned. What
+    comes out is a complete definition an operator can keep and import again;
+    the formatting and comments of whatever they originally typed are not
+    preserved, because a revision is a canonical document and the entry's
+    draft is where their text lives.
+    """
+    retained = _revision_or_error(engine, revision)
+    return {
+        "revision": retained.revision,
+        "name": retained.name,
+        "format": retained.format,
+        "yaml": export_yaml(retained),
+    }
+
+
+# The starter a new workflow opens on: the smallest thing that is a real
+# format-2 definition. One agent step that gets the operator's prompt, and an
+# ending that says what finishing meant — because format 2 does not let a run
+# stop by falling off the end of the list.
+STARTER_TEMPLATE = """\
+# A new workflow. Edit it, Validate it, then save an executable revision.
+# Saving a draft keeps your text; only an executable save makes this
+# launchable.
+format: 2
+name: {name}
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    # `null` asks this step for no result document. Declare `results` here
+    # when a later decision has to route on what the step found.
+    outcome: null
+    prompt:
+      parts:
+        - value: {{op: input, name: task.prompt}}
+
+  - name: finish
+    kind: decision
+    cases:
+      - when: true
+        next: {{complete: true, result: done}}
+    otherwise: {{complete: true, result: done}}
+"""
+
+
+class WorkflowLibraryCreate(BaseModel):
+    """A new custom entry.
+
+    Exactly one source, or none: `yaml` is pasted or imported text,
+    `source_revision` duplicates a retained revision under the new name, and
+    omitting both opens the starter. Supplying both is refused rather than
+    resolved by precedence — an ambiguous create is an operator who meant one
+    of two different things.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Deliberately not validated by a field validator: FastAPI answers one of
+    # those with its own list-shaped `detail`, which carries no `message` for a
+    # client to show. The name is checked by `create_entry`, so a bad one comes
+    # back through the same refusal shape as every other authoring error.
+    name: str
+    yaml: str | None = None
+    source_revision: str | None = None
+
+
+class WorkflowDraftSave(BaseModel):
+    """Inert text plus the edit version it is replacing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    yaml: str
+    expected_version: int
+
+
+class WorkflowValidateIn(BaseModel):
+    """Text to check. `name` binds the check to an existing entry's immutable
+    identity, so an editor is told about a rename before it saves rather than
+    after."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    yaml: str
+    name: str | None = None
+
+
+class WorkflowEntryVersionIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int
+
+
+class WorkflowLibraryEntryOut(BaseModel):
+    name: str
+    origin: str
+    archived: bool
+    version: int
+    has_draft: bool
+    current_revision: str | None
+    current_format: int | None
+    available: bool
+    unavailable_reason: str | None
+    unavailable_detail: str | None
+    created_at: str
+    updated_at: str
+    descriptor: WorkflowOut | None
+
+
+class RevisionSummaryOut(BaseModel):
+    revision: str
+    workflow_name: str
+    format: int
+    created_at: str
+
+
+class WorkflowLibraryDetailOut(BaseModel):
+    entry: WorkflowLibraryEntryOut
+    # The raw text of the editor's last saved draft, exactly as submitted. For
+    # a built-in this is its packaged text, which is read-only.
+    draft_yaml: str | None
+    revisions: list[RevisionSummaryOut]
+
+
+class WorkflowValidationOut(BaseModel):
+    revision: str
+    name: str
+    format: int
+    definition: dict[str, Any]
+    descriptor: WorkflowOut
+
+
+def _entry_payload(entry: LibraryEntry) -> dict[str, Any]:
+    """Event and response shape for one entry — the same one either way, so a
+    client's reducer has a single path for both."""
+    return asdict(entry)
+
+
+def _detail_payload(detail: LibraryDetail) -> dict[str, Any]:
+    return {
+        "entry": _entry_payload(detail.entry),
+        "draft_yaml": detail.draft_yaml,
+        "revisions": [asdict(summary) for summary in detail.revisions],
+    }
+
+
+def _publish_entry(events: EventHub, detail: LibraryDetail) -> None:
+    """One full-entry upsert per committed mutation.
+
+    Full, not a patch: the reducer that applies it also has to update the
+    launch catalog, and it can only decide whether this entry is still
+    eligible from the whole entry. Ordering is carried by the entry's edit
+    version rather than by delivery order.
+    """
+    events.publish("workflow_library_updated", _entry_payload(detail.entry))
+
+
+def _document_error(exc: WorkflowDocumentError) -> HTTPException:
+    """A structured refusal an editor can point at.
+
+    Carries where in the document the problem is, why, and — when the parser
+    supplied them — the source line and column. The submitted text is never
+    echoed back: an error is not a place to mirror a megabyte.
+    """
+    detail: dict[str, Any] = {
+        "reason": "workflow_document_invalid",
+        "location": getattr(exc, "location", "") or None,
+        "message": getattr(exc, "reason", None) or str(exc),
+    }
+    if isinstance(exc, UnsupportedWorkflowFormatError):
+        detail["reason"] = "workflow_format_unsupported"
+        detail["format"] = exc.version
+    mark = getattr(exc, "__cause__", None)
+    position = getattr(mark, "problem_mark", None) or getattr(mark, "context_mark", None)
+    if position is not None:
+        detail["line"] = position.line + 1
+        detail["column"] = position.column + 1
+    return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail)
+
+
+def _library_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, (WorkflowEntryNotFoundError, UnknownWorkflowNameError)):
+        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    if isinstance(exc, WorkflowVersionConflictError):
+        # The conflict says what the entry's version actually is, so an editor
+        # can offer to reload rather than guess. Nothing was written.
+        return HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "reason": "workflow_version_conflict",
+                "message": str(exc),
+                "name": exc.name,
+                "expected_version": exc.expected,
+                "current_version": exc.actual,
+            },
+        )
+    if isinstance(exc, DuplicateWorkflowNameError):
+        return HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "reason": "workflow_name_taken",
+                "message": str(exc),
+                "name": exc.name,
+                "origin": exc.origin,
+                "archived": exc.archived,
+            },
+        )
+    if isinstance(exc, BuiltinWorkflowReadOnlyError):
+        return HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"reason": "workflow_builtin_read_only", "message": str(exc)},
+        )
+    if isinstance(exc, ArchivedWorkflowError):
+        return HTTPException(
+            status.HTTP_409_CONFLICT,
+            {"reason": "workflow_archived", "message": str(exc)},
+        )
+    if isinstance(exc, WorkflowDocumentError):
+        return _document_error(exc)
+    # Invalid names, oversized text, and a document renaming its entry: all
+    # things the operator can fix in the editor.
+    return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
+
+
+def _validated(text: str) -> WorkflowRevision:
+    """Parse and validate submitted text, outside any write reservation.
+
+    Reading, not executing: the loader evaluates nothing, runs no command,
+    fetches no URL, and opens no path named in the document.
+    """
+    try:
+        check_draft_size(text)
+    except WorkflowDraftTooLargeError as exc:
+        raise _library_error(exc) from exc
+    try:
+        return load_definition(text)
+    except WorkflowDocumentError as exc:
+        raise _document_error(exc) from exc
+
+
+@router.get("/workflow-library", response_model=list[WorkflowLibraryEntryOut])
+def list_workflow_library_route(
+    engine: Engine = Depends(_engine),
+) -> list[dict[str, Any]]:
+    """Every entry, in name order — draft-only, archived, and damaged included.
+
+    The library is what exists. What can launch is `GET /workflows`.
+    """
+    return [_entry_payload(entry) for entry in list_entries(engine)]
+
+
+@router.post(
+    "/workflow-library",
+    response_model=WorkflowLibraryDetailOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_workflow_library_route(
+    body: WorkflowLibraryCreate,
+    engine: Engine = Depends(_engine),
+    events: EventHub = Depends(_events),
+) -> dict[str, Any]:
+    """Create, duplicate, or start from the packaged starter.
+
+    None of the three validates or selects a revision: what is created is a
+    draft, and a draft cannot launch. Duplication reads the chosen retained
+    document and changes only its top-level name before serializing it, so the
+    copy is the same procedure under a new identity — a genuinely different
+    document, and therefore a different content revision.
+    """
+    if body.yaml is not None and body.source_revision is not None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "supply either 'yaml' or 'source_revision', not both",
+        )
+    if body.yaml is not None:
+        text = body.yaml
+    elif body.source_revision is not None:
+        source = _revision_or_error(engine, body.source_revision)
+        renamed = dict(source.document)
+        renamed["name"] = body.name
+        try:
+            text = export_yaml(make_revision(load_canonical_document(renamed)))
+        except WorkflowDocumentError as exc:
+            raise _document_error(exc) from exc
+    else:
+        text = STARTER_TEMPLATE.format(name=body.name)
+    try:
+        detail = create_entry(engine, name=body.name, yaml_text=text)
+    except (
+        InvalidWorkflowNameError,
+        DuplicateWorkflowNameError,
+        WorkflowDraftTooLargeError,
+    ) as exc:
+        raise _library_error(exc) from exc
+    _publish_entry(events, detail)
+    return _detail_payload(detail)
+
+
+@router.post("/workflow-library/validate", response_model=WorkflowValidationOut)
+def validate_workflow_route(
+    body: WorkflowValidateIn, engine: Engine = Depends(_engine)
+) -> dict[str, Any]:
+    """Check this exact text. Nothing is persisted and nothing is authorized.
+
+    Structural only: it says the document is a workflow this engine can read,
+    never that the commands it names are installed, that a model will produce
+    what a step asks for, or that the run will succeed.
+    """
+    revision = _validated(body.yaml)
+    if body.name is not None and body.name != revision.name:
+        raise _library_error(WorkflowNameMismatchError(body.name, revision.name))
+    return {
+        "revision": revision.revision,
+        "name": revision.name,
+        "format": revision.format,
+        "definition": revision.document,
+        "descriptor": asdict(describe(revision)),
+    }
+
+
+@router.get("/workflow-library/{name}", response_model=WorkflowLibraryDetailOut)
+def get_workflow_library_route(
+    name: str, engine: Engine = Depends(_engine)
+) -> dict[str, Any]:
+    """One entry: its summary, its raw text, and its retained history.
+
+    A built-in has no stored draft, so its text comes from the package — the
+    example an operator reads before duplicating it.
+    """
+    try:
+        detail = get_detail(engine, name)
+    except WorkflowEntryNotFoundError as exc:
+        raise _library_error(exc) from exc
+    payload = _detail_payload(detail)
+    if detail.entry.origin == ORIGIN_BUILTIN:
+        try:
+            payload["draft_yaml"] = packaged_yaml(name)
+        except OSError:
+            # A built-in this package no longer ships. Its history stays
+            # readable; only its example text is gone.
+            payload["draft_yaml"] = None
+    return payload
+
+
+@router.put(
+    "/workflow-library/{name}/draft", response_model=WorkflowLibraryDetailOut
+)
+def save_workflow_draft_route(
+    name: str,
+    body: WorkflowDraftSave,
+    engine: Engine = Depends(_engine),
+    events: EventHub = Depends(_events),
+) -> dict[str, Any]:
+    """Persist the editor's text as it stands, valid or not.
+
+    A draft is work in progress. Saving one never touches the entry's current
+    revision, so a half-finished edit cannot take a launchable workflow away.
+    """
+    try:
+        detail = save_draft(
+            engine,
+            name,
+            yaml_text=body.yaml,
+            expected_version=body.expected_version,
+        )
+    except (
+        WorkflowEntryNotFoundError,
+        WorkflowVersionConflictError,
+        BuiltinWorkflowReadOnlyError,
+        ArchivedWorkflowError,
+        WorkflowDraftTooLargeError,
+    ) as exc:
+        raise _library_error(exc) from exc
+    _publish_entry(events, detail)
+    return _detail_payload(detail)
+
+
+@router.post(
+    "/workflow-library/{name}/revisions", response_model=WorkflowLibraryDetailOut
+)
+def save_workflow_revision_route(
+    name: str,
+    body: WorkflowDraftSave,
+    engine: Engine = Depends(_engine),
+    events: EventHub = Depends(_events),
+) -> dict[str, Any]:
+    """Validate this text, retain it, and make it the entry's current choice.
+
+    The submitted text is validated here and now — an earlier `validate` call
+    is informative, not a token — and only then does the reservation open to
+    compare the version, retain the document, and move the selection, all
+    together. Re-saving semantically identical YAML reuses the existing
+    content revision. It never starts a task.
+    """
+    revision = _validated(body.yaml)
+    try:
+        detail = save_revision(
+            engine,
+            name,
+            revision=revision,
+            yaml_text=body.yaml,
+            expected_version=body.expected_version,
+        )
+    except (
+        WorkflowEntryNotFoundError,
+        WorkflowVersionConflictError,
+        BuiltinWorkflowReadOnlyError,
+        ArchivedWorkflowError,
+        WorkflowNameMismatchError,
+        WorkflowDraftTooLargeError,
+    ) as exc:
+        raise _library_error(exc) from exc
+    _publish_entry(events, detail)
+    return _detail_payload(detail)
+
+
+@router.post(
+    "/workflow-library/{name}/archive", response_model=WorkflowLibraryDetailOut
+)
+def archive_workflow_route(
+    name: str,
+    body: WorkflowEntryVersionIn,
+    engine: Engine = Depends(_engine),
+    events: EventHub = Depends(_events),
+) -> dict[str, Any]:
+    """Take an entry out of future launch choices. Nothing is deleted."""
+    return _set_archived(engine, events, name, True, body.expected_version)
+
+
+@router.post(
+    "/workflow-library/{name}/restore", response_model=WorkflowLibraryDetailOut
+)
+def restore_workflow_route(
+    name: str,
+    body: WorkflowEntryVersionIn,
+    engine: Engine = Depends(_engine),
+    events: EventHub = Depends(_events),
+) -> dict[str, Any]:
+    """Make the retained current revision eligible again, if it is readable.
+
+    A draft-only entry comes back draft-only: archiving never granted it a
+    revision, so restoring cannot either.
+    """
+    return _set_archived(engine, events, name, False, body.expected_version)
+
+
+def _set_archived(
+    engine: Engine, events: EventHub, name: str, archived: bool, expected_version: int
+) -> dict[str, Any]:
+    try:
+        detail = set_archived(
+            engine, name, archived=archived, expected_version=expected_version
+        )
+    except (
+        WorkflowEntryNotFoundError,
+        WorkflowVersionConflictError,
+        BuiltinWorkflowReadOnlyError,
+    ) as exc:
+        raise _library_error(exc) from exc
+    _publish_entry(events, detail)
+    return _detail_payload(detail)
 
 
 # --- Task launch --------------------------------------------------------------

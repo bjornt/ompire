@@ -34,6 +34,7 @@ from ompire_daemon.workflow_definitions import (
     evaluate_predicate,
     evaluate_value,
     evidence_views,
+    export_yaml,
     load_definition,
     parse_yaml_document,
     record_view,
@@ -895,3 +896,123 @@ def test_describe_treats_a_choice_gate_as_a_branch() -> None:
         ("undecided", True),
     ]
     assert descriptor.format == 2
+
+
+# --- YAML emission and portability (ADR-0031) ---------------------------------
+
+
+def _round_trip(text: str) -> None:
+    """Load, export, load again — and demand the same content identity.
+
+    The identity is the whole assertion. A serializer that changed a scalar's
+    type, folded a prompt differently, or dropped a field would produce a
+    document that still parses and means something else, and only the digest
+    catches that.
+    """
+    original = load_definition(text)
+    exported = export_yaml(original)
+    assert load_definition(exported).revision == original.revision
+
+
+def test_an_exported_definition_reloads_to_the_same_revision() -> None:
+    _round_trip(MINIMAL)
+    _round_trip(FORMAT_2)
+
+
+def test_export_preserves_both_packaged_formats() -> None:
+    """The frozen format-1 identity survives a round trip, and so does the
+    much larger format-2 built-in."""
+    from ompire_daemon.workflows import load_packaged_workflows
+
+    for revision in load_packaged_workflows().values():
+        assert load_definition(export_yaml(revision)).revision == revision.revision
+
+
+def test_export_never_lets_a_string_come_back_as_something_else() -> None:
+    """The loader reads unquoted scalars under JSON's rules, so text that
+    *looks* like a literal has to be emitted quoted.
+
+    `yes`, a date, and `1.0` are all ordinary prose in a prompt. A serializer
+    that emitted them plain would produce a document whose prompt renders a
+    boolean, and whose author never wrote one.
+    """
+    definition = """
+format: 1
+name: scalars
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    prompt:
+      separator: "\\n"
+      parts:
+        - text: "true"
+        - text: "null"
+        - text: "2026-09-07"
+        - text: "1.0"
+        - text: "0o17"
+        - text: ""
+        - text: "  leading and trailing  "
+        - text: "line one\\nline two\\n"
+        - text: "trailing space at eol \\nnext"
+        - value: {op: literal, value: {"true": 1, "12": "x", "": null}}
+"""
+    _round_trip(definition)
+    exported = export_yaml(load_definition(definition))
+    parts = load_definition(exported).definition.steps[0].prompt.parts
+    assert parts[0].text == "true"
+    assert parts[3].text == "1.0"
+    assert parts[5].text == ""
+
+
+def test_export_omits_defaults_and_normalization_puts_them_back() -> None:
+    """Readability, without a second meaning.
+
+    The canonical document spells out every default; a file repeating
+    `role: default`, `when: true`, and `evidence: {}` on every step is one an
+    operator cannot read. Leaving them implicit is safe precisely because
+    normalization restores them and the identity does not move.
+    """
+    revision = load_definition(FORMAT_2)
+    exported = export_yaml(revision)
+    assert "role: default" not in exported
+    assert "when: true" not in exported
+    assert "evidence: {}" not in exported
+    assert load_definition(exported).document == revision.document
+
+
+def test_a_near_boundary_document_still_exports_and_reloads() -> None:
+    """A definition close to the loader's own limits, not a toy.
+
+    Export expands nothing back to the canonical form, so a document that was
+    accepted has to survive the round trip rather than come back too big or
+    too deeply nested to load.
+    """
+    steps = []
+    for index in range(120):
+        steps.append(
+            f"""
+  - name: step-{index}
+    kind: agent
+    session: main
+    role: smol
+    max_visits: 3
+    on_exhausted: {{step: bail}}
+    when: {{op: exists, value: {{op: input, name: task.prompt}}}}
+    expects_outcome: true
+    prompt:
+      separator: "\\n\\n"
+      parts:
+        - text: "{'instruction ' * 40}"
+        - value: {{op: latest, steps: [step-0], with_outcome: true}}
+          format: json
+"""
+        )
+    text = (
+        "format: 1\nname: big\nsessions: [main]\nprimary: main\nsteps:"
+        + "".join(steps)
+        + '\n  - name: bail\n    kind: gate\n    message: {parts: [{text: "stop"}]}\n'
+    )
+    _round_trip(text)

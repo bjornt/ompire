@@ -198,12 +198,18 @@ class RevisionSummary:
     created_at: str
 
 
-def list_revisions(engine: Engine, *, workflow_name: str | None = None) -> list[RevisionSummary]:
+def list_revisions_conn(
+    conn: Connection, *, workflow_name: str | None = None
+) -> list[RevisionSummary]:
+    """Retained history, oldest first, on a caller-supplied connection.
+
+    Takes a connection so an executable save can return the history it just
+    appended to from inside its own transaction, rather than from a later read
+    that might have moved on.
+    """
     query = workflow_revisions.select().order_by(workflow_revisions.c.created_at)
     if workflow_name is not None:
         query = query.where(workflow_revisions.c.workflow_name == workflow_name)
-    with engine.connect() as conn:
-        rows = conn.execute(query).all()
     return [
         RevisionSummary(
             revision=row.revision,
@@ -211,5 +217,10 @@ def list_revisions(engine: Engine, *, workflow_name: str | None = None) -> list[
             format=row.format,
             created_at=row.created_at,
         )
-        for row in rows
+        for row in conn.execute(query).all()
     ]
+
+
+def list_revisions(engine: Engine, *, workflow_name: str | None = None) -> list[RevisionSummary]:
+    with engine.connect() as conn:
+        return list_revisions_conn(conn, workflow_name=workflow_name)

@@ -52,7 +52,7 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0016"
+    assert version == "0017"
     assert "projects" in tables
     assert "tasks" in tables
     # Templates are retired (ADR-0026): the live table is gone and only inert
@@ -66,6 +66,9 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
     # Durable review history (review capability; ADR-0016's review slice).
     assert "reviews" in tables
     assert "review_iterations" in tables
+    # The operator-owned library over the append-only revisions (ADR-0031).
+    assert "workflow_revisions" in tables
+    assert "workflow_library" in tables
     assert "pr_url" in task_columns
     assert "template_name" not in task_columns
     # The launch decision a task was accepted under (ADR-0026).
@@ -198,7 +201,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0016"
+    assert version == "0017"
     assert row == "demo"
 
 

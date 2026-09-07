@@ -115,6 +115,11 @@ from ompire_daemon.registry.tasks import (
     pin_execution_inputs,
     pin_workflow_binding,
 )
+from ompire_daemon.registry.workflow_library import (
+    UnknownWorkflowNameError,
+    WorkflowNotLaunchableError,
+    resolve_current,
+)
 from ompire_daemon.registry.workflows import (
     PAUSE_UNRESOLVED_DECISION,
     build_pause,
@@ -131,7 +136,6 @@ from ompire_daemon.workflow_definitions import (
     WorkflowRevision,
     describe,
 )
-from ompire_daemon.workflows import UnknownWorkflowNameError, current_revision
 
 logger = logging.getLogger(__name__)
 
@@ -461,18 +465,34 @@ UNCERTAINTY_NOTICE = (
 )
 
 
-def _candidate_revision(task: Task) -> WorkflowRevision | None:
-    """The current definition of *this task's own* workflow name, or None.
+def _candidate_revision(
+    engine: Engine, task: Task
+) -> tuple[WorkflowRevision | None, str | None]:
+    """The library's current definition of *this task's own* workflow name.
 
-    Only that one name is offered. There is no revision picker and no way to
-    switch a task to a different workflow: the task's history was produced by
-    something calling itself `bugfix`, and offering anything else would be
-    inviting the operator to relabel a run rather than continue it.
+    Only that one name is offered, and only its current executable revision.
+    There is no revision picker, no draft, and no way to switch a task to a
+    different workflow: the task's history was produced by something calling
+    itself `bugfix`, and offering anything else would be inviting the operator
+    to relabel a run rather than continue it.
+
+    Returns the reason instead when there is no candidate, so an archived or
+    draft-only entry is explained as itself rather than as a missing name.
     """
     try:
-        return current_revision(task.workflow_name)
+        with engine.connect() as conn:
+            return resolve_current(conn, task.workflow_name), None
     except UnknownWorkflowNameError:
-        return None
+        return None, (
+            f"this daemon's workflow library has no workflow named "
+            f"{task.workflow_name!r}, so there is no candidate definition to "
+            "continue under"
+        )
+    except WorkflowNotLaunchableError as exc:
+        return None, (
+            f"the workflow {task.workflow_name!r} has no current definition to "
+            f"continue under: {exc.detail}"
+        )
 
 
 def _legacy_gate_pair(records: list[Any], index: int) -> bool:
@@ -616,7 +636,7 @@ def workflow_continuation(engine: Engine, task: Task) -> dict[str, Any] | None:
         return None
     if task.execution_inputs is not None and task.execution_inputs.workflow_binding:
         return None
-    revision = _candidate_revision(task)
+    revision, unavailable = _candidate_revision(engine, task)
     legacy_through, interrupted = _history_boundary(engine, task)
     if revision is None:
         return {
@@ -624,13 +644,7 @@ def workflow_continuation(engine: Engine, task: Task) -> dict[str, Any] | None:
             "revision": None,
             "available": False,
             "compatible": False,
-            "problems": [
-                (
-                    f"this daemon installs no workflow named "
-                    f"{task.workflow_name!r}, so there is no candidate "
-                    "definition to continue under"
-                )
-            ],
+            "problems": [unavailable],
             "legacy_through_seq": legacy_through,
             "interrupted_legacy_seq": interrupted,
             "uncertainty_notice": UNCERTAINTY_NOTICE,
@@ -853,11 +867,10 @@ def _resolve_continuation(
         raise ReconciliationConflictError(
             f"task {task_id} cannot be confirmed: {readiness.detail}"
         )
-    revision = _candidate_revision(task)
+    revision, unavailable = _candidate_revision(engine, task)
     if revision is None:
         raise ReconciliationConflictError(
-            f"this daemon installs no workflow named {task.workflow_name!r}, so "
-            f"task {task_id} has no candidate definition to continue under"
+            f"task {task_id} cannot be continued: {unavailable}"
         )
     problems = _compatibility_problems(engine, task, revision)
     legacy_through, interrupted = _history_boundary(engine, task)

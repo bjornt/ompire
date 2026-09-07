@@ -35,6 +35,7 @@ import type {
   StepRecord,
   Task,
   WorkflowDescriptor,
+  WorkflowLibraryEntry,
   WorkflowState,
   WorkflowStepPayload,
 } from "../types";
@@ -46,14 +47,23 @@ export interface DaemonState {
    * alone is insufficient: it precedes that first message. */
   snapshotReady: boolean;
   projects: Project[];
-  /** Every installed workflow (ADR-0026, ADR-0028). Snapshot-only, with no
-   * change event: definitions ship with the daemon, so the catalog is
-   * constant for the life of the process. Each entry carries the revision its
-   * name currently resolves to, which is not necessarily what an existing
-   * task pinned. An older snapshot without the field normalizes to empty —
-   * which routes must not read as "no workflows exist" before
-   * `snapshotReady`. */
+  /** Every workflow a new launch may select (ADR-0026, ADR-0028, ADR-0031).
+   * Replaced by the snapshot and kept current from `workflow_library_updated`,
+   * because the library is editable now. Each entry carries the revision its
+   * name currently resolves to, which is not necessarily what an existing task
+   * pinned. An older snapshot without the field normalizes to empty — which
+   * routes must not read as "no workflows exist" before `snapshotReady`. */
   workflowCatalog: WorkflowDescriptor[];
+  /** The whole library (ADR-0031), in name order: archived, draft-only, and
+   * unavailable entries included. Deliberately a superset of
+   * `workflowCatalog` — the library says what exists and the catalog says
+   * what can launch, and a view that filtered the catalog itself could not
+   * tell an archived entry from one that was never there.
+   *
+   * Never holds editor text: an open editor's buffer is local to the route
+   * that owns it, and a remote update must not overwrite what somebody is
+   * typing. */
+  workflowLibrary: WorkflowLibraryEntry[];
   /** Global model profiles (ADR-0025), keyed by name like projects: replaced
    * wholesale by the snapshot, upserted by `model_profile_created`/
    * `model_profile_updated`, dropped by `model_profile_deleted`. An older
@@ -111,6 +121,7 @@ export const initialDaemonState: DaemonState = {
   snapshotReady: false,
   projects: [],
   workflowCatalog: [],
+  workflowLibrary: [],
   modelProfiles: [],
   tasks: [],
   spawnProgress: {},
@@ -185,6 +196,38 @@ function normalizeGitHubStatus(status: GitHubStatus | undefined): GitHubStatus |
   return { ...status, targets };
 }
 
+function upsertLibraryEntry(
+  entries: WorkflowLibraryEntry[],
+  entry: WorkflowLibraryEntry,
+): WorkflowLibraryEntry[] {
+  const index = entries.findIndex((e) => e.name === entry.name);
+  if (index !== -1) {
+    const next = [...entries];
+    next[index] = entry;
+    return next;
+  }
+  const at = entries.findIndex((e) => e.name.localeCompare(entry.name) > 0);
+  if (at === -1) return [...entries, entry];
+  return [...entries.slice(0, at), entry, ...entries.slice(at)];
+}
+
+/** Bring the launch catalog in line with one library entry.
+ *
+ * The daemon marks an entry eligible by giving it a `descriptor`, so this
+ * never re-derives eligibility from archive flags or revision state — it
+ * inserts what the daemon said is launchable and removes the name when the
+ * daemon said it is not. */
+function applyCatalogEntry(
+  catalog: WorkflowDescriptor[],
+  entry: WorkflowLibraryEntry,
+): WorkflowDescriptor[] {
+  const without = catalog.filter((w) => w.name !== entry.name);
+  if (entry.descriptor === null) return without;
+  const at = without.findIndex((w) => w.name.localeCompare(entry.name) > 0);
+  if (at === -1) return [...without, entry.descriptor];
+  return [...without.slice(0, at), entry.descriptor, ...without.slice(at)];
+}
+
 // Architecture: ADR-0004 (docs/adr/0004-use-rest-and-websocket-snapshot-deltas.md)
 /** Applies one envelope from the daemon's WebSocket. `snapshot` is a full
  * state replacement; every other `type` is an incremental delta. Unknown
@@ -219,6 +262,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         snapshotReady: true,
         projects: payload.projects,
         workflowCatalog: payload.workflow_catalog ?? [],
+        workflowLibrary: payload.workflow_library ?? [],
         modelProfiles: payload.model_profiles ?? [],
         tasks: payload.tasks,
         spawnProgress: {},
@@ -259,6 +303,23 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         ...state,
         projects: state.projects.filter((p) => p.name !== name),
         projectSetupProgress,
+      };
+    }
+    case "workflow_library_updated": {
+      const entry = envelope.payload as WorkflowLibraryEntry;
+      const existing = state.workflowLibrary.find((e) => e.name === entry.name);
+      // Producers need not publish in commit order, and a mutation's own REST
+      // response is fed through this same case. The entry's edit version is
+      // what orders them: an older version is stale and dropped, and an equal
+      // one is the update already applied.
+      if (existing !== undefined && existing.version >= entry.version) return state;
+      return {
+        ...state,
+        workflowLibrary: upsertLibraryEntry(state.workflowLibrary, entry),
+        // The launch catalog follows from this same payload, so an entry that
+        // stopped being eligible — archived, or saved into an unreadable
+        // state — leaves the catalog in the same step it changed the library.
+        workflowCatalog: applyCatalogEntry(state.workflowCatalog, entry),
       };
     }
     case "model_profile_created":

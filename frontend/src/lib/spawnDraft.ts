@@ -76,12 +76,18 @@ export const emptySpawnDraft: SpawnDraft = {
   stepOverrides: {},
 };
 
-/** Restore the draft a Settings round trip interrupted.
+/** Restore the draft a Settings or Workflows round trip interrupted.
  *
  * The draft is transient frontend state, not authoritative registry data, so
  * it lives in session storage rather than in a new server-side entity: it
- * exists only so that leaving the form to create a model profile does not
- * cost the operator everything they had typed.
+ * exists only so that leaving the form to create a model profile — or to save
+ * a workflow — does not cost the operator everything they had typed.
+ *
+ * A project preselection fills a field the operator has not chosen yet; it
+ * never replaces one they have. A *workflow* handoff is a different thing —
+ * it is an explicit "launch this one" — so it is applied by the view through
+ * the same selector a person uses, once, rather than reapplied here on every
+ * mount of the same history entry.
  */
 export function loadSpawnDraft(preselectedProject?: string): SpawnDraft {
   let stored: SpawnDraft = emptySpawnDraft;

@@ -29,7 +29,8 @@ of the tree.
 
 Three things, and nothing else has to exist first:
 
-- **a workflow** — any of the ones the daemon ships, against any ready project;
+- **a workflow** — any launchable entry in your [library](#write-your-own-workflow),
+  packaged or your own, against any ready project;
 - **a project** — its checkout, remotes, base branch, branch pattern, Workshop
   additions source, and standing preamble come with it;
 - **a model profile** — either the project's default, inherited, or one you
@@ -200,14 +201,15 @@ branch, and the project's checkout and publishing routing.
 That is what the task runs — through the pipeline, the workflow, a restart,
 review, and shipping. Editing a profile afterwards, or deleting one, changes
 your next launch and nothing about this one. The same is true of the workflow
-itself: upgrading Ompire changes what your *next* `bugfix` task runs, not one
-already in flight. You can see exactly what a task was accepted with, per
+itself: saving a new revision, archiving the entry, or upgrading Ompire changes
+what your *next* task runs, not one already in flight. You can see exactly what a task was accepted with, per
 consumer, on its detail view — including the revision, with the definition
 itself readable there.
 
 ## Workflows
 
-Two workflows ship today, and both are available to every project:
+Two workflows ship as read-only examples, and both are available to every
+project:
 
 - `single-step` — one agent step. The agent works, you review, you ship.
 - `bugfix` — QA tries to reproduce, a coder diagnoses, QA tries again with
@@ -217,6 +219,8 @@ Two workflows ship today, and both are available to every project:
   declares rather than a bare Resume. Its five model consumers are `reproduce`,
   `diagnose`, `reproduce-informed`, `fix`, and `verify`. See
   [the bugfix workflow](../reference/bugfix-workflow.md).
+
+You add your own in **Workflows** — see below.
 
 A workflow's steps name an abstract role — `default`, or one of the auxiliary
 roles — never a model. Which model answers to that role is your profile's
@@ -228,6 +232,65 @@ binding than the one currently in effect, Ompire restarts that session's agent
 process and resumes the same native session, so the context carries over. You
 may see the session read as *starting* for a moment while that happens; it is
 not a new conversation and not a failure.
+
+## Write your own workflow
+
+Open **Workflows**. There is no daemon release and no restart in this loop.
+
+1. **Start from something.** *New workflow* opens a minimal format-2 example;
+   *Duplicate* copies a saved revision — including a packaged one — under a name
+   you choose; *Import YAML…* reads a local file into the editor. You can also
+   paste. The name is permanent and cannot collide with a built-in or with an
+   archived name.
+2. **Edit the YAML.** Save a draft whenever you like: drafts take any text,
+   valid or not, and survive a refresh and a daemon restart. Saving one never
+   changes what the workflow would launch.
+3. **Validate.** You get either the revision identity and a read-only reading
+   of the definition, or the location and reason of the problem. Editing after
+   that marks the result out of date — validate again. Validation is
+   structural: it does not say the commands exist or the run will succeed.
+4. **Save an executable revision.** This validates the text again, retains it,
+   and makes it what a new launch of this name pins. Until you do, the entry is
+   *draft only* and cannot be launched at all. Saving starts nothing.
+5. **Launch it.** *Launch in Spawn* carries the workflow into the ordinary
+   Spawn form; you still choose the project and the profile and review the
+   resolution before submitting.
+
+The grammar is documented in
+[Workflow definitions](../../develop/reference/workflow-definitions.md), and the
+library's lifecycle in
+[Workflow engine](../reference/workflow-engine.md#the-workflow-library).
+
+### Keep, share, and retire one
+
+Export a saved revision to get a standalone YAML file, verified to load back to
+the same revision. Re-importing it unchanged under the same name is the same
+procedure and reuses the same revision; under a *different* name it is a
+different document with its own revision. Comments and formatting are not
+preserved — download the draft instead if you want your own text back.
+
+Archive removes a workflow from launch choices without deleting its draft, its
+revisions, or the tasks that ran them; Restore puts it back. Built-ins cannot be
+edited or archived — duplicate them instead.
+
+### When something goes wrong
+
+**"was edited elsewhere"** — another tab or another browser saved first. Nothing
+of yours was written and your text is still in the editor. Copy or download it,
+reload the saved version, and reapply your change. There is no merge and no
+overwrite: a workflow whose YAML differs from another tab's only in a comment is
+still a different edit.
+
+**"the workflow changed since it was previewed"** — you saved a new executable
+revision while a Spawn preview was open. Review the new resolution and submit
+again. Everything you typed is kept, and any per-step model overrides are
+cleared with a notice, because the steps may have moved.
+
+**A workflow marked unavailable in Spawn** — it was archived, has no executable
+revision yet, or its saved revision cannot be read. The selection stays visible
+with the reason rather than being swapped for another one. Fix it in the
+library: restore it, or save a corrected executable revision. Tasks already
+running under it are unaffected either way.
 
 ## While it runs
 

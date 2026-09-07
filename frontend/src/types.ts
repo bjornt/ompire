@@ -101,9 +101,10 @@ export interface WorkflowStepDescriptor {
   conditional: boolean;
 }
 
-/** An installed workflow. Definitions ship with the daemon (ADR-0028), so
- * this catalog arrives in the snapshot and never changes while the daemon
- * runs — there is no CRUD and no change event.
+/** A workflow a new launch may select. The library is editable (ADR-0031), so
+ * this catalog changes while the daemon runs: it is replaced by the snapshot
+ * and updated from `workflow_library_updated`, and it holds only entries that
+ * are non-archived and whose current revision is readable.
  *
  * `revision` is the content identity a *new* launch of this name would pin.
  * A task's own revision is on the task, and the two can differ: that is the
@@ -128,6 +129,75 @@ export interface WorkflowRevisionDetail {
   primary_session: string;
   sessions: string[];
   definition: Record<string, unknown>;
+}
+
+/** Why a library entry cannot be launched. `draft_only` and `not_packaged`
+ * come from the entry itself; the rest are the retained-revision read's own
+ * classifications, so the reason an entry is unlaunchable is the reason its
+ * revision gives. */
+export type WorkflowUnavailableReason =
+  | "draft_only"
+  | "archived"
+  | "not_packaged"
+  | "missing"
+  | "unsupported_format"
+  | "integrity"
+  | "invalid";
+
+/** One entry of the workflow library (ADR-0031): what exists, not what can
+ * launch.
+ *
+ * `version` is the *edit* version, advanced by every successful mutation
+ * including a comment-only draft save. It is what a save submits back to
+ * prove it is not overwriting somebody else's edit, and it is what orders
+ * these payloads — deliberately not `current_revision`, which does not move
+ * when only a comment changes.
+ *
+ * `descriptor` is present exactly when the entry is eligible for a launch, so
+ * a client cannot offer an archived or damaged entry by reading this payload.
+ * Raw draft text and retained history are fetched on detail, never carried
+ * here. */
+export interface WorkflowLibraryEntry {
+  name: string;
+  origin: "builtin" | "custom";
+  archived: boolean;
+  version: number;
+  has_draft: boolean;
+  current_revision: string | null;
+  current_format: number | null;
+  available: boolean;
+  unavailable_reason: WorkflowUnavailableReason | null;
+  unavailable_detail: string | null;
+  created_at: string;
+  updated_at: string;
+  descriptor: WorkflowDescriptor | null;
+}
+
+/** One retained revision's place in an entry's history. */
+export interface WorkflowRevisionSummary {
+  revision: string;
+  workflow_name: string;
+  format: number;
+  created_at: string;
+}
+
+/** One entry with the two things a list never carries: the raw text of its
+ * saved draft, and its retained revision history. */
+export interface WorkflowLibraryDetail {
+  entry: WorkflowLibraryEntry;
+  draft_yaml: string | null;
+  revisions: WorkflowRevisionSummary[];
+}
+
+/** A successful validation: what this exact text means, and the identity it
+ * would be saved under. Structural only — it never says the commands exist,
+ * the models will comply, or the run will succeed. */
+export interface WorkflowValidation {
+  revision: string;
+  name: string;
+  format: number;
+  definition: Record<string, unknown>;
+  descriptor: WorkflowDescriptor;
 }
 
 /** The workspace and prompt inputs one task actually runs under. */
@@ -789,8 +859,10 @@ export interface SnapshotPayload {
   /** The complete sorted model-profile registry (ADR-0025); absent from
    * snapshots emitted before this capability. */
   model_profiles?: ModelProfile[];
-  /** Every registered built-in workflow (ADR-0026). Snapshot-only: the
-   * catalog is constant for the life of the daemon process. */
+  /** Every library entry (ADR-0031), archived and draft-only included. */
+  workflow_library?: WorkflowLibraryEntry[];
+  /** Only the entries a new launch may select, derived by the daemon from the
+   * same library read as `workflow_library`. */
   workflow_catalog?: WorkflowDescriptor[];
   tasks: Task[];
   /** Nested task id → session name → info (workflow-engine design D-7; JSON

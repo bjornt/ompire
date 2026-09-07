@@ -14,7 +14,7 @@ Everything it changes goes through REST.
 ### Global chrome
 
 Every route renders a sticky header: the logo, nav links for Tasks, Projects,
-Spawn task, Ship flow, and Settings, and a right-side chip group.
+Workflows, Spawn task, Ship flow, and Settings, and a right-side chip group.
 
 Task detail is deliberately absent from the nav — it is reached from a task,
 not from a menu.
@@ -124,8 +124,55 @@ carries the token identifying what was reviewed; a resolution that changed in
 between is refused, and the changed choices are shown to review and submit
 again rather than launched automatically.
 
-The draft survives leaving the view — going to Settings to create a profile and
-coming back restores everything typed.
+The draft survives leaving the view — going to Settings to create a profile, or
+to Workflows to save one, and coming back restores everything typed. Opening
+Spawn from a workflow's **Launch in Spawn** preselects that workflow and keeps
+everything else.
+
+Because the library is editable, the selected workflow can change underneath an
+open form. A new executable revision of it invalidates the resolution and a new
+one is fetched; the task-wide text, project, profile, and workspace choices are
+kept, and any per-step model overrides are cleared with a visible notice rather
+than reattached to steps that may have moved. Editing only that workflow's
+draft changes nothing and refetches nothing. If it is archived or becomes
+unreadable, it stays visibly selected with the reason and a link to the library,
+submission is disabled, and no other workflow is chosen for you.
+
+### The Workflows views
+
+`/workflows` lists the library: name, origin (`builtin` or `custom`), and one
+state phrase — *launchable*, *draft only*, *archived*, or the specific reason
+its saved revision cannot be read. Archived entries are behind an explicit
+checkbox rather than mixed into the list. Before the first snapshot the view
+shows loading, never an empty library. A library with no custom entries offers
+Create, Import, and the packaged examples to duplicate.
+
+`/workflows/<name>` is one entry. A built-in shows its packaged text read-only
+with a Duplicate action; a custom entry opens the YAML editor.
+
+The editor's three buttons do three different things — **Save draft**,
+**Validate**, **Save executable revision** — and the view says which is which
+rather than assuming it is obvious. A successful validation shows the revision
+identity and a read-only reading of the definition: each step's kind, session
+and role, its instruction, the results it must declare, where its routes go, the
+answers a gate offers, what it reads as evidence, and its visit bound. That
+reading is a presentation of the saved YAML, not a second place to edit one.
+Editing the text marks a validation result out of date rather than hiding it.
+
+The editor's text is **local** until a save succeeds. A change committed
+elsewhere updates the library everywhere and never overwrites an open buffer;
+an unsaved buffer is marked unsaved and survives a lost connection. Importing a
+file, or loading an older revision into the editor, asks before replacing
+unsaved text, and so does leaving the page.
+
+A refused save changes nothing and keeps the text exactly as typed. An edit
+conflict offers three things and no fourth: copy the local text, discard the
+edits and reload the saved version, or keep editing. There is no force and no
+automatic merge.
+
+Saved revisions are listed newest first. Any of them can be inspected, exported
+as YAML, or loaded into the editor; a draft downloads separately and is labelled
+a draft rather than a validated workflow.
 
 ### Task detail configuration
 
@@ -147,8 +194,8 @@ pins future behavior and changes no recorded history. See
 A route that needs to decide whether a task exists waits for the current
 connection's first full snapshot. Socket open alone is not enough: it happens
 before that message, and a reconnect replaces any previous projection. The
-Ship flow index and `/ship/<task-id>` therefore render loading until a
-snapshot; an unknown or non-numeric ship id after it provides recovery links
+Ship flow index, `/workflows`, and `/ship/<task-id>` therefore render loading
+until a snapshot; an unknown or non-numeric ship id after it provides recovery links
 to Ship flow and Tasks. Any other unmatched application address renders a
 **Page not found** surface inside the normal chrome rather than a blank view.
 

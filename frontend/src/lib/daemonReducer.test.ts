@@ -1503,3 +1503,104 @@ describe("model profiles (ADR-0025)", () => {
     expect(applyEnvelope(deleted, snapshot([cheap])).modelProfiles).toEqual([cheap]);
   });
 });
+
+describe("the workflow library projection", () => {
+  const entry = (
+    overrides: Partial<import("../types").WorkflowLibraryEntry> = {},
+  ): import("../types").WorkflowLibraryEntry => {
+    const name = overrides.name ?? "custom";
+    return {
+    name,
+    origin: "custom",
+    archived: false,
+    version: 2,
+    has_draft: true,
+    current_revision: "sha256:aaa",
+    current_format: 1,
+    available: true,
+    unavailable_reason: null,
+    unavailable_detail: null,
+    created_at: "2026-09-07T00:00:00Z",
+    updated_at: "2026-09-07T00:00:00Z",
+    descriptor: { ...singleStep, name, revision: "sha256:aaa" },
+    ...overrides,
+    };
+  };
+
+  function withLibrary(entries: import("../types").WorkflowLibraryEntry[]) {
+    return applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: {
+        projects: [],
+        tasks: [],
+        workflow_library: entries,
+        workflow_catalog: entries.flatMap((e) => (e.descriptor ? [e.descriptor] : [])),
+      },
+    });
+  }
+
+  function update(state: typeof initialDaemonState, payload: unknown) {
+    return applyEnvelope(state, {
+      seq: 1,
+      ts: "",
+      type: "workflow_library_updated",
+      payload,
+    });
+  }
+
+  it("carries the library and the catalog it implies through the snapshot", () => {
+    const state = withLibrary([entry({ name: "draft-only", descriptor: null, available: false })]);
+    expect(state.workflowLibrary.map((e) => e.name)).toEqual(["draft-only"]);
+    expect(state.workflowCatalog).toEqual([]);
+  });
+
+  it("upserts an entry in name order and adds it to the catalog when eligible", () => {
+    const state = withLibrary([entry({ name: "zeta" })]);
+    const next = update(state, entry({ name: "alpha" }));
+    expect(next.workflowLibrary.map((e) => e.name)).toEqual(["alpha", "zeta"]);
+    expect(next.workflowCatalog.map((w) => w.name)).toEqual(["alpha", "zeta"]);
+  });
+
+  it("removes a workflow from the catalog when it stops being eligible", () => {
+    // Archiving is one event: the library still lists the entry, and the
+    // catalog no longer offers it. A view that filtered the catalog itself
+    // could not tell this from a workflow that never existed.
+    const state = withLibrary([entry()]);
+    const next = update(
+      state,
+      entry({
+        version: 3,
+        archived: true,
+        available: false,
+        unavailable_reason: "archived",
+        descriptor: null,
+      }),
+    );
+    expect(next.workflowLibrary.map((e) => e.name)).toEqual(["custom"]);
+    expect(next.workflowCatalog).toEqual([]);
+  });
+
+  it("ignores an older version and treats an equal one as already applied", () => {
+    // Producers need not publish in commit order, and a REST response is fed
+    // through this same case, so ordering is carried by the edit version.
+    const state = withLibrary([entry({ version: 5 })]);
+    const older = update(state, entry({ version: 4, descriptor: null, available: false }));
+    expect(older).toBe(state);
+    const same = update(state, entry({ version: 5, descriptor: null }));
+    expect(same).toBe(state);
+    const newer = update(state, entry({ version: 6, descriptor: null, available: false }));
+    expect(newer.workflowCatalog).toEqual([]);
+  });
+
+  it("normalizes a snapshot with no library at all", () => {
+    const next = applyEnvelope(initialDaemonState, {
+      seq: 0,
+      ts: "",
+      type: "snapshot",
+      payload: { projects: [], tasks: [] },
+    });
+    expect(next.workflowLibrary).toEqual([]);
+  });
+});

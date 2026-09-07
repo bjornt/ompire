@@ -43,7 +43,7 @@ from ompire_daemon.review import ReviewManager, restore_reviews
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import ShipManager
 from ompire_daemon.static import DEFAULT_FRONTEND_DIST, mount_frontend
-from ompire_daemon.workflows import WorkflowRunner, register_catalog
+from ompire_daemon.workflows import WorkflowRunner, install_packaged_workflows
 
 logger = logging.getLogger(__name__)
 
@@ -140,13 +140,15 @@ async def _prepare_startup(
     classifier hands it to recovery, or the daemon would try to resume a run
     whose model policy nobody has confirmed.
     """
-    # Every installed definition, retained under its content identity. A
-    # packaged definition that does not parse or validate raises out of here
-    # and stops the daemon: shipping an unexecutable built-in is a build
-    # error, and starting anyway would leave launches silently unavailable.
-    retained = register_catalog(engine)
-    if retained:
-        logger.info("retained %d new workflow revision(s)", len(retained))
+    # Every packaged definition, retained under its content identity and
+    # selected by its built-in library entry (ADR-0031). A packaged definition
+    # that does not parse or validate raises out of here and stops the daemon:
+    # shipping an unexecutable built-in is a build error, and starting anyway
+    # would leave launches silently unavailable. Custom entries and their
+    # drafts are untouched, and a broken custom draft is never parsed here —
+    # which is why one cannot keep the daemon from starting.
+    for conflict in install_packaged_workflows(engine):
+        logger.error("workflow library: %s", conflict.detail)
     # Finish what migration 0013 could not: seed ordinary defaults for
     # projects that never had a template, and record any retired `judge_model`
     # as evidence to acknowledge (ADR-0026). Idempotent across restarts.

@@ -27,7 +27,7 @@ All paths are under `daemon/src/ompire_daemon/`.
 | `db.py` | Engine, schema definition, WAL configuration. Note it does *not* enable `PRAGMA foreign_keys` — see [Database schema](database-schema.md#reference-safety-without-global-fk-enforcement). |
 | `model_config.py` | The vocabularies every model consumer agrees on: thinking levels and the four abstract roles. Model identifiers are not validated here — the provider-qualified grammar lives with profile value validation. |
 | `execution_inputs.py` | The typed launch decision pinned to a task — including its workflow revision — its JSON codec, and `ModelPolicy`, the complete native role map one omp process runs under. |
-| `workflow_definitions.py` | The workflow document in both formats: immutable data model, strict format-aware YAML loader, canonicalization and content identity, the bounded three-valued evaluator, result contracts, and evidence selection. Imports nothing from the registry or the task model. See [Workflow definitions](workflow-definitions.md). |
+| `workflow_definitions.py` | The workflow document in both formats: immutable data model, strict format-aware YAML loader, canonicalization and content identity, verified YAML emission, the bounded three-valued evaluator, result contracts, and evidence selection. Imports nothing from the registry or the task model. See [Workflow definitions](workflow-definitions.md). |
 | `migrate.py` | Runs Alembic migrations at startup. |
 | `registry/projects.py` | Projects, including the guarded default-model-profile reference |
 | `registry/model_profiles.py` | Model profiles: the four-role contract, provider-qualified identifier grammar, reference-guarded deletion, and the `reserved_write` SQLite write reservation both reference checks share |
@@ -35,6 +35,7 @@ All paths are under `daemon/src/ompire_daemon/`.
 | `registry/sessions.py` | Session identity, `(task_id, name)` |
 | `registry/workflows.py` | Workflow runs, step records, and the atomic waiting, retry, and gate-decision transitions |
 | `registry/workflow_definitions.py` | Retained revisions: append-only, verified on read, cached by content identity and never by name |
+| `registry/workflow_library.py` | The operator-owned library above those revisions: entries, inert drafts, current-revision selection, archive/restore, edit versions, and the single transactional prospective lookup. See [ADR-0031](../../adr/0031-let-operators-own-a-workflow-library-above-retained-revisions.md) |
 | `registry/reviews.py` | Review status and ordered iteration history |
 | `registry/settings.py` | Layered settings: override, then TOML, then default |
 | `registry/launch.py` | Inert upgrade evidence and the operator decisions that close out a reconciliation. Nothing here is read to execute anything. |
@@ -54,7 +55,7 @@ All paths are under `daemon/src/ompire_daemon/`.
 | `agent.py` | Agent child process lifecycle and event fan-out. |
 | `rpc.py` | Stdio NDJSON transport. Correlates requests by ID while push events interleave. |
 | `sessions.py` | The per-session status state machine. Every transition goes through one guarded method. |
-| `workflows.py` | The packaged catalog and the engine that carries a definition out: step execution, routing, uncertainty pauses, gates, and restart recovery. |
+| `workflows.py` | The packaged built-ins and the engine that carries a definition out: step execution, routing, uncertainty pauses, gates, and restart recovery. What a *name* currently means is not here — it lives in the library. |
 | `taskdefinition.py` | The one resolver from a task to *its* pinned definition, and the classified readiness a task reports when that cannot be resolved. Every runtime consumer goes through here. |
 | `recovery.py` | Startup recovery for sessions and interrupted operations. |
 

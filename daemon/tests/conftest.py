@@ -44,45 +44,61 @@ esac
 
 
 @pytest.fixture(autouse=True)
-def isolated_workflow_catalog():
-    """Every test starts from the packaged catalog and an empty revision cache.
+def isolated_revision_cache():
+    """Every test starts with an empty decoded-revision cache.
 
-    Both are process-local (ADR-0028), so a definition one test installs, or a
-    revision one test decoded, would otherwise resolve inside another test
+    The cache is process-local and keyed by content identity (ADR-0028), so a
+    revision one test decoded would otherwise resolve inside another test
     whose database has never heard of it — and a coexistence test would pass
-    for the wrong reason.
+    for the wrong reason. What a *name* means is no longer process-local: it
+    lives in each test's own database (ADR-0031).
     """
     from ompire_daemon.registry.workflow_definitions import clear_cache
-    from ompire_daemon.workflows import reset_catalog
 
-    reset_catalog()
     clear_cache()
     yield
-    reset_catalog()
     clear_cache()
 
 
 def register_builtin_workflows(engine):
-    """Retain the installed definitions, exactly as daemon startup does.
+    """Install the packaged definitions, exactly as daemon startup does.
 
     Tests that build an engine directly instead of going through `create_app`
-    have to do this themselves: a task cannot resolve a revision the store
+    have to do this themselves: a launch cannot resolve a name the library
     does not hold, which is the behavior under test everywhere else.
     """
-    from ompire_daemon.workflows import register_catalog
+    from ompire_daemon.workflows import install_packaged_workflows
 
-    return register_catalog(engine)
+    return install_packaged_workflows(engine)
 
 
-def install_test_workflow(engine, document: str):
-    """Install and retain one definition written for a single test."""
-    from ompire_daemon.registry.workflow_definitions import register_revisions
+def install_test_workflow(engine, document: str, *, name=None):
+    """Save one definition written for a single test as a custom entry.
+
+    Goes through the same library operations the REST layer uses, so a test
+    fixture cannot install something an operator could not have saved.
+    """
+    from ompire_daemon.registry.workflow_library import (
+        WorkflowEntryNotFoundError,
+        create_entry,
+        get_detail,
+        save_revision,
+    )
     from ompire_daemon.workflow_definitions import load_definition
-    from ompire_daemon.workflows import install_definition
 
     revision = load_definition(document)
-    install_definition(revision)
-    register_revisions(engine, [revision])
+    entry_name = name or revision.name
+    try:
+        version = get_detail(engine, entry_name).entry.version
+    except WorkflowEntryNotFoundError:
+        version = create_entry(engine, name=entry_name, yaml_text=document).entry.version
+    save_revision(
+        engine,
+        entry_name,
+        revision=revision,
+        yaml_text=document,
+        expected_version=version,
+    )
     return revision
 
 
@@ -311,6 +327,7 @@ def make_execution_inputs(
     step_profile_names: dict | None = None,
     step_profiles: dict | None = None,
     revision=None,
+    engine=None,
 ):
     """A complete accepted-input document for tests that build a task row
     directly instead of going through preview/accept.
@@ -320,10 +337,12 @@ def make_execution_inputs(
     that dimension. `step_profiles` supplies the role maps those named
     profiles bind, so a test can give two steps genuinely different models.
 
-    `revision` pins the definition, defaulting to the installed one of
-    `workflow_name` — the same thing acceptance would have pinned. Pass a
-    revision explicitly to build a task on a definition that is *not* the
-    current one, which is how coexistence across an edit is exercised.
+    `revision` pins the definition. Left out, it is the library's current
+    choice for `workflow_name` when an `engine` is supplied, and the packaged
+    definition otherwise — either way, the same thing acceptance would have
+    pinned. Pass a revision explicitly to build a task on a definition that is
+    *not* the library's current one, which is how coexistence across an edit
+    is exercised.
     """
     from ompire_daemon.execution_inputs import (
         PROFILE_SOURCE_PROJECT,
@@ -336,9 +355,16 @@ def make_execution_inputs(
         WorkspaceInputs,
     )
     from ompire_daemon.registry.model_profiles import RoleBinding
-    from ompire_daemon.workflows import current_revision
+    from ompire_daemon.registry.workflow_library import resolve_current
+    from ompire_daemon.workflows import load_packaged_workflows
 
-    pinned = revision if revision is not None else current_revision(workflow_name)
+    if revision is not None:
+        pinned = revision
+    elif engine is not None:
+        with engine.connect() as conn:
+            pinned = resolve_current(conn, workflow_name)
+    else:
+        pinned = load_packaged_workflows()[workflow_name]
 
     source = roles or TEST_ROLES
     decoded = {

@@ -24,8 +24,11 @@ from ompire_daemon.registry.model_profiles import list_model_profiles
 from ompire_daemon.registry.projects import list_projects
 from ompire_daemon.registry.settings import SettingsStore
 from ompire_daemon.registry.tasks import list_tasks, task_payload
+from ompire_daemon.registry.workflow_library import (
+    launchable_descriptors,
+    list_entries,
+)
 from ompire_daemon.registry.workflows import list_step_records
-from ompire_daemon.workflows import describe_catalog
 
 router = APIRouter()
 
@@ -70,15 +73,82 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     events: EventHub = websocket.app.state.events
 
     seq = itertools.count()
+    # Subscribe *before* reading the snapshot, and release on every exit
+    # below. The library is mutable now (ADR-0031), so a save committing while
+    # this snapshot is being assembled would otherwise fall into the gap
+    # between the read and the subscription and never reach this client.
+    queue = events.subscribe()
+    try:
+        await _deliver_snapshot(websocket, seq, engine)
+        await _drain_snapshot_overlap(websocket, queue, seq)
+    except BaseException:
+        events.unsubscribe(queue)
+        websocket.app.state.ws_connections.discard(websocket)
+        raise
+
+    forwarder = asyncio.create_task(_forward_events(websocket, queue, seq))
+    try:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                break
+    finally:
+        forwarder.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await forwarder
+        events.unsubscribe(queue)
+        websocket.app.state.ws_connections.discard(websocket)
+
+
+# Event types the client orders by a version carried in the payload, so an
+# out-of-order or duplicate delivery is dropped rather than applied. Only these
+# are safe to forward from the window the snapshot was being read in.
+VERSION_ORDERED_TYPES = frozenset({"workflow_library_updated"})
+
+
+async def _drain_snapshot_overlap(
+    websocket: WebSocket, queue: asyncio.Queue, seq: itertools.count
+) -> None:
+    """Forward what queued up while the snapshot was being assembled — but only
+    the deltas the client can order for itself.
+
+    Subscribing before the read is what keeps a concurrent library save from
+    falling into the gap, and an entry's edit version makes re-delivering one
+    the snapshot already carries a no-op. Every other delta is unversioned: one
+    published *before* the snapshot read and delivered after it would move the
+    client backwards, which is worse than the missed update it replaces. Those
+    are dropped here, exactly as the gap dropped them before — the snapshot is
+    already newer than any of them.
+    """
+    while True:
+        try:
+            event = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
+        if event.type in VERSION_ORDERED_TYPES:
+            await _send_envelope(websocket, next(seq), event.type, event.payload)
+
+
+async def _deliver_snapshot(
+    websocket: WebSocket, seq: itertools.count, engine: Engine
+) -> None:
+    """Assemble and send the authoritative replacement snapshot."""
     projects_payload = [asdict(p) for p in list_projects(engine)]
     # Global model profiles (ADR-0025), sorted by name: the same authoritative
     # replacement the projects registry gets.
     model_profiles_payload = [asdict(p) for p in list_model_profiles(engine)]
-    # The installed workflow catalog (ADR-0026, ADR-0028). Definitions ship
-    # with the daemon, so it rides in the snapshot and has no change event: it
-    # cannot change while the process runs. Each entry names the revision that
-    # name currently resolves to; a *task's* revision is on the task.
-    workflow_catalog_payload = [asdict(d) for d in describe_catalog()]
+    # The workflow library and the launch catalog it implies (ADR-0031),
+    # derived from one read so the two cannot disagree. The library is every
+    # entry — draft-only, archived, and damaged included — while the catalog is
+    # only what a new launch may actually select. Both change while the daemon
+    # runs, so both are also delivered incrementally by
+    # `workflow_library_updated`; each entry names the revision that name
+    # currently resolves to, and a *task's* revision is on the task.
+    library_entries = list_entries(engine)
+    workflow_library_payload = [asdict(entry) for entry in library_entries]
+    workflow_catalog_payload = [
+        asdict(d) for d in launchable_descriptors(library_entries)
+    ]
     tasks_payload = [task_payload(t, engine=engine) for t in list_tasks(engine)]
     # Session statuses ride separately from task rows (design D-4), nested
     # task → session (workflow-engine design D-7); JSON object keys are
@@ -126,6 +196,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         {
             "projects": projects_payload,
             "model_profiles": model_profiles_payload,
+            "workflow_library": workflow_library_payload,
             "workflow_catalog": workflow_catalog_payload,
             "tasks": tasks_payload,
             "sessions": sessions_payload,
@@ -138,20 +209,6 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             "settings": settings,
         },
     )
-
-    queue = events.subscribe()
-    forwarder = asyncio.create_task(_forward_events(websocket, queue, seq))
-    try:
-        while True:
-            message = await websocket.receive()
-            if message["type"] == "websocket.disconnect":
-                break
-    finally:
-        forwarder.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await forwarder
-        events.unsubscribe(queue)
-        websocket.app.state.ws_connections.discard(websocket)
 
 
 async def _forward_agent_events(

@@ -736,6 +736,13 @@ def _require_str(data: Mapping[str, Any], key: str, location: str) -> str:
     return value
 
 
+def is_slug_name(value: str) -> bool:
+    """The identifier shape a workflow, step, session, result, or evidence
+    alias uses. Public so the library can refuse a bad entry name with the
+    same rule the loader would apply to the document."""
+    return bool(_SLUG_RE.match(value))
+
+
 def _require_slug(data: Mapping[str, Any], key: str, location: str) -> str:
     value = _require_str(data, key, location)
     if not _SLUG_RE.match(value):
@@ -1904,6 +1911,252 @@ def load_definition(text: str) -> WorkflowRevision:
 def load_canonical_document(document: Mapping[str, Any]) -> WorkflowDefinition:
     """Re-validate a retained canonical document before executing it."""
     return definition_from_document(document)
+
+
+# --- YAML emission (ADR-0031) -------------------------------------------------
+# The inverse of the loader, for exporting a retained revision as a standalone
+# definition an operator can read, keep, and import again.
+#
+# Two rules make that honest. Every string is emitted *quoted* — block style
+# for multiline text, double quotes otherwise — because the loader resolves an
+# unquoted scalar under JSON's rules, so a prompt containing `yes`, `2026-09-07`,
+# or `1.0` must never come back as a boolean, a date-shaped string it wasn't,
+# or a number. And the result is loaded again before it is returned: an export
+# that does not reproduce the revision's own content identity is a bug, not
+# output.
+#
+# Formatting and comments are not preserved. A revision is a canonical
+# document, not the text somebody typed; the entry's draft holds that text.
+
+
+class _WorkflowDumper(yaml.SafeDumper):
+    """Emits only what the loader accepts: no anchors, aliases, or tags."""
+
+    def ignore_aliases(self, data: Any) -> bool:
+        return True
+
+
+def _plain_scalar_is_text(raw: str) -> bool:
+    """True when the loader would read this plain scalar back as this exact
+    string, rather than as null, a boolean, or a number."""
+    if raw in ("", "null", "true", "false"):
+        return False
+    if _INT_RE.match(raw):
+        return False
+    return not (_FLOAT_RE.match(raw) and ("." in raw or "e" in raw or "E" in raw))
+
+
+def _represent_str(dumper: yaml.SafeDumper, data: str) -> yaml.ScalarNode:
+    """Block style for multiline text, plain where that reads back unchanged,
+    quoted otherwise.
+
+    The emitter narrows this further on its own — a string it cannot write as
+    a block scalar or as a plain one is quoted — and every style it can fall
+    back to is a quoted style, which the loader always reads as a string.
+    """
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    style = "" if _plain_scalar_is_text(data) else '"'
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+
+
+_WorkflowDumper.add_representer(str, _represent_str)
+
+
+def _emit(document: Mapping[str, Any]) -> str:
+    return yaml.dump(
+        dict(document),
+        Dumper=_WorkflowDumper,
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=True,
+        # Effectively unlimited: line folding is lossless, but an unfolded
+        # document is what an operator can diff and edit.
+        width=1_000_000,
+    )
+
+
+def _export_value(document: Mapping[str, Any]) -> dict[str, Any]:
+    op = document["op"]
+    if op == "latest":
+        out: dict[str, Any] = {"op": "latest", "steps": list(document["steps"])}
+        if document["after"] is not None:
+            out["after"] = document["after"]
+        if document["with_outcome"]:
+            out["with_outcome"] = True
+        return out
+    if op == "get":
+        return {
+            "op": "get",
+            "value": _export_value(document["value"]),
+            "keys": list(document["keys"]),
+        }
+    if op == "coalesce":
+        return {
+            "op": "coalesce",
+            "values": [_export_value(item) for item in document["values"]],
+        }
+    # `literal`, `input`, `evidence`, `count`: nothing optional, and a
+    # literal's payload is the author's own data — never normalized, never
+    # pruned.
+    return dict(document)
+
+
+def _export_predicate(document: Any) -> Any:
+    if isinstance(document, bool):
+        return document
+    op = document["op"]
+    if op in COMPARISONS:
+        return {
+            "op": op,
+            "left": _export_value(document["left"]),
+            "right": _export_value(document["right"]),
+        }
+    if op == "exists":
+        return {"op": "exists", "value": _export_value(document["value"])}
+    if op == "is_type":
+        return {
+            "op": "is_type",
+            "value": _export_value(document["value"]),
+            "type": document["type"],
+        }
+    if op == "not":
+        return {"op": "not", "of": _export_predicate(document["of"])}
+    return {"op": op, "of": [_export_predicate(item) for item in document["of"]]}
+
+
+_EMPTY_TEXT_DOCUMENT = {"separator": "", "parts": []}
+
+
+def _export_text(document: Mapping[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if document["separator"]:
+        out["separator"] = document["separator"]
+    parts: list[dict[str, Any]] = []
+    for part in document["parts"]:
+        if "text" in part:
+            parts.append({"text": part["text"]})
+        elif "value" in part:
+            emitted: dict[str, Any] = {"value": _export_value(part["value"])}
+            if part["format"] != "text":
+                emitted["format"] = part["format"]
+            parts.append(emitted)
+        else:
+            conditional: dict[str, Any] = {
+                "if": _export_predicate(part["if"]),
+                "then": _export_text(part["then"]),
+            }
+            if part["else"] != _EMPTY_TEXT_DOCUMENT:
+                conditional["else"] = _export_text(part["else"])
+            parts.append(conditional)
+    out["parts"] = parts
+    return out
+
+
+def _export_selectors(document: Mapping[str, Any]) -> dict[str, Any]:
+    selectors: dict[str, Any] = {}
+    for alias, selector in document.items():
+        emitted: dict[str, Any] = {"steps": list(selector["steps"])}
+        if selector["after"] is not None:
+            emitted["after"] = selector["after"]
+        if not selector["with_outcome"]:
+            emitted["with_outcome"] = False
+        if not selector["required"]:
+            emitted["required"] = False
+        selectors[alias] = emitted
+    return selectors
+
+
+def _export_outcome(document: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if document is None:
+        return None
+    return {
+        "results": {
+            name: ({"required": dict(contract["required"])} if contract["required"] else {})
+            for name, contract in document["results"].items()
+        }
+    }
+
+
+def _export_step(document: Mapping[str, Any], version: int) -> dict[str, Any]:
+    out: dict[str, Any] = {"name": document["name"], "kind": document["kind"]}
+    if document["max_visits"] is not None:
+        out["max_visits"] = document["max_visits"]
+        out["on_exhausted"] = document["on_exhausted"]
+    if version >= 2 and document["evidence"]:
+        out["evidence"] = _export_selectors(document["evidence"])
+    kind = document["kind"]
+    if kind == "agent":
+        out["session"] = document["session"]
+        if document["role"] != DEFAULT_ROLE:
+            out["role"] = document["role"]
+        if version == 1:
+            if document["expects_outcome"]:
+                out["expects_outcome"] = True
+        else:
+            out["outcome"] = _export_outcome(document["outcome"])
+        if document["when"] is not True:
+            out["when"] = _export_predicate(document["when"])
+        # Last: the prompt is the block an author reads, so it belongs under
+        # the fields that say which step this is.
+        out["prompt"] = _export_text(document["prompt"])
+    elif kind == "command":
+        out["argv"] = list(document["argv"])
+        if document["timeout"] != DEFAULT_COMMAND_TIMEOUT:
+            out["timeout"] = document["timeout"]
+        out["idempotent"] = True
+    elif kind == "decision":
+        out["cases"] = [
+            {"when": _export_predicate(case["when"]), "next": dict(case["next"])}
+            for case in document["cases"]
+        ]
+        out["otherwise"] = dict(document["otherwise"])
+    else:
+        if version >= 2:
+            out["choices"] = [dict(choice) for choice in document["choices"]]
+        out["message"] = _export_text(document["message"])
+    return out
+
+
+def export_document(document: Mapping[str, Any]) -> dict[str, Any]:
+    """A canonical document with its defaulted fields left implicit.
+
+    Normalization puts every default back, so this changes the bytes and not
+    the meaning: the exported document loads to the same definition and the
+    same content identity. It exists because the canonical form spells out
+    every default, and a document that repeats `role: default`, `when: true`,
+    and `evidence: {}` on every step is one an operator cannot read.
+    """
+    version = document["format"]
+    return {
+        "format": version,
+        "name": document["name"],
+        "sessions": list(document["sessions"]),
+        "primary": document["primary"],
+        "steps": [_export_step(step, version) for step in document["steps"]],
+    }
+
+
+def export_yaml(revision: WorkflowRevision) -> str:
+    """One retained revision as a standalone YAML definition.
+
+    Verified before it is returned: the emitted text is loaded back through
+    the production loader and must reproduce this revision's identity. If the
+    readable form somehow cannot, the fully explicit canonical document is
+    emitted instead — and if *that* fails, the export is refused rather than
+    handing an operator a file that would import as a different procedure.
+    """
+    for candidate in (export_document(revision.document), revision.document):
+        text = _emit(candidate)
+        try:
+            reloaded = load_definition(text)
+        except WorkflowDocumentError:
+            continue
+        if reloaded.revision == revision.revision:
+            return text
+    raise WorkflowDocumentError(  # pragma: no cover - a serializer bug, not input
+        "", "this definition cannot be serialized back to YAML"
+    )
 
 
 # --- evaluation ---------------------------------------------------------------

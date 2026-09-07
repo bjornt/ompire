@@ -657,13 +657,30 @@ steps:
 """
 
 
-def _install_format_1_bugfix() -> None:
-    """Make the process catalog's `bugfix` a format-1 definition."""
-    from ompire_daemon.workflow_definitions import load_definition
-    from ompire_daemon.workflows import catalog, install_definition
+def _install_format_1_bugfix(engine) -> None:
+    """Point the built-in `bugfix` entry at a format-1 definition.
 
-    catalog()  # load the packaged set first, then shadow one entry
-    install_definition(load_definition(LEGACY_FORMAT_1_BUGFIX))
+    The daemon this task is upgrading from shipped a format-1 `bugfix`, so
+    that is what its library entry has to say for the continuation candidate
+    to be the one the operator would actually be offered. Written straight to
+    the entry because built-ins are package-owned: no operator API can do
+    this, and startup has already run.
+    """
+    from sqlalchemy import text as sa_text
+
+    from ompire_daemon.registry.workflow_definitions import insert_revision
+    from ompire_daemon.workflow_definitions import load_definition
+
+    revision = load_definition(LEGACY_FORMAT_1_BUGFIX)
+    with engine.begin() as conn:
+        insert_revision(conn, revision)
+        conn.execute(
+            sa_text(
+                "UPDATE workflow_library SET current_revision = :rev "
+                "WHERE name = 'bugfix'"
+            ),
+            {"rev": revision.revision},
+        )
 
 def _seed_legacy_bugfix_at_a_synthesized_gate(config: Config, checkout: Path) -> int:
     """A bugfix task parked exactly as the pre-ADR-0028 engine left one.
@@ -789,11 +806,11 @@ def test_an_old_synthesized_escalation_gate_retries_the_decision(
     confirmation the waiting record becomes an uncertainty pause whose action
     retries the decision — never the old fall-through to the next step.
     """
-    _install_format_1_bugfix()
     _land_at_0012(daemon_config)
     _seed(daemon_config, git_checkout, [{"name": "t"}])
     task_id = _seed_legacy_bugfix_at_a_synthesized_gate(daemon_config, git_checkout)
     app = create_app(daemon_config, frontend_dist=daemon_config.data_dir / "no-dist")
+    _install_format_1_bugfix(app.state.engine)
     from ompire_daemon.registry.model_profiles import create_model_profile
 
     create_model_profile(app.state.engine, name="chosen", roles=TEST_ROLES)

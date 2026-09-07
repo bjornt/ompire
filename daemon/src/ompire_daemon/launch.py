@@ -58,8 +58,12 @@ from ompire_daemon.registry.projects import (
     validate_branch_pattern,
     validate_workshop_additions,
 )
+from ompire_daemon.registry.workflow_library import (
+    UnknownWorkflowNameError,
+    WorkflowNotLaunchableError,
+    resolve_current,
+)
 from ompire_daemon.workflow_definitions import WorkflowRevision, describe
-from ompire_daemon.workflows import UnknownWorkflowNameError, current_revision
 
 
 class LaunchInputError(ValueError):
@@ -526,9 +530,15 @@ def resolve_launch(conn: Connection, request: LaunchRequest) -> ResolvedLaunch:
             "reconciliation; resolve it in the project editor before launching",
         )
 
+    # The library's current selection for this name, read on *this*
+    # connection (ADR-0031). Inside acceptance that connection holds the write
+    # reservation, so an executable save or an archive committing alongside
+    # cannot land between the check and the pin. An archived, draft-only, or
+    # damaged entry refuses the launch and says which — it never resolves to
+    # some other revision.
     try:
-        revision = current_revision(request.workflow_name)
-    except UnknownWorkflowNameError as exc:
+        revision = resolve_current(conn, request.workflow_name)
+    except (UnknownWorkflowNameError, WorkflowNotLaunchableError) as exc:
         raise LaunchInputError("workflow_name", str(exc)) from exc
 
     reader = _ProfileReader(conn)

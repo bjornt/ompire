@@ -146,6 +146,44 @@ workflow_revisions = Table(
     Index("ix_workflow_revisions_workflow_name", "workflow_name"),
 )
 
+# The operator-owned workflow library (ADR-0031): which procedures exist, what
+# each one's editable text says, and which retained revision a *new* launch of
+# that name would pin. Deliberately a separate table from `workflow_revisions`
+# above: revisions are append-only executable documents, and this is the
+# mutable selection over them.
+#
+# `draft_yaml` is inert text — whatever the operator last saved in the editor,
+# possibly invalid, possibly empty, and never executed. NULL for a built-in,
+# whose text comes from the package.
+#
+# `current_revision` is the entry's executable choice, NULL for a draft-only
+# entry. The named, non-cascading FK is schema metadata; the runtime guarantee
+# is the write reservation, because this connection does not enable
+# `PRAGMA foreign_keys`. Nothing here ever deletes a revision row.
+#
+# `version` is the *edit* version, advanced by every successful mutation
+# including a comment-only draft save. It is what two tabs compare, and it is
+# deliberately not the content revision: identical semantics under a changed
+# comment is the same procedure but a different edit.
+workflow_library = Table(
+    "workflow_library",
+    metadata,
+    Column("name", String, primary_key=True),
+    Column("origin", String, nullable=False),
+    Column("draft_yaml", Text, nullable=True),
+    Column(
+        "current_revision",
+        String,
+        ForeignKey("workflow_revisions.revision", name="fk_workflow_library_revision"),
+        nullable=True,
+    ),
+    Column("archived", Integer, nullable=False, server_default="0"),
+    Column("version", Integer, nullable=False, server_default="1"),
+    Column("created_at", String, nullable=False),
+    Column("updated_at", String, nullable=False),
+    Index("ix_workflow_library_current_revision", "current_revision"),
+)
+
 tasks = Table(
     "tasks",
     metadata,

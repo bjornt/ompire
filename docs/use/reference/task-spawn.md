@@ -7,10 +7,11 @@ branch, and a running container. It is the boundary between "a task record
 exists" and "an agent can work".
 
 A launch is three choices: a workflow, a project, and a model profile. Every
-registered workflow is available to every ready project, and there is no saved
+launchable workflow is available to every ready project, and there is no saved
 preset in between — see [Model profiles](model-profiles.md) for what a profile
-binds and [Projects](projects.md) for the workspace defaults a launch
-inherits.
+binds, [Projects](projects.md) for the workspace defaults a launch inherits, and
+[Workflow engine](workflow-engine.md#the-workflow-library) for the library the
+workflows themselves come from.
 
 Launching is two calls. `POST /api/tasks/preview` resolves the selections and
 returns what would run; `POST /api/tasks` submits the same selections plus the
@@ -24,7 +25,7 @@ Both calls accept:
 | Field | Required | Meaning |
 |---|---|---|
 | `project_name` | yes | The project to work against |
-| `workflow_name` | yes | Any installed workflow. The launch pins that name's current revision. |
+| `workflow_name` | yes | A launchable library entry: not archived, and with a current revision that reads back as an executable definition. The launch pins that revision. An unknown, archived, draft-only, or unreadable name is refused on this field |
 | `slug` | yes | Task slug; the branch is derived from it |
 | `prompt` | yes | The operator's instruction, including any `@file` mentions |
 | `model_profile` | no | Omitted means "inherit the project default"; a name replaces that inheritance for this task |
@@ -144,7 +145,9 @@ will carry.
 The controls are rendered from the daemon's workflow catalog rather than from
 the resolution, so a row whose selected profile has since been deleted stays on
 screen — with that profile still shown, marked unavailable — and can be
-corrected. Ompire never silently re-picks a profile for you.
+corrected. Ompire never silently re-picks a profile for you, and it never
+re-picks a workflow either: one archived under an open form stays selected and
+named, with the reason and a link to the library, and submission is disabled.
 
 Rows follow the task profile only while they are inherited: changing the task
 profile moves every inherited row and leaves explicit ones alone. An explicit
@@ -152,6 +155,12 @@ choice equal to what would have been inherited is still explicit. Changing the
 workflow clears every row choice and says which were cleared; nothing transfers
 by position or by a coincidentally matching name, and the slug, prompt, task
 profile, and workspace overrides stay.
+
+Saving a new executable revision of the *selected* workflow does the same, for
+the same reason: the steps may have moved. The form re-resolves against the new
+revision and keeps everything that is not workflow-scoped. Editing only that
+workflow's draft changes nothing about what would run, so it re-resolves nothing
+and clears nothing.
 
 Thinking is shown as the policy the profile states. omp resolves `auto` and
 `max` to a model-specific level at run time; [task detail](task-detail.md)
@@ -196,9 +205,10 @@ resolution to look at and submit again, never as an automatic retry. If the
 accepted task is deleted or purged while the form is locked, the form unlocks
 and says so.
 
-Leaving the form to create a model profile in Settings keeps the draft: coming
-back restores the workflow, project, slug, prompt, and every override,
-including the per-row choices.
+Leaving the form to create a model profile in Settings — or to save a workflow
+in Workflows — keeps the draft: coming back restores the workflow, project,
+slug, prompt, and every override, including the per-row choices. Arriving from a
+workflow's **Launch in Spawn** selects that workflow and keeps the rest.
 
 ## File mentions
 

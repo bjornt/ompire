@@ -31,6 +31,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         assert payload.keys() == {
             "projects",
             "model_profiles",
+            "workflow_library",
             "workflow_catalog",
             "tasks",
             "sessions",
@@ -44,8 +45,15 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         }
         assert payload["projects"] == []
         assert payload["model_profiles"] == []
-        # Definitions ship with the daemon (ADR-0028): the catalog is in the
-        # snapshot and has no change event, because it cannot change.
+        # The library is what exists; the catalog is what a launch may select
+        # (ADR-0031). Both come from one read, so a fresh install shows the two
+        # packaged built-ins in both, each carrying its current revision.
+        assert [w["name"] for w in payload["workflow_library"]] == [
+            "bugfix",
+            "single-step",
+        ]
+        assert {w["origin"] for w in payload["workflow_library"]} == {"builtin"}
+        assert all(w["available"] for w in payload["workflow_library"])
         assert [w["name"] for w in payload["workflow_catalog"]] == [
             "bugfix",
             "single-step",
@@ -383,3 +391,168 @@ def test_snapshot_serves_durable_review_history_with_no_live_process(
     assert review["port"] is None
     assert [it["outcome"] for it in review["iterations"]] == ["comments", "approved"]
     assert review["iterations"][0]["comment_count"] == 2
+
+
+MINIMAL_WORKFLOW = """
+format: 1
+name: custom
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    prompt:
+      parts:
+        - text: "do it"
+"""
+
+
+def _library_events(ws, count: int) -> list[dict]:
+    events = []
+    while len(events) < count:
+        message = ws.receive_json()
+        if message["type"] == "workflow_library_updated":
+            events.append(message["payload"])
+    return events
+
+
+def test_every_library_mutation_reaches_a_connected_client(
+    client: TestClient, auth_token: str, auth_headers: dict[str, str]
+) -> None:
+    """The library is editable now (ADR-0031), so it needs deltas.
+
+    One full-entry upsert per committed mutation, each carrying a higher edit
+    version than the last, and each saying whether the entry is still a launch
+    choice — the receiver derives the catalog from that rather than from a
+    second event.
+    """
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        ws.receive_json()  # snapshot
+
+        created = client.post(
+            "/api/workflow-library",
+            headers=auth_headers,
+            json={"name": "custom", "yaml": MINIMAL_WORKFLOW},
+        )
+        assert created.status_code == 201, created.text
+        version = created.json()["entry"]["version"]
+
+        saved = client.post(
+            "/api/workflow-library/custom/revisions",
+            headers=auth_headers,
+            json={"yaml": MINIMAL_WORKFLOW, "expected_version": version},
+        )
+        assert saved.status_code == 200, saved.text
+
+        archived = client.post(
+            "/api/workflow-library/custom/archive",
+            headers=auth_headers,
+            json={"expected_version": saved.json()["entry"]["version"]},
+        )
+        assert archived.status_code == 200, archived.text
+
+        create_event, save_event, archive_event = _library_events(ws, 3)
+
+    # A draft cannot launch, so the first upsert offers no descriptor.
+    assert create_event["name"] == "custom"
+    assert create_event["descriptor"] is None
+    assert create_event["unavailable_reason"] == "draft_only"
+    # The executable save makes it eligible, and the payload carries the shape
+    # a launch form would render.
+    assert save_event["descriptor"]["name"] == "custom"
+    assert save_event["available"] is True
+    # Archiving withdraws it in the same event that reports the change.
+    assert archive_event["descriptor"] is None
+    assert archive_event["archived"] is True
+    versions = [e["version"] for e in (create_event, save_event, archive_event)]
+    assert versions == sorted(versions) and len(set(versions)) == 3
+
+
+def test_a_mutation_during_snapshot_delivery_is_not_lost(
+    client: TestClient, auth_token: str, auth_headers: dict[str, str]
+) -> None:
+    """A save committing while a snapshot is being assembled must still reach
+    the client.
+
+    The socket subscribes before it reads, so the worst case is an entry
+    delivered twice — which the entry's edit version makes idempotent — rather
+    than an entry delivered never.
+    """
+    client.post(
+        "/api/workflow-library",
+        headers=auth_headers,
+        json={"name": "custom", "yaml": MINIMAL_WORKFLOW},
+    )
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        snapshot = ws.receive_json()["payload"]
+        names = [e["name"] for e in snapshot["workflow_library"]]
+        assert names == ["bugfix", "custom", "single-step"]
+
+        entry = next(e for e in snapshot["workflow_library"] if e["name"] == "custom")
+        client.post(
+            "/api/workflow-library/custom/revisions",
+            headers=auth_headers,
+            json={"yaml": MINIMAL_WORKFLOW, "expected_version": entry["version"]},
+        )
+        [event] = _library_events(ws, 1)
+        assert event["version"] > entry["version"]
+        assert event["available"] is True
+
+
+async def test_a_snapshot_overlap_forwards_only_what_a_client_can_order() -> None:
+    """What subscribing before the snapshot read is allowed to deliver.
+
+    A library entry carries an edit version, so re-delivering one the snapshot
+    already holds is a no-op the client drops — which is why it is safe to
+    forward, and why a genuinely newer one is not lost. Every other delta is
+    unversioned: one published *before* the snapshot was read and delivered
+    after it would move the client backwards, which is worse than the missed
+    update it replaces. Those are dropped here exactly as the pre-subscription
+    gap dropped them, because the snapshot is already newer than all of them.
+    """
+    import asyncio
+    import itertools
+
+    from ompire_daemon.api.ws import _drain_snapshot_overlap
+    from ompire_daemon.events import Event
+
+    queue: asyncio.Queue = asyncio.Queue()
+    for event in (
+        Event("task_updated", {"id": 1}),
+        Event("workflow_library_updated", {"name": "custom", "version": 3}),
+        Event("settings_changed", {"settings": {}}),
+        Event("workflow_library_updated", {"name": "custom", "version": 4}),
+    ):
+        queue.put_nowait(event)
+
+    sent: list[tuple[str, object]] = []
+
+    class _Recorder:
+        async def send_json(self, envelope: dict) -> None:
+            sent.append((envelope["type"], envelope["payload"]))
+
+    await _drain_snapshot_overlap(_Recorder(), queue, itertools.count())
+
+    assert [t for t, _ in sent] == [
+        "workflow_library_updated",
+        "workflow_library_updated",
+    ]
+    # In publication order, so the client's version check sees the newer last.
+    assert [p["version"] for _, p in sent] == [3, 4]
+    assert queue.empty()
+
+
+def test_a_reconnect_replaces_the_library_projection(
+    client: TestClient, auth_token: str, auth_headers: dict[str, str]
+) -> None:
+    client.post(
+        "/api/workflow-library",
+        headers=auth_headers,
+        json={"name": "custom", "yaml": MINIMAL_WORKFLOW},
+    )
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        first = ws.receive_json()["payload"]["workflow_library"]
+    with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
+        again = ws.receive_json()["payload"]["workflow_library"]
+    assert first == again

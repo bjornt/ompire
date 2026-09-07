@@ -48,6 +48,7 @@ relying on it.
 | [0028](0028-retain-declarative-workflow-revisions.md) | Retain declarative workflow revisions and pin them to tasks | Accepted |
 | [0029](0029-declare-domain-outcomes-and-evidence-handoffs.md) | Declare domain outcomes and bind evidence to the attempt that used it | Accepted |
 | [0030](0030-commit-human-decisions-before-advancing.md) | Commit a human decision before the run advances | Accepted |
+| [0031](0031-let-operators-own-a-workflow-library-above-retained-revisions.md) | Let operators own a workflow library above retained revisions | Accepted |
 
 ## Template
 

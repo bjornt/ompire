@@ -307,8 +307,9 @@ document ([ADR-0028](../../adr/0028-retain-declarative-workflow-revisions.md)).
 
 Append-only: there is no update, no delete, and no garbage collection. A task
 points at a revision, and that revision must keep meaning what it meant for as
-long as the task is inspectable — including after the packaged definition
-changes and after the name leaves a later release's catalog.
+long as the task is inspectable — including after the library's current
+selection for that name moves on, after the entry is archived, and after the
+name leaves a later release's packaged set.
 
 The whole document is stored, not a summary: an identifier alone would name a
 definition nobody could still read. A row is decoded, re-validated, and
@@ -322,6 +323,51 @@ row. NULL means *not recorded*, which is the truthful value: no pre-upgrade
 attempt froze a binding and no pre-upgrade run declared an ending. Backfilling
 an empty binding map, or a terminal result inferred from a `complete` status,
 would manufacture history.
+
+## `workflow_library`
+
+The mutable selection over those append-only revisions
+([ADR-0031](../../adr/0031-let-operators-own-a-workflow-library-above-retained-revisions.md)):
+one row per workflow name, holding what an operator owns.
+
+| Column | Type | Notes |
+|---|---|---|
+| `name` | string | Primary key. Permanent — renaming means a separate entry |
+| `origin` | string | `builtin` (packaged, read-only) or `custom` |
+| `draft_yaml` | text | The editor's raw text, exactly as submitted. NULL for a built-in, whose text is in the package |
+| `current_revision` | string | FK to `workflow_revisions.revision`; NULL for a draft-only entry |
+| `archived` | integer | 0/1. Out of launch choices, deleting nothing |
+| `version` | integer | The **edit** version. Advances on every successful mutation |
+| `created_at`, `updated_at` | string | ISO-8601 |
+
+`draft_yaml` is inert. Any UTF-8 within the 1 MiB document limit is stored
+verbatim — empty, invalid, or unsafe-looking alike — and nothing in the daemon
+parses it. Startup never reads it, so a broken draft cannot keep the daemon from
+starting or take a launchable workflow away.
+
+`version` is deliberately not `current_revision`. A revision is a digest of
+normalized semantics, so a comment-only edit does not move it; every mutation of
+an existing entry compares this counter instead, inside the write reservation
+that performs the write. As elsewhere in this schema the FK is metadata only —
+the runtime guarantee is that reservation, because `PRAGMA foreign_keys` is not
+enabled (see [Reference safety](#reference-safety-without-global-fk-enforcement)).
+
+An executable save inserts the retained revision and updates
+`current_revision`, `draft_yaml`, and `version` in **one** transaction, so a
+restart cannot expose a retained document nothing selected or a selection
+pointing at a document that was never written. Nothing here deletes a revision
+row; archive and restore only flip `archived`.
+
+Built-in rows are synchronized at startup from the definitions the running
+package ships. A name the package stops shipping keeps its row and its history
+with `current_revision` set to NULL — unlaunchable, not deleted. A packaged name
+an operator's custom entry already owns is reported and skipped: the custom row
+is left untouched, and the daemon still starts.
+
+Migration `0017` creates the table empty. It copies nothing out of
+`workflow_revisions` and invents no built-in row: a migration cannot know what
+the *next* start will ship, and guessing would file a built-in under a revision
+this package never contained.
 
 ## `reviews`
 

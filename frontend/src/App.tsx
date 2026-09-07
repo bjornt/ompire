@@ -9,6 +9,8 @@ import { NotFoundView } from "./routes/NotFoundView";
 import { SpawnView } from "./routes/SpawnView";
 import { ProjectsView } from "./routes/ProjectsView";
 import { SettingsView } from "./routes/SettingsView";
+import { WorkflowsView } from "./routes/WorkflowsView";
+import { WorkflowDetailView } from "./routes/WorkflowDetailView";
 
 export function App() {
   return (
@@ -20,6 +22,8 @@ export function App() {
             <Route path="/tasks" element={<TasksView />} />
             <Route path="/tasks/:id" element={<TaskDetailView />} />
             <Route path="/projects" element={<ProjectsView />} />
+            <Route path="/workflows" element={<WorkflowsView />} />
+            <Route path="/workflows/:name" element={<WorkflowDetailView />} />
             <Route path="/spawn" element={<SpawnView />} />
             <Route path="/ship" element={<ShipIndexView />} />
             <Route path="/ship/:id" element={<ShipFlowView />} />

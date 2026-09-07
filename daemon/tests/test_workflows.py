@@ -34,6 +34,13 @@ from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.sessions import get_session
 from ompire_daemon.registry.tasks import Task, create_task, get_task, task_payload
+from ompire_daemon.registry.workflow_library import (
+    UnknownWorkflowNameError,
+    WorkflowNotLaunchableError,
+    list_entries,
+    resolve_current,
+    set_archived,
+)
 from ompire_daemon.registry.workflows import (
     WorkflowGateChoiceError,
     WorkflowWaitConflictError,
@@ -47,11 +54,8 @@ from ompire_daemon.taskdefinition import (
 )
 from ompire_daemon.workflows import (
     COMPLETE,
-    UnknownWorkflowNameError,
     WorkflowNotWaitingError,
     WorkflowRunner,
-    catalog_names,
-    current_revision,
 )
 from tests.conftest import (
     TEST_ROLES,
@@ -119,6 +123,7 @@ def _make_task(
         prompt=prompt,
         workflow_name=workflow,
         execution_inputs=make_execution_inputs(
+            engine=engine,
             checkout_path=str(tmp_path / "checkout"),
             workflow_name=workflow,
             preamble=preamble,
@@ -418,16 +423,18 @@ def branch_workflow(engine: Engine, fake_workshop_cli: Path):
     return install_test_workflow(engine, BRANCH_YAML)
 
 
-# --- the catalog and the pinned revision (ADR-0028) ---------------------------
+# --- the library and the pinned revision (ADR-0028, ADR-0031) -----------------
 
 
-def test_the_packaged_definitions_are_the_catalog() -> None:
-    assert catalog_names() == ("bugfix", "single-step")
-    revision = current_revision("single-step")
-    assert revision.revision.startswith("sha256:")
-    assert revision.definition.primary == "main"
-    with pytest.raises(UnknownWorkflowNameError):
-        current_revision("no-such-workflow")
+def test_the_packaged_definitions_are_the_builtin_entries(engine: Engine) -> None:
+    assert [entry.name for entry in list_entries(engine)] == ["bugfix", "single-step"]
+    assert {entry.origin for entry in list_entries(engine)} == {"builtin"}
+    with engine.connect() as conn:
+        revision = resolve_current(conn, "single-step")
+        assert revision.revision.startswith("sha256:")
+        assert revision.definition.primary == "main"
+        with pytest.raises(UnknownWorkflowNameError):
+            resolve_current(conn, "no-such-workflow")
 
 
 def test_a_broken_packaged_definition_stops_the_daemon(
@@ -451,7 +458,6 @@ def test_a_broken_packaged_definition_stops_the_daemon(
     monkeypatch.setattr(
         workflows_module.resources, "files", lambda _package: _BadPackage()
     )
-    workflows_module.reset_catalog()
     with pytest.raises(workflows_module.PackagedWorkflowError, match="is invalid"):
         workflows_module.load_packaged_workflows()
 
@@ -472,14 +478,13 @@ def test_a_missing_packaged_resource_stops_the_daemon(
     monkeypatch.setattr(
         workflows_module.resources, "files", lambda _package: _AbsentPackage()
     )
-    workflows_module.reset_catalog()
     with pytest.raises(workflows_module.PackagedWorkflowError, match="missing"):
         workflows_module.load_packaged_workflows()
 
 
 def test_launch_rejects_an_uninstalled_workflow(engine: Engine, project) -> None:
-    """The installed catalog is the only source of valid workflow names, and a
-    launch names one directly (ADR-0026)."""
+    """The library is the only source of valid workflow names, and a launch
+    names one directly (ADR-0026, ADR-0031)."""
     from ompire_daemon.launch import LaunchInputError, LaunchRequest, resolve_launch
 
     request = LaunchRequest(
@@ -501,10 +506,11 @@ async def test_a_running_task_keeps_its_revision_when_the_definition_changes(
 ) -> None:
     """The point of pinning, end to end.
 
-    A task is accepted under one definition; the installed definition is then
-    edited. The run still sends the prompt it was accepted with, still resolves
-    to its own revision, and the *new* revision is what a new launch would get.
-    Both revisions stay retained and readable at once.
+    A task is accepted under one definition; the library entry is then edited
+    and a new executable revision saved. The run still sends the prompt it was
+    accepted with, still resolves to its own revision, and the *new* revision
+    is what a new launch would get. Both revisions stay retained and readable
+    at once.
     """
     original = install_test_workflow(
         engine,
@@ -541,7 +547,8 @@ steps:
 """,
     )
     assert edited.revision != original.revision
-    assert current_revision("editable").revision == edited.revision
+    with engine.connect() as conn:
+        assert resolve_current(conn, "editable").revision == edited.revision
 
     runner, supervisor, _tracker, _hub, _scenario = rig
     _start(runner, engine, task)
@@ -559,12 +566,12 @@ steps:
     assert get_revision(engine, original.revision).revision == original.revision
     assert get_revision(engine, edited.revision).revision == edited.revision
 
-    # And the task survives its workflow *name* leaving the catalog entirely —
-    # a later release that drops a definition. Nothing resolves by name.
-    from ompire_daemon.workflows import uninstall_definition
-
-    uninstall_definition("editable")
-    assert "editable" not in catalog_names()
+    # And the task survives its workflow leaving the launch choices entirely —
+    # the entry is archived. Nothing resolves by name.
+    version = next(e.version for e in list_entries(engine) if e.name == "editable")
+    set_archived(engine, "editable", archived=True, expected_version=version)
+    with engine.connect() as conn, pytest.raises(WorkflowNotLaunchableError):
+        resolve_current(conn, "editable")
     clear_cache()
     still = resolve_task_definition(engine, get_task(engine, task.id))
     assert still.revision == original.revision
@@ -575,7 +582,7 @@ def test_a_task_whose_revision_is_unavailable_is_refused_not_substituted(
     engine: Engine, project, tmp_path: Path
 ) -> None:
     """A damaged or absent revision blocks *this* task and says why. It never
-    falls back to the catalog's current definition of the same name."""
+    falls back to the library's current definition of the same name."""
     from sqlalchemy import text as sa_text
 
     from ompire_daemon.registry.workflow_definitions import clear_cache
@@ -1767,7 +1774,8 @@ def test_a_retained_revision_is_readable_and_a_damaged_one_is_classified(
 
     from ompire_daemon.registry.workflow_definitions import clear_cache
 
-    revision = current_revision("bugfix").revision
+    with client.app.state.engine.connect() as conn:
+        revision = resolve_current(conn, "bugfix").revision
     response = client.get(f"/api/workflows/revisions/{revision}", headers=auth_headers)
     assert response.status_code == 200, response.text
     body = response.json()
@@ -2022,11 +2030,13 @@ def _failing_repro_script(fake_workshop_cli: Path) -> None:
     )
 
 
-def _bugfix_task(engine, tmp_path: Path, slug: str, **kwargs) -> Task:
+def _bugfix_task(
+    engine, tmp_path: Path, slug: str, workflow: str = "bugfix", **kwargs
+) -> Task:
     return _make_task(
         engine,
         tmp_path,
-        workflow="bugfix",
+        workflow=workflow,
         slug=slug,
         prompt="bug: off by one",
         **kwargs,
@@ -2569,12 +2579,24 @@ async def test_bugfix_exhausted_investigation_can_only_stop(
     assert final.workflow_result == "stopped-without-fix"
 
 
-async def test_bugfix_editing_the_catalog_does_not_touch_a_running_task(
+async def test_bugfix_editing_the_library_does_not_touch_a_running_task(
     rig, engine, project, tmp_path: Path
 ) -> None:
-    """The pinning property, restated for the new definition."""
+    """The pinning property, restated for the new definition.
+
+    The packaged `bugfix` is read-only, so the edit happens where an operator's
+    edits actually happen: a custom copy of it, saved as a new executable
+    revision while a task accepted under the old one is waiting at a gate.
+    """
+    packaged = (
+        resources.files("ompire_daemon.builtin_workflows")
+        .joinpath("bugfix.yaml")
+        .read_text(encoding="utf-8")
+        .replace("name: bugfix", "name: my-bugfix", 1)
+    )
+    install_test_workflow(engine, packaged)
     runner, supervisor, _tracker, _hub, _scenario = rig
-    task = _bugfix_task(engine, tmp_path, "bugfix-pinned")
+    task = _bugfix_task(engine, tmp_path, "bugfix-pinned", workflow="my-bugfix")
     pinned = resolve_task_definition(engine, task).revision
     clone = Path(task.clone_path)
     driver = _feed(
@@ -2588,15 +2610,12 @@ async def test_bugfix_editing_the_catalog_does_not_touch_a_running_task(
     await driver
 
     gate_before = list_step_records(engine, task.id)[-1].outcome
-    # Edit the catalog under the running task: a different label on a choice.
-    edited = (
-        resources.files("ompire_daemon.builtin_workflows")
-        .joinpath("bugfix.yaml")
-        .read_text(encoding="utf-8")
-        .replace("label: Stop without a fix", "label: Abandon it")
+    # Edit the library under the running task: a different label on a choice.
+    install_test_workflow(
+        engine, packaged.replace("label: Stop without a fix", "label: Abandon it")
     )
-    install_test_workflow(engine, edited)
-    assert current_revision("bugfix").revision != pinned
+    with engine.connect() as conn:
+        assert resolve_current(conn, "my-bugfix").revision != pinned
 
     # The waiting question is unchanged, and answering it uses what it asked.
     assert list_step_records(engine, task.id)[-1].outcome == gate_before

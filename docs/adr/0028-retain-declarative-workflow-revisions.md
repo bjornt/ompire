@@ -4,6 +4,9 @@
 - Date: 2026-09-06
 
 Supersedes [ADR-0018](0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md).
+Extended by [ADR-0031](0031-let-operators-own-a-workflow-library-above-retained-revisions.md),
+which lifts the packaged-only catalog boundary below while keeping every
+revision rule here intact.
 
 ## Context
 
@@ -108,7 +111,10 @@ Confirmation governs future execution only; it starts nothing.
 
 In this change the catalog is still daemon-packaged definitions only. There is
 no project scan, upload, CRUD, or plugin loader, and a packaged definition that
-does not validate fails daemon startup.
+does not validate fails daemon startup. That boundary was explicitly temporary;
+[ADR-0031](0031-let-operators-own-a-workflow-library-above-retained-revisions.md)
+lifts it by adding an operator-owned library *above* these retained revisions,
+leaving them append-only and content-addressed exactly as described here.
 
 ## Consequences
 
@@ -153,8 +159,10 @@ orchestration semantics. It also does not claim exactly-once agent or tool
 execution — an idempotent command may re-run on recovery, which is why the
 format requires commands to declare it.
 
-Revisit this decision when definitions arrive from outside a daemon release, at
-which point the packaged-only catalog boundary is the thing that changes; when
+Revisit this decision when definitions arrive from outside a daemon release —
+which happened in
+[ADR-0031](0031-let-operators-own-a-workflow-library-above-retained-revisions.md),
+and changed only the packaged-only catalog boundary; when
 the operation set genuinely cannot express a needed workflow, which is a
 format-2 question; or if retained-document growth stops being negligible.
 

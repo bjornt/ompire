@@ -10,17 +10,26 @@ pauses, legacy continuation — see the operator reference,
 
 ## Where definitions live
 
+Definitions come from two places, and both end up in the same append-only
+store.
+
 Packaged definitions are YAML resources under
 `daemon/src/ompire_daemon/builtin_workflows/`, read through
 `importlib.resources` so an installed daemon finds them inside its own
 distribution. They are declared as a package (`__init__.py`) so packaging tools
 carry the `.yaml` files into the wheel; the snap installs that wheel, so no
-separate packaging step is needed.
+separate packaging step is needed. At startup they are retained and pointed at
+by their `builtin` library entries.
+
+Operator definitions arrive over the authoring API and are retained by an
+executable save. They are the same grammar read by the same loader; nothing
+about a definition is different because a person wrote it rather than the
+package.
 
 `workflow_definitions.py` owns the data model, the loader, canonicalization,
-and the evaluator. It imports nothing from the registry, the task model, or the
-supervisor: it answers "what does this document mean", and `workflows.py`
-answers "how is that carried out".
+YAML emission, and the evaluator. It imports nothing from the registry, the
+task model, or the supervisor: it answers "what does this document mean", and
+`workflows.py` answers "how is that carried out".
 
 ## The document
 
@@ -442,11 +451,60 @@ every retained format-1 revision still hashes to the identity it was filed
 under — a property `test_workflow_definitions.py` checks directly, because
 silent drift there would invalidate every pinned task at once.
 
+## Emitting YAML
+
+`export_yaml()` is the inverse of the loader, for handing a retained revision
+back as a file. Two rules make it honest.
+
+Every string is emitted quoted or as a block scalar unless emitting it plain
+would read back as the same string. The loader resolves an unquoted scalar
+under JSON's rules, so a prompt containing `true`, `1.0`, or `2026-09-07` must
+never come back as a boolean, a number, or something other than what was
+written. Anchors, aliases, and explicit tags are never emitted, because the
+loader refuses them.
+
+And the result is loaded again before it is returned: an export that does not
+reproduce the revision's own content identity is a bug, not output. That check
+is what makes the second rule safe — defaults are left implicit, so the file an
+operator reads is not `role: default`, `when: true`, and `evidence: {}` on every
+step. Normalization restores them without moving the digest. If the readable
+form somehow fails to round-trip, the fully explicit canonical document is
+emitted instead; if that fails too, the export is refused.
+
+Formatting and comments are not preserved. A revision is a canonical document;
+the text somebody typed lives in the library entry's draft, which is returned
+verbatim and separately.
+
 ## Retained storage
 
 `registry/workflow_definitions.py` owns the `workflow_revisions` table. It is
 append-only — no update, no delete — and reads are cached by *revision*, never
 by workflow name.
+
+`registry/workflow_library.py` owns the mutable layer above it: which names
+exist, each one's inert draft text, its current revision, its archive state,
+and its edit version
+([ADR-0031](../../adr/0031-let-operators-own-a-workflow-library-above-retained-revisions.md)).
+The boundary between the two is worth holding on to when adding code near it:
+
+| | Retained revisions | Library entries |
+|---|---|---|
+| Keyed by | Content identity | Name |
+| Mutability | Append-only | Every field but the name |
+| Read by | A task's own pinned revision, and inspection | Prospective name resolution only |
+| Contains | Executable documents | Draft text, a pointer, an archive flag, an edit version |
+
+Draft text is never parsed by the daemon — not at startup, not on read, not on
+list. A summary is built without touching it, so an entry with an unparseable
+draft is an ordinary entry. Only an executable save parses, and it parses the
+exact text submitted to it.
+
+`resolve_current(conn, name)` is the single prospective lookup, and it takes a
+connection rather than an engine on purpose: acceptance calls it on the
+connection holding its write reservation. There is no process-local catalog to
+go stale. Runtime resolution still goes through `taskdefinition.py` and the
+task's own revision, and never consults library archive state or current
+pointers.
 
 A stored row is decoded, re-validated, and re-hashed back to the key it is
 filed under before it is executed. A row that fails any of those is reported as
@@ -454,6 +512,10 @@ unavailable with a classified reason (`missing`, `unsupported_format`,
 `integrity`, `invalid`) rather than executed.
 
 ## Adding or changing a packaged definition
+
+Packaged definitions are the read-only examples, so this is a daemon change,
+not an authoring one — an operator adds a workflow through the library instead.
+
 
 1. Edit the YAML under `builtin_workflows/`. Startup validates it; a malformed
    built-in stops the daemon.
@@ -469,5 +531,7 @@ unavailable with a classified reason (`missing`, `unsupported_format`,
    result-envelope mismatch and any step the new definition does not declare.
 
 `daemon/tests/test_workflow_definitions.py` covers the loader's refusals, the
-identity rules, and three-valued evaluation. `test_workflows.py` covers the
-built-ins executing through the real engine.
+identity rules, three-valued evaluation, and the export round trip.
+`test_workflows.py` covers the built-ins executing through the real engine, and
+`test_workflow_library.py` / `test_workflow_library_rest.py` cover the library's
+lifecycle and its authoring surface.

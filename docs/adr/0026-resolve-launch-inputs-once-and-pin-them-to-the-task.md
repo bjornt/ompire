@@ -3,6 +3,10 @@
 - Status: Accepted
 - Date: 2026-09-05
 
+Extended by [ADR-0031](0031-let-operators-own-a-workflow-library-above-retained-revisions.md),
+which makes the prospective name lookup below a transactional read of an
+editable library rather than of a fixed packaged catalog.
+
 ## Context
 
 Starting a task used to require a template: a saved, mutable preset naming a
@@ -133,6 +137,10 @@ were retained has a null workflow binding, and that null is a real state — the
 definition it ran was never recorded and cannot be reconstructed — filled in
 only by an explicit operator confirmation through this record's existing
 task-configuration path, never by looking the name up in today's catalog.
+That prospective lookup is now a read of the operator-owned workflow library
+([ADR-0031](0031-let-operators-own-a-workflow-library-above-retained-revisions.md)),
+taken on the same connection as the project and profile reads so an edit cannot
+land between resolution and acceptance.
 
 The engine-reserved auxiliary consumer this record described is gone. There is
 no implicit judge, so there is no consumer outside the declared steps; a launch

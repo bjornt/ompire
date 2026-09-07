@@ -76,15 +76,19 @@ check, is in [Model profiles](model-profiles.md).
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/api/workflows` | Read-only catalog of every installed workflow |
+| `GET` | `/api/workflows` | Read-only catalog of every *launchable* workflow |
 | `GET` | `/api/workflows/revisions/{revision}` | One retained definition, by content identity |
+| `GET` | `/api/workflows/revisions/{revision}/yaml` | The same revision as a standalone YAML definition |
 
 Each catalog entry carries the workflow's current `revision` and `format`, its
 sessions, its primary session, and every declared step with its kind, session,
 abstract role (agent steps only) and whether a route or its own condition can
-pass it by. Every model consumer is one of those steps. Definitions ship with
-the daemon, so there is no CRUD and no change event; the same catalog rides in
-the WebSocket snapshot.
+pass it by. Every model consumer is one of those steps.
+
+The catalog holds only entries a new launch may select: not archived, and with a
+current revision that reads back as an executable definition. Everything that
+*exists* is under [Workflow library](#workflow-library) below. Both ride in the
+WebSocket snapshot, derived from one read.
 
 The revision endpoint returns the identity, the format, the primary session,
 the sessions, and the normalized `definition` document itself. It is addressed
@@ -93,6 +97,57 @@ pin and this answers what a given task accepted. An unknown revision is `404`.
 A retained document that cannot be read — damaged, or written for a format this
 daemon does not implement — is `409` with reason `workflow_definition_unavailable`
 and a specific `unavailable_reason`; it is never executed to answer a read.
+
+The `/yaml` form emits that same retained document as a complete YAML
+definition, verified to load back to the same revision before it is returned.
+Comments and formatting are not preserved — a revision is a normalized document.
+Its `404`/`409` responses are the ones above.
+
+## Workflow library
+
+Authoring lives here ([ADR-0031](../../adr/0031-let-operators-own-a-workflow-library-above-retained-revisions.md)).
+Every route is authenticated, and none of them starts a task.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/workflow-library` | Every entry: draft-only, archived, and unavailable included |
+| `POST` | `/api/workflow-library` | Create a custom entry from `yaml`, from `source_revision`, or from the starter |
+| `POST` | `/api/workflow-library/validate` | Check `yaml` (optionally against an entry `name`). Persists nothing |
+| `GET` | `/api/workflow-library/{name}` | One entry: summary, raw draft text, retained revision history |
+| `PUT` | `/api/workflow-library/{name}/draft` | Save inert draft text |
+| `POST` | `/api/workflow-library/{name}/revisions` | Validate, retain, and select an executable revision |
+| `POST` | `/api/workflow-library/{name}/archive` | Remove from launch choices; deletes nothing |
+| `POST` | `/api/workflow-library/{name}/restore` | Make the retained current revision eligible again |
+
+An entry summary carries `name`, `origin` (`builtin`/`custom`), `archived`,
+`version`, `has_draft`, `current_revision`, `current_format`, `available`, an
+`unavailable_reason` and `unavailable_detail` when it is not, timestamps, and a
+`descriptor` — present exactly when the entry is a valid launch choice, which is
+what makes the launch catalog derivable from the library.
+
+`version` is the entry's **edit** version, not its content revision. It advances
+on every successful mutation, including a comment-only draft save, and every
+mutation of an existing entry must submit the `expected_version` it loaded.
+
+| Status | Reason | Meaning |
+|---|---|---|
+| `404` | — | No entry, or no such retained revision |
+| `409` | `workflow_version_conflict` | Someone committed first. Nothing was written; the body carries `current_version` |
+| `409` | `workflow_name_taken` | The name belongs to a live, archived, or built-in entry |
+| `409` | `workflow_builtin_read_only` | Built-ins are packaged examples; duplicate instead |
+| `409` | `workflow_archived` | Restore the entry before editing it |
+| `422` | `workflow_document_invalid` | With `location`, `message`, and `line`/`column` when the parser supplied them |
+| `422` | `workflow_format_unsupported` | The document declares a `format` this daemon does not implement |
+
+There is no force-overwrite and no automatic merge: a conflict changes nothing,
+and reconciling is the client's decision. Drafts accept any UTF-8 up to 1 MiB
+and are never parsed; only an executable save validates, and it validates the
+exact text submitted to it — an earlier `validate` response is informative, not
+an authorization. Validation and import execute no commands, fetch no URLs, and
+open no path named in a document.
+
+Every committed mutation publishes one full-entry `workflow_library_updated`
+event over the WebSocket.
 
 ## Tasks
 

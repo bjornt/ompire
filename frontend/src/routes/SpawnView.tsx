@@ -93,8 +93,15 @@ const WORKSPACE_LABELS: Record<(typeof WORKSPACE_FIELDS)[number], string> = {
 };
 
 export function SpawnView() {
-  const { snapshotReady, projects, modelProfiles, workflowCatalog, tasks, spawnProgress } =
-    useDaemonState();
+  const {
+    snapshotReady,
+    projects,
+    modelProfiles,
+    workflowCatalog,
+    workflowLibrary,
+    tasks,
+    spawnProgress,
+  } = useDaemonState();
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -111,9 +118,12 @@ export function SpawnView() {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [staleReview, setStaleReview] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
-  // Set when a workflow change discarded row overrides, so the operator is
-  // told rather than silently losing selections they made.
-  const [clearedRows, setClearedRows] = useState<string[] | null>(null);
+  // Set when a workflow change — or a new executable revision of the selected
+  // one — discarded row overrides, so the operator is told rather than
+  // silently losing selections they made.
+  const [clearedRows, setClearedRows] = useState<
+    { rows: string[]; reason: "workflow" | "revision" } | null
+  >(null);
   const submitLockRef = useRef(false);
   const seenRef = useRef(false);
   // Monotonic request id: a slow preview response must never replace a newer
@@ -140,7 +150,9 @@ export function SpawnView() {
       setDraft((current) => {
         if (workflow === current.workflow) return current;
         const cleared = Object.keys(current.stepOverrides);
-        setClearedRows(cleared.length > 0 ? cleared.sort() : null);
+        setClearedRows(
+          cleared.length > 0 ? { rows: cleared.sort(), reason: "workflow" } : null,
+        );
         return { ...current, workflow, stepOverrides: {} };
       });
     },
@@ -169,6 +181,20 @@ export function SpawnView() {
     },
     [],
   );
+
+  /** Apply a "Launch in Spawn" handoff, once.
+   *
+   * Through the same selector the form uses, so switching away from a chosen
+   * workflow clears its per-step overrides and says so. The router state is
+   * then cleared: it lives on the history entry, so leaving and coming Back
+   * would otherwise re-apply it and silently discard whatever the operator
+   * had chosen since. */
+  useEffect(() => {
+    const handoff = (location.state as { workflow?: string } | null)?.workflow;
+    if (!handoff) return;
+    selectWorkflow(handoff);
+    navigate(location.pathname, { replace: true, state: null });
+  }, [location.state, location.pathname, navigate, selectWorkflow]);
 
   const launchInput: LaunchInput | null = useMemo(() => {
     if (!draft.project || !draft.workflow || !draft.slug) return null;
@@ -204,6 +230,52 @@ export function SpawnView() {
   }, [draft]);
 
   const workflow = workflowCatalog.find((w) => w.name === draft.workflow) ?? null;
+
+  /** The library entry behind the selection, whether or not it can launch.
+   *
+   * Kept separate from the catalog lookup so a selection that has just been
+   * archived, or whose saved revision has become unreadable, stays visible
+   * with its reason instead of silently resolving to nothing — or, worse, to
+   * another workflow. */
+  const selectedEntry =
+    draft.workflow === ""
+      ? null
+      : (workflowLibrary.find((entry) => entry.name === draft.workflow) ?? null);
+  const workflowUnavailable =
+    draft.workflow !== "" && snapshotReady && workflow === null
+      ? (selectedEntry?.unavailable_detail ??
+        `The workflow ${draft.workflow} is no longer in the library.`)
+      : null;
+
+  /** The exact revision the selected workflow currently resolves to.
+   *
+   * A saved executable revision changes what this launch would run, so a
+   * reviewed preview is no longer about the same procedure and has to be
+   * re-resolved. Editing only the entry's draft does not move this value, so
+   * it deliberately does not refetch — and does not reset the row overrides,
+   * which are still about these same steps. */
+  const selectedRevision = workflow?.revision ?? null;
+  const lastRevisionRef = useRef<string | null>(selectedRevision);
+
+  useEffect(() => {
+    if (lastRevisionRef.current === selectedRevision) return;
+    const previous = lastRevisionRef.current;
+    lastRevisionRef.current = selectedRevision;
+    // Only a *change* to an already-selected workflow's revision clears the
+    // rows; first selection and switching workflows are handled where they
+    // happen. Re-resolution is not done here — `selectedRevision` is a
+    // dependency of the preview effect, so the new resolution is fetched
+    // whether or not there was anything to clear.
+    if (previous === null || selectedRevision === null) return;
+    setDraft((current) => {
+      const cleared = Object.keys(current.stepOverrides);
+      if (cleared.length === 0) return current;
+      // Re-attaching a per-step model choice by name would apply it to a step
+      // the operator never looked at, so the choices are dropped and said so.
+      setClearedRows({ rows: cleared.sort(), reason: "revision" });
+      return { ...current, stepOverrides: {} };
+    });
+  }, [selectedRevision]);
 
   /** The rows to render. Preview rows when a resolution exists; otherwise the
    * declared catalog, so an invalid selection can still be corrected on the
@@ -278,9 +350,11 @@ export function SpawnView() {
     return () => {
       cancelled = true;
     };
-    // `profileRevision` is a dependency, not an input: it re-resolves when
-    // the registry moves under an open draft.
-  }, [launchInput, profileRevision]);
+    // `profileRevision` and `selectedRevision` are dependencies, not inputs:
+    // they re-resolve when the profile registry or the selected workflow's
+    // saved definition moves under an open draft. A draft-only library edit
+    // moves neither, so it refetches nothing.
+  }, [launchInput, profileRevision, selectedRevision]);
 
   const locked = phase.kind !== "idle";
   const spawnedId = phase.kind === "launching" || phase.kind === "failed" ? phase.taskId : null;
@@ -345,6 +419,7 @@ export function SpawnView() {
   }
 
   const noProfiles = snapshotReady && modelProfiles.length === 0;
+  const noWorkflows = snapshotReady && workflowCatalog.length === 0;
   const projectBlocked =
     project !== null &&
     (project.setup_state !== "ready" || project.launch_config_state !== "reconciled");
@@ -370,6 +445,9 @@ export function SpawnView() {
               data-testid="spawn-workflow"
             >
               <option value="">select a workflow</option>
+              {workflowUnavailable !== null && (
+                <option value={draft.workflow}>{draft.workflow} — unavailable</option>
+              )}
               {workflowCatalog.map((candidate) => (
                 <option key={candidate.name} value={candidate.name}>
                   {candidate.name} — {candidate.steps.length} step
@@ -380,8 +458,25 @@ export function SpawnView() {
               ))}
             </select>
             <div className="hint">
-              Every workflow is available to every ready project — no template setup.
+              Every launchable workflow is available to every ready project — no template
+              setup. <Link to="/workflows">Workflows</Link> is where you create, edit, and
+              archive them.
             </div>
+            {workflowUnavailable !== null && (
+              <p className="submitError" data-testid="spawn-workflow-unavailable">
+                {workflowUnavailable} Pick another workflow, or fix this one in{" "}
+                <Link to={`/workflows/${encodeURIComponent(draft.workflow)}`}>
+                  the library
+                </Link>
+                . Everything else you have entered is kept.
+              </p>
+            )}
+            {noWorkflows && (
+              <p className="hint" data-testid="spawn-no-workflows">
+                No workflow can be launched right now. Save an executable revision in{" "}
+                <Link to="/workflows">Workflows</Link> first.
+              </p>
+            )}
           </div>
 
           <div className="field">
@@ -621,9 +716,11 @@ export function SpawnView() {
               )}
               {clearedRows !== null && (
                 <div className="submitError" role="status" data-testid="cleared-overrides">
-                  Changing workflow cleared the per-step choices you had made (
-                  {clearedRows.join(", ")}). A step name in another workflow is a
-                  different step, so nothing was carried over.
+                  {clearedRows.reason === "workflow"
+                    ? "Changing workflow cleared the per-step choices you had made ("
+                    : "This workflow was saved with a new revision, which cleared the per-step choices you had made ("}
+                  {clearedRows.rows.join(", ")}). A step of that name in the changed
+                  definition is a different step, so nothing was carried over.
                 </div>
               )}
               {rows.length === 0 ? (

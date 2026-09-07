@@ -68,7 +68,12 @@ from ompire_daemon.registry.sessions import (
     record_session_spawned,
 )
 from ompire_daemon.registry.tasks import require_task_inputs, task_payload
-from ompire_daemon.registry.workflow_definitions import register_revisions
+from ompire_daemon.registry.workflow_library import (
+    BuiltinConflict,
+    UnknownWorkflowNameError,
+    WorkflowNotLaunchableError,
+    synchronize_builtins,
+)
 from ompire_daemon.registry.workflows import (
     GATE_SNAPSHOT_VERSION,
     MAX_FEEDBACK_BYTES,
@@ -120,7 +125,6 @@ from ompire_daemon.workflow_definitions import (
     WorkflowRevision,
     bindings_document,
     bindings_from_document,
-    describe,
     destination_document,
     evaluate_predicate,
     evidence_views,
@@ -296,12 +300,6 @@ _COMMAND_OUTPUT_TAIL = 8 * 1024
 COMPLETE = "__complete__"
 
 
-class UnknownWorkflowNameError(ValueError):
-    def __init__(self, name: str) -> None:
-        super().__init__(f"unknown workflow {name!r}")
-        self.name = name
-
-
 class WorkflowNotWaitingError(Exception):
     def __init__(self, task_id: int, status: str | None) -> None:
         super().__init__(
@@ -311,16 +309,20 @@ class WorkflowNotWaitingError(Exception):
         self.status = status
 
 
-# --- the packaged catalog (ADR-0028) ------------------------------------------
-# Definitions ship with the daemon as package resources. In this change that is
-# the *only* source: no project-directory scan, no upload, no CRUD, no plugin
-# loader. A packaged definition that does not validate fails startup, because
-# shipping an unexecutable built-in is a build error, not a runtime surprise.
+# --- the packaged built-ins (ADR-0028, ADR-0031) ------------------------------
+# Definitions ship with the daemon as package resources, and those packaged
+# ones are the *built-in* entries of the library: read-only examples an
+# operator duplicates rather than edits. A packaged definition that does not
+# validate fails startup, because shipping an unexecutable built-in is a build
+# error, not a runtime surprise.
+#
+# What a name currently means is no longer a process-local map. It lives in
+# `workflow_library`, is resolved through a connection, and can change while
+# the daemon runs — which is why this module exports no catalog: reading one
+# would be reading a cache of something an operator can edit.
 
 BUILTIN_PACKAGE = "ompire_daemon.builtin_workflows"
 BUILTIN_NAMES = ("single-step", "bugfix")
-
-_catalog: dict[str, WorkflowRevision] = {}
 
 
 class PackagedWorkflowError(RuntimeError):
@@ -357,59 +359,26 @@ def load_packaged_workflows() -> dict[str, WorkflowRevision]:
     return loaded
 
 
-def catalog() -> dict[str, WorkflowRevision]:
-    """The process-local name → current revision map."""
-    if not _catalog:
-        _catalog.update(load_packaged_workflows())
-    return _catalog
+def packaged_yaml(name: str) -> str:
+    """A built-in's shipped text, for reading it in the library.
 
-
-def current_revision(name: str) -> WorkflowRevision:
-    """What a *new* launch of this name would pin. Never used to resolve an
-    already-accepted task: that is the whole point of pinning."""
-    try:
-        return catalog()[name]
-    except KeyError:
-        raise UnknownWorkflowNameError(name) from None
-
-
-def catalog_names() -> tuple[str, ...]:
-    return tuple(sorted(catalog()))
-
-
-def describe_catalog() -> list[Any]:
-    """Every installed definition, in name order. Installed definitions change
-    only with the daemon, so the catalog is constant for the life of the
-    process and carries no change event."""
-    return [describe(catalog()[name]) for name in catalog_names()]
-
-
-def install_definition(revision: WorkflowRevision) -> None:
-    """Add one definition to the process catalog.
-
-    The seam startup registration and tests both use. It does not retain the
-    revision — `register_catalog` does that — because entering the catalog and
-    being durably readable are two different facts.
+    Built-ins keep no draft — their text is in the package, not in the
+    database — so this is where an operator's "show me this example" comes
+    from.
     """
-    _catalog.update(catalog())
-    _catalog[revision.name] = revision
+    resource = resources.files(BUILTIN_PACKAGE) / f"{name}.yaml"
+    return resource.read_text(encoding="utf-8")
 
 
-def uninstall_definition(name: str) -> None:
-    """Test support: remove a definition installed for one test."""
-    _catalog.pop(name, None)
+def install_packaged_workflows(engine: SAEngine) -> list[BuiltinConflict]:
+    """Retain every packaged definition and point its built-in entry at it.
 
-
-def reset_catalog() -> None:
-    """Test support: forget installed definitions, packaged ones included."""
-    _catalog.clear()
-
-
-def register_catalog(engine: SAEngine) -> list[str]:
-    """Retain every installed definition's revision. Runs at startup, before
-    launch initialization and recovery, so nothing can resolve a task against
-    a revision the database does not hold."""
-    return register_revisions(engine, [catalog()[name] for name in catalog_names()])
+    Runs at startup, before launch initialization and recovery, so nothing can
+    resolve a task against a revision the database does not hold. Custom
+    entries and their drafts are untouched, and a name a custom entry already
+    owns is reported rather than overwritten.
+    """
+    return synchronize_builtins(engine, list(load_packaged_workflows().values()))
 
 
 # --- outcome reading (design D-3) --------------------------------------------
@@ -1834,18 +1803,13 @@ __all__ = [
     "RETRY_PREFIX",
     "PackagedWorkflowError",
     "UnknownWorkflowNameError",
+    "WorkflowNotLaunchableError",
     "WorkflowNotWaitingError",
     "WorkflowRunner",
-    "catalog",
-    "catalog_names",
-    "current_revision",
-    "describe_catalog",
-    "install_definition",
+    "install_packaged_workflows",
     "load_packaged_workflows",
+    "packaged_yaml",
     "read_outcome",
     "read_result",
-    "register_catalog",
-    "reset_catalog",
     "result_instruction",
-    "uninstall_definition",
 ]
