@@ -156,6 +156,41 @@ rather than asserting against the API behind them. Run Chrome with
 `--no-sandbox` only where the container forces it; it is not needed in a
 workshop.
 
+### Verify visual workflow authoring
+
+The workflow editor is a browser surface, and its interesting failures are all
+browser failures: work lost across a mode switch, a stale answer applied to a
+newer edit, an invalid draft that a diagram makes look finished. Verify it
+against the running harness, not against the conversion endpoint.
+
+A reproducible pass:
+
+1. Bring the harness up and open **Workflows** at 1440×900. Create a workflow
+   and switch to **Visual**.
+2. Build the flow entirely with the form controls — agents and the primary,
+   step cards, instructions with explicit references, ordered decision cases,
+   a gate with named answers, and a visit bound with its exhaustion gate. Do
+   not type in the YAML editor at any point.
+3. Save a draft while it is still incomplete, reload, and confirm the same
+   partial work comes back with its located reason.
+4. Finish it, save an executable revision, and launch it from Spawn. Check that
+   the preview names the revision you just saved and shows the same flow.
+5. Drive the run with `local-test/ompctl` and follow the pinned procedure on
+   task detail: each visit separately, the evidence links to the producing
+   attempts, and the same conversation across the steps that share an agent.
+6. Repeat the editing pass at 390×844 and with the keyboard only — every card
+   edit, reorder, route selection, error jump, and mode switch is reachable
+   with Tab and Enter.
+
+Interruptions worth including, because each one has a way to lose work
+silently: a two-tab conflicting save, a reconnect with local edits on screen,
+a daemon restart while the run is gated, and a library edit after launch
+followed by reopening the old task.
+
+The `workflow-decisions` scenario establishes a run with declared results,
+evidence handoffs and a gate, which is the state task-detail inspection is
+worth checking against.
+
 ### When there is no browser
 
 Say which property you could not verify in the browser, report the non-browser

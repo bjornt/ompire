@@ -113,8 +113,9 @@ Each override shows the project's value until it is changed and then offers its
 own reset; only changed fields are sent.
 
 Beside it, the daemon's resolution of the current draft: the workflow revision
-it would pin, and every declared step of the chosen workflow with its kind,
-session, abstract role, model, and thinking policy. Command, decision, and gate
+it would pin — readable as the whole procedure it declares, in the same
+presentation the library uses — and every declared step of the chosen workflow
+with its kind, session, abstract role, model, and thinking policy. Command, decision, and gate
 rows carry no model. A step a route can pass by, or that carries its own
 condition, is marked conditional. Every model consumer is one of these rows.
 
@@ -147,8 +148,32 @@ checkbox rather than mixed into the list. Before the first snapshot the view
 shows loading, never an empty library. A library with no custom entries offers
 Create, Import, and the packaged examples to duplicate.
 
-`/workflows/<name>` is one entry. A built-in shows its packaged text read-only
-with a Duplicate action; a custom entry opens the YAML editor.
+`/workflows/<name>` is one entry. A built-in shows its procedure read-only,
+with its packaged text behind a disclosure and a Duplicate action; a custom
+entry opens the editor.
+
+The editor has two views of **one** draft — **Visual**, a list of step cards
+with an agents panel, and **YAML**, the text — and switching between them is
+neither a save nor a launch. Every field either format supports has a form
+control, so a branching workflow can be written without opening the text view.
+A workflow's name and format are shown in both and editable in neither: a name
+is the entry's identity, and a format is the rules the document is read under.
+
+Opening the visual view and leaving it without changing anything leaves the
+text exactly as typed, comments included. Once something is changed visually,
+saving rewrites the document — its layout is normalized and comments are
+dropped, while what it means is unchanged. Text that cannot be parsed stays in
+the YAML view with its line and reason, and the visual view refuses to open
+rather than substituting an empty or last-valid document. An unsupported format
+or construct is named, kept as written, and never silently converted.
+
+A draft that parses but is not yet a workflow is ordinary work: it can be saved
+and reopened, and the daemon's reason appears both in a summary and at the
+field it is about, with a link that opens the card even while it is collapsed.
+Renaming a step or an agent moves the routes, selectors, and assignments that
+name it and leaves instructions and literal values alone; removing a step lists
+what names it first and leaves any surviving references visibly broken rather
+than repairing them.
 
 The editor's three buttons do three different things — **Save draft**,
 **Validate**, **Save executable revision** — and the view says which is which
@@ -156,8 +181,8 @@ rather than assuming it is obvious. A successful validation shows the revision
 identity and a read-only reading of the definition: each step's kind, session
 and role, its instruction, the results it must declare, where its routes go, the
 answers a gate offers, what it reads as evidence, and its visit bound. That
-reading is a presentation of the saved YAML, not a second place to edit one.
-Editing the text marks a validation result out of date rather than hiding it.
+reading is a presentation of the saved definition, not a third place to edit
+one. Editing marks a validation result out of date rather than hiding it.
 
 The editor's text is **local** until a save succeeds. A change committed
 elsewhere updates the library everywhere and never overwrites an open buffer;
@@ -173,6 +198,10 @@ automatic merge.
 Saved revisions are listed newest first. Any of them can be inspected, exported
 as YAML, or loaded into the editor; a draft downloads separately and is labelled
 a draft rather than a validated workflow.
+
+Task detail carries the same presentation for the revision that task
+*accepted*, with its recorded attempts laid over it. See
+[Task detail](task-detail.md#procedure).
 
 ### Task detail configuration
 

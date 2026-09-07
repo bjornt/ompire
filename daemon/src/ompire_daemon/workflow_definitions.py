@@ -2159,6 +2159,93 @@ def export_yaml(revision: WorkflowRevision) -> str:
     )
 
 
+# --- authoring drafts (ADR-0031) ----------------------------------------------
+# A visual editor edits *data*, not text, so the two things a draft round trip
+# needs are here beside the loader they mirror: the same bounds applied to a
+# submitted document instead of submitted text, and the same emitter used to
+# write that document back out as YAML.
+#
+# A draft is not a definition. It may be incomplete, may carry fields no
+# format understands, and is never executable — `definition_from_document` is
+# still the only thing that says what a document *means*. What these two
+# guarantee is narrower and load-bearing: a draft that crosses this boundary
+# is bounded JSON data, and the text it is emitted as parses back to it.
+
+
+def _walk_draft(value: Any, location: str, depth: int, counted: list[int]) -> None:
+    if depth > MAX_DEPTH:
+        raise WorkflowDocumentError(
+            location, f"document nests deeper than {MAX_DEPTH} levels"
+        )
+    counted[0] += 1
+    if counted[0] > MAX_NODES:
+        raise WorkflowDocumentError("", f"document has more than {MAX_NODES} nodes")
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        # `inf` and `nan` have no JSON spelling, so a document containing one
+        # could not be written and read back as itself.
+        if not math.isfinite(value):
+            raise WorkflowDocumentError(location, f"non-finite number {value!r}")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _walk_draft(item, f"{location}[{index}]", depth + 1, counted)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise WorkflowDocumentError(location, "mapping keys must be strings")
+            _walk_draft(
+                item, f"{location}.{key}" if location else key, depth + 1, counted
+            )
+        return
+    raise WorkflowDocumentError(location, f"{type(value).__name__} is not JSON data")
+
+
+def check_draft_data(data: Any) -> dict[str, Any]:
+    """The loader's bounds, applied to a submitted document.
+
+    Depth, node count, step count, JSON-only scalars, string keys. Refused
+    before anything expensive happens, for the same reason `_check_events`
+    bounds the parse rather than the parsed result.
+
+    Says nothing about whether the document is a workflow: an unfinished card
+    with a missing destination passes here and fails validation, which is
+    exactly what lets a half-authored draft be saved and reopened.
+    """
+    if not isinstance(data, dict):
+        raise WorkflowDocumentError("", "document root must be a mapping")
+    _walk_draft(data, "", 0, [0])
+    steps = data.get("steps")
+    if isinstance(steps, list) and len(steps) > MAX_STEPS:
+        raise WorkflowDocumentError("steps", f"more than {MAX_STEPS} steps")
+    return data
+
+
+def emit_draft_yaml(document: Mapping[str, Any]) -> str:
+    """One draft document as YAML text, through the emitter a revision uses.
+
+    Named for what it does rather than for what it returns: `draft_yaml` is
+    already the column, the detail field, and the response key holding an
+    entry's saved text, and a function sharing that name is a trap for the
+    next person who assigns to it.
+
+    Every string is quoted or block-styled by the shared representer, so a
+    prompt containing `yes` or `1.0` reads back as the string it was. The
+    emitted text is parsed again by the caller: a draft whose text does not
+    load back to the submitted data is a serializer bug, and the round trip is
+    where it would be caught rather than after it is saved.
+    """
+    check_draft_data(document)
+    text = _emit(document)
+    if len(text.encode("utf-8")) > MAX_DOCUMENT_BYTES:
+        raise WorkflowDocumentError(
+            "", f"document is larger than {MAX_DOCUMENT_BYTES} bytes"
+        )
+    return text
+
+
 # --- evaluation ---------------------------------------------------------------
 
 

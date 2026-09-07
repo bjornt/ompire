@@ -242,19 +242,66 @@ Open **Workflows**. There is no daemon release and no restart in this loop.
    you choose; *Import YAML…* reads a local file into the editor. You can also
    paste. The name is permanent and cannot collide with a built-in or with an
    archived name.
-2. **Edit the YAML.** Save a draft whenever you like: drafts take any text,
-   valid or not, and survive a refresh and a daemon restart. Saving one never
-   changes what the workflow would launch.
-3. **Validate.** You get either the revision identity and a read-only reading
-   of the definition, or the location and reason of the problem. Editing after
-   that marks the result out of date — validate again. Validation is
-   structural: it does not say the commands exist or the run will succeed.
+2. **Edit it.** *Visual* gives you an agents panel and a list of step cards;
+   *YAML* gives you the text. They are two views of one draft, and switching
+   between them is neither a save nor a launch. Save a draft whenever you like:
+   drafts take any text, valid or not, and survive a refresh and a daemon
+   restart. Saving one never changes what the workflow would launch.
+3. **Validate.** You get either the revision identity and a readable reading of
+   the definition, or the location and reason of the problem. In the visual
+   editor the reason also appears at the field it is about, with a link that
+   opens the card even if it is collapsed. Editing after that marks the result
+   out of date — validate again. Validation is structural: it does not say the
+   commands exist or the run will succeed.
 4. **Save an executable revision.** This validates the text again, retains it,
    and makes it what a new launch of this name pins. Until you do, the entry is
    *draft only* and cannot be launched at all. Saving starts nothing.
 5. **Launch it.** *Launch in Spawn* carries the workflow into the ordinary
    Spawn form; you still choose the project and the profile and review the
-   resolution before submitting.
+   resolution before submitting. The preview shows the exact revision you are
+   accepting and the whole procedure it declares, alongside the model each step
+   would use.
+
+### Building one without writing YAML
+
+Everything either format supports has a form control, so you never have to open
+the text editor to write a branching workflow.
+
+- **Agents** names the conversations. A step assigned to an agent that ran
+  earlier continues *that* conversation, which is how QA verifies a fix in the
+  session where it reproduced the bug. Which model an agent uses is chosen at
+  launch, not here.
+- **Step cards** carry the kind, the assigned agent, the abstract model role,
+  the instruction, the results the step must declare, the evidence it is
+  handed, and what happens next. Add, move, and remove cards with buttons; the
+  card order is execution order, and moving one tells you which step it now
+  continues to.
+- **Instructions** are built from parts: words you write, an explicit reference
+  to something from the run, or a conditional section. There is no template
+  language and nothing to type in an expression box.
+- **Decisions** are ordered condition/destination rows with an explicit
+  fallback. **Gates** are a question plus the named answers you offer, each
+  with its own destination and an optional requirement that the person writes
+  a reason.
+- **Visit bounds** are declared with the gate they reach when they run out, so
+  a loop that stops asks somebody rather than ending quietly.
+
+Renaming a step or an agent moves the routes, selectors, and assignments that
+name it, and leaves instructions and literal values alone. Removing a step
+lists what names it first, and if you remove it anyway those references stay
+visible as broken ones instead of being quietly repaired.
+
+Two things are the same in both views and editable in neither. The workflow's
+**name** is the entry's identity — renaming means creating a separate workflow
+— and its **format** is the rules it is read under, so an existing format-1
+workflow keeps being read as format 1 rather than being upgraded.
+
+Once you change something visually, saving rewrites the document: its layout is
+normalized and YAML comments are dropped. What it means does not change.
+Download the draft first if you want to keep your own formatting. Text that
+cannot be parsed at all stays in the YAML editor with its line and reason — the
+visual editor refuses to open rather than replacing your work with an empty
+document.
 
 The grammar is documented in
 [Workflow definitions](../../develop/reference/workflow-definitions.md), and the
@@ -291,6 +338,20 @@ revision yet, or its saved revision cannot be read. The selection stays visible
 with the reason rather than being swapped for another one. Fix it in the
 library: restore it, or save a corrected executable revision. Tasks already
 running under it are unaffected either way.
+
+### Follow it once it is running
+
+Task detail shows the procedure the task accepted with what happened laid over
+it, read from the revision the task pinned rather than from what the workflow
+name means today. Editing or archiving the entry afterwards changes neither.
+
+Selecting a step shows each visit separately — a rejected verification and the
+corrected one are both there — with the result it declared, the evidence it was
+handed as links to the exact producing attempts, the answer somebody gave at a
+gate and the reason they wrote, and a link into that step's conversation. A
+step nobody reached stays visible as work the procedure allows, not as work
+that succeeded, and where the run recorded nothing the page says so instead of
+guessing.
 
 ## While it runs
 

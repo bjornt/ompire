@@ -1,3 +1,5 @@
+import type { DraftObject } from "./lib/workflowDocument";
+
 /** `checkout_mode` says who owns the base checkout: `adopted` is the
  * operator's own, `cloned` was created by Ompire (ADR-0022). `fetch_remote` is
  * the remote spawn fetches in *that* checkout — unrelated to the per-task
@@ -128,7 +130,10 @@ export interface WorkflowRevisionDetail {
   format: number;
   primary_session: string;
   sessions: string[];
-  definition: Record<string, unknown>;
+  /** Carried as a lossless document: a definition's literal numbers are
+   * executable data, and rounding one would describe a different procedure
+   * than the one that runs. */
+  definition: DraftObject;
 }
 
 /** Why a library entry cannot be launched. `draft_only` and `not_packaged`
@@ -196,8 +201,41 @@ export interface WorkflowValidation {
   revision: string;
   name: string;
   format: number;
-  definition: Record<string, unknown>;
+  definition: DraftObject;
   descriptor: WorkflowDescriptor;
+}
+
+/** Why a draft is not executable, and where to look.
+ *
+ * Reported beside the draft rather than instead of it: an unfinished card
+ * with a missing destination is work an operator is allowed to keep, reopen,
+ * and finish. `location` is the daemon's own address into the document
+ * (`steps[2].cases[0].next`), so an editor can jump to the offending field. */
+export interface WorkflowDraftRefusal {
+  ok: false;
+  reason: string;
+  location: string | null;
+  message: string;
+  line: number | null;
+  column: number | null;
+  /** The declared version, when the refusal is an unsupported format. */
+  format: unknown;
+}
+
+export type WorkflowDraftValidation = ({ ok: true } & WorkflowValidation) | WorkflowDraftRefusal;
+
+/** One draft translated between the text the library stores and the data the
+ * visual editor holds (`POST /api/workflow-library/document`).
+ *
+ * `document` is the parsed draft, not a canonicalized definition: unknown
+ * fields and incomplete values survive it. `yaml` is the text form of that
+ * same draft — for text submitted as text, it is the submitted text
+ * unchanged, so opening the visual editor and closing it rewrites nothing.
+ * The call persists nothing and authorizes nothing. */
+export interface WorkflowDocumentConversion {
+  document: DraftObject;
+  yaml: string;
+  validation: WorkflowDraftValidation;
 }
 
 /** The workspace and prompt inputs one task actually runs under. */

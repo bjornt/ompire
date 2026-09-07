@@ -238,6 +238,40 @@ rather than applied. The pending state is also in the snapshot-driven task
 payload, so the card survives reloads and reconnects; a gate that vanished on
 refresh would strand the run.
 
+### Procedure
+
+The whole definition the task accepted, with what happened laid over it. It is
+addressed by the task's **retained revision**, so editing or archiving the
+workflow in the library afterwards changes neither this flow nor anything the
+run recorded.
+
+Every step of the definition is listed, whether or not it ran, with its kind,
+assigned agent, abstract role, instruction, required results, the evidence it
+reads, its visit bound, and every route declared out of it. Those routes are
+declarations: nothing here evaluates a condition, so no branch is shown as the
+one a run took or will take.
+
+Selecting a step shows its attempts, each one separately:
+
+| Shown | Meaning |
+|---|---|
+| No attempts | Work the procedure allows. Not skipped, not done — never reached |
+| Several attempts | Every visit, in order. A rejected verification and the corrected one are both there |
+| A declared result | The name the step wrote, with its summary |
+| A stop without a decision | The engine refusing to guess, with the reason it gave |
+| A recorded answer | Who chose it, which answer, any reason they wrote, and where it went |
+| An evidence alias | A link to the exact producing attempt, by step and sequence number |
+
+Where the record is silent, it says so. A step that declares no evidence was
+handed none; an attempt from a format-1 run kept no bindings, so what it was
+handed is not on the record. Neither is filled in from today's definition. A
+visit count is the number of visits **on the record**, which for a run
+predating step records is fewer than it actually had.
+
+Answering a gate and retrying a stopped step remain the [gate
+card](#gate-card)'s controls on the waiting attempt. A step the run has not
+reached offers no action.
+
 ### Step history
 
 Each attempt records which prior attempts it was handed. A finished run can

@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -178,11 +178,14 @@ from ompire_daemon.workflow_definitions import (
     WorkflowDefinition,
     WorkflowDocumentError,
     WorkflowRevision,
+    definition_from_document,
     describe,
+    emit_draft_yaml,
     export_yaml,
     load_canonical_document,
     load_definition,
     make_revision,
+    parse_yaml_document,
 )
 from ompire_daemon.workflows import (
     WorkflowNotWaitingError,
@@ -1193,12 +1196,17 @@ def _publish_entry(events: EventHub, detail: LibraryDetail) -> None:
     events.publish("workflow_library_updated", _entry_payload(detail.entry))
 
 
-def _document_error(exc: WorkflowDocumentError) -> HTTPException:
+def _document_error_detail(exc: WorkflowDocumentError) -> dict[str, Any]:
     """A structured refusal an editor can point at.
 
     Carries where in the document the problem is, why, and — when the parser
     supplied them — the source line and column. The submitted text is never
     echoed back: an error is not a place to mirror a megabyte.
+
+    One shape, two carriers. A document that cannot be *parsed* is an HTTP
+    refusal; a document that parses but is not a valid workflow is a
+    diagnostic reported beside the draft it describes, because that draft is
+    still work an operator is allowed to keep.
     """
     detail: dict[str, Any] = {
         "reason": "workflow_document_invalid",
@@ -1213,7 +1221,13 @@ def _document_error(exc: WorkflowDocumentError) -> HTTPException:
     if position is not None:
         detail["line"] = position.line + 1
         detail["column"] = position.column + 1
-    return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, detail)
+    return detail
+
+
+def _document_error(exc: WorkflowDocumentError) -> HTTPException:
+    return HTTPException(
+        status.HTTP_422_UNPROCESSABLE_CONTENT, _document_error_detail(exc)
+    )
 
 
 def _library_error(exc: Exception) -> HTTPException:
@@ -1353,6 +1367,142 @@ def validate_workflow_route(
         "format": revision.format,
         "definition": revision.document,
         "descriptor": asdict(describe(revision)),
+    }
+
+
+# --- authoring conversion ------------------------------------------------------
+# The visual editor edits a *document*; the library stores *text*. This is the
+# only translation between the two, and it is deliberately the narrowest thing
+# that can be: authenticated, stateless, and inert.
+#
+# It persists nothing, retains no revision, publishes no event, runs no
+# command, and authorizes no later save. Saving a draft and saving an
+# executable revision still take exact YAML and the loaded `expected_version`,
+# and an executable save still runs its own validation on what it is given —
+# a conversion answer is never a token.
+#
+# Its response separates two questions an editor keeps conflating. *Can this
+# be read at all* is the parse, and a failure there is an HTTP refusal.
+# *Is it a workflow* is the validation, and a failure there comes back beside
+# the unchanged draft, because an unfinished card with a missing destination
+# is work an operator is allowed to keep, reopen, and finish.
+
+
+class WorkflowDocumentIn(BaseModel):
+    """One draft, in whichever direction it is being converted.
+
+    Exactly one of `yaml` and `document`: supplying both is an editor that
+    does not know which representation it is holding, which is the bug this
+    interface exists to make impossible. `name` binds the check to an existing
+    entry's identity, exactly as `validate` does.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    yaml: str | None = None
+    document: dict[str, Any] | None = None
+    name: str | None = None
+
+
+class WorkflowDocumentValidOut(BaseModel):
+    """The same projection `validate` returns, for a draft that is a
+    workflow. `definition` is the canonical document, not the draft."""
+
+    ok: Literal[True] = True
+    revision: str
+    name: str
+    format: int
+    definition: dict[str, Any]
+    descriptor: WorkflowOut
+
+
+class WorkflowDocumentInvalidOut(BaseModel):
+    """Why this draft is not executable, and where to look."""
+
+    ok: Literal[False] = False
+    reason: str
+    location: str | None = None
+    message: str
+    line: int | None = None
+    column: int | None = None
+    format: Any | None = None
+
+
+class WorkflowDocumentOut(BaseModel):
+    # The parsed draft, exactly as submitted — *not* a canonicalized
+    # definition. Unknown fields and incomplete values survive, so an editor
+    # reading this back cannot silently drop what it does not understand.
+    document: dict[str, Any]
+    # The text form of that same draft. For YAML input it is the submitted
+    # text unchanged, so opening the visual editor and closing it again
+    # rewrites nothing.
+    yaml: str
+    validation: WorkflowDocumentValidOut | WorkflowDocumentInvalidOut
+
+
+def _draft_validation(document: Mapping[str, Any], name: str | None) -> dict[str, Any]:
+    """Semantic validation of a parsed draft, reported rather than raised."""
+    try:
+        revision = make_revision(definition_from_document(document))
+    except WorkflowDocumentError as exc:
+        return {"ok": False, **_document_error_detail(exc)}
+    if name is not None and name != revision.name:
+        mismatch = WorkflowNameMismatchError(name, revision.name)
+        return {
+            "ok": False,
+            "reason": "workflow_name_mismatch",
+            "location": "name",
+            "message": str(mismatch),
+        }
+    return {
+        "ok": True,
+        "revision": revision.revision,
+        "name": revision.name,
+        "format": revision.format,
+        "definition": revision.document,
+        "descriptor": asdict(describe(revision)),
+    }
+
+
+@router.post("/workflow-library/document", response_model=WorkflowDocumentOut)
+def convert_workflow_document_route(body: WorkflowDocumentIn) -> dict[str, Any]:
+    """Translate one draft between text and data, and say what it means.
+
+    YAML in goes through the production bounded parser — the same depth, node,
+    size, anchor, and scalar rules a save applies — and the submitted text
+    comes back untouched. Data in is bounded first, emitted through the
+    revision emitter, and then *parsed back*: what is returned as `document`
+    is what the loader would see, so the two representations cannot drift.
+
+    Neither direction converts a format. An unsupported version is reported as
+    an unsupported version; syntactically safe conversion is not semantic
+    support, and it is certainly not permission to launch.
+    """
+    if (body.yaml is None) == (body.document is None):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "supply exactly one of 'yaml' or 'document'",
+        )
+    if body.yaml is not None:
+        text = body.yaml
+        try:
+            check_draft_size(text)
+        except WorkflowDraftTooLargeError as exc:
+            raise _library_error(exc) from exc
+        try:
+            document = parse_yaml_document(text)
+        except WorkflowDocumentError as exc:
+            raise _document_error(exc) from exc
+    else:
+        try:
+            text = emit_draft_yaml(body.document or {})
+            document = parse_yaml_document(text)
+        except WorkflowDocumentError as exc:
+            raise _document_error(exc) from exc
+    return {
+        "document": document,
+        "yaml": text,
+        "validation": _draft_validation(document, body.name),
     }
 
 

@@ -13,6 +13,7 @@ import type {
   Project,
   ProjectFiles,
   WorkflowDescriptor,
+  WorkflowDocumentConversion,
   WorkflowLibraryDetail,
   WorkflowLibraryEntry,
   WorkflowReadinessReason,
@@ -27,6 +28,8 @@ import type {
   ThinkingLevel,
   WorkshopAdditionsSource,
 } from "../types";
+import { envelopeNumber, parseLossless, stringifyLossless } from "./losslessJson";
+import { asObject, asString, type DraftObject } from "./workflowDocument";
 import { getDaemonToken } from "./token";
 
 /** Minimal authenticated REST client. Commands go over REST, events come back
@@ -68,6 +71,57 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     throw new DaemonError(detail, response.status, structured);
   }
   return (await response.json()) as T;
+}
+
+/** The same request, through the lossless JSON codec.
+ *
+ * Used only where a payload carries a workflow *definition*: a draft, a
+ * retained document, or a validation result. Those contain executable literal
+ * data, and `JSON.parse` would silently turn `1.0` into `1` and drop the
+ * digits of a large integer — which changes a definition's canonical bytes,
+ * and therefore its identity, without anybody editing it.
+ *
+ * Everything else keeps ordinary JSON: task, session, and settings numbers
+ * are ordinary numbers, and handing a view a `LosslessNumber` where it
+ * expects a `number` would buy nothing and break rendering.
+ */
+async function requestLossless(
+  method: string,
+  path: string,
+  body?: unknown,
+): Promise<unknown> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  const token = getDaemonToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+
+  const response = await fetch(path, {
+    method,
+    headers,
+    body: body === undefined ? undefined : stringifyLossless(body),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    let detail = `${response.status}`;
+    let structured: Record<string, unknown> | null = null;
+    try {
+      const data = JSON.parse(text) as { detail?: unknown };
+      if (typeof data.detail === "string") detail = data.detail;
+      else if (
+        typeof data.detail === "object" &&
+        data.detail !== null &&
+        "message" in data.detail &&
+        typeof data.detail.message === "string"
+      ) {
+        detail = data.detail.message;
+        structured = data.detail as Record<string, unknown>;
+      }
+    } catch {
+      /* non-JSON error body; keep the status code */
+    }
+    throw new DaemonError(detail, response.status, structured);
+  }
+  return parseLossless(text);
 }
 
 /** A refused command, with the daemon's structured reason kept alongside the
@@ -294,11 +348,22 @@ export function resumeWorkflow(
 /** Read one retained definition by content identity. Deliberately not
  * addressable by workflow name: a name says what a *new* launch would get,
  * and this answers "what did that task accept". */
-export function getWorkflowRevision(revision: string): Promise<WorkflowRevisionDetail> {
-  return request<WorkflowRevisionDetail>(
-    "GET",
-    `/api/workflows/revisions/${encodeURIComponent(revision)}`,
+export async function getWorkflowRevision(
+  revision: string,
+): Promise<WorkflowRevisionDetail> {
+  const body = asObject(
+    await requestLossless("GET", `/api/workflows/revisions/${encodeURIComponent(revision)}`),
   );
+  return {
+    revision: asString(body?.revision) ?? revision,
+    name: asString(body?.name) ?? "",
+    format: envelopeNumber(body?.format),
+    primary_session: asString(body?.primary_session) ?? "",
+    sessions: (Array.isArray(body?.sessions) ? body.sessions : []).map(
+      (name) => asString(name) ?? "",
+    ),
+    definition: asObject(body?.definition) ?? {},
+  };
 }
 
 /** Export one retained revision as a standalone YAML definition.
@@ -354,11 +419,64 @@ export function saveWorkflowDraft(
 
 /** Check this exact text. Nothing is saved, and the answer authorizes
  * nothing: an executable save re-validates what it is given. */
-export function validateWorkflow(yaml: string, name?: string): Promise<WorkflowValidation> {
-  return request<WorkflowValidation>("POST", "/api/workflow-library/validate", {
+export async function validateWorkflow(
+  yaml: string,
+  name?: string,
+): Promise<WorkflowValidation> {
+  const body = await requestLossless("POST", "/api/workflow-library/validate", {
     yaml,
     ...(name !== undefined ? { name } : {}),
   });
+  return readValidation(asObject(body) ?? {});
+}
+
+function readValidation(body: DraftObject): WorkflowValidation {
+  return {
+    revision: asString(body.revision) ?? "",
+    name: asString(body.name) ?? "",
+    format: envelopeNumber(body.format),
+    definition: asObject(body.definition) ?? {},
+    descriptor: body.descriptor as unknown as WorkflowDescriptor,
+  };
+}
+
+/** Translate one draft between YAML text and structured data, and say what it
+ * currently means.
+ *
+ * Stateless and inert: it persists nothing, retains no revision, and
+ * authorizes no later save — an executable save still re-validates the exact
+ * text it is handed. A draft that parses but is not yet a workflow comes back
+ * whole, with a located reason, which is what lets half-built visual work be
+ * saved and reopened. */
+export async function convertWorkflowDocument(input: {
+  yaml?: string;
+  document?: DraftObject;
+  name?: string;
+}): Promise<WorkflowDocumentConversion> {
+  const body = asObject(
+    await requestLossless("POST", "/api/workflow-library/document", input),
+  );
+  const validation = asObject(body?.validation) ?? {};
+  return {
+    document: asObject(body?.document) ?? {},
+    yaml: asString(body?.yaml) ?? "",
+    validation:
+      validation.ok === true
+        ? { ok: true, ...readValidation(validation) }
+        : {
+            ok: false,
+            reason: asString(validation.reason) ?? "workflow_document_invalid",
+            location: asString(validation.location),
+            message: asString(validation.message) ?? "This draft is not a workflow yet.",
+            line: validation.line === undefined || validation.line === null
+              ? null
+              : envelopeNumber(validation.line),
+            column: validation.column === undefined || validation.column === null
+              ? null
+              : envelopeNumber(validation.column),
+            format: validation.format ?? null,
+          },
+  };
 }
 
 /** Validate this text, retain it, and make it the entry's current choice —

@@ -744,7 +744,11 @@ export function SpawnView() {
                     // edited prompt or route invalidates this review even
                     // though the step list looks unchanged (ADR-0028).
                     <div className="hint" data-testid="preview-revision">
-                      Revision <WorkflowRevision revision={preview.workflow_revision} />
+                      Revision{" "}
+                      <WorkflowRevision
+                        revision={preview.workflow_revision}
+                        summaryLabel="read the whole procedure this launch would accept"
+                      />
                     </div>
                   )}
                   <table className="stepTable" data-testid="step-preview">

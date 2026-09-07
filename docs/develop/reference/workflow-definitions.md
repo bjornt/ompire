@@ -475,6 +475,51 @@ Formatting and comments are not preserved. A revision is a canonical document;
 the text somebody typed lives in the library entry's draft, which is returned
 verbatim and separately.
 
+## Draft conversion
+
+A visual editor edits *data*; the library stores *text*. `check_draft_data()`
+and `emit_draft_yaml()` are the only translation between them, and
+`POST /api/workflow-library/document` is the only place they are exposed.
+
+`check_draft_data()` applies the loader's bounds to a submitted document rather
+than to submitted text: depth, node count, step count, string mapping keys, and
+JSON-only scalars, with non-finite numbers refused because they have no JSON
+spelling and so could not be written and read back as themselves. It is
+deliberately not validation — a card with a missing destination passes it and
+fails `definition_from_document()`, which is exactly what lets half-authored
+work be saved and reopened.
+
+`emit_draft_yaml()` emits that document through the same representer `export_yaml()`
+uses, so a prompt containing `yes`, `1.10`, or an empty string reads back as
+the string it was. The REST route then parses the emitted text again and
+returns *that* as `document`, so the text and the data a client holds cannot
+drift apart.
+
+Three properties are load-bearing, and each is covered directly:
+
+**A draft is not a definition.** Unknown fields and incomplete values survive
+the round trip. Conversion never canonicalizes, never fills in a default, and
+never removes a construct it does not understand — a document a future format
+adds comes back whole, with an explicit unsupported-field diagnostic.
+
+**Scalars keep their type and their token.** `1` and `1.0` are different
+literals, `"yes"` is not `true`, and `""` is not `null`. Because a literal is
+executable data inside a canonical document, collapsing any of these would move
+a revision's identity without anybody editing the definition. The frontend
+carries the same guarantee over the wire: definition-bearing payloads use a
+lossless JSON codec (`frontend/src/lib/losslessJson.ts`) so a number keeps its
+exact source token until somebody edits it, and an integer past 2^53 is never
+narrowed to JavaScript's safe range.
+
+**Neither direction converts a format.** An unsupported `format` is reported as
+unsupported in `validation`; it is never read under the newest rules. Both
+supported formats round-trip under their own rules, and a format-1 document
+stays format 1.
+
+`daemon/tests/test_workflow_definitions.py` covers the bounds and the scalar
+round trips; `test_workflow_library_rest.py` covers the route's refusals and
+that conversion changes no library state and authorizes no save.
+
 ## Retained storage
 
 `registry/workflow_definitions.py` owns the `workflow_revisions` table. It is

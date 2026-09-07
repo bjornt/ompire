@@ -30,7 +30,9 @@ from ompire_daemon.workflow_definitions import (
     bindings_document,
     bindings_from_document,
     canonical_bytes,
+    check_draft_data,
     describe,
+    emit_draft_yaml,
     evaluate_predicate,
     evaluate_value,
     evidence_views,
@@ -1016,3 +1018,73 @@ def test_a_near_boundary_document_still_exports_and_reloads() -> None:
         + '\n  - name: bail\n    kind: gate\n    message: {parts: [{text: "stop"}]}\n'
     )
     _round_trip(text)
+
+
+# --- draft documents ----------------------------------------------------------
+# A visual editor edits data, so a draft crosses the boundary as data and has
+# to come back as text that parses to the same thing. These hold the two
+# promises that makes: the loader's bounds apply to submitted data, and the
+# emitter's output reads back unchanged.
+
+
+def test_a_draft_is_emitted_as_text_that_parses_back_to_itself() -> None:
+    """Including the scalars YAML would otherwise reinterpret.
+
+    `yes` is a boolean in YAML 1.1, `1.10` is a number to anything that
+    guesses, and an empty string is easy to emit as null. A prompt that comes
+    back as a different type is a changed instruction.
+    """
+    draft = {
+        "format": 2,
+        "name": "custom",
+        "note": "yes",
+        "off": "no",
+        "version": "1.10",
+        "empty": "",
+        "nothing": None,
+        "flag": True,
+        "count": 1,
+        "ratio": 1.0,
+        "nested": [{"a": ["b", 2]}],
+    }
+    assert parse_yaml_document(emit_draft_yaml(draft)) == draft
+
+
+def test_an_integral_float_stays_a_float_through_a_draft_round_trip() -> None:
+    """`1.0` and `1` are different literals, and a literal is executable data.
+
+    Collapsing them would change a definition's canonical bytes, and therefore
+    its identity, without anybody editing it.
+    """
+    emitted = emit_draft_yaml({"format": 2, "timeout": 1.0})
+    assert isinstance(parse_yaml_document(emitted)["timeout"], float)
+    assert isinstance(parse_yaml_document(emit_draft_yaml({"n": 1}))["n"], int)
+
+
+def test_draft_bounds_refuse_what_the_loader_would_refuse() -> None:
+    with pytest.raises(WorkflowDocumentError, match="must be a mapping"):
+        check_draft_data([1, 2])
+    with pytest.raises(WorkflowDocumentError, match="keys must be strings"):
+        check_draft_data({"steps": {1: "x"}})
+    with pytest.raises(WorkflowDocumentError, match="not JSON data"):
+        check_draft_data({"when": object()})
+    with pytest.raises(WorkflowDocumentError, match="non-finite"):
+        check_draft_data({"n": float("inf")})
+    with pytest.raises(WorkflowDocumentError, match="more than 256 steps"):
+        check_draft_data({"steps": [{"name": f"s{i}"} for i in range(300)]})
+    deep: dict = {}
+    node = deep
+    for _ in range(40):
+        child: dict = {}
+        node["n"] = child
+        node = child
+    with pytest.raises(WorkflowDocumentError, match="nests deeper"):
+        check_draft_data(deep)
+
+
+def test_a_draft_may_be_incomplete_and_carry_fields_no_format_knows() -> None:
+    """Bounds are not validation. A half-built card has to survive."""
+    draft = {"format": 2, "steps": [{"name": "work", "next": None}], "invented": [1]}
+    assert parse_yaml_document(emit_draft_yaml(draft)) == draft
+    with pytest.raises(WorkflowDocumentError):
+        load_definition(emit_draft_yaml(draft))

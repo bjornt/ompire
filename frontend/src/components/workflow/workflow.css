@@ -1,0 +1,370 @@
+/* The shared flow presentation and the visual editor.
+ *
+ * Two constraints shape everything here. State is never carried by colour
+ * alone — every chip, every broken reference, and every attempt state also
+ * says what it is in words, because a colour is unreadable to a screen reader
+ * and unreliable to anybody who cannot distinguish two of them. And the whole
+ * surface has to work at a phone width: the card list is the primary view and
+ * reflows, while the overview diagram is an addition that steps aside. */
+
+.flow {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.flowLayout {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.flowOverview {
+  position: sticky;
+  top: 0.5rem;
+  flex: 0 0 auto;
+  overflow: auto;
+  max-height: 70vh;
+}
+
+.flowCards {
+  flex: 1 1 auto;
+  min-width: 0;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+@media (max-width: 900px) {
+  .flowLayout {
+    flex-direction: column;
+  }
+  .flowOverview {
+    position: static;
+    max-height: none;
+    width: 100%;
+    order: 2;
+  }
+  .flowCards {
+    order: 1;
+    width: 100%;
+  }
+}
+
+.flowCard {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  background: var(--surface);
+  min-width: 0;
+}
+
+.flowCard:focus-visible,
+.flowCard:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.flowHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+
+.flowIndex {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.6;
+}
+
+.flowName {
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.flowChip {
+  font-size: 0.78em;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0 0.45em;
+  white-space: nowrap;
+}
+
+.flowBody {
+  margin: 0.4rem 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.flowRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.2rem 0.6rem;
+}
+
+.flowRow > dt {
+  flex: 0 0 9rem;
+  opacity: 0.7;
+  font-size: 0.9em;
+}
+
+.flowRow > dd {
+  flex: 1 1 14rem;
+  margin: 0;
+  min-width: 0;
+}
+
+.flowList,
+.flowEdges,
+.flowParts,
+.flowArgv {
+  margin: 0;
+  padding-left: 1.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.flowEdges {
+  list-style: none;
+  padding-left: 0;
+}
+
+.flowEdges > li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.3rem;
+}
+
+.flowProse {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+}
+
+.flowText {
+  min-width: 0;
+}
+
+.flowValue {
+  font-style: italic;
+}
+
+.flowConditional {
+  border-left: 2px solid var(--line);
+  padding-left: 0.5rem;
+}
+
+.flowMuted {
+  opacity: 0.7;
+  margin: 0;
+}
+
+/* A broken reference is stated in words, underlined, and never merely tinted:
+ * an invalid flow that only *looks* different is one an operator will launch. */
+.flowBroken {
+  color: var(--red);
+  text-decoration: underline wavy;
+}
+
+.flowTarget {
+  font-weight: 600;
+}
+
+.flowDiagram {
+  display: block;
+  max-width: 100%;
+}
+
+.flowNode > rect {
+  fill: var(--surface);
+  stroke: var(--line);
+}
+
+.flowNode > text {
+  font-size: 12px;
+  fill: currentColor;
+}
+
+.flowNode {
+  cursor: pointer;
+}
+
+.flowNode.current > rect {
+  stroke-width: 2.5;
+}
+
+.flowEdgePath {
+  stroke: var(--line);
+  stroke-width: 1.5;
+}
+
+.flowEdgePath.kind-case,
+.flowEdgePath.kind-choice {
+  stroke-dasharray: 5 3;
+}
+
+.flowEdgePath.kind-exhausted,
+.flowEdgePath.kind-skip {
+  stroke-dasharray: 2 3;
+}
+
+/* --- the editor ----------------------------------------------------------- */
+
+.editorSection {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  margin-bottom: 0.6rem;
+  box-sizing: border-box;
+  min-width: 0;
+}
+
+.editorField {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.3rem 0.6rem;
+  margin: 0.25rem 0;
+}
+
+.editorField > label,
+.editorField > .editorLabel {
+  flex: 0 0 9rem;
+  font-size: 0.9em;
+  opacity: 0.8;
+}
+
+.editorField > input,
+.editorField > select,
+.editorField > textarea {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+
+.editorRows {
+  list-style: none;
+  margin: 0.25rem 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.editorRow {
+  border-left: 2px solid var(--line);
+  padding-left: 0.5rem;
+  box-sizing: border-box;
+  min-width: 0;
+}
+
+/* Recursive controls nest, and so does their padding: a predicate inside a
+ * case inside a card is four wrappers deep. At a phone width that indentation
+ * is what pushes a field past the edge, so the nesting is flattened and the
+ * label takes its own line rather than competing with the input for it. */
+@media (max-width: 640px) {
+  .editorSection {
+    padding: 0.5rem 0.4rem;
+  }
+
+  .editorRow {
+    padding-left: 0.35rem;
+  }
+
+  .editorField > label,
+  .editorField > .editorLabel {
+    flex: 1 1 100%;
+  }
+
+  .flowRow > dt {
+    flex: 1 1 100%;
+  }
+}
+
+.editorActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.4rem;
+}
+
+.editorCard[data-invalid="true"] {
+  border-color: var(--red);
+}
+
+.editorProblem {
+  color: var(--red);
+  margin: 0.2rem 0;
+}
+
+.editorProblems {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.editorStale {
+  opacity: 0.7;
+}
+
+/* --- execution overlay ---------------------------------------------------- */
+
+.attemptList {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0 0;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.attempt {
+  border-left: 3px solid var(--line);
+  padding-left: 0.6rem;
+  min-width: 0;
+}
+
+/* Status is stated in the chip text as well; the stripe is a second cue, not
+ * the only one. */
+.attempt[data-status="failed"],
+.attempt[data-status="waiting"] {
+  border-left-color: var(--red);
+}
+
+.attempt[data-status="ok"] {
+  border-left-color: var(--green);
+}
+
+.attempt:focus-visible,
+.attempt:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.flowCard.current {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.editorCheck {
+  flex: 1 1 12rem;
+}
+
+/* The read-only wrapper is structural, not visual: it must not add a border,
+ * padding, or a box of its own around the whole editor. */
+.editorEditable {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}

@@ -77,6 +77,12 @@ only in comments would produce the same revision and the second save would
 silently overwrite the first. A stale submission is a `409` carrying the
 entry's actual version, and writes nothing. There is no force parameter.
 
+`/api/workflow-library/document` is deliberately outside all of that. It
+translates a draft between text and structured data for an editing client and
+takes no reservation, because it writes nothing: no row, no revision, no event.
+It is also not a token — an executable save re-validates the exact text handed
+to it regardless of what any earlier conversion or validation said.
+
 Task detail's configuration routes carry a second, structurally identical
 boundary for the tasks an upgrade left blocked.
 `POST /api/tasks/{id}/configuration/preview` resolves a continuation without

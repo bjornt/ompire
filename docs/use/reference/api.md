@@ -113,6 +113,7 @@ Every route is authenticated, and none of them starts a task.
 | `GET` | `/api/workflow-library` | Every entry: draft-only, archived, and unavailable included |
 | `POST` | `/api/workflow-library` | Create a custom entry from `yaml`, from `source_revision`, or from the starter |
 | `POST` | `/api/workflow-library/validate` | Check `yaml` (optionally against an entry `name`). Persists nothing |
+| `POST` | `/api/workflow-library/document` | Translate one draft between `yaml` and `document`, and report what it means. Persists nothing |
 | `GET` | `/api/workflow-library/{name}` | One entry: summary, raw draft text, retained revision history |
 | `PUT` | `/api/workflow-library/{name}/draft` | Save inert draft text |
 | `POST` | `/api/workflow-library/{name}/revisions` | Validate, retain, and select an executable revision |
@@ -138,6 +139,40 @@ mutation of an existing entry must submit the `expected_version` it loaded.
 | `409` | `workflow_archived` | Restore the entry before editing it |
 | `422` | `workflow_document_invalid` | With `location`, `message`, and `line`/`column` when the parser supplied them |
 | `422` | `workflow_format_unsupported` | The document declares a `format` this daemon does not implement |
+
+### Draft conversion
+
+`POST /api/workflow-library/document` is what the visual editor uses to move
+one draft between the text the library stores and the data a form edits. Send
+exactly one of `yaml` or `document`, plus an optional `name` for the same
+name-match check `validate` applies; sending both, neither, or an undeclared
+key is `422`.
+
+It answers `{document, yaml, validation}`:
+
+- `document` is the **parsed draft**, not a canonicalized definition. Unknown
+  fields and incomplete values survive it, so a half-authored flow comes back
+  whole rather than tidied into something the author did not write.
+- `yaml` is the text form of that same draft. For `yaml` in, it is the text you
+  submitted, unchanged. For `document` in, it is emitted through the same
+  serializer a revision export uses and then parsed again, so the two
+  representations cannot disagree.
+- `validation` is either `{"ok": true, …}` — the same projection `validate`
+  returns — or `{"ok": false, reason, location, message, …}`, the located
+  refusal shape. A draft that parses but is not yet a workflow gets the second
+  one **beside its unchanged data**, which is what lets incomplete visual work
+  be saved and reopened.
+
+A document that cannot be parsed or exceeds the loader's byte, depth, node, or
+step bounds is a `422` with the usual `workflow_document_invalid` shape. A
+declared `format` this daemon does not implement is reported as
+`workflow_format_unsupported` in `validation` and is never converted to the
+current format: syntactically safe conversion is not semantic support.
+
+The call persists nothing, retains no revision, publishes no event, runs no
+command, and authorizes nothing. Draft and executable saves still take exact
+YAML and the `expected_version` the client loaded, and an executable save still
+validates what it is given.
 
 There is no force-overwrite and no automatic merge: a conflict changes nothing,
 and reconciling is the client's decision. Drafts accept any UTF-8 up to 1 MiB

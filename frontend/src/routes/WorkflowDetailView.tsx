@@ -11,14 +11,17 @@ import {
   setWorkflowArchived,
   validateWorkflow,
 } from "../lib/api";
-import { WorkflowOutline } from "../components/WorkflowOutline";
+import { WorkflowFlow } from "../components/workflow/WorkflowFlow";
+import { WorkflowEditor } from "../components/workflow/WorkflowEditor";
 import { useDaemonReconcile, useDaemonState } from "../lib/useDaemonState";
+import { useWorkflowDraft } from "../lib/workflowDraft";
 import { readWorkflowFile, workflowStateLabel } from "../lib/workflowLibrary";
 import type {
   WorkflowLibraryDetail,
   WorkflowRevisionSummary,
   WorkflowValidation,
 } from "../types";
+import type { DraftObject } from "../lib/workflowDocument";
 import "./WorkflowsView.css";
 
 function errorText(error: unknown): string {
@@ -130,6 +133,34 @@ function RevisionList({
   );
 }
 
+/** A built-in's procedure, read the same way every other flow is read.
+ *
+ * Its packaged text is still available below, but the flow is what an
+ * operator compares before duplicating it — a read-only entry is not a reason
+ * to make its definition harder to understand. */
+function BuiltinFlow({ revision }: { revision: string }) {
+  const [definition, setDefinition] = useState<DraftObject | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    setDefinition(null);
+    setError(null);
+    getWorkflowRevision(revision)
+      .then((loaded) => {
+        if (live) setDefinition(loaded.definition);
+      })
+      .catch((err: unknown) => {
+        if (live) setError(errorText(err));
+      });
+    return () => {
+      live = false;
+    };
+  }, [revision]);
+  if (error !== null) return <p className="submitError">{error}</p>;
+  if (definition === null) return <p className="hint">Reading the definition…</p>;
+  return <WorkflowFlow definition={definition} testId="workflow-builtin-flow" />;
+}
+
 export function WorkflowDetailView() {
   const { name = "" } = useParams();
   const navigate = useNavigate();
@@ -139,9 +170,24 @@ export function WorkflowDetailView() {
   const entry = workflowLibrary.find((candidate) => candidate.name === name) ?? null;
   const [detail, setDetail] = useState<WorkflowLibraryDetail | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
-  /** The editor's own text. Local until a save succeeds: a snapshot, an event,
-   * or a slow response must never overwrite what somebody is typing. */
-  const [buffer, setBuffer] = useState<string | null>(null);
+  /** The editor's own working copy, in one representation at a time. Local
+   * until a save succeeds: a snapshot, an event, or a slow response must never
+   * overwrite what somebody is editing. */
+  const draft = useWorkflowDraft(name);
+  const {
+    reset: resetDraft,
+    setText: draftSetText,
+    edit: draftEdit,
+    generation,
+  } = draft;
+  /** The generation as it stands *now*, so an answer can tell whether the
+   * draft it describes is still on screen. Reading state inside an async
+   * handler would read the value captured when it started. */
+  const generationRef = useRef(generation);
+  useEffect(() => {
+    generationRef.current = generation;
+  }, [generation]);
+  const [loaded, setLoaded] = useState(false);
   const [checked, setChecked] = useState<Checked>({ kind: "none" });
   const [busy, setBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -151,14 +197,10 @@ export function WorkflowDetailView() {
   const [conflict, setConflict] = useState<string | null>(null);
   const [inspecting, setInspecting] = useState<{
     revision: string;
-    definition: Record<string, unknown> | null;
+    definition: DraftObject | null;
     error: string | null;
   } | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
-  /** The buffer as it stands *now*, so a validation response can tell whether
-   * the text it describes is still on screen. Reading state inside an async
-   * handler would read the value captured when it started. */
-  const bufferRef = useRef<string | null>(buffer);
   /** The entry version the loaded text belongs to. Every save submits it, so a
    * save can never be applied over an edit this editor never saw. */
   const [baseVersion, setBaseVersion] = useState<number | null>(null);
@@ -171,7 +213,8 @@ export function WorkflowDetailView() {
         setDetail(loaded);
         setBaseVersion(loaded.entry.version);
         if (options.replaceBuffer) {
-          setBuffer(loaded.draft_yaml ?? "");
+          resetDraft(loaded.draft_yaml ?? "");
+          setLoaded(true);
           setChecked({ kind: "none" });
           setConflict(null);
         }
@@ -179,23 +222,24 @@ export function WorkflowDetailView() {
         setLoadError(errorText(err));
       }
     },
-    [name],
+    [name, resetDraft],
   );
 
   // Loaded once per entry. A later library update refreshes the *summary*
-  // through daemon state; it deliberately never refetches over the buffer.
+  // through daemon state; it deliberately never refetches over local work.
   useEffect(() => {
     setDetail(null);
-    setBuffer(null);
+    setLoaded(false);
     void load({ replaceBuffer: true });
   }, [load]);
 
-  useEffect(() => {
-    bufferRef.current = buffer;
-  }, [buffer]);
-
+  /** Unsaved work, whichever mode it was done in. A visual change counts even
+   * before it has been serialized: the text has not caught up, but the draft
+   * has moved. */
   const dirty =
-    detail !== null && buffer !== null && buffer !== (detail.draft_yaml ?? "");
+    detail !== null &&
+    loaded &&
+    (draft.visualChanged || draft.text !== (detail.draft_yaml ?? ""));
 
   // Leaving with unsaved text is guarded the same way anywhere it can happen.
   useEffect(() => {
@@ -214,14 +258,27 @@ export function WorkflowDetailView() {
   const summary = entry ?? detail?.entry ?? null;
   const readOnly = summary?.origin === "builtin" || summary?.archived === true;
 
-  const setText = useCallback((next: string) => {
-    setBuffer(next);
-    // An edit does not discard the last result — it marks it as describing
-    // text that is no longer what is on screen.
-    setChecked((current) =>
-      current.kind === "none" ? current : { ...current, stale: true },
-    );
-  }, []);
+  const setText = useCallback(
+    (next: string) => {
+      draftSetText(next);
+      // An edit does not discard the last result — it marks it as describing
+      // text that is no longer what is on screen.
+      setChecked((current) =>
+        current.kind === "none" ? current : { ...current, stale: true },
+      );
+    },
+    [draftSetText],
+  );
+
+  const editDocument = useCallback(
+    (update: (document: DraftObject) => DraftObject) => {
+      draftEdit(update);
+      setChecked((current) =>
+        current.kind === "none" ? current : { ...current, stale: true },
+      );
+    },
+    [draftEdit],
+  );
 
   const replaceBuffer = useCallback(
     (next: string, confirmMessage: string) => {
@@ -262,22 +319,46 @@ export function WorkflowDetailView() {
     }
   }
 
+  /** The exact text of the edit currently on screen.
+   *
+   * In visual mode this serializes the current generation rather than reusing
+   * an older answer: a save must submit what the operator is looking at, and
+   * a conversion that cannot produce it refuses the save instead of sending
+   * a stale document. */
+  async function submittedText(): Promise<string | null> {
+    const text = await draft.currentText();
+    if (text === null) {
+      setActionError(
+        "Your visual changes could not be turned back into a document, so nothing was submitted. Your work is still here — retry, or download it.",
+      );
+    }
+    return text;
+  }
+
   async function onSaveDraft() {
-    if (buffer === null || baseVersion === null) return;
-    const saved = await run("draft", () => saveWorkflowDraft(name, buffer, baseVersion));
+    if (baseVersion === null) return;
+    const text = await submittedText();
+    if (text === null) return;
+    const saved = await run("draft", () => saveWorkflowDraft(name, text, baseVersion));
     if (saved !== null) applyDetail(saved);
   }
 
   async function onValidate() {
-    if (buffer === null || busy !== null) return;
+    if (busy !== null) return;
+    const submitted = await submittedText();
+    if (submitted === null) return;
     // Tied to the exact text submitted, so a result can never describe a
-    // different buffer than the one it was asked about.
-    const submitted = buffer;
+    // different draft than the one it was asked about.
+    const submittedGeneration = generationRef.current;
     setBusy("validate");
     setActionError(null);
     try {
       const result = await validateWorkflow(submitted, name);
-      setChecked({ kind: "ok", result, stale: submitted !== bufferRef.current });
+      setChecked({
+        kind: "ok",
+        result,
+        stale: submittedGeneration !== generationRef.current,
+      });
     } catch (err) {
       const detailBody = err instanceof DaemonError ? err.detail : null;
       setChecked({
@@ -285,7 +366,7 @@ export function WorkflowDetailView() {
         message: errorText(err),
         location: typeof detailBody?.location === "string" ? detailBody.location : null,
         line: typeof detailBody?.line === "number" ? detailBody.line : null,
-        stale: submitted !== bufferRef.current,
+        stale: submittedGeneration !== generationRef.current,
       });
     } finally {
       setBusy(null);
@@ -293,9 +374,11 @@ export function WorkflowDetailView() {
   }
 
   async function onSaveRevision() {
-    if (buffer === null || baseVersion === null) return;
+    if (baseVersion === null) return;
+    const text = await submittedText();
+    if (text === null) return;
     const saved = await run("revision", () =>
-      saveWorkflowRevision(name, buffer, baseVersion),
+      saveWorkflowRevision(name, text, baseVersion),
     );
     if (saved !== null) {
       applyDetail(saved);
@@ -317,11 +400,23 @@ export function WorkflowDetailView() {
     download(`${exported.name}.yaml`, exported.yaml);
   }
 
-  function onDownloadDraft() {
-    if (buffer === null) return;
-    // Labelled a draft on purpose: it is the text in the editor, which is not
+  async function onDownloadDraft() {
+    // Labelled a draft on purpose: it is the work in the editor, which is not
     // necessarily a valid workflow and is certainly not a saved revision.
-    download(`${name}.draft.yaml`, buffer);
+    const text = await draft.currentText();
+    if (text !== null) {
+      download(`${name}.draft.yaml`, text);
+      return;
+    }
+    // The conversion service could not be reached. Rather than leave somebody
+    // with no way to keep visual work, hand them the document as JSON — which
+    // is valid YAML, so it imports again — and say that is what it is.
+    const fallback = draft.fallbackText();
+    if (fallback === null) return;
+    download(`${name}.draft.json.yaml`, fallback);
+    setActionError(
+      "The daemon could not turn this draft back into YAML, so it was downloaded as JSON instead. JSON is valid YAML, so importing the file works; the layout is not what you typed.",
+    );
   }
 
   async function onDuplicate() {
@@ -451,32 +546,102 @@ export function WorkflowDetailView() {
               </button>
             )}
           </div>
-          <pre className="yamlReadonly" data-testid="workflow-packaged-yaml">
-            {detail.draft_yaml ?? "This package no longer ships this definition."}
-          </pre>
+          {summary.current_revision !== null && (
+            <BuiltinFlow revision={summary.current_revision} />
+          )}
+          <details>
+            <summary>Read its YAML</summary>
+            <pre className="yamlReadonly" data-testid="workflow-packaged-yaml">
+              {detail.draft_yaml ?? "This package no longer ships this definition."}
+            </pre>
+          </details>
         </section>
       ) : (
         <section className="panel">
           <h2 className="panelTitle">
-            YAML {summary.archived ? "(archived — read-only)" : "editor"}
+            {summary.archived ? "Editor (archived — read-only)" : "Editor"}
           </h2>
           {dirty && (
             <p className="hint unsavedHint" data-testid="workflow-unsaved">
               Unsaved changes in this editor.
             </p>
           )}
-          <label className="visuallyHidden" htmlFor="workflow-yaml">
-            Workflow definition YAML
-          </label>
-          <textarea
-            id="workflow-yaml"
-            className="yamlEditor mono"
-            spellCheck={false}
-            readOnly={readOnly}
-            value={buffer ?? ""}
-            onChange={(e) => setText(e.target.value)}
-            data-testid="workflow-editor"
-          />
+          {/* Two views of one draft, never two drafts. Switching is not a save
+              and not a launch; what changes is which controls you get. */}
+          <div className="formActions" role="group" aria-label="Editing mode">
+            <button
+              type="button"
+              className={draft.mode === "visual" ? "primaryButton" : "ghostButton"}
+              aria-pressed={draft.mode === "visual"}
+              disabled={draft.converting}
+              data-testid="workflow-mode-visual"
+              onClick={() => void draft.enterVisual()}
+            >
+              {draft.mode === "visual" ? "Visual" : "Switch to visual"}
+            </button>
+            <button
+              type="button"
+              className={draft.mode === "yaml" ? "primaryButton" : "ghostButton"}
+              aria-pressed={draft.mode === "yaml"}
+              disabled={draft.converting}
+              data-testid="workflow-mode-yaml"
+              onClick={() => void draft.leaveVisual()}
+            >
+              {draft.mode === "yaml" ? "YAML" : "Switch to YAML"}
+            </button>
+            {draft.converting && <span className="hint">Working…</span>}
+          </div>
+          {draft.mode === "visual" && (
+            <p className="hint" data-testid="workflow-visual-warning">
+              Editing here rewrites the document when you save, which normalizes
+              its layout and drops YAML comments. What it does not change is
+              what the workflow means. Download the draft first if you want to
+              keep your own formatting.
+            </p>
+          )}
+          {draft.conversionError !== null && (
+            <div className="checkFailed" data-testid="workflow-conversion-error">
+              <p>{draft.conversionError}</p>
+              <p className="hint">
+                Nothing was changed and nothing was saved. Your work is exactly
+                as you left it.
+              </p>
+              <button
+                type="button"
+                className="ghostButton"
+                data-testid="workflow-conversion-retry"
+                onClick={() =>
+                  void (draft.mode === "visual" ? draft.revalidate() : draft.enterVisual())
+                }
+              >
+                Try again
+              </button>
+            </div>
+          )}
+          {draft.mode === "visual" && draft.document !== null ? (
+            <WorkflowEditor
+              document={draft.document}
+              onChange={editDocument}
+              validation={draft.validation}
+              readOnly={readOnly}
+              stale={draft.converting}
+            />
+          ) : (
+            <>
+              <label className="visuallyHidden" htmlFor="workflow-yaml">
+                Workflow definition YAML
+              </label>
+              <textarea
+                id="workflow-yaml"
+                className="yamlEditor mono"
+                spellCheck={false}
+                readOnly={readOnly}
+                value={draft.text}
+                onChange={(e) => setText(e.target.value)}
+                data-testid="workflow-editor"
+              />
+            </>
+          )}
           <div className="formActions">
             <button
               type="button"
@@ -515,7 +680,12 @@ export function WorkflowDetailView() {
             >
               Import into editor…
             </button>
-            <button type="button" className="ghostButton" onClick={onDownloadDraft}>
+            <button
+              type="button"
+              className="ghostButton"
+              onClick={() => void onDownloadDraft()}
+              data-testid="workflow-download-draft"
+            >
               Download draft
             </button>
           </div>
@@ -549,7 +719,7 @@ export function WorkflowDetailView() {
           {conflict !== null && (
             <ConflictNotice
               message={conflict}
-              buffer={buffer ?? ""}
+              buffer={draft.text}
               onReload={() => void load({ replaceBuffer: true })}
               onDismiss={() => setConflict(null)}
             />
@@ -593,7 +763,7 @@ export function WorkflowDetailView() {
                   You have edited the text since this check. Validate again.
                 </p>
               )}
-              <WorkflowOutline definition={checked.result.definition} />
+              <WorkflowFlow definition={checked.result.definition} testId="workflow-check-flow" />
             </div>
           )}
 
@@ -678,7 +848,7 @@ export function WorkflowDetailView() {
             ) : inspecting.definition === null ? (
               <p className="hint">Loading…</p>
             ) : (
-              <WorkflowOutline definition={inspecting.definition} />
+              <WorkflowFlow definition={inspecting.definition} testId="workflow-inspect-flow" />
             )}
           </div>
         )}

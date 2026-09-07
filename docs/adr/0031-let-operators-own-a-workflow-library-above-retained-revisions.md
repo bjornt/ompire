@@ -133,10 +133,16 @@ and a repair path, while everything else keeps working. What it costs is that
 "the library" is no longer a thing that is simply valid: every consumer has to
 handle an entry that exists but cannot run.
 
-YAML is the whole authoring surface in this change. It is an expert one, and it
-is deliberately the first one: the step-card builder is a separate change over
-this same library, and building it first would have meant designing a visual
-editor against a store that did not exist yet.
+YAML was the whole authoring surface when this decision was taken, and it was
+deliberately the first one: the step-card builder is a separate change over this
+same library, and building it first would have meant designing a visual editor
+against a store that did not exist yet. That builder now exists. It edits the
+same drafts, through the same draft, validate, and executable-save operations,
+and it adds one stateless conversion between the text this library stores and
+the data a form edits — no second store, no second validator, and no authority
+this decision did not already grant. The ownership, concurrency, and per-entry
+failure rules above are unchanged by it; what changed is that YAML is now one of
+two ways to write a definition rather than the only one.
 
 ## Alternatives considered
 

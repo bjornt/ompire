@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ReviewSummary } from "../components/ReviewSummary";
+import { WorkflowRevision } from "../components/WorkflowRevision";
+import { StepAttempts } from "../components/workflow/StepAttempts";
+import { attemptsFor } from "../lib/workflowAttempts";
+import { asObject } from "../lib/workflowDocument";
 import { useAgentChannel } from "../lib/agentChannel";
 import { isStreaming, useAgentStatus } from "../lib/agentStatus";
 import { cancelReview, getTaskDetail, resumeWorkflow, startReview } from "../lib/api";
@@ -496,6 +500,72 @@ function workshopLabel(detail: TaskDetail): { text: string; status: WorkshopStat
   return { text: `${status} · ${detail.workshop_id}`, status };
 }
 
+/** The procedure this task accepted, with what happened laid over it.
+ *
+ * Addressed by the task's *retained* revision, never by its workflow name:
+ * the library may have moved on, been edited, or been archived since, and the
+ * only definition that explains this run is the one it pinned (ADR-0028).
+ *
+ * The declaration and the attempts stay separate. An unvisited step is shown
+ * as work the procedure allows; a step visited three times shows three
+ * records. Answering a gate and retrying a pause remain the existing
+ * attempt-scoped controls above — there is no action here on a step the run
+ * has merely not reached. */
+function PinnedProcedure({
+  revision,
+  workflow,
+  onOpenSession,
+}: {
+  revision: string;
+  workflow: WorkflowState;
+  onOpenSession: (session: string) => void;
+}) {
+  const openAttempt = (seq: number) => {
+    const card = document.getElementById(`attempt-${seq}`);
+    card?.scrollIntoView?.({ block: "nearest" });
+    card?.focus();
+  };
+  return (
+    <div className="panel" data-testid="pinned-procedure">
+      <h2 className="panelTitle">Procedure</h2>
+      <p className="hint">
+        The definition this task accepted, not what its name means today.
+        Editing or archiving the workflow in the library changes neither this
+        flow nor anything it recorded.
+      </p>
+      <WorkflowRevision
+        revision={revision}
+        current={workflow.step}
+        summaryLabel="read the pinned procedure and what happened at each step"
+        extras={(_index, name, step) => {
+          const attempts = attemptsFor(workflow, name);
+          const declaresEvidence = Object.keys(asObject(step.evidence) ?? {}).length > 0;
+          return {
+            className: name === workflow.step ? "flowCard current" : undefined,
+            badge:
+              attempts.length === 0 ? (
+                <span className="flowChip">not visited</span>
+              ) : (
+                <span className="flowChip">
+                  {attempts.length} attempt{attempts.length === 1 ? "" : "s"}
+                </span>
+              ),
+            body: (
+              <StepAttempts
+                attempts={attempts}
+                workflow={workflow}
+                declaresEvidence={declaresEvidence}
+                onOpenSession={onOpenSession}
+                onOpenAttempt={openAttempt}
+              />
+            ),
+          };
+        }}
+      />
+    </div>
+  );
+}
+
 export function TaskDetailView() {
   const { id } = useParams();
   const taskId = Number(id);
@@ -651,6 +721,14 @@ export function TaskDetailView() {
 
       {workflow !== null && workflow.status === "waiting" && (
         <GateCard taskId={taskId} workflow={workflow} />
+      )}
+
+      {workflow !== null && liveTask?.workflow_revision != null && (
+        <PinnedProcedure
+          revision={liveTask.workflow_revision}
+          workflow={workflow}
+          onOpenSession={setSelected}
+        />
       )}
 
       {session?.question && (

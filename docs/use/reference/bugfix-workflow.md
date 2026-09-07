@@ -304,6 +304,33 @@ over, and the session reads as *starting* for a moment. A repeated `fix` uses
 The task prompt should be the issue — what is wrong, and how to observe it.
 The workflow supplies the procedure.
 
+### Reading a run of it
+
+The whole procedure is readable in the UI without opening YAML — in the library
+before you launch, in the Spawn preview as the exact revision you are
+accepting, and in task detail as the revision that task pinned.
+
+The three things this workflow's shape turns on are all visible there:
+
+- **The branches.** Each routing step lists its ordered conditions and where
+  each one leads, including the informed-reproduction return and the
+  rejected-fix loop back to `fix`. They are declared routes, not predictions:
+  nothing on the page evaluates a condition, so no branch is shown as the one
+  a run took.
+- **The gates.** A gate card shows its question and the answers it offers, and
+  once somebody has answered, which answer they chose, the reason they wrote,
+  and where it went. A gate the run never reached stays visible as a possible
+  stop and offers no action.
+- **The reused QA session.** `reproduce`, `reproduce-informed`, and `verify`
+  all show `reproducer` as their agent, and each attempt links into that one
+  conversation. The evidence each step was handed links to the exact producing
+  attempt, so a verification says which fix attempt it checked rather than
+  implying it checked the newest.
+
+A failed first reproduction is a declared result with its own evidence, and it
+reaches `diagnose` intact. Nothing in this surface relabels a code-level
+hypothesis as a reproduction.
+
 ## Older bugfix runs
 
 A task accepted before this revision keeps running the definition it pinned.

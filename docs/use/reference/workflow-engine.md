@@ -118,6 +118,57 @@ including a comment-only draft save. It is what stops two browser tabs from
 overwriting each other, and it is deliberately not the revision: comments do
 not change a revision, but they are still a real edit.
 
+### Two ways to edit one draft
+
+An entry's draft has two editors, and they are two views of the same document
+rather than two documents. **Visual** is a list of step cards with an agents
+panel; **YAML** is the text. Switching between them is not a save and not a
+launch.
+
+The visual editor covers everything either format supports: named agents and
+which one the task opens on, each step's kind, assigned agent, abstract model
+role and run condition, instructions built from text and explicit references,
+required results and their artifact fields, evidence selectors with their
+sources, freshness anchor and optional flag, command arguments as separate
+rows, ordered decision cases, gate questions with their named answers, and
+visit bounds with the gate they reach when exhausted. Nothing supported is
+hidden behind the text editor.
+
+Two things are deliberately not editable in either view. A workflow's **name**
+is the library entry's identity, so renaming means creating a separate entry.
+A workflow's **format** is the rules its document is read under, so an existing
+format-1 workflow stays format 1 and keeps its own outcome, history, gate, and
+completion rules; new workflows are format 2.
+
+What switching costs you:
+
+- Opening the visual editor and going back **without changing anything** leaves
+  your text exactly as you typed it, comments included.
+- Once you change something visually, saving rewrites the document. That
+  normalizes its layout and drops YAML comments. It does not change what the
+  workflow means — download the draft first if you want to keep your own
+  formatting.
+- Text that cannot be parsed at all stays in the YAML editor with the line and
+  reason. The visual editor refuses to open rather than showing you an empty or
+  last-known-good document.
+- A format or a construct this daemon does not support is named as such. It is
+  kept exactly as written, is not editable in the forms, and is never silently
+  converted or stripped.
+
+A draft that parses but is not yet a workflow is normal work, not an error
+state. A route with no destination, a step that names a card you deleted, a
+gate with no answers — all of these can be saved as a draft and reopened. The
+editor shows the daemon's reason at the field it is about, with a link that
+opens the card even when it is collapsed. None of them can be saved as an
+executable revision.
+
+Renaming a step or an agent moves the routes, selectors, visit counts, and
+assignments that name it. It does not touch instructions, literal values, or
+result names that merely contain the same word — those are not references.
+Removing a step lists what names it first; if you remove it anyway, those
+references stay visible as broken ones rather than being repaired into
+something you did not ask for.
+
 ### The three save operations
 
 They are separate on purpose, and only the third changes what runs.
@@ -126,9 +177,12 @@ They are separate on purpose, and only the third changes what runs.
 |---|---|---|
 | **Save draft** | Persists the text as-is | Never validates, never changes the current revision |
 | **Validate** | Checks that exact text and shows either a read-only reading of it or a located error | Saves nothing, and authorizes nothing later |
+
 | **Save executable revision** | Validates the text again, retains it, makes it the current revision, and saves it as the draft | Never starts a task |
 
-Editing after a validation marks that result out of date; validate again.
+Editing after a validation marks that result out of date; validate again. In
+the visual editor a save submits the edit you are looking at: if it cannot be
+turned back into a document, nothing is submitted and your work stays put.
 Validation is *structural*: it says the daemon can read the definition, not that
 the commands it names are installed, that a model will comply, or that the run
 will succeed. A failed executable save leaves the last one exactly where it was.
@@ -138,7 +192,7 @@ will succeed. A failed executable save leaves the last one exactly where it was.
 Four ways in, all of which produce a draft and nothing else:
 
 - **New workflow** opens a minimal format-2 example with one agent step and a
-  named ending.
+  named ending, which you can then build out in either editor.
 - **Duplicate** copies a saved revision into a new entry under a name you
   choose. This is how you customize a built-in.
 - **Import YAML** reads a local file into the editor. The file is read by your
@@ -155,6 +209,11 @@ Exporting a saved revision gives you a standalone YAML definition, verified to
 load back to the same revision before it is handed to you. Comments and
 formatting are not preserved: a revision is a normalized document, and your text
 lives in the entry's draft, which downloads separately and is labelled a draft.
+
+A draft download is your text. If the daemon cannot turn a visually edited
+draft back into YAML — it is unreachable, say — the download is offered as JSON
+instead and labelled as such. JSON is valid YAML, so the file imports again;
+its layout is not what you typed.
 
 Re-importing an unchanged export under the same name is the same procedure and
 reuses the same revision. Importing it under a *different* name is a different
@@ -587,6 +646,41 @@ A run that was `complete` or `failed` is never re-driven. Its sessions are
 only resumed — on that same last-applied policy, which is what a follow-up,
 review feedback, or ship drafting then continues with.
 
+### Reading a run against its procedure
+
+Task detail shows the procedure the task accepted, laid over what actually
+happened. It is addressed by the task's **retained revision**, never by its
+workflow name: editing or archiving the entry in the library changes neither
+this flow nor anything the run recorded.
+
+Declaration and attempt are kept apart, because conflating them is how a run
+gets read as more successful than it was.
+
+| What you see | What it means |
+|---|---|
+| A step with no attempts | Work the procedure allows. Not skipped, not done — never reached |
+| Several attempts on one step | Every visit, in order. A rejected verification and the corrected one are both there |
+| A declared result | The name the step wrote, with its summary |
+| A stop without a decision | The engine refusing to guess, with the reason it gave |
+| A gate's recorded answer | Who chose it, which answer, any reason they wrote, and where it went |
+| An evidence alias | A link to the exact producing attempt, by step and sequence number |
+
+The routes shown under each step are the ones the definition **declares**.
+Nothing on this page evaluates a condition, so no route is presented as the one
+a run took or will take. Where history recorded a destination but not the
+reasoning behind it — which every run does, because the engine stores the
+destination and not the clause — you see the declared conditions and the
+recorded inputs, not a reconstructed verdict.
+
+Where history is silent, it says so. An attempt from a format-1 run recorded no
+evidence bindings, so what it was handed is not recoverable; that is reported as
+unrecorded rather than filled in from today's definition. A visit count is the
+number of visits on the record, which for a run predating step records is fewer
+than it actually had.
+
+Answering a gate and retrying a stopped step remain the controls on the waiting
+attempt itself. A gate the run has not reached offers no action.
+
 ### Git exclusion
 
 The clone step appends `.ompire/` to the clone's `.git/info/exclude`,
@@ -609,6 +703,7 @@ there is no judge to configure (see
 | `POST` | `/api/tasks/{id}/workflow/resume` |
 | `GET` | `/api/workflows` |
 | `GET` | `/api/workflows/revisions/{revision}` |
+| `POST` | `/api/workflow-library/document` |
 
 `resume` advances a waiting run. It names the waiting attempt's sequence
 number, and the daemon decides from the waiting record which of three waits it
@@ -633,6 +728,12 @@ them. `GET /api/workflow-library` returns every entry instead, archived and
 draft-only included. Both ride in the WebSocket snapshot, derived from one read,
 and every committed change publishes one `workflow_library_updated` entry from
 which the launch catalog follows.
+
+`POST /api/workflow-library/document` translates one draft between YAML text
+and structured data, and reports what it currently means. It is what the visual
+editor uses. It persists nothing, retains no revision, publishes no event, runs
+no command, and authorizes no later save — an executable save still validates
+the exact text it is handed.
 
 `GET /api/workflows/revisions/{revision}` reads one retained definition by
 content identity — deliberately not by name, because a name says what a *new*

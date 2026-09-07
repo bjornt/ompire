@@ -107,6 +107,20 @@ function detail(
 /** Route every request this view makes; a test overrides only what it cares
  * about. Each handler receives the parsed body so a test can assert on what
  * was actually submitted. */
+/** A response the client can read either way it reads one.
+ *
+ * Definition-bearing payloads go through the lossless codec, which reads the
+ * body as text; everything else calls `json()`. Serving both from the same
+ * value keeps the stub from deciding which client path a test exercises. */
+function respond(status: number, json: unknown) {
+  return {
+    ok: status < 400,
+    status,
+    json: () => Promise.resolve(json),
+    text: () => Promise.resolve(JSON.stringify(json)),
+  };
+}
+
 function stubFetch(
   handlers: Record<string, (body: unknown) => { status?: number; json: unknown }> = {},
 ) {
@@ -119,16 +133,12 @@ function stubFetch(
     const handler = handlers[key];
     if (handler !== undefined) {
       const { status = 200, json } = handler(body);
-      return Promise.resolve({
-        ok: status < 400,
-        status,
-        json: () => Promise.resolve(json),
-      });
+      return Promise.resolve(respond(status, json));
     }
     if (url.startsWith("/api/workflow-library/") && method === "GET") {
-      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(detail()) });
+      return Promise.resolve(respond(200, detail()));
     }
-    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) });
+    return Promise.resolve(respond(200, {}));
   });
   vi.stubGlobal("fetch", fetchMock);
   return { fetchMock, calls };
@@ -358,7 +368,7 @@ describe("the workflow editor", () => {
     const ok = await screen.findByTestId("workflow-check-ok");
     expect(ok.textContent).toContain("Valid format-1 definition");
     // The read-only reading, not a second editor.
-    expect(within(ok).getByTestId("outline-step-work").textContent).toContain("do it");
+    expect(within(ok).getByTestId("flow-step-work").textContent).toContain("do it");
     expect(screen.queryByTestId("workflow-check-stale")).toBeNull();
 
     await user.type(editor, "x");

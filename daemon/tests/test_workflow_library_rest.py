@@ -514,3 +514,196 @@ def test_an_accepted_task_keeps_its_revision_across_edit_and_archive(
         client.get(f"/api/workflows/revisions/{pinned}", headers=headers).status_code
         == 200
     )
+
+
+# --- authoring conversion -----------------------------------------------------
+# `POST /api/workflow-library/document` is the only translation between the
+# text the library stores and the data a visual editor holds. What these hold
+# is that it stays inert: it persists nothing, authorizes nothing, and refuses
+# rather than repairing what it cannot represent.
+
+
+def convert(client: TestClient, headers, **body):
+    return client.post("/api/workflow-library/document", headers=headers, json=body)
+
+
+def test_conversion_needs_the_token_like_every_other_authoring_route(
+    client: TestClient,
+) -> None:
+    assert client.post(
+        "/api/workflow-library/document", json={"yaml": minimal()}
+    ).status_code in (401, 403)
+
+
+def test_yaml_in_returns_the_submitted_text_unchanged_with_its_parsed_data(
+    client: TestClient, headers
+) -> None:
+    text = minimal(body="do it")
+    body = convert(client, headers, yaml=text).json()
+    # The text is not reformatted by being read. Opening the visual editor and
+    # closing it again must not rewrite somebody's document.
+    assert body["yaml"] == text
+    assert body["document"]["name"] == "custom"
+    assert body["document"]["steps"][0]["kind"] == "agent"
+    assert body["validation"]["ok"] is True
+    assert body["validation"]["format"] == 1
+
+
+def test_document_in_comes_back_as_the_text_that_parses_to_it(
+    client: TestClient, headers
+) -> None:
+    submitted = convert(client, headers, yaml=minimal()).json()["document"]
+    round_tripped = convert(client, headers, document=submitted).json()
+    assert round_tripped["document"] == submitted
+    # And that text is really the loader's input, not a display form.
+    assert convert(client, headers, yaml=round_tripped["yaml"]).json()[
+        "document"
+    ] == submitted
+
+
+def test_a_parseable_but_unfinished_draft_keeps_its_data_and_says_why(
+    client: TestClient, headers
+) -> None:
+    """The case that makes visual authoring usable: incomplete work survives.
+
+    A card pointing at a step that does not exist is exactly what a half-built
+    flow looks like. It must come back whole, with a located reason, and it
+    must not be executable.
+    """
+    draft = {
+        "format": 2,
+        "name": "custom",
+        "sessions": ["main"],
+        "primary": "main",
+        "steps": [
+            {
+                "name": "work",
+                "kind": "decision",
+                "cases": [{"when": True, "next": {"step": "nowhere"}}],
+                "otherwise": {"complete": True, "result": "done"},
+            }
+        ],
+    }
+    body = convert(client, headers, document=draft).json()
+    assert body["document"]["steps"][0]["cases"][0]["next"] == {"step": "nowhere"}
+    assert body["validation"]["ok"] is False
+    assert body["validation"]["reason"] == "workflow_document_invalid"
+    assert "nowhere" in body["validation"]["message"]
+    assert body["validation"]["location"]
+
+
+def test_unknown_fields_survive_conversion_rather_than_being_dropped(
+    client: TestClient, headers
+) -> None:
+    draft = {"format": 2, "name": "custom", "invented": {"keep": [1, 2]}}
+    body = convert(client, headers, document=draft).json()
+    assert body["document"]["invented"] == {"keep": [1, 2]}
+    assert body["validation"]["ok"] is False
+    # Refused as unknown, never silently stripped into a "clean" document.
+    assert "invented" in body["validation"]["message"]
+
+
+def test_an_unsupported_format_is_reported_not_converted(
+    client: TestClient, headers
+) -> None:
+    body = convert(
+        client, headers, document={"format": 99, "name": "custom", "steps": []}
+    ).json()
+    assert body["document"]["format"] == 99
+    assert body["validation"]["reason"] == "workflow_format_unsupported"
+    assert body["validation"]["format"] == 99
+
+
+def test_scalars_that_yaml_would_reinterpret_survive_the_round_trip(
+    client: TestClient, headers
+) -> None:
+    """`yes`, `1.0`, and a version-shaped string are the classic losses."""
+    draft = {
+        "format": 2,
+        "name": "custom",
+        "note": "yes",
+        "ratio": 1.0,
+        "count": 1,
+        "version": "1.10",
+        "empty": "",
+    }
+    body = convert(client, headers, document=draft).json()
+    assert body["document"]["note"] == "yes"
+    assert body["document"]["version"] == "1.10"
+    assert body["document"]["empty"] == ""
+    assert isinstance(body["document"]["ratio"], float)
+    assert isinstance(body["document"]["count"], int)
+    assert body["document"]["count"] == 1
+
+
+def test_a_name_mismatch_is_reported_against_the_entry_it_would_be_saved_into(
+    client: TestClient, headers
+) -> None:
+    body = convert(client, headers, yaml=minimal(name="other"), name="custom").json()
+    assert body["validation"]["ok"] is False
+    assert body["validation"]["reason"] == "workflow_name_mismatch"
+    assert body["validation"]["location"] == "name"
+
+
+def test_unparseable_yaml_is_an_http_refusal_that_locates_the_problem(
+    client: TestClient, headers
+) -> None:
+    response = convert(client, headers, yaml="steps: [\n  - name: x\n")
+    assert response.status_code == 422
+    assert response.json()["detail"]["reason"] == "workflow_document_invalid"
+
+
+def test_unsafe_and_oversized_input_is_refused_before_anything_expensive(
+    client: TestClient, headers
+) -> None:
+    anchored = "format: &a 2\nname: custom\nalias: *a\n"
+    assert convert(client, headers, yaml=anchored).status_code == 422
+    assert convert(client, headers, yaml="x: " + "a" * (1024 * 1024)).status_code == 422
+    # Data too deep to be a document the loader would accept, submitted as
+    # data rather than as text, is refused by the same bound.
+    deep: dict = {"format": 2}
+    node: dict = deep
+    for _ in range(40):
+        child: dict = {}
+        node["n"] = child
+        node = child
+    assert convert(client, headers, document=deep).status_code == 422
+
+
+def test_supplying_both_or_neither_representation_is_refused(
+    client: TestClient, headers
+) -> None:
+    assert convert(client, headers, yaml=minimal(), document={}).status_code == 422
+    assert convert(client, headers).status_code == 422
+    # And a transport key nobody defined is not quietly ignored.
+    assert convert(client, headers, yaml=minimal(), surprise=1).status_code == 422
+
+
+def test_conversion_changes_no_library_state_and_authorizes_no_save(
+    client: TestClient, headers
+) -> None:
+    assert create(client, headers, name="custom").status_code == 201
+    before = client.get("/api/workflow-library/custom", headers=headers).json()
+
+    assert convert(client, headers, yaml=minimal(body="unsaved"), name="custom").status_code == 200
+    after = client.get("/api/workflow-library/custom", headers=headers).json()
+    assert after == before
+
+    # A successful conversion is not a token: the executable save re-validates
+    # exactly what it is handed, and refuses invalid text it never saw.
+    assert convert(client, headers, yaml="format: 2\nname: custom\n").status_code == 200
+    refused = client.post(
+        "/api/workflow-library/custom/revisions",
+        headers=headers,
+        json={
+            "yaml": "format: 2\nname: custom\n",
+            "expected_version": version(client, headers, "custom"),
+        },
+    )
+    assert refused.status_code == 422
+    assert (
+        client.get("/api/workflow-library/custom", headers=headers).json()["entry"][
+            "current_revision"
+        ]
+        is None
+    )
