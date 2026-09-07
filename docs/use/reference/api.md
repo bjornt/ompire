@@ -186,7 +186,7 @@ All paths are under `/api/tasks/{id}/sessions/{session}/agent`.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/api/tasks/{id}/workflow/resume` | Advance a waiting run: resume a declared gate, or retry a paused step |
+| `POST` | `/api/tasks/{id}/workflow/resume` | Advance a waiting run: answer a gate with one of its declared choices, resume a gate that offers none, or retry a paused step |
 | `POST` | `/api/tasks/{id}/review` | Open a review |
 | `POST` | `/api/tasks/{id}/review/cancel` | Cancel and restore the clone |
 | `POST` | `/api/tasks/{id}/ship/draft` | Ensure one initial agent draft, or explicitly replace it with `{"replace": true}`. A new/replacement request requires a live, `idle` primary agent; an ordinary repeated request returns observed ship state without a second agent turn. |

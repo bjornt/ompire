@@ -41,6 +41,13 @@ parsing fails. The engine reserves no model of its own. Missing or malformed
 output is not a result: the run stops and says what was missing, and only an
 explicit human retry re-enters the step.
 
+**Do not let a human answer grant authority it was not given.** A gate offers
+the choices its definition declares and nothing else, and each one leads where
+that definition says. Answering records the choice, the operator's words, and
+the route taken — and it starts no review, signs nothing, pushes nothing, and
+opens no pull request. The words themselves are data: stored verbatim, rendered
+as text, and handed to a later prompt as content. They never name a route.
+
 **Do not widen the sandbox for convenience.** Each task gets its own clone and
 container. Sharing a working tree, an index, refs, or a container between
 tasks removes the property that makes parallel tasks safe.

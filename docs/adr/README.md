@@ -26,7 +26,7 @@ relying on it.
 | [0006](0006-give-every-task-a-separate-clone-and-workshop.md) | Give every task a separate clone and Workshop container | Proposed |
 | [0007](0007-use-native-omp-rpc.md) | Integrate agents through supervised native Omp RPC processes | Accepted |
 | [0008](0008-model-tasks-as-workflows-over-named-sessions.md) | Model tasks as workflows over named sessions | Accepted |
-| [0009](0009-use-structured-git-excluded-outcomes.md) | Use structured, Git-excluded files for agent-step outcomes | Accepted |
+| [0009](0009-use-structured-git-excluded-outcomes.md) | Use structured, Git-excluded files for agent-step outcomes | Accepted; superseded for workflow format 2 by ADR-0029 |
 | [0010](0010-separate-projects-templates-and-task-snapshots.md) | Separate projects, templates, and task snapshots | Superseded by ADR-0026 |
 | [0011](0011-keep-review-and-publishing-authority-outside-agent-sandbox.md) | Keep review and publishing authority outside the agent sandbox | Accepted |
 | [0012](0012-derive-attention-centrally-from-session-state.md) | Derive attention centrally from session state | Accepted |

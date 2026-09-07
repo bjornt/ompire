@@ -27,13 +27,13 @@ All paths are under `daemon/src/ompire_daemon/`.
 | `db.py` | Engine, schema definition, WAL configuration. Note it does *not* enable `PRAGMA foreign_keys` — see [Database schema](database-schema.md#reference-safety-without-global-fk-enforcement). |
 | `model_config.py` | The vocabularies every model consumer agrees on: thinking levels and the four abstract roles. Model identifiers are not validated here — the provider-qualified grammar lives with profile value validation. |
 | `execution_inputs.py` | The typed launch decision pinned to a task — including its workflow revision — its JSON codec, and `ModelPolicy`, the complete native role map one omp process runs under. |
-| `workflow_definitions.py` | The format-1 document: immutable data model, strict YAML loader, canonicalization and content identity, and the bounded three-valued evaluator. Imports nothing from the registry or the task model. See [Workflow definitions](workflow-definitions.md). |
+| `workflow_definitions.py` | The workflow document in both formats: immutable data model, strict format-aware YAML loader, canonicalization and content identity, the bounded three-valued evaluator, result contracts, and evidence selection. Imports nothing from the registry or the task model. See [Workflow definitions](workflow-definitions.md). |
 | `migrate.py` | Runs Alembic migrations at startup. |
 | `registry/projects.py` | Projects, including the guarded default-model-profile reference |
 | `registry/model_profiles.py` | Model profiles: the four-role contract, provider-qualified identifier grammar, reference-guarded deletion, and the `reserved_write` SQLite write reservation both reference checks share |
 | `registry/tasks.py` | Tasks and their publishing state |
 | `registry/sessions.py` | Session identity, `(task_id, name)` |
-| `registry/workflows.py` | Workflow runs, step records, and the atomic waiting/retry transitions |
+| `registry/workflows.py` | Workflow runs, step records, and the atomic waiting, retry, and gate-decision transitions |
 | `registry/workflow_definitions.py` | Retained revisions: append-only, verified on read, cached by content identity and never by name |
 | `registry/reviews.py` | Review status and ordered iteration history |
 | `registry/settings.py` | Layered settings: override, then TOML, then default |

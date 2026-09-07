@@ -487,12 +487,14 @@ there is no judge to configure (see
 | `GET` | `/api/workflows/revisions/{revision}` |
 
 `resume` advances a waiting run. It names the waiting attempt's sequence
-number, and the daemon decides from the waiting record whether that means
-resuming a declared gate or retrying a paused step.
+number, and the daemon decides from the waiting record which of three waits it
+is: answering a gate with one of its declared choices, resuming a format-1
+gate with an optional note, or retrying a paused step.
 
-Each step start and finish broadcasts `workflow_step` carrying the task id,
-step name, kind, and status, with error text on failure and the pause document
-when the run stopped rather than deciding.
+Each step start and finish broadcasts `workflow_step` carrying the task id, the
+attempt's sequence number, the step name, kind, and status — with error text on
+failure, the pause document when the run stopped rather than deciding, and a
+gate's whole question when it is waiting on one.
 
 The snapshot carries each task's workflow state, so reconnecting clients see
 current runs without replaying events. Each task also carries its pinned

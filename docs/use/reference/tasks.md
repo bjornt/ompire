@@ -27,6 +27,7 @@ It also denormalizes configuration and outcome:
 | `workflow_name` | The workflow chosen at creation |
 | `workflow_status` | `running`, `waiting`, `complete`, or `failed`; null before the workspace is ready |
 | `workflow_step` | Current step name; null when no run is in flight |
+| `workflow_result` | The declared ending a finished run reached — `workflow_status` says it stopped, this says what stopping meant. Null while it runs, and for a workflow whose format has no named endings |
 | `pr_url` | Set when the task ships a pull request |
 | `pr_state` | `open`, `merged`, or `closed`; null until the first successful poll |
 | `pr_merged_at` | Set only when merged |
