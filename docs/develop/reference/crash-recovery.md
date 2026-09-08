@@ -166,7 +166,7 @@ launched and cleared when the process is observed exiting:
 
 | Persisted state | Startup behavior |
 |---|---|
-| `open`, marker set | Reviewer died with the daemon: append an `interrupted` iteration, land the review `aborted`, clear the marker |
+| `open`, marker set | Reviewer died with the daemon: append an `interrupted` iteration — bound to the candidate it was reading and the workflow attempt it was launched for — land the review `aborted`, clear the marker |
 | `open`, marker clear | Comments are with the agent: restored untouched |
 | Terminal (`approved`/`aborted`/`error`) | Restored untouched |
 | No row | No review ran; nothing is inferred |
@@ -175,6 +175,13 @@ A recovered task's primary session presents as `starting`, `idle`, or
 `failed`, never `reviewing`, and can start a fresh review that appends to the
 same history. Operator-facing detail is in
 [Review](../../use/reference/review.md#retention-and-restart).
+
+A run that owns its review reads that recorded iteration when it re-drives the
+waiting `review` step, and consumes it exactly once: an interrupted review is
+an honest `interrupted` result the definition's own routes handle, and llmvet
+is never relaunched on anyone's behalf. Because `restore_reviews` runs before
+task classification, the verdict is already on record by the time the runner
+looks for it.
 
 ### Delivery recovery
 
@@ -209,6 +216,31 @@ Authorized work that simply did not finish is *not* resumed on the operator's
 behalf. The delivery moves to `blocked`, and a fresh preview and confirmation
 decide whether the rest still applies. A draft interrupted mid-turn becomes an
 explicit retryable interruption rather than a new agent turn.
+
+### Workflow-owned delivery
+
+When the run itself performs the actions
+([ADR-0033](../../adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md)),
+each attempt also names the delivery step that asked for it, and the runner's
+recovery has exactly two honest moves once `ShipManager.restore()` has
+classified the journal:
+
+| Recorded state | What the run does |
+|---|---|
+| The action succeeded | **Adopt it.** The step finishes with that recorded result and the run continues. This closes the crash window between the journal write and the step transition, where re-running the step would sign or push a second time. |
+| Anything else | **Wait.** The same attempt stays open as a *continuation*, keeping its grant and its journal context, until the operator confirms the remaining work against a fresh preview. |
+
+The continuation is deliberately not `retry_paused_step`. A retry opens a *new*
+attempt, which is right for work that can simply be done again; a privileged
+action's attempt owns a write-ahead intent and possibly a partially observed
+effect, so `resume_paused_attempt` returns the same row to `running` and the
+per-attempt uniqueness that prevents a second signature still applies. An
+attempt whose non-execution was *proven* is excluded from that uniqueness, so a
+continuation after one opens a fresh attempt and both stay on record.
+
+The crash window after a gate answer commits but before any effect runs lands
+in the same place: the grant is real, no effect exists, and the run waits for a
+confirmation rather than performing something nobody has seen a preview of.
 
 ### Legacy parked clones
 

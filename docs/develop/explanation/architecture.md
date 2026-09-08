@@ -109,8 +109,8 @@ lazily. One is declared primary, and task-scoped operations — review, ship —
 target it.
 
 A workflow definition is a **document**, not code: a bounded YAML subset
-declaring sequential `agent`, `command`, `decision`, and `gate` steps, with a
-content-derived revision as its identity. The document carries its own
+declaring sequential `agent`, `command`, `decision`, `gate`, `review`, and
+`delivery` steps, with a content-derived revision as its identity. The document carries its own
 semantics version, so a change to what a retained document *means* is a new
 format rather than a silent reinterpretation; two versions execute side by
 side. Workflow state and step records are
@@ -152,10 +152,37 @@ Human edges are ordinary routes: they pass through the same visit bounds, so a
 loop built out of answers is as finite as one built out of results, and no
 answer grants authority the definition did not declare.
 
+### The workflow owns authority; the trusted services own the operations
+
+Review and each privileged publication effect are typed steps
+([ADR-0033](../../adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md)),
+and three separate things have to line up before one happens:
+
+- the **definition requests** it — a `delivery` step naming one effect, its
+  predecessor, and the approval that can permit it;
+- a **person grants** it — an approving choice naming the exact contiguous
+  chain, against a preview of the real content, destination, and identities;
+- a **trusted service performs** it — `ReviewManager` and `ShipManager` remain
+  the only owners of capture, signing, push leases, forge writes, and
+  reconciliation.
+
+The runner decides *when* an operation is eligible and never learns how one is
+carried out; `runauthority.py` answers "may this happen now" from durable state
+alone, for the runner, REST, Ship flow, and any direct service caller alike, and
+its refusals are what the UI renders. A caller supplies identities and expected
+versions, never a verdict.
+
+Two transactions span both registries: a gate answer with the grant it produces
+and the run's move to its first action, and a succeeded action's journal result
+with the step transition it produces. Each effect is linked to the attempt that
+asked for it *before* it happens, so an interrupted one is adopted rather than
+repeated.
+
 See [ADR-0008](../../adr/0008-model-tasks-as-workflows-over-named-sessions.md),
 [ADR-0028](../../adr/0028-retain-declarative-workflow-revisions.md),
 [ADR-0029](../../adr/0029-declare-domain-outcomes-and-evidence-handoffs.md),
-and [ADR-0030](../../adr/0030-commit-human-decisions-before-advancing.md).
+[ADR-0030](../../adr/0030-commit-human-decisions-before-advancing.md),
+and [ADR-0033](../../adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md).
 
 ## A task executes the definition it accepted, not the one deployed today
 
@@ -274,9 +301,15 @@ See [The attention model](../../use/explanation/attention.md).
 ## Review and publishing sit outside the sandbox
 
 Review runs on the host side, so the reviewed agent cannot mediate its own
-verdict. The agent may draft commit and pull-request text; the daemon performs
-the signed commit, the push, and the pull-request creation with host-side
-credentials.
+verdict. The daemon performs the signed commit, the push, and the pull-request
+creation with host-side credentials.
+
+*When* either happens is the workflow's, not the page's: a definition that
+declares review starts it at the step that declares one, and publication
+happens only where a `delivery` step says so and a person has authorized that
+exact chain. A definition that declares neither can do neither — which is what
+older retained revisions are, and the trusted service refuses rather than
+inferring authority nobody wrote down.
 
 Both are bound to *content* rather than to a task's live state
 ([ADR-0032](../../adr/0032-bind-trusted-delivery-to-retained-candidates.md)).
@@ -289,10 +322,11 @@ under review or what gets signed; it can only make its own approval visibly
 unusable.
 
 Publishing is three independently admitted operations — commit, push, pull
-request — and the operator selects how far a delivery goes. Every attempt
-journals what it intends to write before it runs, so an interrupted sequence is
-reconciled against the specific result it was going for rather than repeated or
-assumed lost.
+request — and how far a delivery goes is the chain the workflow declared and a
+person authorized, fixed at the moment they answer rather than extended
+afterwards. Every attempt journals what it intends to write before it runs, so
+an interrupted sequence is reconciled against the specific result it was going
+for rather than repeated or assumed lost.
 
 See [Why the control plane is trusted and the agent is not](trust-model.md).
 
@@ -302,8 +336,9 @@ Documentation that only described the intended architecture would mislead. Two
 areas are known-unreconciled and tracked in `ADR.PLAN.md`:
 
 **[The durability boundary](../../adr/0016-persist-authority-bearing-task-history-and-provenance.md).**
-Workflow steps, session identity, tasks, settings, PR state, review history, and
-delivery authorization, intent and outcomes are durable. Session status and
+Workflow steps, session identity, tasks, settings, PR state, review history and
+reports, and delivery authorization, intent and outcomes are durable, each
+linked to the run attempt that produced it. Session status and
 attention state are not, and neither is full commit lineage or transcript
 retention — which is the part ADR-0016 still names and this design has not
 reached. The gap is narrower than it was, not closed.

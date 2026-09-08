@@ -37,6 +37,7 @@ import os
 import re
 import tempfile
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -72,8 +73,7 @@ from ompire_daemon.gpg import STATE_READY, gpg_signing_refusal
 from ompire_daemon.registry.reviews import get_review
 from ompire_daemon.registry.ships import (
     ENDING_ACTIONS,
-    ENDINGS,
-    MODES,
+    ActionRecord,
     CandidateRecord,
     DeliveryConflictError,
     DeliveryRecord,
@@ -110,7 +110,16 @@ from ompire_daemon.registry.tasks import (
     require_task_inputs,
     task_payload,
 )
+from ompire_daemon.registry.workflows import DeliveryAuthorization, latest_step_record
+from ompire_daemon.runauthority import (
+    SOURCE_LEGACY_CONTINUATION,
+    SOURCE_WORKFLOW_ACTION,
+    SOURCE_WORKFLOW_GATE,
+    RunAuthority,
+    resolve_authority,
+)
 from ompire_daemon.sessions import wait_for_idle
+from ompire_daemon.workflow_definitions import DeliveryStep
 
 if TYPE_CHECKING:
     from ompire_daemon.agent import AgentSupervisor
@@ -259,6 +268,23 @@ class SessionNotIdleError(ShipError):
         self.current_status = current_status
 
 
+class DraftNotDeclaredError(ShipError):
+    """This workflow does not draft publication text through an agent turn.
+
+    Not a failure to draft: a refusal to start a turn nobody declared. The
+    definition's own gate metadata supplies the starting text, and the
+    operator edits it.
+    """
+
+    def __init__(self, task_id: int) -> None:
+        super().__init__(
+            f"task {task_id} runs a workflow that declares its own publication "
+            "text; edit the fields directly rather than asking an agent for a "
+            "draft"
+        )
+        self.task_id = task_id
+
+
 class ShipAlreadyPublishedError(ShipError):
     def __init__(self, task_id: int) -> None:
         super().__init__(f"task {task_id} is already published or archived")
@@ -314,6 +340,16 @@ class DeliveryPreview:
     ending: str
     mode: str
     request_id: str
+    # How this delivery would be authorized: an unanswered workflow gate, an
+    # already-authorized action the run is at, or an authorization made before
+    # workflows owned publication. Never absent — a preview with no source is
+    # refused rather than shown.
+    source: str
+    # The exact question and answer, when a gate is what would authorize it.
+    gate_seq: int | None
+    choice_id: str | None
+    # The review attempt the grant is bound to, and its recorded verdict.
+    review_seq: int | None
     candidate_id: str | None
     candidate: dict[str, Any] | None
     review: dict[str, Any]
@@ -340,6 +376,11 @@ class DeliveryPreview:
             "ending": self.ending,
             "mode": self.mode,
             "request_id": self.request_id,
+            "source": self.source,
+            "gate_seq": self.gate_seq,
+            "choice_id": self.choice_id,
+            "review_seq": self.review_seq,
+            "actions": list(ENDING_ACTIONS[self.ending]),
             "candidate_id": self.candidate_id,
             "candidate": self.candidate,
             "review": self.review,
@@ -367,6 +408,11 @@ def correlation_marker(task_id: int, request_id: str) -> str:
 def body_with_marker(body: str, marker: str) -> str:
     """The exact pull-request body Ompire will write."""
     return f"{body.rstrip()}\n\n<!-- {_MARKER_PREFIX}: {marker} -->\n"
+
+
+# How a workflow-owned action lands its result: the runner supplies this so
+# the journal write and the run's own step transition are one commit.
+Settle = Callable[[int, dict[str, Any], dict[str, Any] | None, str | None], None]
 
 
 def _fingerprint(payload: dict[str, Any]) -> str:
@@ -440,15 +486,99 @@ class ShipManager:
             "results": {},
             "pr_url": None,
             "legacy_publication": False,
+            "authority": {
+                "format": None,
+                "source": None,
+                "declared_actions": [],
+                "declares_review": False,
+                "gate_seq": None,
+                "gate_step": None,
+                "review_seq": None,
+                "review_outcome": None,
+                "choices": [],
+                "suggested": {},
+                "action_seq": None,
+                "action_step": None,
+                "action_kind": None,
+                "awaiting_continuation": False,
+                "review_step_seq": None,
+                "refusal_code": None,
+                "refusal": None,
+            },
             "actions": [],
             "decisions": [],
             "history": [],
         }
 
+    def authority_payload(self, task: Task) -> dict[str, Any]:
+        """What this run's own procedure currently permits, for every reader.
+
+        The same resolution the service admits against, projected. That is the
+        point: a page cannot offer a button the service would refuse, or hide
+        one it would accept, because both are reading the same answer.
+        """
+        authority = resolve_authority(self._engine, task)
+        refusal = authority.refusal()
+        approval = authority.approval
+        action = authority.action
+        return {
+            "format": authority.format,
+            "source": authority.source,
+            "declared_actions": list(authority.declared_actions),
+            "declares_review": authority.declares_review,
+            "gate_seq": approval.seq if approval is not None else None,
+            "gate_step": approval.step.name if approval is not None else None,
+            "review_seq": (
+                approval.review_step_seq if approval is not None else None
+            ),
+            "review_outcome": (
+                approval.review.outcome
+                if approval is not None and approval.review is not None
+                else None
+            ),
+            "choices": (
+                [
+                    {
+                        "id": choice.id,
+                        "label": choice.label,
+                        "feedback_required": choice.feedback_required,
+                        "authorizes": (
+                            None
+                            if choice.authorize is None
+                            else list(choice.authorize.steps)
+                        ),
+                    }
+                    for choice in approval.step.choices
+                ]
+                if approval is not None
+                else []
+            ),
+            "suggested": (
+                (approval.snapshot.get("delivery") or {}).get("suggested") or {}
+                if approval is not None
+                else {}
+            ),
+            "action_seq": action.seq if action is not None else None,
+            "action_step": action.step.name if action is not None else None,
+            "action_kind": action.step.action if action is not None else None,
+            "awaiting_continuation": (
+                action.awaiting_continuation if action is not None else False
+            ),
+            "review_step_seq": authority.review_seq,
+            "refusal_code": refusal[0] if refusal is not None else None,
+            "refusal": refusal[1] if refusal is not None else None,
+        }
+
     def projection(self, task: Task) -> dict[str, Any] | None:
         deliveries = list_deliveries(self._engine, task.id)
         if not deliveries and task.pr_url is None:
-            return None
+            # A task with no delivery record still has an *authority*: the
+            # question its run is at, or the reason there is none. Without it
+            # a page would have to guess whether an approval exists.
+            authority = self.authority_payload(task)
+            if authority["source"] is None:
+                return None
+            return {**self.empty_projection(task.id), "authority": authority}
         current = deliveries[-1] if deliveries else None
         results = self._results(current) if current is not None else {}
         pr_url = (results.get("pr") or {}).get("url") or task.pr_url
@@ -466,6 +596,7 @@ class ShipManager:
             "draft": current.draft if current is not None else None,
             "blocked_reason": current.blocked_reason if current is not None else None,
             "workspace_owner": self._guard.owner(task.id),
+            "authority": self.authority_payload(task),
             "completed_actions": (
                 [k for k in ("commit", "push", "pr") if current.succeeded(k)]
                 if current is not None
@@ -663,15 +794,21 @@ class ShipManager:
     async def draft(self, task: Task, *, replace: bool = False) -> dict[str, Any]:
         """Ask the primary session's live, idle agent for publication text.
 
-        A normal request ensures an initial draft and returns any existing
-        attempt unchanged. `replace` is the explicit regeneration path. The
-        draft is durable and inert: it selects nothing, authorizes nothing, and
-        every field stays editable by hand.
+        Only for a definition written before publication was declarable. A
+        format-3 workflow gets its publication text from the gate's own
+        declared metadata over frozen evidence, or from the operator typing
+        it: a page that could start an agent turn during an approval wait
+        would change the very content the approval is about, and would be a
+        turn nobody declared. Editing the text by hand stays available in
+        both, because that is inert.
         """
         from ompire_daemon.taskdefinition import task_primary_session
 
         if task.state == "archived":
             raise ShipAlreadyPublishedError(task.id)
+        authority = resolve_authority(self._engine, task)
+        if authority.declares_delivery:
+            raise DraftNotDeclaredError(task.id)
 
         delivery = open_delivery(
             self._engine, task.id, workflow_revision=_task_revision(task)
@@ -779,43 +916,50 @@ class ShipManager:
         self,
         task: Task,
         *,
-        ending: str,
-        mode: str,
+        ending: str | None = None,
+        mode: str | None = None,
         commit_message: str,
         pr_title: str,
         pr_body: str,
         request_id: str,
         delivery_id: int | None = None,
+        gate_seq: int | None = None,
+        choice_id: str | None = None,
     ) -> DeliveryPreview:
-        """Resolve one requested ending against current, freshly probed facts.
+        """Resolve the delivery this run's procedure currently permits.
 
         Read-only in every sense that matters: it captures nothing, writes no
         Git state, and grants no authority. What it produces is a description of
         the remaining actions plus a fingerprint over the exact inputs, so a
         later confirmation can be checked against something the operator
         actually saw.
+
+        The ending and mode are *derived*, not requested. They come from the
+        pinned definition's own chain, so a caller cannot widen a workflow's
+        declared ending by asking for a longer one; a caller that names a
+        different ending is told it disagrees rather than quietly overridden.
         """
-        if ending not in ENDINGS:
-            raise PreviewMismatchError(f"delivery ending {ending!r} is not supported")
-        if mode not in MODES:
-            raise PreviewMismatchError(f"delivery mode {mode!r} is not supported")
+        authority, resolution = self._authority_for_preview(task, gate_seq, choice_id)
+        derived_ending, derived_mode, delivery = resolution
+        if ending is not None and ending != derived_ending:
+            raise PreviewMismatchError(
+                f"this run authorizes a delivery ending at {derived_ending!r}, "
+                f"not {ending!r}; the workflow's own chain decides how far it "
+                "goes"
+            )
+        if mode is not None and mode != derived_mode:
+            raise PreviewMismatchError(
+                f"this delivery commits in {derived_mode!r} mode, not {mode!r}"
+            )
+        ending, mode = derived_ending, derived_mode
+        if delivery_id is not None and delivery_id != delivery.id:
+            raise PreviewMismatchError(
+                f"delivery {delivery_id} is not the one this run is at"
+            )
 
         blockers: list[Blocker] = []
-        delivery = self._delivery_for_preview(task, delivery_id)
         completed = [k for k in ("commit", "push", "pr") if delivery.succeeded(k)]
         remaining = [k for k in ENDING_ACTIONS[ending] if k not in completed]
-
-        if delivery.ending is not None and delivery.authorized_at is not None:
-            # Continuing an existing delivery: mode and content were fixed by
-            # the original authorization and cannot be re-chosen here.
-            mode = delivery.mode or mode
-            if len(ENDING_ACTIONS[ending]) < len(ENDING_ACTIONS[delivery.ending]):
-                blockers.append(
-                    Blocker(
-                        "ending-narrower",
-                        f"this delivery is already authorized through {delivery.ending}",
-                    )
-                )
 
         if not remaining:
             blockers.append(
@@ -840,6 +984,7 @@ class ShipManager:
             task, delivery, remaining
         )
         blockers.extend(candidate_blockers)
+        blockers.extend(self._question_blockers(authority, review_info))
 
         destination = self._destination(task)
         identity: dict[str, Any] = {}
@@ -910,10 +1055,20 @@ class ShipManager:
             else None
         )
         version = task_version(self._engine, task.id)
+        review_seq = (
+            authority.approval.review_step_seq
+            if authority.approval is not None
+            else delivery.review_seq
+        )
         # The token covers exactly the inputs this delivery will use. A commit
         # message means nothing once the commit is done, and pull-request text
         # means nothing for an ending that opens none — including them would
         # invalidate a continuation over a field it cannot act on.
+        #
+        # It also covers *which decision* this is: the question, the answer,
+        # and the review attempt the grant is bound to. Without those, a
+        # confirmation prepared against one question could be replayed against
+        # the next one with identical content.
         fingerprint = _fingerprint(
             {
                 "task_id": task.id,
@@ -921,6 +1076,10 @@ class ShipManager:
                 "version": version,
                 "ending": ending,
                 "mode": mode,
+                "source": authority.source,
+                "gate_seq": gate_seq,
+                "choice_id": choice_id,
+                "review_seq": review_seq,
                 "candidate_id": candidate.candidate_id if candidate else None,
                 "review_candidate_id": review_info.get("approved_candidate_id"),
                 "commit_message": (
@@ -936,6 +1095,7 @@ class ShipManager:
                 "request_id": request_id,
             }
         )
+        assert authority.source is not None
         return DeliveryPreview(
             task_id=task.id,
             delivery_id=delivery.id,
@@ -943,6 +1103,10 @@ class ShipManager:
             ending=ending,
             mode=mode,
             request_id=request_id,
+            source=authority.source,
+            gate_seq=gate_seq,
+            choice_id=choice_id,
+            review_seq=review_seq,
             candidate_id=candidate.candidate_id if candidate else None,
             candidate=candidate_payload,
             review=review_info,
@@ -957,6 +1121,66 @@ class ShipManager:
             blockers=blockers,
             fingerprint=fingerprint,
         )
+
+    def _authority_for_preview(
+        self, task: Task, gate_seq: int | None, choice_id: str | None
+    ) -> tuple[RunAuthority, tuple[str, str, DeliveryRecord]]:
+        """What this run permits, and the ending, mode, and delivery it means.
+
+        Everything privileged goes through here, whether it arrived as a REST
+        request, a Ship-flow confirmation, or a direct service call. That is
+        the point: there is no second door where a caller supplies its own
+        ending and a delivery follows it.
+        """
+        authority = resolve_authority(self._engine, task)
+        approval = authority.approval
+        if approval is not None:
+            if gate_seq is None or choice_id is None:
+                raise PreviewMismatchError(
+                    "this run is waiting at an approval; a delivery preview "
+                    "must name the question ('gate_seq') and the answer "
+                    "('choice_id') it is about"
+                )
+            if gate_seq != approval.seq:
+                raise PreviewMismatchError(
+                    f"this run is waiting on attempt {approval.seq}, not "
+                    f"{gate_seq}; reload the question before answering it"
+                )
+            choice = approval.step.choice_named(choice_id)
+            if choice is None:
+                raise PreviewMismatchError(
+                    f"{choice_id!r} is not one of this question's answers"
+                )
+            grant = choice.authorize
+            if grant is None:
+                raise PreviewMismatchError(
+                    f"the answer {choice_id!r} authorizes no publication; it "
+                    "needs no delivery preview and grants nothing"
+                )
+            definition = authority.revision.definition  # type: ignore[union-attr]
+            chain = [definition.step_named(name) for name in grant.steps]
+            first, last = chain[0], chain[-1]
+            assert isinstance(first, DeliveryStep) and isinstance(last, DeliveryStep)
+            delivery = open_delivery(
+                self._engine, task.id, workflow_revision=_task_revision(task)
+            )
+            assert first.mode is not None
+            return authority, (last.action, first.mode, delivery)
+
+        action = authority.action
+        if action is not None:
+            delivery = action.delivery
+            assert delivery.ending is not None and delivery.mode is not None
+            return authority, (delivery.ending, delivery.mode, delivery)
+
+        legacy = authority.legacy
+        if legacy is not None:
+            assert legacy.ending is not None and legacy.mode is not None
+            return authority, (legacy.ending, legacy.mode, legacy)
+
+        refusal = authority.refusal()
+        assert refusal is not None
+        raise DeliveryBlockedError([Blocker(refusal[0], refusal[1])])
 
     def _delivery_for_preview(
         self, task: Task, delivery_id: int | None
@@ -1063,6 +1287,60 @@ class ShipManager:
         info["retained"] = True
         return candidate, info, blockers
 
+    @staticmethod
+    def _question_blockers(
+        authority: RunAuthority, review_info: dict[str, Any]
+    ) -> list[Blocker]:
+        """The grant must rest on the review *this question* is asking about.
+
+        The task-level approval check above says "this task has an approval
+        that covers the current content". That is necessary and not
+        sufficient: a review that finished after the question was asked would
+        satisfy it while answering a different question. So the frozen binding
+        is checked too — the exact attempt, its verdict, and the candidate it
+        actually graded.
+        """
+        approval = authority.approval
+        if approval is None:
+            return []
+        review_info["question_review_seq"] = approval.review_step_seq
+        iteration = approval.review
+        if iteration is None:
+            return [
+                Blocker(
+                    "review-unrecorded",
+                    (
+                        "the approval this run is waiting at names a review "
+                        "attempt with no recorded verdict; nothing can be "
+                        "authorized against a review that did not happen"
+                    ),
+                )
+            ]
+        review_info["question_review_outcome"] = iteration.outcome
+        review_info["question_review_candidate_id"] = iteration.candidate_id
+        if iteration.outcome != "approved":
+            return [
+                Blocker(
+                    "review-not-approved",
+                    (
+                        f"the review this approval is about ended "
+                        f"{iteration.outcome!r}, not approved"
+                    ),
+                )
+            ]
+        current = review_info.get("current_candidate_id")
+        if current is not None and iteration.candidate_id != current:
+            return [
+                Blocker(
+                    "review-stale",
+                    (
+                        "the content changed after the review this approval is "
+                        "about; review the current content before publishing it"
+                    ),
+                )
+            ]
+        return []
+
     def _retain_blockers(self, candidate: CandidateRecord) -> list[Blocker]:
         blockers: list[Blocker] = []
         if candidate.dirty:
@@ -1094,17 +1372,103 @@ class ShipManager:
 
     # --- delivery ----------------------------------------------------------
 
+    async def confirm(
+        self,
+        task: Task,
+        resolved: DeliveryPreview,
+        *,
+        runner: Any,
+        note: str | None = None,
+        expected_version: int | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Commit one operator authorization for a resolved, unblocked preview.
+
+        The single confirmation operation. Task detail's approval and Ship
+        flow's confirm button are two front doors onto it, and a direct
+        service call is a third — none of them can authorize anything this
+        does not.
+
+        When a workflow gate is what authorizes the delivery, the decision and
+        the grant become durable in the *same* transaction as the run's move to
+        its first action. Nothing privileged has happened when this returns:
+        what exists is a record of what the operator confirmed, which every
+        action then re-reads rather than taking from its caller.
+        """
+        if resolved.blockers:
+            raise DeliveryBlockedError(resolved.blockers)
+        if resolved.source == SOURCE_WORKFLOW_ACTION:
+            # An interrupted chain the operator is continuing. The grant is
+            # unchanged — this refreshes what it was confirmed against and
+            # hands the *same* attempt back to the run, so the journal link
+            # that stops a repeated effect survives the continuation.
+            delivery_id, projection = await self.authorize(
+                task, resolved, expected_version=expected_version
+            )
+            from ompire_daemon.taskdefinition import resolve_task_definition
+
+            waiting = latest_step_record(self._engine, task.id)
+            if waiting is not None and waiting.status == "waiting":
+                runner.continue_delivery(
+                    task,
+                    resolve_task_definition(self._engine, task),
+                    expected_seq=waiting.seq,
+                )
+            return delivery_id, projection
+        if resolved.source != SOURCE_WORKFLOW_GATE:
+            return await self.authorize(
+                task, resolved, expected_version=expected_version
+            )
+        if resolved.candidate_id is None:
+            raise PreviewMismatchError(
+                "there is no retained content to deliver for this task"
+            )
+        assert resolved.gate_seq is not None and resolved.choice_id is not None
+        from ompire_daemon.taskdefinition import resolve_task_definition
+
+        authorization = DeliveryAuthorization(
+            delivery_id=resolved.delivery_id,
+            expected_version=resolved.version,
+            candidate_id=resolved.candidate_id,
+            review_candidate_id=resolved.review.get("approved_candidate_id"),
+            review_seq=resolved.review_seq,
+            mode=resolved.mode,
+            ending=resolved.ending,
+            actions=ENDING_ACTIONS[resolved.ending],
+            commit_message=resolved.commit_message,
+            pr_title=resolved.pr_title,
+            pr_body=resolved.pr_body,
+            routing=resolved.routing,
+            identity=resolved.identity,
+            request_key=resolved.request_id,
+            input_fingerprint=resolved.fingerprint,
+        )
+        updated = runner.answer_gate(
+            task,
+            resolve_task_definition(self._engine, task),
+            expected_seq=resolved.gate_seq,
+            choice_id=resolved.choice_id,
+            note=note,
+            authorization=authorization,
+        )
+        published = self.publish(updated)
+        assert published is not None
+        return resolved.delivery_id, published
+
     async def deliver(
         self,
         task: Task,
         *,
-        ending: str,
-        mode: str,
         commit_message: str,
         pr_title: str,
         pr_body: str,
         request_id: str,
         preview_token: str,
+        runner: Any,
+        note: str | None = None,
+        gate_seq: int | None = None,
+        choice_id: str | None = None,
+        ending: str | None = None,
+        mode: str | None = None,
         delivery_id: int | None = None,
         expected_version: int | None = None,
     ) -> dict[str, Any]:
@@ -1112,7 +1476,7 @@ class ShipManager:
 
         The direct service entry point, and as authoritative as REST: admission
         is re-resolved here rather than trusted from the caller. The REST layer
-        parses and authenticates, then calls `preview` and `authorize` itself so
+        parses and authenticates, then calls `preview` and `confirm` itself so
         it can background the execution.
         """
         resolved = await self.preview(
@@ -1124,18 +1488,21 @@ class ShipManager:
             pr_body=pr_body,
             request_id=request_id,
             delivery_id=delivery_id,
+            gate_seq=gate_seq,
+            choice_id=choice_id,
         )
         if resolved.fingerprint != preview_token:
             raise PreviewMismatchError(
                 "the delivery changed since it was previewed; review the new "
                 "preview before confirming"
             )
-        if resolved.blockers:
-            raise DeliveryBlockedError(resolved.blockers)
-        delivery_id, _projection = await self.authorize(
-            task, resolved, expected_version=expected_version
+        delivery_id, _projection = await self.confirm(
+            task, resolved, runner=runner, note=note, expected_version=expected_version
         )
-        await self._run_prefix(task, delivery_id, request_id)
+        if resolved.source == SOURCE_LEGACY_CONTINUATION:
+            # A pre-upgrade grant has no run to drive it, so its remaining
+            # prefix is executed here.
+            await self._run_prefix(task, delivery_id, request_id)
         projection = self.projection(task)
         assert projection is not None
         return projection
@@ -1253,6 +1620,134 @@ class ShipManager:
             lambda _t: self._backgrounds.pop(task.id, None)
         )
 
+    def _land(
+        self,
+        action_id: int,
+        *,
+        result: dict[str, Any],
+        identity: dict[str, Any] | None = None,
+        disposition: str | None = None,
+        settle: Settle | None = None,
+    ) -> None:
+        """Record one action's verified success.
+
+        `settle` is how a workflow-owned action lands: the runner supplies it,
+        and it commits the journal result *and* the step's transition in one
+        write. Without it — a continuation, a pre-upgrade grant — the journal
+        result stands alone, exactly as before.
+        """
+        if settle is None:
+            complete_action(
+                self._engine,
+                action_id,
+                result=result,
+                identity=identity,
+                disposition=disposition,
+            )
+            return
+        settle(action_id, result, identity, disposition)
+
+    def workflow_action(self, task_id: int, workflow_seq: int) -> ActionRecord | None:
+        """The action attempt this workflow step opened, if it opened one.
+
+        What recovery asks before it does anything: an effect that is already
+        on record is adopted, and one that is not is left for an explicit
+        continuation. Neither answer involves performing it again.
+        """
+        delivery = get_latest_delivery(self._engine, task_id)
+        if delivery is None:
+            return None
+        for action in delivery.actions:
+            if action.workflow_seq == workflow_seq:
+                return action
+        return None
+
+    async def perform_action(
+        self,
+        task: Task,
+        *,
+        action: str,
+        workflow_seq: int,
+        request_id: str,
+        settle: Settle,
+    ) -> bool:
+        """Perform the one effect this run's current delivery step declares.
+
+        The runner decides that the step is next; this decides whether it is
+        *permitted*, and performs it through the same admitted operation an
+        operator's confirmation would. Authority is re-resolved here rather
+        than trusted from the caller: a step is not a grant, and the run being
+        at one proves only where the run is.
+        """
+        authority = resolve_authority(self._engine, task)
+        pending = authority.action
+        if pending is None or pending.seq != workflow_seq:
+            raise DeliveryBlockedError(
+                [
+                    Blocker(
+                        "not-at-action",
+                        (
+                            f"this run has no authorized action outstanding at "
+                            f"attempt {workflow_seq}"
+                        ),
+                    )
+                ]
+            )
+        if pending.step.action != action:
+            raise DeliveryBlockedError(
+                [
+                    Blocker(
+                        "action-mismatch",
+                        (
+                            f"attempt {workflow_seq} is a {pending.step.action!r} "
+                            f"action, not {action!r}"
+                        ),
+                    )
+                ]
+            )
+        delivery = pending.delivery
+        if action not in delivery.remaining_actions:
+            raise DeliveryBlockedError(
+                [
+                    Blocker(
+                        "action-not-granted",
+                        (
+                            f"the authorization for this run does not have a "
+                            f"remaining {action} action"
+                        ),
+                    )
+                ]
+            )
+        if delivery.remaining_actions[0] != action:
+            # The predecessor is consumed, not assumed: an action never runs
+            # because the one before it was skipped.
+            raise DeliveryBlockedError(
+                [
+                    Blocker(
+                        "predecessor-missing",
+                        (
+                            f"{delivery.remaining_actions[0]} has not completed, "
+                            f"so {action} cannot run yet"
+                        ),
+                    )
+                ]
+            )
+        runners = {"commit": self._run_commit, "push": self._run_push, "pr": self._run_pr}
+        async with self._guard.hold(task.id, f"workflow-{action}"):
+            ok = await runners[action](
+                task, delivery, request_id, workflow_seq=workflow_seq, settle=settle
+            )
+        if ok:
+            landed = get_delivery(self._engine, delivery.id)
+            if landed is not None and not landed.remaining_actions:
+                # The chain performed every effect it was granted. Its
+                # candidate staging repository has served its purpose; an
+                # unresolved one is deliberately kept.
+                set_disposition(self._engine, delivery.id, "completed")
+                self.release_candidate_storage(task.id)
+        self._refresh(task.id)
+        return ok
+
     async def _run_prefix(self, task: Task, delivery_id: int, request_id: str) -> None:
         """Execute the remaining authorized actions, in order, stopping at the
         first that does not verifiably succeed."""
@@ -1292,7 +1787,13 @@ class ShipManager:
     # --- commit ------------------------------------------------------------
 
     async def _run_commit(
-        self, task: Task, delivery: DeliveryRecord, request_id: str
+        self,
+        task: Task,
+        delivery: DeliveryRecord,
+        request_id: str,
+        *,
+        workflow_seq: int | None = None,
+        settle: Settle | None = None,
     ) -> bool:
         assert delivery.candidate_id is not None
         candidate = get_candidate(self._engine, delivery.candidate_id)
@@ -1353,6 +1854,7 @@ class ShipManager:
                 input_fingerprint=_fingerprint(expected),
                 expected=expected,
                 identity=delivery.identity,
+                workflow_seq=workflow_seq,
             )
         except DeliveryConflictError as exc:
             set_disposition(
@@ -1409,11 +1911,8 @@ class ShipManager:
             "installed_over": candidate.original_head,
             "note": install_note,
         }
-        complete_action(
-            self._engine,
-            action.id,
-            result=result,
-            identity=delivery.identity,
+        self._land(
+            action.id, result=result, identity=delivery.identity, settle=settle
         )
         if not installed:
             set_disposition(
@@ -1799,7 +2298,13 @@ class ShipManager:
     # --- push --------------------------------------------------------------
 
     async def _run_push(
-        self, task: Task, delivery: DeliveryRecord, request_id: str
+        self,
+        task: Task,
+        delivery: DeliveryRecord,
+        request_id: str,
+        *,
+        workflow_seq: int | None = None,
+        settle: Settle | None = None,
     ) -> bool:
         commit = delivery.succeeded("commit")
         if commit is None or not (commit.result or {}).get("signed_tip"):
@@ -1838,6 +2343,7 @@ class ShipManager:
                 input_fingerprint=_fingerprint(expected),
                 expected=expected,
                 identity=delivery.identity,
+                workflow_seq=workflow_seq,
             )
         except DeliveryConflictError as exc:
             set_disposition(
@@ -1848,10 +2354,10 @@ class ShipManager:
         if observed == tip:
             # Already at the authorized head: the push is a completed fact,
             # not something to repeat.
-            complete_action(
-                self._engine,
+            self._land(
                 action.id,
                 result={**expected, "head": tip, "adopted": True},
+                settle=settle,
             )
             return True
 
@@ -1890,10 +2396,10 @@ class ShipManager:
             )
             self._guard.block(task.id, "a push landed on an unexpected remote head")
             return False
-        complete_action(
-            self._engine,
+        self._land(
             action.id,
             result={**expected, "head": tip, "adopted": False},
+            settle=settle,
         )
         return True
 
@@ -2040,7 +2546,13 @@ class ShipManager:
     # --- pull request ------------------------------------------------------
 
     async def _run_pr(
-        self, task: Task, delivery: DeliveryRecord, request_id: str
+        self,
+        task: Task,
+        delivery: DeliveryRecord,
+        request_id: str,
+        *,
+        workflow_seq: int | None = None,
+        settle: Settle | None = None,
     ) -> bool:
         push = delivery.succeeded("push")
         if push is None:
@@ -2082,6 +2594,7 @@ class ShipManager:
                 input_fingerprint=_fingerprint(expected),
                 expected=expected,
                 identity=delivery.identity,
+                workflow_seq=workflow_seq,
             )
         except DeliveryConflictError as exc:
             set_disposition(
@@ -2108,10 +2621,19 @@ class ShipManager:
                 task, action.id, expected, str(exc)
             )
 
-        self._attach_pr(task, action.id, {**expected, "url": url, "adopted": False})
+        self._attach_pr(
+            task, action.id, {**expected, "url": url, "adopted": False}, settle=settle
+        )
         return True
 
-    def _attach_pr(self, task: Task, action_id: int, result: dict[str, Any]) -> None:
+    def _attach_pr(
+        self,
+        task: Task,
+        action_id: int,
+        result: dict[str, Any],
+        *,
+        settle: Settle | None = None,
+    ) -> None:
         """Land the PR identity on the task and the action together.
 
         One transaction is not available across two registries, so the ordering
@@ -2119,7 +2641,7 @@ class ShipManager:
         crash between them leaves a recorded successful PR whose URL the next
         startup reattaches, never a polled task with no evidence behind it.
         """
-        complete_action(self._engine, action_id, result=result)
+        self._land(action_id, result=result, settle=settle)
         updated = mark_pr_url(self._engine, task.id, result["url"])
         self._hub.publish("task_updated", task_payload(updated, engine=self._engine))
 

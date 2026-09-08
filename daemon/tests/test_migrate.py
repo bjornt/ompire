@@ -52,7 +52,7 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0018"
+    assert version == "0019"
     assert "projects" in tables
     assert "tasks" in tables
     # Templates are retired (ADR-0026): the live table is gone and only inert
@@ -201,7 +201,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0018"
+    assert version == "0019"
     assert row == "demo"
 
 
@@ -653,15 +653,19 @@ def test_0010_review_tables_roundtrip(tmp_path: Path) -> None:
         iteration_columns = {
             row[1] for row in conn.execute(text("PRAGMA table_info(review_iterations)"))
         }
-        # 0018 adds the nullable candidate binding to both (ADR-0032). It is
-        # nullable precisely so this backfill-free property survives: a review
-        # recorded before content binding keeps a NULL candidate rather than
-        # being attributed to a tree nobody reviewed.
+        # 0018 adds the nullable candidate binding to both (ADR-0032), and
+        # 0019 the nullable run link and the retained report. Every one of
+        # them is nullable precisely so this backfill-free property survives:
+        # a review recorded before content binding keeps a NULL candidate
+        # rather than being attributed to a tree nobody reviewed, and one
+        # started by hand keeps a NULL step rather than a run that never
+        # asked for it.
         assert review_columns == {
             "task_id",
             "status",
             "process_started_at",
             "candidate_id",
+            "workflow_seq",
             "created_at",
             "updated_at",
         }
@@ -672,6 +676,9 @@ def test_0010_review_tables_roundtrip(tmp_path: Path) -> None:
             "comment_count",
             "stderr",
             "candidate_id",
+            "workflow_seq",
+            "findings",
+            "findings_state",
             "recorded_at",
         }
         # No backfill for pre-existing tasks.
@@ -1816,4 +1823,95 @@ def test_0018_adds_the_delivery_journal_without_inventing_history(tmp_path: Path
         assert (
             conn.execute(text("SELECT COUNT(*) FROM review_iterations")).scalar_one()
             == 1
+        )
+
+
+def test_0019_marks_pre_upgrade_grants_without_inventing_run_links(
+    tmp_path: Path,
+) -> None:
+    """0019 records where history ends and adds nothing to it.
+
+    A delivery authorized through the old Ship page really was not granted by
+    a workflow decision, so its new run links stay NULL. What the migration
+    does add is the *boundary*: that delivery's id is at or below it, so it
+    can still be continued under the grant it genuinely has, while any row
+    created afterwards has to carry its own authority no matter what its
+    links say.
+    """
+    db_path = tmp_path / "ompire.db"
+    _land_at_0007_with_tasks(db_path)
+    engine = make_engine(db_path)
+
+    from alembic import command
+
+    command.upgrade(_alembic_cfg(db_path), "0018")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO deliveries (id, task_id, version, ending, mode, "
+                "authorized_at, disposition, created_at, updated_at) VALUES "
+                "(7, 1, 1, 'push', 'squash', 't', 'authorized', 't', 't')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO delivery_actions (id, delivery_id, seq, kind, "
+                "attempt, request_key, input_fingerprint, phase, created_at, "
+                "updated_at) VALUES "
+                "(3, 7, 1, 'commit', 1, 'r', 'f', 'succeeded', 't', 't')"
+            )
+        )
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT workflow_gate_seq, workflow_choice_id, review_seq "
+                "FROM deliveries WHERE id = 7"
+            )
+        ).one()
+        assert row == (None, None, None)
+        assert (
+            conn.execute(
+                text("SELECT workflow_seq FROM delivery_actions WHERE id = 3")
+            ).scalar_one()
+            is None
+        )
+        boundary = conn.execute(
+            text(
+                "SELECT id, max_delivery_id, max_action_id "
+                "FROM delivery_authority_boundary"
+            )
+        ).all()
+        assert boundary == [(1, 7, 3)]
+
+    # A delivery created after the upgrade sits above the boundary, so an
+    # unset link can never read as a pre-upgrade grant.
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO deliveries (task_id, version, disposition, "
+                "created_at, updated_at) VALUES (1, 2, 'open', 't', 't')"
+            )
+        )
+        assert (
+            conn.execute(text("SELECT MAX(id) FROM deliveries")).scalar_one() > 7
+        )
+
+    command.downgrade(_alembic_cfg(db_path), "0018")
+    with engine.connect() as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            )
+        }
+        assert "delivery_authority_boundary" not in tables
+        # The authorization itself outlives the boundary that classified it.
+        assert (
+            conn.execute(
+                text("SELECT ending FROM deliveries WHERE id = 7")
+            ).scalar_one()
+            == "push"
         )

@@ -35,6 +35,7 @@ def registry_task_id(app, tmp_path: Path) -> int:
         clone_path=str(tmp_path / "clone"),
         prompt="do things",
         execution_inputs=make_execution_inputs(
+            engine=app.state.engine,
             checkout_path=str(tmp_path / "checkout"),
         ),
     )

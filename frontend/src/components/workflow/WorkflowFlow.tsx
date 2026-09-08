@@ -9,9 +9,12 @@ import {
 } from "../../lib/workflowDocument";
 import { numberToken } from "../../lib/losslessJson";
 import {
+  declaredActions,
   describePredicate,
   describeTarget,
   edgesFrom,
+  readDeliveryAction,
+  readDeliveryGate,
   readEvidence,
   readFlow,
   readResults,
@@ -44,6 +47,10 @@ const EDGE_WORDS: Record<FlowEdge["kind"], string> = {
   case: "branch",
   otherwise: "fallback",
   choice: "your answer",
+  // The one edge that confers authority, named as such: reading it as an
+  // ordinary answer is how a diagram hides what a click would permit.
+  authorize: "you authorize",
+  delivered: "once published",
   exhausted: "bound reached",
   skip: "skipped",
 };
@@ -283,6 +290,7 @@ export function WorkflowFlow({
   const currentIndex =
     current == null ? null : flow.steps.findIndex((step) => step.name === current);
   const unknownTop = unknownDocumentFields(definition);
+  const actions = declaredActions(definition);
 
   return (
     <div className="flow" data-testid={testId}>
@@ -296,6 +304,11 @@ export function WorkflowFlow({
       <p className="hint">
         What this procedure declares may happen. Which route a run takes is
         decided while it runs, from evidence this page has never seen.
+      </p>
+      <p className="hint" data-testid="flow-declared-actions">
+        {actions.length === 0
+          ? "This workflow publishes nothing. It has no step that can sign, push, or open a pull request, so no answer anywhere in it can authorize one."
+          : `It can publish: ${actions.join(", ")} — each only if you answer the approval that grants it.`}
       </p>
       {unknownTop.length > 0 && (
         <p className="flowBroken" data-testid="flow-unknown-fields">
@@ -319,6 +332,8 @@ export function WorkflowFlow({
             const evidence = readEvidence(step);
             const results = readResults(step);
             const unknown = unknownStepFields(step);
+            const deliveryGate = readDeliveryGate(step);
+            const deliveryAction = readDeliveryAction(definition, step);
             const bound = numberToken(step.max_visits);
             return (
               <li
@@ -430,6 +445,9 @@ export function WorkflowFlow({
                       <ul className="flowList">
                         {asArray(step.choices).map((choice, choiceIndex) => {
                           const object = asObject(choice);
+                          const grant = asArray(asObject(object?.authorize)?.steps)
+                            .map((name) => asString(name) ?? "?")
+                            .join(" → ");
                           return (
                             <li key={choiceIndex}>
                               <code className="mono">
@@ -439,11 +457,46 @@ export function WorkflowFlow({
                               {object?.feedback_required === true
                                 ? " · needs a reason from you"
                                 : ""}
+                              {grant === "" ? (
+                                ""
+                              ) : (
+                                <> · authorizes {grant}</>
+                              )}
                             </li>
                           );
                         })}
                       </ul>
                     </Row>
+                  )}
+                  {deliveryGate !== null && (
+                    <Row label="This approval is about">
+                      the review bound to{" "}
+                      <code className="mono">{deliveryGate.review ?? "nothing"}</code>
+                      {deliveryGate.metadata.length === 0
+                        ? " · it suggests no publication text"
+                        : ` · it suggests ${deliveryGate.metadata
+                            .map((entry) => entry.field)
+                            .join(", ")}`}
+                    </Row>
+                  )}
+                  {deliveryAction !== null && (
+                    <>
+                      <Row label="Publishes">
+                        <strong>{deliveryAction.action ?? "no action"}</strong>
+                        {deliveryAction.mode === null
+                          ? ""
+                          : ` · ${deliveryAction.mode}`}
+                        {deliveryAction.previous === null
+                          ? ""
+                          : ` · consumes ${deliveryAction.previous}`}
+                      </Row>
+                      <Row label="Only if you answer">
+                        <code className="mono">
+                          {deliveryAction.approval ?? "no approval"}
+                        </code>{" "}
+                        with the choice that grants it
+                      </Row>
+                    </>
                   )}
                   {bound !== null && (
                     <Row label="Visit bound">

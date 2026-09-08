@@ -9,6 +9,7 @@ for a direct service caller and not only for a REST request.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,9 +18,11 @@ from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.ships import (
+    AuthorityBoundary,
     DeliveryConflictError,
     SourceCommit,
     append_decision,
+    authority_boundary,
     authorize_delivery,
     complete_action,
     delete_task_deliveries,
@@ -30,6 +33,7 @@ from ompire_daemon.registry.ships import (
     get_candidate,
     get_delivery,
     get_latest_delivery,
+    is_pre_upgrade_grant,
     list_deliveries,
     list_unresolved_deliveries,
     mark_action_executing,
@@ -564,3 +568,117 @@ def test_an_executing_or_unresolved_action_freezes_the_authorization(
     assert unchanged.ending == "commit"
     assert unchanged.mode == "squash"
     assert unchanged.commit_message == "ship: it"
+
+
+# --- workflow-scoped authority (format 3) ------------------------------------
+
+
+def test_a_step_performs_its_effect_once_even_under_a_retry(engine, task) -> None:
+    """Two prepares for the same delivery step are one attempt, not two.
+
+    The re-driven step is the ordinary case: a restart, a retried dispatch, a
+    duplicated call. The uniqueness is enforced under the same reservation as
+    the insert, because "check then insert" is exactly the race that produces
+    a second signature.
+    """
+    _candidate(engine, task)
+    delivery = open_delivery(engine, task.id)
+    _authorize(engine, task, delivery)
+    first = prepare_action(
+        engine,
+        delivery.id,
+        kind="commit",
+        request_key="req-a",
+        input_fingerprint="fp",
+        expected={"ref": "refs/heads/x"},
+        workflow_seq=9,
+    )
+    again = prepare_action(
+        engine,
+        delivery.id,
+        kind="commit",
+        request_key="req-a",
+        input_fingerprint="fp",
+        expected={"ref": "refs/heads/x"},
+        workflow_seq=9,
+    )
+    assert again.id == first.id
+    assert first.workflow_seq == 9
+
+    mark_action_executing(engine, first.id)
+    complete_action(engine, first.id, result={"commit_id": "c" * 40})
+    # A different request identity for the same step is refused rather than
+    # allowed to open a second effect for one authorization.
+    with pytest.raises(DeliveryConflictError, match="performs its effect once"):
+        prepare_action(
+            engine,
+            delivery.id,
+            kind="push",
+            request_key="req-b",
+            input_fingerprint="fp",
+            expected={"ref": "refs/heads/x"},
+            workflow_seq=9,
+        )
+
+
+def test_an_authorization_records_the_decision_that_granted_it(engine, task) -> None:
+    _candidate(engine, task)
+    delivery = open_delivery(engine, task.id)
+    granted = authorize_delivery(
+        engine,
+        delivery.id,
+        expected_version=delivery.version,
+        candidate_id="cand-1",
+        review_candidate_id="cand-1",
+        mode="squash",
+        ending="pr",
+        commit_message="ship: it",
+        pr_title="It",
+        pr_body="why",
+        routing={"ref": "refs/heads/ompire/task-1"},
+        identity={},
+        request_key="req-w",
+        input_fingerprint="fp-w",
+        workflow_gate_seq=4,
+        workflow_choice_id="publish",
+        review_seq=2,
+    )
+    assert granted.workflow_authorized is True
+    assert (granted.workflow_gate_seq, granted.workflow_choice_id) == (4, "publish")
+    assert granted.review_seq == 2
+    detail = next(d for d in granted.decisions if d.kind == "authorize").detail
+    assert detail["workflow_choice_id"] == "publish"
+
+
+def test_a_manual_grant_is_never_mistaken_for_a_workflow_one(engine, task) -> None:
+    _candidate(engine, task)
+    delivery = open_delivery(engine, task.id)
+    granted = _authorize(engine, task, delivery)
+    assert granted.workflow_authorized is False
+    assert granted.workflow_gate_seq is None
+
+
+def test_the_upgrade_boundary_classifies_only_what_predates_it(engine, task) -> None:
+    """A new row cannot pass itself off as historical by leaving links unset.
+
+    On a fresh database the boundary is zero, so *nothing* is pre-upgrade —
+    which is the correct answer for a daemon that never had legacy grants.
+    """
+    _candidate(engine, task)
+    boundary = authority_boundary(engine)
+    assert boundary is not None
+    delivery = open_delivery(engine, task.id)
+    granted = _authorize(engine, task, delivery)
+    assert granted.id > boundary.max_delivery_id
+    assert is_pre_upgrade_grant(boundary, granted) is False
+    # Pretend this row predates the upgrade: an unauthorized one still is not
+    # a grant, and only a genuine authorization below the line counts.
+    wide = AuthorityBoundary(
+        max_delivery_id=granted.id,
+        max_action_id=0,
+        recorded_at=boundary.recorded_at,
+    )
+    assert is_pre_upgrade_grant(wide, granted) is True
+    # And a row below the line that was never authorized is not a grant.
+    unauthorized = replace(granted, authorized_at=None, ending=None)
+    assert is_pre_upgrade_grant(wide, unauthorized) is False

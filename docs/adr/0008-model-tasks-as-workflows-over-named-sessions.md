@@ -3,6 +3,12 @@
 - Status: Accepted
 - Date: 2026-07-17
 
+Its typed-step vocabulary is extended by
+[ADR-0033](0033-scope-trusted-delivery-authority-to-the-workflow-run.md),
+which makes independent review and each trusted publication effect steps of
+the workflow rather than operations beside it. Task and session ownership
+are unchanged.
+
 ## Context
 
 An operator asks Ompire to accomplish a task, such as investigating a defect, producing a change, reviewing the result, or publishing approved work. The lifetime and authority of that request are broader than any one coding-agent conversation. A task owns an isolated workspace, may require several agents with different conversational contexts, may execute deterministic commands without an agent, may wait for an operator decision, and may continue through review and publishing after an agent turn ends.

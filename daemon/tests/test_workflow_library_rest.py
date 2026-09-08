@@ -105,7 +105,10 @@ def test_creating_without_a_source_opens_a_valid_starter(
         json={"yaml": detail["draft_yaml"], "name": "starter"},
     )
     assert checked.status_code == 200
-    assert checked.json()["format"] == 2
+    # The starter is format 3 and publishes nothing: review, an approval, and
+    # the actions it authorizes are all things an author adds deliberately.
+    assert checked.json()["format"] == 3
+    assert checked.json()["descriptor"]["actions"] == []
     assert [s["name"] for s in checked.json()["descriptor"]["steps"]] == [
         "work",
         "finish",
@@ -137,7 +140,7 @@ def test_duplicating_a_builtin_copies_the_procedure_under_a_new_name(
     assert "name: my-bugfix" in detail["draft_yaml"]
     saved = save_revision(client, headers, "my-bugfix", detail["draft_yaml"]).json()
     assert saved["entry"]["current_revision"] != bugfix["revision"]
-    assert saved["entry"]["current_format"] == 2
+    assert saved["entry"]["current_format"] == 3
     assert saved["entry"]["available"] is True
 
 

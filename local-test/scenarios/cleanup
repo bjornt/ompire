@@ -10,7 +10,7 @@ set -euo pipefail
 
 # --- task 1: plain cleanup ------------------------------------------------------
 
-tid=$(spawn_task "$(unique_slug clean)" "Cleanup E2E: the work.")
+tid=$(spawn_work_only "$(unique_slug clean)" "Cleanup E2E: the work.")
 wait_for "work step completes" 180 workflow_complete "$tid"
 clone=$(task_field "$tid" clone_path)
 assert "workshop registered for the clone" \
@@ -26,7 +26,7 @@ assert "workshop deregistered" bash -c "! '$WSCTL' list | grep -Fq '$clone'"
 
 # --- task 2: workshop already gone ----------------------------------------------
 
-tid2=$(spawn_task "$(unique_slug clean2)" "Cleanup E2E 2: the work.")
+tid2=$(spawn_work_only "$(unique_slug clean2)" "Cleanup E2E 2: the work.")
 wait_for "work step completes (task 2)" 180 workflow_complete "$tid2"
 clone2=$(task_field "$tid2" clone_path)
 $WSCTL remove "$clone2" >/dev/null

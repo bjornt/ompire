@@ -81,6 +81,7 @@ def _make_task(engine, project, tmp_path: Path, slug: str):
         clone_path=str(clone_path),
         prompt="fix it",
         execution_inputs=make_execution_inputs(
+            engine=engine,
             checkout_path=project.checkout_path,
             project_name=project.name,
             branch=f"ompire/{slug}",

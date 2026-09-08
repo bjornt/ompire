@@ -95,12 +95,19 @@ export interface ModelProfile {
  * earlier can route past this step, so it may not execute. */
 export interface WorkflowStepDescriptor {
   name: string;
-  kind: "agent" | "command" | "decision" | "gate";
+  kind: "agent" | "command" | "decision" | "gate" | "review" | "delivery";
   session: string | null;
   role: ModelRole | null;
   /** A declared route can pass this step by, or its own condition can hold
-   * it back, so it may not run. */
+   * it back, so it may not run. A privileged action is always conditional:
+   * it runs only if a person answers its approval with the choice that
+   * grants it. */
   conditional: boolean;
+  /** The one privileged effect a delivery step performs, and the gate whose
+   * answer is the only thing that can authorize it. Null for every other
+   * kind — a step that publishes nothing says so. */
+  action?: "commit" | "push" | "pr" | null;
+  approval?: string | null;
 }
 
 /** A workflow a new launch may select. The library is editable (ADR-0031), so
@@ -118,6 +125,12 @@ export interface WorkflowDescriptor {
   primary_session: string;
   sessions: string[];
   steps: WorkflowStepDescriptor[];
+  /** Every privileged effect a launch of this workflow could perform, in
+   * effect order. An empty list is a statement — it publishes nothing — not
+   * an absence of information. */
+  actions?: ("commit" | "push" | "pr")[];
+  /** Whether it declares independent review at all. */
+  reviews?: boolean;
 }
 
 /** One retained definition, read by content identity
@@ -454,6 +467,12 @@ export interface GateChoice {
   label: string;
   feedback_required: boolean;
   next: Record<string, unknown>;
+  /** The exact chain of privileged action steps this answer authorizes, when
+   * it authorizes any (format 3). Present on a delivery gate's snapshot;
+   * absent everywhere else. An answer that carries one cannot be given from a
+   * generic Resume — it needs the content, target, and identity preview the
+   * confirmation is checked against. */
+  authorize?: { steps: string[] } | null;
 }
 
 /** The operator's answer, once given. Recorded beside — never instead of —
@@ -704,6 +723,14 @@ export interface ReviewIteration {
    * recorded before reviews were content-bound; such an approval is history,
    * not authorization for current work. */
   candidate_id?: string | null;
+  /** The workflow attempt that asked for this review, or null for one an
+   * operator started by hand. Never backfilled. */
+  workflow_seq?: number | null;
+  /** The reviewer's own report, and what was retained of it. A correction may
+   * only be run against a `complete` capture: a count is not a report, and a
+   * truncated one presented as the whole opinion is worse than none. */
+  findings?: string | null;
+  findings_state?: "complete" | "empty" | "truncated" | "unavailable" | null;
   recorded_at: string;
 }
 
@@ -715,6 +742,8 @@ export interface ReviewState {
   port: number | null;
   /** The candidate the current (or last) round is bound to. */
   candidate_id?: string | null;
+  /** The workflow attempt the current (or last) round was launched for. */
+  workflow_seq?: number | null;
   iterations: ReviewIteration[];
 }
 
@@ -749,6 +778,46 @@ export interface ShipDraft {
 
 /** How far a delivery is authorized to go. Not a workflow result. */
 export type ShipEnding = "commit" | "push" | "pr";
+
+/** One answer a delivery approval offers, and exactly what it would permit. */
+export interface RunApprovalChoice {
+  id: string;
+  label: string;
+  feedback_required: boolean;
+  /** The chain of action steps this answer authorizes, or null when it
+   * authorizes nothing. Never "publishing" in general. */
+  authorizes: string[] | null;
+}
+
+/** Where a run stands with respect to publishing.
+ *
+ * `source` says how authority would be established right now: an unanswered
+ * approval, an already-authorized action, an authorization made before
+ * workflows owned publication, or nothing at all. When it is null, `refusal`
+ * says why in words an operator can act on. */
+export interface RunAuthority {
+  format: number | null;
+  source: "workflow-gate" | "workflow-action" | "legacy-continuation" | null;
+  declared_actions: ShipActionKind[];
+  declares_review: boolean;
+  gate_seq: number | null;
+  gate_step: string | null;
+  review_seq: number | null;
+  review_outcome: string | null;
+  choices: RunApprovalChoice[];
+  /** The publication text the definition suggested, per field. An editable
+   * draft beside the decision — never what gets published on its own. */
+  suggested: Partial<Record<"message" | "pr_title" | "pr_body", string>>;
+  action_seq: number | null;
+  action_step: string | null;
+  action_kind: ShipActionKind | null;
+  /** True when an interrupted effect is waiting for an explicit continuation
+   * rather than being retried on the operator's behalf. */
+  awaiting_continuation: boolean;
+  review_step_seq: number | null;
+  refusal_code: string | null;
+  refusal: string | null;
+}
 
 export type ShipActionKind = "commit" | "push" | "pr";
 
@@ -856,6 +925,10 @@ export interface ShipProjection {
   pr_url: string | null;
   /** A publication recorded before delivery had a journal behind it. */
   legacy_publication: boolean;
+  /** What this task's own pinned procedure currently permits, resolved by the
+   * daemon (ADR-0033). Both decision surfaces read it, so neither can offer a
+   * button the service would refuse. */
+  authority?: RunAuthority;
   actions: ShipAction[];
   decisions: ShipDecision[];
   history: ShipHistoryEntry[];
@@ -873,9 +946,17 @@ export interface ShipPreview {
   task_id: number;
   delivery_id: number;
   version: number;
+  /** Derived from the run's pinned chain, not requested. */
   ending: ShipEnding;
   mode: "squash" | "retain";
   request_id: string;
+  /** How this delivery would be authorized, and which decision it is about. */
+  source: "workflow-gate" | "workflow-action" | "legacy-continuation";
+  gate_seq: number | null;
+  choice_id: string | null;
+  review_seq: number | null;
+  /** Every action this confirmation would permit, in effect order. */
+  actions: ShipActionKind[];
   candidate_id: string | null;
   candidate: {
     candidate_id: string;
@@ -893,6 +974,12 @@ export interface ShipPreview {
     content_bound: boolean;
     stale?: boolean | null;
     retained?: boolean;
+    /** The exact review attempt this question froze, and what it decided.
+     * A later review satisfying the task-level check does not satisfy this
+     * one — that substitution is what the binding exists to prevent. */
+    question_review_seq?: number | null;
+    question_review_outcome?: string | null;
+    question_review_candidate_id?: string | null;
   };
   completed_actions: ShipActionKind[];
   remaining_actions: ShipActionKind[];

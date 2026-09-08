@@ -377,6 +377,7 @@ this package never contained.
 | `status` | string | `open`, `approved`, `aborted`, `error` |
 | `process_started_at` | string, nullable | Write-ahead marker; ISO-8601 |
 | `candidate_id` | string, nullable | The protected candidate this round is grading |
+| `workflow_seq` | integer, nullable | The workflow attempt this round was launched for |
 | `created_at`, `updated_at` | string | ISO-8601 |
 
 One row per task, upserted on every start: re-review after comments reopens
@@ -398,6 +399,12 @@ It is nullable because that is the whole upgrade story: a review recorded before
 content binding keeps a `NULL` and stays readable, and nothing infers which tree
 it graded. Such an approval is history, not authorization.
 
+`workflow_seq` is written *with* the process marker, before llmvet starts, so a
+restart can resolve an interrupted reviewer against the step still waiting on
+it rather than against wherever the run has moved to. `NULL` is an
+operator-started review, which is a different fact rather than a missing one
+([ADR-0033](../../adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md)).
+
 ## `review_iterations`
 
 | Column | Type | Notes |
@@ -408,6 +415,9 @@ it graded. Such an approval is history, not authorization.
 | `comment_count` | integer, nullable | Cosmetic; the comment text is authoritative |
 | `stderr` | text, nullable | Captured reviewer stderr |
 | `candidate_id` | string, nullable | The candidate this iteration graded |
+| `workflow_seq` | integer, nullable | The workflow attempt that asked for this review |
+| `findings` | text, nullable | The reviewer's own report |
+| `findings_state` | string, nullable | `complete`, `empty`, `truncated`, `unavailable` |
 | `recorded_at` | string | ISO-8601 |
 
 Ordered `(task_id, seq)` like `workflow_steps`, because re-review revisits the
@@ -417,6 +427,12 @@ same review. `interrupted` is iteration-only and always accompanies an
 The terminal `approved` iteration's `candidate_id` is what delivery reads: it
 says what an approval covers, so "is this still the reviewed content?" is a
 comparison rather than an assumption.
+
+`findings` is the reviewer's report, retained whole rather than counted, and
+`findings_state` says what was kept. The two travel together on purpose: a
+correction that runs automatically should require `complete`, because a
+truncated capture handed to an agent as though it were the reviewer's whole
+opinion is worse than no correction at all. `comment_count` stays cosmetic.
 
 ## `delivery_candidates`
 
@@ -462,6 +478,9 @@ what was reviewed and signed.
 | `authorized_at`, `authorized_by` | string, nullable | `operator` for the authenticated single-operator command |
 | `request_key`, `input_fingerprint` | string, nullable | Replay identity; unique per task where set |
 | `draft_json` | text, nullable | Durable publication draft and its state |
+| `workflow_gate_seq` | integer, nullable | The answered gate attempt that granted this |
+| `workflow_choice_id` | string, nullable | The answer that granted it |
+| `review_seq` | integer, nullable | The review attempt the grant is bound to |
 | `disposition` | string | `open`, `authorized`, `completed`, `blocked`, `unresolved`, `abandoned` |
 | `blocked_reason` | text, nullable | Why it stopped |
 | `created_at`, `updated_at` | string | ISO-8601 |
@@ -479,6 +498,31 @@ selected signer, and the observed GitHub host, login and credential-source
 label. Never a credential value. The ambient Git transport principal is recorded
 as explicitly unattributed rather than invented.
 
+The three workflow columns say *which decision* granted the authorization. They
+are written in the same transaction as the gate answer and the run's move to
+its first action, so a crash cannot separate an approval from the grant it
+produced. All three are `NULL` for an authorization made outside a workflow
+decision, and a `NULL` there never means "granted by the workflow" — which is
+why `delivery_authority_boundary` exists.
+
+## `delivery_authority_boundary`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | integer | Primary key; always `1` |
+| `max_delivery_id` | integer | The highest `deliveries.id` that existed before the upgrade |
+| `max_action_id` | integer | The highest `delivery_actions.id` that existed before it |
+| `recorded_at` | string | ISO-8601 |
+
+Exactly one row, written by migration `0019` and never updated.
+
+A `NULL` workflow link is ambiguous on its own: it is what a genuine
+pre-upgrade authorization looks like, and it is also what a freshly inserted row
+looks like for the instant before its links are written. Rows at or below this
+boundary predate the upgrade and may be *continued* under their original grant;
+anything above it must carry its own workflow authority. Nothing can move the
+boundary, so no new row can ever look historical.
+
 ## `delivery_actions`
 
 | Column | Type | Notes |
@@ -493,6 +537,7 @@ as explicitly unattributed rather than invented.
 | `identity_json` | text, nullable | Safe identity facts for this attempt |
 | `result_json` | text, nullable | The verified outcome |
 | `error` | text, nullable | Sanitized failure detail |
+| `workflow_seq` | integer, nullable | The delivery-step attempt this action belongs to |
 | `created_at`, `updated_at` | string | ISO-8601 |
 
 `phase` is the write-ahead marker. `prepared` commits before anything runs;
@@ -509,6 +554,13 @@ Recovery looks for exactly that, instead of guessing from today's state.
 `progress_json` records per-signature progress, so an interrupted retain rewrite
 is inspectable rather than an opaque boolean.
 
+`workflow_seq` is persisted with the intent, before the effect, and at most one
+*live* action may carry it for a delivery — enforced under the same reservation
+as the insert, and by a partial unique index that excludes `failed` rows. That
+is what makes a re-driven step adopt its own action instead of dispatching a
+second one, while still letting an operator continue after an attempt whose
+non-execution was proven.
+
 ## `delivery_decisions`
 
 | Column | Type | Notes |
@@ -521,10 +573,13 @@ is inspectable rather than an opaque boolean.
 | `note` | text, nullable | The operator's own words |
 | `decided_at` | string | ISO-8601 |
 
-Append-only. Extending a delivery to a further ending adds a row; it never
-rewrites the authorization that came before it. A delivery whose first action was
-refused has no terminal prefix to protect, so a corrected confirmation may
-replace it — and that, too, is appended as its own decision.
+Append-only. A delivery whose first action was refused has no terminal prefix to
+protect, so a corrected confirmation may replace it — and that, too, is appended
+as its own decision.
+
+`extend` belongs to the pre-format-3 policy where an operator could widen a
+completed ending. Existing rows keep it and stay readable; a workflow-authorized
+run performs the chain its answer named and produces no new ones.
 
 ## `settings`
 
@@ -561,12 +616,19 @@ reserving the single non-terminal delivery per task, admitting an action attempt
 and landing a result with the eligibility it grants — plus explicit child
 deletion in purge, because a cascade cannot be assumed.
 
+The workflow links added by migration `0019` are checked the same way. Two
+transactions now span both registries under one reservation: a gate answer with
+the delivery authorization it grants and the run's successor attempt, and a
+succeeded action's journal result with the step transition it produces. Neither
+pair can be half-written.
+
 ## What is not durable
 
 Session status, attention state, and the live reviewer process (its URL and
-port) are in-memory. Review status and iteration history are durable, as are
-delivery authorizations, action attempts, and reconciliation decisions —
-realizing the review and delivery slices of
+port) are in-memory. Review status, iteration history and the reviewer's report
+are durable, as are delivery authorizations, action attempts, and
+reconciliation decisions — and each now names the workflow attempt that asked
+for it, realizing the review and delivery slices of
 [ADR-0016](../../adr/0016-persist-authority-bearing-task-history-and-provenance.md).
 
 The durable boundary is still narrower than [`VISION.md`](../../VISION.md)

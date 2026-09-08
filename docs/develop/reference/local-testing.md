@@ -104,8 +104,14 @@ Review is where the trust boundary lives; faking it would test nothing worth
 testing.
 
 Because review reads an isolated checkout of the task's captured candidate, a
-runbook has to give the task something to review before starting one. An empty
-delta is a refusal, not an empty review.
+runbook has to give the task something to review before the run reaches its
+review step. An empty delta is a refusal, not an empty review.
+
+Both packaged workflows declare their own `review` step, so a runbook waits for
+the reviewer the *run* started rather than starting one (`approve_run_review`).
+A runbook about agent behavior, session events, or recovery instead launches
+`work-only` — a format-3 workflow with one agent step and a named ending — so
+it is not made to answer a publication decision it never meant to ask about.
 
 ### GPG
 
@@ -242,12 +248,12 @@ to assertions.
 | `happy-path` | Spawn through shipped |
 | `file-mentions` | Prompt `@file` search, refusal, and delivery |
 | `ask-approval` | Interactive gates |
-| `workflow-decisions` | A bugfix run's declared results, frozen evidence, and human decisions |
-| `review-comments` | Comment loopback through the real reviewer UI |
-| `ship-retain` | Multi-commit re-signing |
-| `ship-endings` | Local, pushed, and pull-request endings; going further later without re-signing; local-only cleanup |
-| `ship-failures` | Every refusal named before any effect — missing/stale review, GitHub auth and target denial, signing, retain preconditions — and recovery from each |
-| `ship-interrupted` | Lost replies: an already-landed push adopted rather than repeated, a pull request found by its correlation marker, and an unsearchable forge left explicitly unresolved |
+| `workflow-decisions` | A bugfix run's declared results, frozen evidence, human decisions, and both approvals — including the one whose endings keep the "never reproduced" limitation |
+| `review-comments` | A comments verdict driving the *declared* correction route: the whole report retained, carried to the step the definition names, and a second review after it |
+| `ship-retain` | Multi-commit re-signing, through a workflow the runbook authors because `retain` is a mode an author declares |
+| `ship-endings` | A local ending is complete; a completed ending cannot be widened, at the preview or at any action endpoint; one answer authorizes a whole chain; local-only cleanup keeps its journal |
+| `ship-failures` | Every refusal named before any effect — nothing authorizable before the decision, GitHub auth and target denial, signing, retain preconditions, stale approval — and recovery from each |
+| `ship-interrupted` | Lost replies: an already-landed push adopted through the run's own continuation rather than repeated, a pull request found by its correlation marker, and an unsearchable forge left explicitly unresolved |
 | `merge-poll` | The poll observes merging |
 | `crash-recovery` | Daemon `kill -9` recovery |
 | `cleanup` | Task teardown |

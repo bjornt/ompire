@@ -388,11 +388,35 @@ def test_workflow_catalog_describes_every_declared_step(
         "validation-gate",
         "investigation-exhausted",
         "correction-exhausted",
+        "review",
+        "route-review",
+        "approve",
+        "commit-fix",
+        "push-fix",
+        "open-fix-pr",
+        "approve-unreproduced",
+        "commit-unreproduced",
+        "push-unreproduced",
+        "open-unreproduced-pr",
+        "review-exhausted",
     ]
     # Every agent consumer this launch would need is disclosed, including the
-    # ones the previous definition did not have (ADR-0026).
+    # ones the previous definition did not have (ADR-0026). Review and
+    # delivery add none: the reviewer is an external tool, and an action is
+    # not a turn.
     agents = [step["name"] for step in bugfix["steps"] if step["role"] is not None]
     assert agents == ["reproduce", "diagnose", "reproduce-informed", "fix", "verify"]
+    # What a launch of this workflow could publish, and what would have to
+    # authorize it. Every action is conditional on a person answering a gate.
+    assert bugfix["actions"] == ["commit", "push", "pr"]
+    assert bugfix["reviews"] is True
+    effects = {
+        step["name"]: (step["action"], step["approval"], step["conditional"])
+        for step in bugfix["steps"]
+        if step["action"] is not None
+    }
+    assert effects["commit-fix"] == ("commit", "approve", True)
+    assert effects["open-unreproduced-pr"] == ("pr", "approve-unreproduced", True)
     # Only agent steps name a role; a command, decision, or gate has no model.
     roles = {step["name"]: step["role"] for step in bugfix["steps"]}
     assert roles["reproduce"] == "default"
@@ -403,11 +427,12 @@ def test_workflow_catalog_describes_every_declared_step(
     assert conditional["reproduce"] is False
     assert conditional["fix"] is True
     # The catalog names the exact revision a new launch of this name would
-    # pin, and the semantics version it is read under (ADR-0028). Two formats
-    # coexist: `single-step` is still read under format-1 rules.
+    # pin, and the semantics version it is read under (ADR-0028). Both
+    # packaged workflows are complete procedures now, and say so.
     assert bugfix["revision"].startswith("sha256:")
-    assert bugfix["format"] == 2
-    assert catalog["single-step"]["format"] == 1
+    assert bugfix["format"] == 3
+    assert catalog["single-step"]["format"] == 3
+    assert catalog["single-step"]["actions"] == ["commit", "push", "pr"]
     # Nothing describes a model consumer outside the declared steps.
     assert "judge_session" not in bugfix
     assert "judge_role" not in bugfix
@@ -509,7 +534,9 @@ def test_cleanup_refuses_path_outside_task_root(
         clone_path=str(outside),
         prompt="p",
         execution_inputs=make_execution_inputs(
-            checkout_path=demo_project["checkout_path"], branch="ompire/escapee"
+            engine=app.state.engine,
+            checkout_path=demo_project["checkout_path"],
+            branch="ompire/escapee",
         ),
     )
     response = client.post(f"/api/tasks/{task.id}/cleanup", headers=auth_headers)
@@ -605,7 +632,9 @@ def test_reconciliation_on_restart(tmp_path: Path, git_checkout: Path) -> None:
             clone_path=str(tmp_path / "tasks" / "demo" / "interrupted"),
             prompt="p",
             execution_inputs=make_execution_inputs(
-                checkout_path=str(git_checkout), branch="ompire/interrupted"
+                engine=app.state.engine,
+                checkout_path=str(git_checkout),
+                branch="ompire/interrupted",
             ),
         )
     app.state.engine.dispose()

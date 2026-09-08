@@ -304,6 +304,13 @@ reviews = Table(
     Column("status", String, nullable=False),
     Column("process_started_at", String, nullable=True),
     Column("candidate_id", String, nullable=True),
+    # The workflow attempt this review was launched for (format 3). Written
+    # with the process marker, before llmvet starts, so a restart can resolve
+    # the interrupted reviewer against the step that is waiting for it rather
+    # than against whatever the run has moved on to. NULL is honest history:
+    # a review an operator started by hand, or one recorded before workflows
+    # owned review at all.
+    Column("workflow_seq", Integer, nullable=True),
     Column("created_at", String, nullable=False),
     Column("updated_at", String, nullable=False),
 )
@@ -322,6 +329,16 @@ review_iterations = Table(
     Column("comment_count", Integer, nullable=True),
     Column("stderr", Text, nullable=True),
     Column("candidate_id", String, nullable=True),
+    # The workflow attempt this iteration answered, and the reviewer's actual
+    # report. `findings_state` says what `findings` is: `complete` is the
+    # whole report, `empty` is an approval with nothing to say, `truncated`
+    # is a report too large to retain whole, and `unavailable` is one that
+    # could not be captured. A correction may only run against `complete` —
+    # a count is not a report, and a partial report must never be handed to
+    # an agent as if it were the reviewer's whole opinion.
+    Column("workflow_seq", Integer, nullable=True),
+    Column("findings", Text, nullable=True),
+    Column("findings_state", String, nullable=True),
     Column("recorded_at", String, nullable=False),
 )
 
@@ -394,6 +411,16 @@ deliveries = Table(
     Column("request_key", String, nullable=True),
     Column("input_fingerprint", String, nullable=True),
     Column("draft_json", Text, nullable=True),
+    # Format 3: which decision, on which question, granted this authorization.
+    # `workflow_gate_seq` is the answered gate attempt, `workflow_choice_id`
+    # the choice, and `review_seq` the review iteration the grant is bound to.
+    # All three are NULL for a delivery an operator authorized through the
+    # manual Ship path before workflows owned that authority — and a NULL here
+    # never means "authorized by the workflow", which is why the migration
+    # boundary below exists.
+    Column("workflow_gate_seq", Integer, nullable=True),
+    Column("workflow_choice_id", String, nullable=True),
+    Column("review_seq", Integer, nullable=True),
     Column("disposition", String, nullable=False),
     Column("blocked_reason", Text, nullable=True),
     Column("created_at", String, nullable=False),
@@ -435,9 +462,27 @@ delivery_actions = Table(
     Column("identity_json", Text, nullable=True),
     Column("result_json", Text, nullable=True),
     Column("error", Text, nullable=True),
+    # The workflow delivery-step attempt this action belongs to (format 3).
+    # Persisted with the write-ahead intent, before the effect, so recovery
+    # attaches an observed result to the attempt that asked for it instead of
+    # dispatching a second one.
+    Column("workflow_seq", Integer, nullable=True),
     Column("created_at", String, nullable=False),
     Column("updated_at", String, nullable=False),
     Index("ix_delivery_actions_delivery", "delivery_id", "seq"),
+    # One live effect per workflow step. `failed` rows are excluded because
+    # that phase means the effect is *proven* not to have happened — an
+    # interrupted attempt an operator then continues opens a fresh one, and
+    # the history of both stays readable. Everything else — prepared,
+    # executing, succeeded, needs_reconciliation — is exactly what must never
+    # exist twice for one step.
+    Index(
+        "uq_delivery_actions_workflow_seq",
+        "delivery_id",
+        "workflow_seq",
+        unique=True,
+        sqlite_where=text("workflow_seq IS NOT NULL AND phase != 'failed'"),
+    ),
 )
 
 # Ordered, immutable authorization and reconciliation decisions: who authorized
@@ -455,6 +500,25 @@ delivery_decisions = Table(
     Column("note", Text, nullable=True),
     Column("decided_at", String, nullable=False),
     Index("ix_delivery_decisions_delivery", "delivery_id", "id"),
+)
+
+# The one-time boundary between authority granted before workflows owned
+# publication and everything created after. Exactly one row, written by the
+# migration and never updated.
+#
+# It exists because a NULL workflow link is ambiguous on its own: it is what a
+# genuine pre-upgrade authorization looks like, and it is also what a freshly
+# inserted row looks like for the instant before its links are written. Rows at
+# or below this boundary predate the upgrade and may be *continued* under their
+# original grant; anything above it must carry its own workflow authority.
+# Nothing can move the boundary, so no new row can ever look historical.
+delivery_authority_boundary = Table(
+    "delivery_authority_boundary",
+    metadata,
+    Column("id", Integer, primary_key=True),  # always 1
+    Column("max_delivery_id", Integer, nullable=False),
+    Column("max_action_id", Integer, nullable=False),
+    Column("recorded_at", String, nullable=False),
 )
 
 # ADR-0013: UI-editable overrides are persisted as JSON-encoded scalar

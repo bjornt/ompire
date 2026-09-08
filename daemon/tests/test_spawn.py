@@ -114,10 +114,12 @@ def _make_project(engine, checkout: Path):
     )
 
 
-def _make_inputs(checkout: Path, **overrides):
+def _make_inputs(engine, checkout: Path, **overrides):
     """The accepted launch inputs a spawned task carries (ADR-0026); the
     pipeline reads only these, never a project or profile row."""
-    return make_execution_inputs(checkout_path=str(checkout), **overrides)
+    return make_execution_inputs(
+        engine=engine, checkout_path=str(checkout), **overrides
+    )
 
 
 def _make_task(
@@ -137,7 +139,7 @@ def _make_task(
         branch="ompire/fix-bug",
         clone_path=str(clone_path),
         prompt=prompt,
-        execution_inputs=_make_inputs(checkout, **input_overrides),
+        execution_inputs=_make_inputs(engine, checkout, **input_overrides),
     )
 
 
@@ -780,7 +782,7 @@ async def test_fetch_uses_the_project_fetch_remote(
         branch="ompire/fix-bug",
         clone_path=str(clone_path_for(config.task_dir_root, "demo", "fix-bug")),
         prompt="fix the bug",
-        execution_inputs=_make_inputs(git_checkout, fetch_remote="upstream"),
+        execution_inputs=_make_inputs(engine, git_checkout, fetch_remote="upstream"),
     )
 
     await run(engine, task.id, config)

@@ -19,7 +19,7 @@ from sqlalchemy import text
 from ompire_daemon.app import create_app
 from ompire_daemon.config import Config
 from ompire_daemon.db import db_path_for, make_engine
-from tests.conftest import TEST_ROLES, launch_body
+from tests.conftest import TEST_ROLES, install_plain_workflow, launch_body
 
 TEMPLATE_COLUMNS = (
     "name, project_name, base_branch, branch_pattern, workflow, "
@@ -88,6 +88,9 @@ def upgraded(daemon_config: Config, git_checkout: Path):
         from ompire_daemon.registry.model_profiles import create_model_profile
 
         create_model_profile(app.state.engine, name="chosen", roles=TEST_ROLES)
+        # These tests launch to observe reconciliation, not to publish, so
+        # they select the engine baseline rather than a packaged procedure.
+        install_plain_workflow(app.state.engine)
         client = TestClient(app)
         headers = {"Authorization": f"Bearer {app.state.auth_token}"}
         return app, client, headers
@@ -748,12 +751,12 @@ def _seed_legacy_bugfix_at_a_synthesized_gate(config: Config, checkout: Path) ->
     return task_id
 
 
-def test_a_format_2_candidate_cannot_claim_format_1_history(
+def test_a_newer_candidate_cannot_claim_format_1_history(
     daemon_config: Config, git_checkout: Path
 ) -> None:
     """The format boundary, enforced where a continuation is offered.
 
-    The packaged `bugfix` is format 2: it reads results by declared name, and
+    The packaged `bugfix` is format 3: it reads results by declared name, and
     it does not declare the steps this task actually ran. Its history recorded
     generic success/failed outcomes that the new contract has no way to
     express. Offering it as a continuation would point a different procedure
@@ -771,13 +774,13 @@ def test_a_format_2_candidate_cannot_claim_format_1_history(
         ).json()
         candidate = configuration["workflow_candidate"]
 
-    assert candidate["format"] == 2
+    assert candidate["format"] == 3
     assert candidate["compatible"] is False
     problems = " ".join(candidate["problems"])
     # Both halves are named: the results cannot be reinterpreted, and the
     # steps are not even declared.
     assert "older success/failed envelope" in problems
-    assert "workflow format 2" in problems
+    assert "workflow format 3" in problems
     assert "'triage'" in problems
     # The history itself is untouched and still readable.
     from ompire_daemon.registry.workflows import list_step_records

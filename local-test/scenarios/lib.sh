@@ -235,7 +235,10 @@ task_not_failed() { # task_not_failed TASK_ID
 
 # Wait until the review gate accepts (its 200 is the desired next action)
 # and the review is open; echoes the review state JSON (with `url`).
-review_open() { # review_open TASK_ID
+review_open() { # review_open TASK_ID — start a review by hand
+	# Only for a workflow that does not declare its own review step. A
+	# format-3 run starts the review when it reaches it, and the daemon
+	# refuses one started at any other moment.
 	_api_run POST "/api/tasks/$1/review"
 	if [ "$API_CODE" = 200 ]; then
 		printf '%s' "$API_BODY"
@@ -243,6 +246,29 @@ review_open() { # review_open TASK_ID
 	fi
 	printf 'review start: %s %s' "$API_CODE" "$(jq -r '.detail // empty' <<<"$API_BODY" | head -c 200)"
 	return 1
+}
+
+# The reviewer the *run* started, once it is on the wire. `ws_start` must be
+# recording `review_started` for this to see it.
+run_review_url() { # run_review_url TASK_ID [SKIP]
+	local url
+	url=$(jq -r "select(.type == \"review_started\" and .payload.task_id == $1) | .payload.url" \
+		"$WS_OUT" 2>/dev/null | tail -n +$((${2:-0} + 1)) | tail -1)
+	if [ -n "$url" ] && [ "$url" != null ]; then
+		printf '%s' "$url"
+		return 0
+	fi
+	printf 'no review started yet for task %s' "$1"
+	return 1
+}
+
+# Approve the review this run started, at the step that declares it.
+approve_run_review() { # approve_run_review TASK_ID [SKIP]
+	local url
+	url=$(wait_for "the run starts its review step" 180 run_review_url "$1" "${2:-0}")
+	wait_for "llmvet answers on $url" 30 review_ready "$url"
+	$REVIEW approve --url "$url"
+	ok "review approved via llmvet ($url)"
 }
 
 # --- workflow gates and step history (ADR-0029, ADR-0030) ----------------------
@@ -303,6 +329,36 @@ answer_gate() { # answer_gate TASK_ID CHOICE_ID [NOTE]
 	[ "$API_CODE" = 200 ] ||
 		die "answering '$choice' failed ($API_CODE): $API_BODY"
 	ok "answered $(jq -r .step <<<"$waiting") with '$choice'"
+}
+
+# --- authoring ------------------------------------------------------------------
+
+# Spawn a task that only does the work. For runbooks about agent behavior,
+# session events, or recovery: the packaged workflows are complete procedures
+# that review, ask, and can publish, which would make such a test wait for a
+# decision it never meant to ask about.
+spawn_work_only() { # spawn_work_only SLUG PROMPT
+	save_workflow work-only "$(cat "$(dirname "${BASH_SOURCE[0]}")/work-only.yaml")" >/dev/null
+	spawn_task "$1" "$2" work-only
+}
+
+# Save one executable workflow revision, through the same library operations
+# the UI uses. A scenario that needs a procedure the packaged ones do not
+# declare authors it, exactly as an operator would.
+save_workflow() { # save_workflow NAME YAML
+	local name=$1 yaml=$2 version
+	_api_run POST /api/workflow-library "$(jq -n --arg n "$name" '{name: $n}')"
+	if [ "$API_CODE" = 201 ]; then
+		version=$(jq -r '.entry.version' <<<"$API_BODY")
+	else
+		_api_run GET "/api/workflow-library/$name"
+		[ "$API_CODE" = 200 ] || die "cannot read or create workflow '$name' ($API_CODE): $API_BODY"
+		version=$(jq -r '.entry.version' <<<"$API_BODY")
+	fi
+	_api_run POST "/api/workflow-library/$name/revisions" \
+		"$(jq -n --arg y "$yaml" --argjson v "$version" '{yaml: $y, expected_version: $v}')"
+	[ "$API_CODE" = 200 ] || die "saving workflow '$name' failed ($API_CODE): $API_BODY"
+	ok "workflow '$name' saved as $(jq -r '.entry.current_revision' <<<"$API_BODY" | head -c 19)…"
 }
 
 # --- uniqueness -----------------------------------------------------------------
@@ -512,25 +568,32 @@ ship_draft() { # ship_draft TASK
 
 # Resolve one requested ending read-only. Leaves the response in
 # /tmp/ship-preview-$TASK.json and never authorizes anything.
-ship_preview() { # ship_preview TASK ENDING MODE REQUEST MESSAGE TITLE BODY
-	local tid=$1 ending=$2 mode=$3 req=$4 message=$5 title=$6 body=$7 delivery
-	delivery=$(ship_field "$tid" '.delivery_id // empty' || true)
+ship_preview() { # ship_preview TASK CHOICE REQUEST MESSAGE TITLE BODY
+	# The decision being previewed, not an ending being requested: how far a
+	# delivery goes is what the run's pinned chain says, and the preview
+	# names the question and the answer it is about.
+	local tid=$1 choice=$2 req=$3 message=$4 title=$5 body=$6 gate
+	gate=$(ship_field "$tid" '.authority.gate_seq // empty' || true)
 	api_json POST "/api/tasks/$tid/ship/preview" \
-		"$(jq -n --arg e "$ending" --arg mode "$mode" --arg r "$req" \
+		"$(jq -n --arg c "$choice" --arg r "$req" \
 			--arg m "$message" --arg t "$title" --arg b "$body" \
-			--argjson d "${delivery:-null}" \
-			'{ending: $e, mode: $mode, request_id: $r, message: $m,
-			  pr_title: $t, pr_body: $b, delivery_id: $d}')" \
+			--argjson g "${gate:-null}" \
+			'{gate_seq: $g, choice_id: (if $c == "" then null else $c end),
+			  request_id: $r, message: $m, pr_title: $t, pr_body: $b}')" \
 		>/tmp/ship-preview-$tid.json
 }
 
 # Preview then confirm exactly what the preview offered, and wait for the
 # selected ending. `commit`/`push`/`pr` are endings, not workflow results.
-ship_deliver() { # ship_deliver TASK ENDING [MODE] [MESSAGE] [TITLE] [BODY]
-	local tid=$1 ending=$2 mode=${3:-squash}
-	local message=${4:-"ship: local-test delivery"} title=${5:-"Local test"} body=${6:-"why"}
-	local req="e2e-$tid-$ending-$$-$RANDOM" token version delivery route
-	ship_preview "$tid" "$ending" "$mode" "$req" "$message" "$title" "$body"
+ship_deliver() { # ship_deliver TASK CHOICE [MESSAGE] [TITLE] [BODY]
+	# Answer the run's approval with one of its publishing choices, against
+	# the preview that was just resolved. One confirmation operation: the
+	# decision, the grant, and the run's move to its first action land
+	# together, and the run performs the actions it was granted.
+	local tid=$1 choice=$2
+	local message=${3:-"ship: local-test delivery"} title=${4:-"Local test"} body=${5:-"why"}
+	local req="e2e-$tid-$choice-$$-$RANDOM" token version delivery gate note
+	ship_preview "$tid" "$choice" "$req" "$message" "$title" "$body"
 	[ "$API_CODE" = 200 ] ||
 		die "ship preview rejected for task $tid ($API_CODE): $(cat /tmp/ship-preview-$tid.json)"
 	jq -e '.deliverable' /tmp/ship-preview-$tid.json >/dev/null ||
@@ -538,34 +601,18 @@ ship_deliver() { # ship_deliver TASK ENDING [MODE] [MESSAGE] [TITLE] [BODY]
 	token=$(jq -r '.preview_token' /tmp/ship-preview-$tid.json)
 	version=$(jq -r '.version' /tmp/ship-preview-$tid.json)
 	delivery=$(jq -r '.delivery_id' /tmp/ship-preview-$tid.json)
-
-	# Continuation goes to the action's own endpoint; neither starts an
-	# implicit earlier action.
-	route=commit
-	if jq -e '.completed_actions | index("push")' /tmp/ship-preview-$tid.json >/dev/null; then
-		route=pr
-	elif jq -e '.completed_actions | index("commit")' /tmp/ship-preview-$tid.json >/dev/null; then
-		route=push
-	fi
-
-	if [ "$route" = commit ]; then
-		api_json POST "/api/tasks/$tid/ship/commit" \
-			"$(jq -n --arg e "$ending" --arg mode "$mode" --arg r "$req" --arg tok "$token" \
-				--arg m "$message" --arg t "$title" --arg b "$body" \
-				--argjson d "$delivery" --argjson v "$version" \
-				'{ending: $e, mode: $mode, request_id: $r, preview_token: $tok,
-				  message: $m, pr_title: $t, pr_body: $b,
-				  delivery_id: $d, expected_version: $v}')" >/dev/null
-	else
-		api_json POST "/api/tasks/$tid/ship/$route" \
-			"$(jq -n --arg e "$ending" --arg r "$req" --arg tok "$token" \
-				--arg t "$title" --arg b "$body" \
-				--argjson d "$delivery" --argjson v "$version" \
-				'{ending: $e, request_id: $r, preview_token: $tok,
-				  pr_title: $t, pr_body: $b,
-				  delivery_id: $d, expected_version: $v}')" >/dev/null
-	fi
-	[ "$API_CODE" = 200 ] || die "ship $route rejected for task $tid ($API_CODE): $API_BODY"
+	gate=$(jq -r '.gate_seq // empty' /tmp/ship-preview-$tid.json)
+	note="authorized by the local-test scenario"
+	api_json POST "/api/tasks/$tid/ship/commit" \
+		"$(jq -n --arg c "$choice" --arg r "$req" --arg tok "$token" \
+			--arg m "$message" --arg t "$title" --arg b "$body" --arg n "$note" \
+			--argjson g "${gate:-null}" \
+			--argjson d "$delivery" --argjson v "$version" \
+			'{gate_seq: $g, choice_id: (if $c == "" then null else $c end),
+			  note: $n, request_id: $r, preview_token: $tok,
+			  message: $m, pr_title: $t, pr_body: $b,
+			  delivery_id: $d, expected_version: $v}')" >/dev/null
+	[ "$API_CODE" = 200 ] || die "ship confirmation rejected for task $tid ($API_CODE): $API_BODY"
 }
 
 # Record one operator decision about an unresolved effect. Writes nothing
@@ -624,16 +671,39 @@ approve_review() { # approve_review TASK_ID
 	ok "review approved via llmvet ($url)"
 }
 
-ship_squash() { # ship_squash TASK_ID — the full pull-request ending
-	local tid=$1 message pr_title pr_body
-	ship_draft "$tid"
-	message=$(jq -r '.draft.commit_message' /tmp/ship-draft-$tid.json)
-	pr_title=$(jq -r '.draft.pr_title' /tmp/ship-draft-$tid.json)
-	pr_body=$(jq -r '.draft.pr_body // ""' /tmp/ship-draft-$tid.json)
+ship_squash() { # ship_squash TASK_ID [CHOICE] — through to a pull request
+	# The publication text comes from the workflow's own suggestion, edited
+	# here the way an operator edits it. No agent turn is spent drafting.
+	local tid=$1 choice=${2:-open-pr} message pr_title pr_body
+	message=$(ship_field "$tid" '.authority.suggested.message // "ship: local-test delivery"')
+	pr_title=$(ship_field "$tid" '.authority.suggested.pr_title // "Local test"')
+	pr_body=$(ship_field "$tid" '.authority.suggested.pr_body // "why"')
 	$GPGCTL warm
-	ship_deliver "$tid" pr squash "$message" "$pr_title" "$pr_body"
+	ship_deliver "$tid" "$choice" "$message" "$pr_title" "$pr_body"
 	wait_for "task $tid delivery finishes" 120 ship_done "$tid" pr
 	ok "task $tid shipped (pr: $(task_field "$tid" pr_url))"
+}
+
+# Continue an interrupted chain: the grant already stands, so this re-confirms
+# what it was given against and hands the same attempt back to the run.
+ship_continue() { # ship_continue TASK [MESSAGE] [TITLE] [BODY]
+	local tid=$1
+	[ "$(ship_field "$tid" '.authority.source // empty')" = "workflow-action" ] ||
+		die "task $tid has no interrupted action to continue: $(ship_field "$tid" '.authority')"
+	ship_deliver "$tid" "" "${2:-}" "${3:-}" "${4:-}"
+}
+
+# Wait until the run is at its delivery approval, so a scenario confirms the
+# decision the run is actually asking rather than racing it.
+at_approval() { # at_approval TASK_ID
+	local source
+	source=$(ship_field "$1" '.authority.source // empty' || true)
+	if [ "$source" = "workflow-gate" ]; then
+		printf 'at %s' "$(ship_field "$1" '.authority.gate_step')"
+		return 0
+	fi
+	printf 'authority.source=%s' "${source:-none}"
+	return 1
 }
 
 follow_up() { # follow_up TASK_ID MESSAGE

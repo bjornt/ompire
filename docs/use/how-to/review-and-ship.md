@@ -1,9 +1,15 @@
 # Review and ship a task
 
 When an agent has finished its work, two things stand between it and a
-published result: a review you control, and a delivery the agent cannot perform
-itself. You also choose how far that delivery goes — a local signed commit, a
-pushed branch, or a pull request.
+published result: an independent review, and a decision only you can make. How
+far a delivery goes — a local signed commit, a pushed branch, a pull request,
+or nothing at all — is what the task's own workflow declares and what your
+answer authorizes.
+
+There is **one path**. The workflow says what may happen; you answer its
+question; and the run performs exactly the effects your answer named. Task
+detail and Ship flow are two views of that same decision, not two ways to make
+it.
 
 ## Review
 
@@ -11,21 +17,41 @@ Starting a review opens a real review tool against the host side of the task's
 clone. The agent being reviewed does not run it and cannot influence the
 verdict.
 
-### Start, inspect, and continue from task detail
+### When the workflow owns the review
+
+Both packaged workflows declare their own `review` step, and so does any
+workflow you author with one. There is nothing to start:
 
 1. Open the task card, then its task detail.
-2. In **Review**, wait for the primary session to become idle and select
+2. When the run reaches its review step it starts the reviewer itself. The
+   **Review** panel shows the llmvet URL; select it to inspect the review.
+3. If comments return, the workflow's own route carries the reviewer's report
+   back to the step the author named — usually the one that did the work — and
+   opens the next review when that step finishes. You do not drive the loop,
+   and its bound is what ends it.
+4. After **Approved**, the run reaches its approval and waits for you. Select
+   **Continue to Ship flow**.
+
+The panel says plainly that the run owns the review, so a missing **Start
+review** button is an answer rather than a puzzle.
+
+### When you own the review
+
+A workflow that declares no review step — an older definition, or one you wrote
+without one — is reviewed by you:
+
+1. In **Review**, wait for the primary session to become idle and select
    **Start review**. The panel keeps the action locked while the daemon starts
    the reviewer.
-3. Select the full llmvet URL from the open Review panel to inspect the
-   independent review. Use **Cancel review** only to stop an open review; the
-   panel shows a failed command and allows retry when the daemon's state still
-   permits it.
-4. If comments return, let the primary agent address them. When it is idle
+2. Select the full llmvet URL to inspect the review. Use **Cancel review** only
+   to stop an open review; the panel shows a failed command and allows retry
+   when the daemon's state still permits it.
+3. If comments return, let the primary agent address them. When it is idle
    again, select **Start another review**. The ordered history retains every
    iteration, including reviewer error detail.
-5. After **Approved**, select **Continue to Ship flow**. It opens
-   `/ship/<task-id>` directly at the task's delivery flow.
+
+Such a workflow cannot publish: it has no step that could. See
+[Older tasks](#older-tasks-cannot-publish).
 
 An approval names the content it graded. If the agent changes the workspace
 afterwards, the approval stays on record as history and the panel says it no
@@ -83,44 +109,28 @@ removed and the task clone is untouched throughout.
 Delivery has three phases, deliberately separated so you see exactly what will
 happen before anything does.
 
-### 1. Draft
+### 1. The publication text
 
-On the task-specific Ship flow, select **Draft via agent** to have the primary
-session write the publication text. You can write in the commit-message,
-pull-request title, and pull-request body fields while it works; values you
-change are kept when the agent's result arrives, while untouched fields are
-filled in for you. **Save text** stores what you wrote by hand.
+A workflow that declares its own publication also declares its own text. Its
+approval renders a suggested commit message, pull-request title, and body from
+the run's own evidence, and Ship flow shows them as editable fields. Change
+whatever you like: what you confirm is what gets published.
 
-The draft is inert: it selects nothing and authorizes nothing.
+Asking an agent to draft the text is refused for such a task, and deliberately:
+during an approval wait a turn would change the very content the decision is
+about. **Save text** stores what you wrote by hand, and is always available.
 
-If the agent is still working or reviewing, Ship flow waits for it to become
-idle. If no live agent is available, enter the text by hand. A draft error
-leaves those fields usable and provides an explicit retry; it never retries on
-its own. A daemon restart during a draft turn is reported as an interruption
-rather than silently starting another turn.
-
-The authenticated REST command remains useful for automation or recovery. With
-no body it safely ensures an initial draft — a repeated request returns the
-current draft or current attempt rather than prompting the agent twice:
+For a workflow that declares no publication of its own, **Draft via agent** is
+still there and works as before — with a repeated request returning the current
+draft rather than prompting twice:
 
 ```sh
 curl -sS -X POST http://127.0.0.1:4173/api/tasks/42/ship/draft \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Use a deliberate replacement request to regenerate a ready draft or retry a
-draft error:
-
-```sh
-curl -sS -X POST http://127.0.0.1:4173/api/tasks/42/ship/draft \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"replace": true}'
-```
-
-In the UI, **Re-draft via agent** asks for confirmation only when it would
-replace metadata you edited. After confirmation, newer edits made while the
-replacement is running remain yours.
+Those tasks cannot publish, so the draft is only ever text you copy out by
+hand.
 
 ### GitHub preflight
 
@@ -141,21 +151,27 @@ The check is a read-only GitHub API eligibility check. It does not test the SSH
 key or HTTPS credential used by `git push`; fix a later push authentication
 failure separately.
 
-### 2. Preview the ending
+### 2. Preview the decision
 
-Choose an ending, then select **Review this delivery**. Ompire resolves it
-read-only and shows exactly what a confirmation would permit: the actions still
-to run, the reviewed content being delivered, the signing identity, the account
-and destination, the pull-request body it will write — marker included — and
-every reason it is currently refused.
+Ship flow shows the question the run is asking and the answers that publish
+something, each naming the actions it authorizes. Nothing is preselected.
+Choose one, then select **Review this delivery**. Ompire resolves it read-only
+and shows exactly what a confirmation would permit: which question and answer
+it is about, the review attempt the grant rests on, the actions still to run,
+the reviewed content being delivered, the signing identity, the account and
+destination, the pull-request body it will write — marker included — and every
+reason it is currently refused.
+
+The same over REST. The preview names the decision; the ending and the commit
+mode come from the workflow's own chain rather than from the request:
 
 ```sh
 curl -sS -X POST http://127.0.0.1:4173/api/tasks/42/ship/preview \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-        "ending": "pr",
-        "mode": "squash",
+        "gate_seq": 7,
+        "choice_id": "open-pr",
         "message": "fix: stop the redirect loop after login",
         "pr_title": "Fix login redirect loop",
         "pr_body": "...",
@@ -163,18 +179,20 @@ curl -sS -X POST http://127.0.0.1:4173/api/tasks/42/ship/preview \
       }'
 ```
 
-The response carries a `preview_token`, a `version`, and a `deliverable` flag
-with a list of `blockers`. Nothing has been authorized.
+The response carries a `preview_token`, a `version`, the derived `ending` and
+`actions`, and a `deliverable` flag with a list of `blockers`. Nothing has been
+authorized.
 
-### 3. Confirm the ending
+### 3. Confirm it
 
 ```sh
 curl -sS -X POST http://127.0.0.1:4173/api/tasks/42/ship/commit \
   -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-        "ending": "pr",
-        "mode": "squash",
+        "gate_seq": 7,
+        "choice_id": "open-pr",
+        "note": "why I am publishing this",
         "message": "fix: stop the redirect loop after login",
         "pr_title": "Fix login redirect loop",
         "pr_body": "...",
@@ -184,27 +202,36 @@ curl -sS -X POST http://127.0.0.1:4173/api/tasks/42/ship/commit \
       }'
 ```
 
-The daemon then runs only the actions that ending authorizes. Changing anything
-between the preview and the confirmation invalidates the token, and resending
-the same confirmation cannot start a second delivery.
+That single call records the decision, the authorization it produces, and the
+run's move to its first action — together. The run then performs the actions
+the answer authorized, in order, and nothing else. Changing anything between
+the preview and the confirmation invalidates the token, and resending the same
+confirmation cannot start a second delivery.
 
-Use `ending: "commit"` to stop at a local signed commit, or `ending: "push"` to
-stop at a pushed branch.
+To stop at a local signed commit or a pushed branch, answer with the choice
+that says so. Which endings exist is the workflow's, not the request's.
 
-### Going further later
+### Answers that publish nothing
 
-An existing signed result can be pushed later, and an existing pushed result can
-get a pull request later, each on its own preview and confirmation:
+"Finish without publishing" and "send it back with changes" are answered from
+task detail like any other gate answer — they authorize nothing, so they need
+no preview. Finishing without publishing is a complete, named ending.
 
-```sh
-curl -sS -X POST http://127.0.0.1:4173/api/tasks/42/ship/push \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d '{"ending": "push", "request_id": "…", "preview_token": "…",
-       "delivery_id": 7, "expected_version": 5}'
-```
+### Continuing an interrupted delivery
 
-Neither re-signs, and neither starts an implicit earlier action.
+If a daemon restart or a failure interrupts an authorized chain, the run holds
+that attempt open rather than retrying it. The grant still stands. Preview the
+delivery again — Ship flow says it is continuing an authorized action — and
+confirm; the run resumes the same attempt against the same journal, and an
+effect that is proven to have already happened is adopted instead of repeated.
+
+### Older tasks cannot publish
+
+A task pinned to a workflow that declares no publication steps has no ending to
+authorize. The preview refuses with `no-delivery-vocabulary`, and Ship flow
+says so instead of offering a control that would then be declined. Launch a new
+task from a workflow that declares the delivery you want; the old task keeps
+its work, its history, and its workspace.
 
 ## Delivery modes
 

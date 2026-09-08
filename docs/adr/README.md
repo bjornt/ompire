@@ -50,6 +50,7 @@ relying on it.
 | [0030](0030-commit-human-decisions-before-advancing.md) | Commit a human decision before the run advances | Accepted |
 | [0031](0031-let-operators-own-a-workflow-library-above-retained-revisions.md) | Let operators own a workflow library above retained revisions | Accepted |
 | [0032](0032-bind-trusted-delivery-to-retained-candidates.md) | Bind trusted delivery to retained candidates and write-ahead action intent | Accepted |
+| [0033](0033-scope-trusted-delivery-authority-to-the-workflow-run.md) | Scope trusted delivery authority to the workflow run | Accepted |
 
 ## Template
 

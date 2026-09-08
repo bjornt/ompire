@@ -36,10 +36,14 @@ needs you among the nine that do not can actually reach you. See
 
 **The workflow engine.** Instead of telling one agent "do this workflow" in
 markdown, the workflow is declared deterministically: reproduce, diagnose,
-fix, validate, review, gate, publish. Mechanical and privileged steps —
-signing, pushing, creating pull requests — are performed by the daemon, not
-the agent. Humans are asked for structured feedback at declared gates. This
-part is expected to change the most as it is used for real work.
+fix, validate, review, gate, publish. Review and each privileged step —
+signing, pushing, creating pull requests — are *typed steps of the workflow*,
+performed by the daemon and never by the agent. What they are and when they may
+happen is in the definition; whether a particular run may perform one is a
+person's answer at a declared gate, naming the exact effects it permits.
+Finishing agent work is not permission to publish it. Humans are asked for
+structured feedback at declared gates. This part is expected to change the most
+as it is used for real work.
 
 **The refinement loop.** After work finishes, a retrospective over the
 run's sessions looks at where agents struggled and proposes durable
@@ -67,6 +71,12 @@ Anything expressible as a validated state transition is not delegated to an
 agent. Creating a pull request, choosing the next step from an exit code,
 enforcing an iteration limit, deciding whether a gate is satisfied — these are
 control-plane responsibilities, and they behave the same way every time.
+
+Publishing is the sharpest case. A definition *requests* an effect, a person
+*grants* exactly the chain they were shown, and a trusted service *performs*
+it — three separate things, so that no one of them alone can publish. A
+workflow that declares no publication cannot acquire it, whatever its name,
+whatever an agent reported, and however emphatically anyone asks.
 
 An agent, or a model asked to judge, may be a *declared* step where semantic
 judgment is genuinely useful — one the workflow routes to explicitly and you

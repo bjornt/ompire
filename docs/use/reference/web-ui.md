@@ -163,10 +163,31 @@ entry opens the editor.
 
 The editor has two views of **one** draft — **Visual**, a list of step cards
 with an agents panel, and **YAML**, the text — and switching between them is
-neither a save nor a launch. Every field either format supports has a form
-control, so a branching workflow can be written without opening the text view.
-A workflow's name and format are shown in both and editable in neither: a name
-is the entry's identity, and a format is the rules the document is read under.
+neither a save nor a launch. Every field any format supports has a form
+control, so a branching, reviewing, publishing workflow can be written without
+opening the text view. A workflow's name and format are shown in both and
+editable in neither: a name is the entry's identity, and a format is the rules
+the document is read under.
+
+The flow reading states what the document could publish, listing its declared
+effects or saying plainly that it publishes nothing. An answer that authorizes
+publication is drawn as its own kind of edge, naming the chain it grants —
+reading it as an ordinary answer is how a diagram would hide what a click
+permits.
+
+A **review** card has no instruction and no model: it says what the reviewer
+reads and what verdicts the steps after it can route on. A **delivery** card
+names its one effect, how a commit composes history, the action whose result it
+consumes, the approval that can authorize it, and where the run goes once the
+effect is on record. On a gate, a *delivery binding* selects which of that
+card's own evidence aliases is the review its grant rests on, and offers the
+publication text the workflow suggests. Each answer can then name the exact
+chain it authorizes, or none.
+
+Renaming or removing a step moves — or visibly breaks — those references like
+any other: a grant, an approval, and a consumed predecessor are references, and
+a rename that missed one would leave an answer authorizing a step that no
+longer exists.
 
 Opening the visual view and leaving it without changing anything leaves the
 text exactly as typed, comments included. Once something is changed visually,

@@ -1,0 +1,89 @@
+format: 3
+name: retain-flow
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    outcome: null
+    prompt:
+      parts:
+        - value: {op: input, name: task.prompt}
+
+  - name: hold
+    kind: gate
+    message:
+      parts:
+        - text: "Add any further commits, then continue to review."
+    choices:
+      - id: continue
+        label: Continue to review
+        next: {step: review}
+      - id: stop
+        label: Stop without reviewing
+        next: {complete: true, result: stopped}
+
+  - name: review
+    kind: review
+    evidence:
+      work: {steps: [work], with_outcome: false}
+
+  - name: route-review
+    kind: decision
+    evidence:
+      verdict: {steps: [review]}
+    cases:
+      - when:
+          op: eq
+          left: {op: get, value: {op: evidence, name: verdict}, keys: [outcome, result]}
+          right: {op: literal, value: "approved"}
+        next: {step: approve}
+    otherwise: {step: stop-unapproved}
+
+  - name: approve
+    kind: gate
+    evidence:
+      verdict: {steps: [review]}
+    delivery:
+      review: verdict
+    message:
+      parts:
+        - text: "Publish the retained history?"
+    choices:
+      - id: finish
+        label: Finish without publishing
+        next: {complete: true, result: done-unpublished}
+      - id: open-pr
+        label: Retain, push, and open a pull request
+        next: {step: commit-retained}
+        authorize: {steps: [commit-retained, push-retained, pr-retained]}
+
+  - name: commit-retained
+    kind: delivery
+    action: commit
+    mode: retain
+    approval: approve
+    next: {step: push-retained}
+  - name: push-retained
+    kind: delivery
+    action: push
+    previous: commit-retained
+    approval: approve
+    next: {step: pr-retained}
+  - name: pr-retained
+    kind: delivery
+    action: pr
+    previous: push-retained
+    approval: approve
+    next: {complete: true, result: published}
+
+  - name: stop-unapproved
+    kind: gate
+    message:
+      parts:
+        - text: "Review did not approve."
+    choices:
+      - id: stop
+        label: Stop without publishing
+        next: {complete: true, result: stopped-unreviewed}

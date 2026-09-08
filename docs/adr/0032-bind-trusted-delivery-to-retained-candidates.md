@@ -10,6 +10,13 @@ of [ADR-0016](0016-persist-authority-bearing-task-history-and-provenance.md).
 Preserves [ADR-0026](0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)'s
 accepted-input boundary.
 
+Its policy that an operator may extend a completed delivery to a further ending
+is superseded, for workflow format 3, by
+[ADR-0033](0033-scope-trusted-delivery-authority-to-the-workflow-run.md): a run
+performs the chain its answer named and no more. The protected-candidate,
+write-ahead, and reconciliation rationale below is unchanged, and is what that
+authority is enforced on top of.
+
 ## Context
 
 Publishing was one compound operation. `commit_and_ship` signed, pushed, and

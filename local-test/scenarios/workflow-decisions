@@ -3,14 +3,16 @@
 # local-test/scenarios/workflow-decisions — declared outcomes, evidence
 # handoffs, and human decisions (ADR-0029, ADR-0030).
 #
-# Drives the packaged format-2 `bugfix` through the journey the epic names,
+# Drives the packaged format-3 `bugfix` through the journey the epic names,
 # against the real daemon with the executable fake omp:
 #
 #   1. QA cannot reproduce → the run does NOT stop and does NOT permit a fix;
 #      diagnosis runs with the negative evidence.
 #   2. Diagnosis finds a candidate → QA is sent back in its ORIGINAL session,
 #      against still-unfixed code, and only its new evidence reproduces.
-#   3. Fix → QA verification in that same session → the run ends `validated`.
+#   3. Fix → QA verification in that same session → independent review → the
+#      operator's decision, whose "finish without publishing" ending is
+#      `validated`: a validated fix is not a published one.
 #
 # Then, on a second task, the branches a person owns: no-root-cause opens a
 # gate, its retry carries the operator's words into a new diagnosis, and
@@ -33,10 +35,20 @@ tid=$(spawn_task "$slug" \
 	"[[scenario:happy]]\n[[scenario-param:script=false]]\n[[scenario-param:results=not-reproduced,candidate-found,reproduced,implemented,validated]]\nBug: the empty list case explodes." \
 	bugfix)
 
-result=$(wait_for "run reaches a named ending" 240 workflow_result "$tid")
+# A validated fix reaches review, and only a person decides what happens to it.
+approve_run_review "$tid"
+wait_for "the run reaches its publication decision" 240 at_approval "$tid"
+[ "$(ship_field "$tid" '.authority.gate_step')" = approve ] &&
+	ok "a reproduced-and-verified fix reaches the ordinary approval" ||
+	fail "approval reached" "$(ship_field "$tid" '.authority.gate_step')"
+answer_gate "$tid" finish
+result=$(wait_for "run reaches a named ending" 60 workflow_result "$tid")
 [ "$result" = validated ] &&
-	ok "run ended 'validated'" ||
+	ok "run ended 'validated' — reviewed, decided, and not published" ||
 	fail "terminal result" "expected validated, got $result"
+[ -z "$(task_field "$tid" pr_url)" ] &&
+	ok "finishing without publishing published nothing" ||
+	fail "no publication" "$(task_field "$tid" pr_url)"
 assert "task never failed" task_not_failed "$tid"
 
 steps=$(workflow_steps "$tid")
@@ -44,8 +56,8 @@ steps=$(workflow_steps "$tid")
 # The route: reproduction failed, diagnosis still ran, QA was sent back.
 order=$(jq -r '[.[].step] | join(",")' <<<"$steps")
 case $order in
-reproduce,diagnose,route-diagnosis,reproduce-informed,route-informed,fix,route-fix,verify,route-verification)
-	ok "route: non-reproduction → diagnosis → informed QA → fix → verify" ;;
+reproduce,diagnose,route-diagnosis,reproduce-informed,route-informed,fix,route-fix,verify,route-verification,review,route-review,approve)
+	ok "route: non-reproduction → diagnosis → informed QA → fix → verify → review → decision" ;;
 *) fail "route" "$order" ;;
 esac
 
@@ -165,7 +177,17 @@ choices2=$(jq -r '[.outcome.choices[].id] | join(",")' <<<"$gate2")
 	fail "exception choices" "$choices2"
 
 answer_gate "$tid2" proceed-without-reproduction "customer confirmed it on their build"
-result2=$(wait_for "the authorized run reaches its ending" 240 workflow_result "$tid2")
+
+# A fix nobody could reproduce reaches its *own* approval, whose endings say
+# so. The limitation is in the structure: there is no route from here to an
+# ending that claims a before-and-after.
+approve_run_review "$tid2"
+wait_for "the unreproduced run reaches its own approval" 240 at_approval "$tid2"
+[ "$(ship_field "$tid2" '.authority.gate_step')" = approve-unreproduced ] &&
+	ok "an unreproduced fix reaches the approval that says so" ||
+	fail "unreproduced approval" "$(ship_field "$tid2" '.authority.gate_step')"
+answer_gate "$tid2" finish
+result2=$(wait_for "the authorized run reaches its ending" 60 workflow_result "$tid2")
 [ "$result2" = validated-without-reproduction ] &&
 	ok "the ending keeps the limitation: '$result2'" ||
 	fail "exception ending" "expected validated-without-reproduction, got $result2"

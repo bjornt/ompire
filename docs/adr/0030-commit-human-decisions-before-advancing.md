@@ -3,6 +3,13 @@
 - Status: Accepted
 - Date: 2026-09-06
 
+Its prohibition on a gate answer conferring authority is superseded, for
+workflow format 3 only, by
+[ADR-0033](0033-scope-trusted-delivery-authority-to-the-workflow-run.md):
+an approving choice there names the exact chain of privileged actions it
+grants. Everything below about committing the decision before the run
+advances is unchanged and is what that grant lands inside of.
+
 Extends [ADR-0008](0008-model-tasks-as-workflows-over-named-sessions.md)'s
 human-transition model without changing task or session ownership. Advances the
 decision-history slice of

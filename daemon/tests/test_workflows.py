@@ -60,6 +60,7 @@ from ompire_daemon.workflows import (
 from tests.conftest import (
     TEST_ROLES,
     fake_argv_builder,
+    install_plain_workflow,
     install_test_workflow,
     make_execution_inputs,
     make_test_policy,
@@ -98,7 +99,7 @@ def project(engine: Engine, tmp_path: Path):
 def _make_task(
     engine: Engine,
     tmp_path: Path,
-    workflow: str = "single-step",
+    workflow: str = "plain",
     prompt: str = "do it",
     *,
     preamble: str = "",
@@ -111,6 +112,8 @@ def _make_task(
     included (ADR-0026, ADR-0028). The engine reads the preamble, the role
     bindings, and the pinned revision off the task; there is no second object
     to hand it."""
+    if workflow == "plain":
+        install_plain_workflow(engine)
     name = slug or f"task-{workflow}"
     clone_path = tmp_path / "tasks" / name
     clone_path.mkdir(parents=True, exist_ok=True)
@@ -145,6 +148,58 @@ def _recover(runner: WorkflowRunner, engine: Engine, task: Task) -> None:
     runner.recover_run(task, resolve_task_definition(engine, task))
 
 
+class _StubReviews:
+    """A `ReviewManager` stand-in with the same durable contract.
+
+    It writes the iteration through the real registry and then wakes the
+    parked step, because that ordering is the property under test: the runner
+    must route on what was *recorded*, not on anything handed to it.
+    """
+
+    def __init__(
+        self, engine: Engine, verdicts: list[dict], *, default: dict | None = None
+    ) -> None:
+        self._engine = engine
+        self._verdicts = verdicts
+        self._default = default
+        self._completions: dict[int, asyncio.Future] = {}
+        self.started: list[int] = []
+
+    def watch_completion(self, task_id: int) -> asyncio.Future:
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._completions[task_id] = future
+        return future
+
+    async def start_review(self, task, *, workflow_seq: int | None = None) -> None:
+        from ompire_daemon.registry.reviews import append_iteration, open_review
+
+        self.started.append(workflow_seq)
+        if not self._verdicts and self._default is not None:
+            verdict = dict(self._default)
+        else:
+            verdict = self._verdicts.pop(0)
+        if isinstance(verdict, Exception):
+            raise verdict
+        open_review(
+            self._engine,
+            task.id,
+            candidate_id="cand-1",
+            workflow_seq=workflow_seq,
+        )
+        append_iteration(
+            self._engine,
+            task.id,
+            outcome=verdict["outcome"],
+            candidate_id="cand-1",
+            workflow_seq=workflow_seq,
+            findings=verdict.get("findings"),
+            status=verdict["outcome"] if verdict["outcome"] == "approved" else None,
+        )
+        future = self._completions.pop(task.id, None)
+        if future is not None and not future.done():
+            future.set_result(None)
+
+
 @pytest.fixture
 async def rig(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Runner + supervisor + tracker wired to fake omp with a fast debounce.
@@ -167,6 +222,10 @@ async def rig(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     )
     supervisor = AgentSupervisor(config, hub, tracker)
     runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
+    # A format-3 run reaches a `review` step, which the trusted service owns.
+    # The stub is unbounded and approves by default, so a test about routing
+    # says only what it means to say; one about verdicts sets them explicitly.
+    runner.set_operations(_StubReviews(engine, [], default={"outcome": "approved"}), None)
     try:
         yield runner, supervisor, tracker, hub, scenario
     finally:
@@ -187,7 +246,9 @@ def _restart_rig(engine: Engine, tmp_path: Path):
         spawn_step_timeout=10,
     )
     supervisor = AgentSupervisor(config, hub, tracker)
-    return WorkflowRunner(engine, config, hub, supervisor, tracker), supervisor, tracker, hub
+    runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
+    runner.set_operations(_StubReviews(engine, [], default={"outcome": "approved"}), None)
+    return runner, supervisor, tracker, hub
 
 
 async def _resume_recorded_sessions(engine, supervisor, tracker, task) -> None:
@@ -255,6 +316,13 @@ def retry(runner: WorkflowRunner, engine: Engine, task: Task):
 # --- test definitions ---------------------------------------------------------
 # Written the way an author writes them: YAML documents installed into the
 # process catalog and retained, exactly as a packaged definition is.
+
+# The engine's own baseline: one agent step, one turn, whatever the operator
+# typed. It is deliberately *not* the packaged `single-step`, which declares
+# review, an approval, and delivery. Tests about prompt bytes, restart
+# recovery, and mention handling are about the engine, and pinning them to a
+# workflow that also publishes would make them fail for reasons that have
+# nothing to do with what they check.
 
 OUTCOME_YAML = """
 format: 1
@@ -1780,7 +1848,7 @@ def test_a_retained_revision_is_readable_and_a_damaged_one_is_classified(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["name"] == "bugfix"
-    assert body["format"] == 2
+    assert body["format"] == 3
     assert body["primary_session"] == "coder"
     assert body["definition"]["steps"][0]["name"] == "reproduce"
 
@@ -2043,6 +2111,26 @@ def _bugfix_task(
     )
 
 
+async def _finish_without_publishing(runner, engine, task):
+    """Answer the bugfix approval with the ending that publishes nothing.
+
+    A validated fix no longer ends the run: it goes to review and then to a
+    person. Every test that used to assert `validated` now has to say who
+    decided that, which is the point of the change.
+    """
+    waiting = await wait_for_run(engine, task.id, {"waiting", "complete", "failed"})
+    assert waiting.workflow_status == "waiting", waiting.workflow_status
+    record = list_step_records(engine, task.id)[-1]
+    assert record.step in ("approve", "approve-unreproduced"), record.step
+    return runner.answer_gate(
+        get_task(engine, task.id),
+        resolve_task_definition(engine, task),
+        expected_seq=record.seq,
+        choice_id="finish",
+        note=None,
+    )
+
+
 async def test_bugfix_reproduced_runs_through_diagnosis_script_and_qa(
     rig, engine, project, tmp_path: Path
 ) -> None:
@@ -2067,7 +2155,7 @@ async def test_bugfix_reproduced_runs_through_diagnosis_script_and_qa(
         ],
     )
     _start(runner, engine, task)
-    final = await wait_for_run(engine, task.id, {"complete"})
+    final = await _finish_without_publishing(runner, engine, task)
     await driver
 
     records = list_step_records(engine, task.id)
@@ -2080,9 +2168,14 @@ async def test_bugfix_reproduced_runs_through_diagnosis_script_and_qa(
         ("run-script", "command", "ok"),
         ("verify", "agent", "ok"),
         ("route-verification", "decision", "ok"),
+        ("review", "review", "ok"),
+        ("route-review", "decision", "ok"),
+        ("approve", "gate", "ok"),
     ]
+    # A validated fix is reviewed and then decided; nothing was published, and
+    # the ending says exactly that.
     assert final.workflow_result == "validated"
-    assert records[-1].outcome == {"route": COMPLETE, "result": "validated"}
+    assert records[-1].outcome["decision"]["choice_id"] == "finish"
     # QA reproduced and verified in one conversation; the coder owns the change.
     assert len(user_prompts(supervisor, task.id, "reproducer")) == 2
     assert tracker.get(task.id, "coder") is not None
@@ -2122,7 +2215,7 @@ async def test_bugfix_non_reproduction_reaches_diagnosis_and_returns_to_qa(
         ],
     )
     _start(runner, engine, task)
-    final = await wait_for_run(engine, task.id, {"complete"})
+    final = await _finish_without_publishing(runner, engine, task)
     await driver
 
     records = list_step_records(engine, task.id)
@@ -2136,6 +2229,9 @@ async def test_bugfix_non_reproduction_reaches_diagnosis_and_returns_to_qa(
         "route-fix",
         "verify",
         "route-verification",
+        "review",
+        "route-review",
+        "approve",
     ]
     assert final.workflow_result == "validated"
     # Diagnosis saw the failure as a failure, with what QA tried intact.
@@ -2282,7 +2378,7 @@ async def test_bugfix_continued_non_reproduction_needs_explicit_permission(
         "proceed-without-reproduction",
         "customer confirmed it on their build; ship the guard",
     )
-    final = await wait_for_run(engine, task.id, {"complete"})
+    final = await _finish_without_publishing(runner, engine, task)
     await rest
 
     # The ending says what it is: validated, but never demonstrated.
@@ -2325,7 +2421,7 @@ async def test_bugfix_a_rejected_fix_goes_back_with_the_report(
         ],
     )
     _start(runner, engine, task)
-    final = await wait_for_run(engine, task.id, {"complete"})
+    final = await _finish_without_publishing(runner, engine, task)
     await driver
 
     assert final.workflow_result == "validated"
@@ -2524,7 +2620,7 @@ async def test_bugfix_restart_during_the_return_to_qa_keeps_the_conversation(
             ],
         )
         _recover(runner2, engine, get_task(engine, task.id))
-        final = await wait_for_run(engine, task.id, {"complete"})
+        final = await _finish_without_publishing(runner2, engine, task)
         await rest
 
         assert final.workflow_result == "validated"
@@ -3414,3 +3510,206 @@ async def test_missing_required_evidence_pauses_instead_of_prompting(
     assert missing_required_evidence(decide, bindings_from_document(
         {"version": 1, "bindings": {"repro": None}}
     )) == ("repro",)
+
+
+# --- format 3: review as a declared step --------------------------------------
+
+
+REVIEW_YAML = """
+format: 3
+name: reviewed
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    outcome: null
+    prompt: {parts: [{text: "do it"}]}
+
+  - name: check
+    kind: review
+    max_visits: 2
+    on_exhausted: {step: give-up}
+    evidence:
+      work: {steps: [work], with_outcome: false}
+
+  - name: route
+    kind: decision
+    evidence:
+      verdict: {steps: [check]}
+    cases:
+      - when:
+          op: eq
+          left: {op: get, value: {op: evidence, name: verdict}, keys: [outcome, result]}
+          right: {op: literal, value: "approved"}
+        next: {complete: true, result: approved}
+      - when:
+          op: all
+          of:
+            - op: eq
+              left:
+                op: get
+                value: {op: evidence, name: verdict}
+                keys: [outcome, result]
+              right: {op: literal, value: "comments"}
+            # A correction runs only against the reviewer's *whole* report.
+            - op: eq
+              left:
+                op: get
+                value: {op: evidence, name: verdict}
+                keys: [outcome, findings_state]
+              right: {op: literal, value: "complete"}
+        next: {step: correct}
+    otherwise: {step: give-up}
+
+  - name: correct
+    kind: agent
+    session: main
+    max_visits: 2
+    on_exhausted: {step: give-up}
+    outcome: null
+    evidence:
+      verdict: {steps: [check]}
+    prompt:
+      separator: ""
+      parts:
+        - text: "The reviewer said:\\n"
+        - value:
+            op: get
+            value: {op: evidence, name: verdict}
+            keys: [outcome, findings]
+          format: text
+
+  - name: back-to-review
+    kind: decision
+    cases:
+      - when: true
+        next: {step: check}
+    otherwise: {step: give-up}
+
+  - name: give-up
+    kind: gate
+    evidence:
+      verdict: {steps: [check], required: false}
+    message: {parts: [{text: "Review did not approve."}]}
+    choices:
+      - id: stop
+        label: Stop
+        next: {complete: true, result: stopped-unapproved}
+"""
+
+
+async def _run_reviewed(rig, engine, tmp_path, verdicts):
+    runner, _supervisor, _tracker, _hub, _scenario = rig
+    install_test_workflow(engine, REVIEW_YAML)
+    reviews = _StubReviews(engine, verdicts)
+    runner.set_operations(reviews, None)
+    task = _make_task(engine, tmp_path, workflow="reviewed")
+    _start(runner, engine, task)
+    return task, reviews
+
+
+async def test_an_approved_review_routes_on_what_was_recorded(
+    rig, engine: Engine, tmp_path: Path
+) -> None:
+    task, _reviews = await _run_reviewed(
+        rig, engine, tmp_path, [{"outcome": "approved", "findings": ""}]
+    )
+    finished = await wait_for_run(engine, task.id, {"complete", "failed"})
+    assert finished.workflow_status == "complete"
+    assert finished.workflow_result == "approved"
+    records = list_step_records(engine, task.id)
+    check = next(r for r in records if r.step == "check")
+    assert check.kind == "review"
+    assert check.outcome["result"] == "approved"
+    assert check.outcome["candidate_id"] == "cand-1"
+    assert check.outcome["iteration_seq"] == 1
+
+
+async def test_comments_reach_a_declared_correction_and_not_a_hidden_turn(
+    rig, engine: Engine, tmp_path: Path
+) -> None:
+    """The findings go to the step the author wrote, as its prompt.
+
+    Nothing pushes them into a session behind the run's back: the correcting
+    step is an ordinary agent step reading ordinary evidence, which is what
+    makes the loop visible in the flow and bounded by its own budget.
+    """
+    _runner, supervisor, _tracker, _hub, _scenario = rig
+    task, reviews = await _run_reviewed(
+        rig,
+        engine,
+        tmp_path,
+        [
+            {"outcome": "comments", "findings": "> fix the thing"},
+            {"outcome": "approved", "findings": ""},
+        ],
+    )
+    finished = await wait_for_run(engine, task.id, {"complete", "failed"})
+    assert finished.workflow_result == "approved"
+    prompts = user_prompts(supervisor, task.id, "main")
+    assert any("> fix the thing" in text for text in prompts)
+    # One correction turn, sent by the workflow — not one from the reviewer
+    # and another from the step.
+    assert sum("> fix the thing" in text for text in prompts) == 1
+    assert reviews.started == [2, 6]
+
+
+@pytest.mark.parametrize("verdict", ["aborted", "error", "interrupted"])
+async def test_a_review_that_did_not_approve_never_reads_as_approval(
+    rig, engine: Engine, tmp_path: Path, verdict: str
+) -> None:
+    task, _reviews = await _run_reviewed(
+        rig, engine, tmp_path, [{"outcome": verdict}]
+    )
+    waiting = await wait_for_run(engine, task.id, {"waiting", "failed", "complete"})
+    assert waiting.workflow_status == "waiting"
+    assert waiting.workflow_step == "give-up"
+    check = next(r for r in list_step_records(engine, task.id) if r.step == "check")
+    assert check.outcome["result"] == verdict
+    assert check.outcome["findings"] is None
+
+
+async def test_an_unavailable_reviewer_pauses_instead_of_inventing_a_verdict(
+    rig, engine: Engine, tmp_path: Path
+) -> None:
+    from ompire_daemon.review import ReviewContentError
+
+    task, _reviews = await _run_reviewed(
+        rig,
+        engine,
+        tmp_path,
+        [ReviewContentError("there is nothing to review")],
+    )
+    waiting = await wait_for_run(engine, task.id, {"waiting", "failed", "complete"})
+    assert waiting.workflow_status == "waiting"
+    record = list_step_records(engine, task.id)[-1]
+    assert record.step == "check"
+    assert record.outcome is None
+    assert record.pause["reason"] == "review_unavailable"
+    assert "nothing to review" in record.pause["message"]
+
+
+async def test_a_recorded_verdict_is_consumed_once_across_a_restart(
+    rig, engine: Engine, tmp_path: Path
+) -> None:
+    """A restart between the verdict and the step's completion re-reads the
+    verdict; it never runs a second review of a workspace that moved on."""
+    runner, _supervisor, _tracker, _hub, _scenario = rig
+    install_test_workflow(engine, REVIEW_YAML)
+    reviews = _StubReviews(engine, [{"outcome": "approved", "findings": ""}])
+    runner.set_operations(reviews, None)
+    task = _make_task(engine, tmp_path, workflow="reviewed")
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"complete", "failed"})
+
+    # Re-drive the same recorded attempt with an empty verdict queue: a second
+    # review would raise IndexError, so reaching the same result proves the
+    # recorded one was reused.
+    from ompire_daemon.registry.reviews import iteration_for_step
+
+    check = next(r for r in list_step_records(engine, task.id) if r.step == "check")
+    assert iteration_for_step(engine, task.id, check.seq) is not None
+    assert reviews._verdicts == []
+    assert reviews.started == [2]

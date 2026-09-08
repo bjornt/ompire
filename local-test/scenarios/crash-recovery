@@ -19,7 +19,6 @@
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 PARKED_GATE=""
-PARKED_DRAFT=$(mktemp /tmp/ompire-parked-draft-XXXXXX.json)
 BARE_SANDBOX=$STATE_ROOT/forge/github.com/local-test/sandbox.git
 _agent_live() { # _agent_live CLONE
 	$OMPCTL sessions | awk -v clone="$1" '$0 ~ clone {print $1}' | grep -q .
@@ -31,7 +30,6 @@ _launch_count() { # _launch_count SESSION WANT
 }
 _parked_cleanup() {
 	[ -z "$PARKED_GATE" ] || "$FORGE" gate local-test/sandbox off >/dev/null 2>&1 || true
-	rm -f "$PARKED_DRAFT"
 }
 
 # Reconciled: startup either adopted a completed push or established that it
@@ -52,7 +50,7 @@ ws_start
 
 # --- leg 1: resume after SIGKILL ------------------------------------------------
 
-tid=$(spawn_task "$(unique_slug crash)" "[[scenario:auto-retry-hang]]
+tid=$(spawn_work_only "$(unique_slug crash)" "[[scenario:auto-retry-hang]]
 Keep working; the daemon will die under you.")
 clone=$(task_field "$tid" clone_path)
 
@@ -87,9 +85,8 @@ assert "task never failed after recovery" task_not_failed "$tid"
 # --- leg 2: an interrupted push is reconciled, never repeated -------------------
 
 tid2=$(spawn_task "$(unique_slug parked)" "[[scenario:commit]]\nInterrupted-push E2E: do the work and commit it.")
-wait_for "work step completes (interrupted-push leg)" 180 workflow_complete "$tid2"
-approve_review "$tid2"
-api_json POST "/api/tasks/$tid2/ship/draft" >"$PARKED_DRAFT"
+approve_run_review "$tid2"
+wait_for "the run reaches its publication decision" 180 at_approval "$tid2"
 $GPGCTL warm
 
 branch2=$(task_field "$tid2" branch)
@@ -105,8 +102,7 @@ _push_executing() { # _push_executing TASK
 	printf 'push executing'
 }
 
-ship_deliver "$tid2" push squash \
-	"$(jq -r .draft.commit_message "$PARKED_DRAFT")" "Interrupted" "b"
+ship_deliver "$tid2" push-branch "ship: interrupted push" "Interrupted" "b"
 wait_for "push intent journaled as executing" 120 _push_executing "$tid2"
 signed_tip=$(ship_field "$tid2" '.results.commit.signed_tip')
 [ -n "$signed_tip" ] && ok "the signed result was recorded before the push began" ||

@@ -7,7 +7,9 @@ may say, what changes its revision, and what "cannot decide" means.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 
 import pytest
 
@@ -16,6 +18,8 @@ from ompire_daemon.workflow_definitions import (
     AgentStep,
     CommandStep,
     CompleteDestination,
+    DeliveryGrant,
+    DeliveryStep,
     EvaluationContext,
     EvidenceBinding,
     EvidenceSelector,
@@ -23,6 +27,7 @@ from ompire_daemon.workflow_definitions import (
     GateStep,
     HistoryRecord,
     RenderError,
+    ReviewStep,
     StepDestination,
     Unresolved,
     UnsupportedWorkflowFormatError,
@@ -31,6 +36,7 @@ from ompire_daemon.workflow_definitions import (
     bindings_from_document,
     canonical_bytes,
     check_draft_data,
+    definition_from_document,
     describe,
     emit_draft_yaml,
     evaluate_predicate,
@@ -139,7 +145,7 @@ def test_unsupported_format_is_refused_not_reinterpreted() -> None:
     # A version this interpreter does not implement is refused rather than
     # read under the newest rules it happens to know.
     with pytest.raises(UnsupportedWorkflowFormatError):
-        load(MINIMAL.replace("format: 1", "format: 3"))
+        load(MINIMAL.replace("format: 1", "format: 4"))
 
 
 @pytest.mark.parametrize(
@@ -1088,3 +1094,341 @@ def test_a_draft_may_be_incomplete_and_carry_fields_no_format_knows() -> None:
     assert parse_yaml_document(emit_draft_yaml(draft)) == draft
     with pytest.raises(WorkflowDocumentError):
         load_definition(emit_draft_yaml(draft))
+
+
+# --- format 3: review, delivery, and the authority between them ----------------
+
+
+FORMAT_3 = """
+format: 3
+name: publisher
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    outcome:
+      results:
+        done:
+          required: {headline: string}
+    prompt: {parts: [{text: "do it"}]}
+
+  - name: review
+    kind: review
+    max_visits: 3
+    on_exhausted: {step: review-exhausted}
+    evidence:
+      work: {steps: [work]}
+
+  - name: route-review
+    kind: decision
+    evidence:
+      verdict: {steps: [review]}
+    cases:
+      - when:
+          op: eq
+          left: {op: get, value: {op: evidence, name: verdict}, keys: [outcome, result]}
+          right: {op: literal, value: "approved"}
+        next: {step: approve}
+      - when:
+          op: eq
+          left: {op: get, value: {op: evidence, name: verdict}, keys: [outcome, result]}
+          right: {op: literal, value: "comments"}
+        next: {step: work}
+    otherwise: {step: review-exhausted}
+
+  - name: approve
+    kind: gate
+    evidence:
+      verdict: {steps: [review]}
+      work: {steps: [work]}
+    delivery:
+      review: verdict
+      metadata:
+        pr_title:
+          parts:
+            - value: {op: get, value: {op: evidence, name: work}, keys: [outcome, artifacts, headline]}
+              format: text
+    message: {parts: [{text: "Publish?"}]}
+    choices:
+      - id: publish
+        label: Open a pull request
+        next: {step: commit}
+        authorize: {steps: [commit, push, pr]}
+      - id: finish
+        label: Finish without publishing
+        next: {complete: true, result: done-unpublished}
+
+  - name: commit
+    kind: delivery
+    action: commit
+    mode: squash
+    approval: approve
+    next: {step: push}
+  - name: push
+    kind: delivery
+    action: push
+    previous: commit
+    approval: approve
+    next: {step: pr}
+  - name: pr
+    kind: delivery
+    action: pr
+    previous: push
+    approval: approve
+    next: {complete: true, result: published}
+
+  - name: review-exhausted
+    kind: gate
+    message: {parts: [{text: "no review"}]}
+    choices:
+      - id: stop
+        label: Stop
+        next: {complete: true, result: stopped-unreviewed}
+"""
+
+
+def test_format_3_parses_review_delivery_and_the_grant_between_them() -> None:
+    revision = load(FORMAT_3)
+    definition = revision.definition
+    review = definition.step_named("review")
+    assert isinstance(review, ReviewStep)
+    assert review.max_visits == 3
+    gate = definition.step_named("approve")
+    assert isinstance(gate, GateStep)
+    assert gate.delivery is not None
+    assert gate.delivery.review == "verdict"
+    assert gate.delivery.metadata is not None
+    assert gate.delivery.metadata.message is None  # omitted starts blank
+    assert gate.choice_named("finish").authorize is None
+    assert definition.grant_for("approve", "publish") == DeliveryGrant(
+        steps=("commit", "push", "pr")
+    )
+    commit = definition.step_named("commit")
+    assert isinstance(commit, DeliveryStep)
+    assert (commit.action, commit.mode, commit.previous) == ("commit", "squash", None)
+    assert definition.declared_actions == ("commit", "push", "pr")
+    descriptor = describe(revision)
+    assert descriptor.actions == ("commit", "push", "pr")
+    assert descriptor.reviews is True
+    # An action never runs just because the run reached it.
+    assert all(
+        step.conditional for step in descriptor.steps if step.action is not None
+    )
+
+
+def _chain_document(*actions: str) -> str:
+    """FORMAT_3 with its delivery chain cut back to `actions`."""
+    bodies = {
+        "commit": "  - name: commit\n    kind: delivery\n    action: commit\n"
+        "    mode: squash\n    approval: approve\n    next: {next}\n",
+        "push": "  - name: push\n    kind: delivery\n    action: push\n"
+        "    previous: commit\n    approval: approve\n    next: {next}\n",
+        "pr": "  - name: pr\n    kind: delivery\n    action: pr\n"
+        "    previous: push\n    approval: approve\n    next: {next}\n",
+    }
+    steps = ""
+    for index, action in enumerate(actions):
+        following = (
+            f"{{step: {actions[index + 1]}}}"
+            if index + 1 < len(actions)
+            else "{complete: true, result: published}"
+        )
+        steps += bodies[action].replace("{next}", following)
+    original = "".join(
+        bodies[action].replace(
+            "{next}",
+            f"{{step: {nxt}}}" if nxt else "{complete: true, result: published}",
+        )
+        for action, nxt in (("commit", "push"), ("push", "pr"), ("pr", ""))
+    )
+    assert original in FORMAT_3
+    return FORMAT_3.replace(original, steps).replace(
+        "authorize: {steps: [commit, push, pr]}",
+        f"authorize: {{steps: [{', '.join(actions)}]}}",
+    )
+
+
+@pytest.mark.parametrize(
+    "actions", [("commit",), ("commit", "push"), ("commit", "push", "pr")]
+)
+def test_a_shorter_ending_is_a_whole_valid_chain(actions: tuple[str, ...]) -> None:
+    """Stopping after a local commit, or after a push, is a real ending — not
+    a truncated pull-request flow with its last step missing."""
+    text = _chain_document(*actions)
+    assert load(text).definition.declared_actions == actions
+    _round_trip(text)
+
+
+def test_a_workflow_that_publishes_nothing_says_so() -> None:
+    text = FORMAT_3
+    for cut in (
+        """
+  - name: commit
+    kind: delivery
+    action: commit
+    mode: squash
+    approval: approve
+    next: {step: push}
+  - name: push
+    kind: delivery
+    action: push
+    previous: commit
+    approval: approve
+    next: {step: pr}
+  - name: pr
+    kind: delivery
+    action: pr
+    previous: push
+    approval: approve
+    next: {complete: true, result: published}
+""",
+        """    delivery:
+      review: verdict
+      metadata:
+        pr_title:
+          parts:
+            - value: {op: get, value: {op: evidence, name: work}, keys: [outcome, artifacts, headline]}
+              format: text
+""",
+        """      - id: publish
+        label: Open a pull request
+        next: {step: commit}
+        authorize: {steps: [commit, push, pr]}
+""",
+    ):
+        assert cut in text
+        text = text.replace(cut, "")
+    revision = load(text)
+    assert revision.definition.declared_actions == ()
+    assert describe(revision).actions == ()
+    # Review without delivery is still a perfectly good workflow.
+    assert describe(revision).reviews is True
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected", "match"),
+    [
+        # A grant must be a real chain, starting at the local signed commit.
+        (
+            "authorize: {steps: [commit, push, pr]}",
+            "authorize: {steps: [push, pr]}",
+            "No action performs a missing predecessor",
+        ),
+        (
+            "authorize: {steps: [commit, push, pr]}",
+            "authorize: {steps: [commit, pr]}",
+            "No action performs a missing predecessor",
+        ),
+        # The approving answer goes straight to what it grants.
+        (
+            "        next: {step: commit}\n        authorize",
+            "        next: {step: push}\n        authorize",
+            "must go straight to the first action it grants",
+        ),
+        # A delivery gate always offers a way out that publishes nothing.
+        (
+            (
+                "      - id: finish\n        label: Finish without publishing\n"
+                "        next: {complete: true, result: done-unpublished}\n"
+            ),
+            "",
+            "must also offer a way out that publishes nothing",
+        ),
+        # The grant is bound to a trusted verdict, never to an agent's claim.
+        ("      review: verdict", "      review: work", "is not a review step"),
+        # Nothing runs in the workspace after publication.
+        (
+            "    next: {complete: true, result: published}",
+            "    next: {step: review-exhausted}",
+            "must end the run at a named result",
+        ),
+        # No edge enters a chain except its grant or the action before it.
+        (
+            "    otherwise: {step: review-exhausted}",
+            "    otherwise: {step: push}",
+            "reachable only from the choice that authorizes its chain",
+        ),
+        # Each action belongs to exactly one gate.
+        (
+            "    action: push\n    previous: commit\n    approval: approve",
+            "    action: push\n    previous: commit\n    approval: review-exhausted",
+            "but this grant comes from 'approve'",
+        ),
+        # A commit says how it composes history; nothing else may.
+        ("    action: commit\n    mode: squash\n", "    action: commit\n", "'mode'"),
+        (
+            "    action: push\n    previous: commit",
+            "    action: push\n    mode: squash\n    previous: commit",
+            "unknown field 'mode'",
+        ),
+        # An action nothing can grant is not left lying in the document.
+        (
+            "        authorize: {steps: [commit, push, pr]}",
+            "        authorize: {steps: [commit, push]}",
+            "must end the run at a named result",
+        ),
+        # A privileged step is never reached by simply finishing the one before.
+        (
+            (
+                "  - name: review-exhausted\n    kind: gate\n"
+                "    message: {parts: [{text: \"no review\"}]}\n"
+                "    choices:\n      - id: stop\n        label: Stop\n"
+                "        next: {complete: true, result: stopped-unreviewed}\n"
+            ),
+            "",
+            "routes to undeclared step",
+        ),
+    ],
+)
+def test_format_3_refuses_authority_it_cannot_account_for(
+    mutation: str, expected: str, match: str
+) -> None:
+    assert mutation in FORMAT_3
+    with pytest.raises(WorkflowDocumentError, match=re.escape(match)):
+        load(FORMAT_3.replace(mutation, expected))
+
+
+def test_delivery_vocabulary_belongs_to_format_3_alone() -> None:
+    with pytest.raises(WorkflowDocumentError, match="exists only in format 3"):
+        load(FORMAT_3.replace("format: 3", "format: 2"))
+    # And a format-2 gate has no delivery binding to give it authority.
+    with pytest.raises(WorkflowDocumentError, match="unknown field 'delivery'"):
+        load(
+            FORMAT_2.replace(
+                "    message: {parts: [{text: \"could not reproduce\"}]}",
+                "    delivery: {review: repro}\n"
+                "    message: {parts: [{text: \"could not reproduce\"}]}",
+            )
+        )
+
+
+def test_format_3_exports_and_reloads_to_the_same_revision() -> None:
+    _round_trip(FORMAT_3)
+
+
+def test_earlier_formats_keep_their_canonical_bytes() -> None:
+    """Adding format 3 must not move a single retained revision's identity."""
+    assert (
+        load(MINIMAL).revision
+        == "sha256:" + hashlib.sha256(canonical_bytes(load(MINIMAL).definition)).hexdigest()
+    )
+    for text in (MINIMAL, FORMAT_2):
+        document = json.loads(canonical_bytes(load(text).definition))
+        for step in document["steps"]:
+            assert "delivery" not in step
+            for choice in step.get("choices", []):
+                assert "authorize" not in choice
+
+
+def test_an_invalid_draft_is_still_a_draft() -> None:
+    """Half-authored delivery survives a save; it just cannot execute."""
+    half = {
+        "format": 3,
+        "name": "half",
+        "steps": [{"name": "pr", "kind": "delivery", "action": "pr"}],
+    }
+    assert check_draft_data(half) is half
+    with pytest.raises(WorkflowDocumentError):
+        definition_from_document(half)

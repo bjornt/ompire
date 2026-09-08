@@ -3,14 +3,21 @@
 ## Overview
 
 Delivering a task turns its reviewed work into one of three endings — a local
-signed commit, a pushed branch, or a pull request — and the operator chooses
-which. The primary agent can draft the publication text; the daemon does
-everything else with host-side credentials the agent never sees.
+signed commit, a pushed branch, or a pull request. The daemon performs each
+with host-side credentials the agent never sees.
+
+**The task's own workflow decides which endings are on offer**, and a person
+decides which one happens. A workflow declares publication as steps; one of its
+approval's answers names the exact chain it authorizes; and the run performs
+that chain and nothing more
+([ADR-0033](../../adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md)).
+Ship flow is where that decision is made and where its progress is read — it is
+a view and a control for the procedure, not a way around it.
 
 The flow has four steps — Review, Deliver, Delivered, Cleanup — surfaced as a
-stepper in the Ship Flow view. Opening a task-specific Ship flow prepares an
-eligible agent draft; opening the page, generating a draft, or finishing agent
-work grants no publication authority.
+stepper in the Ship Flow view. Opening the page, preparing text, an approval in
+the review tool, and an agent reporting success all grant no publication
+authority.
 
 Every delivery is content-bound (ADR-0032). Review captures a *candidate* — the
 task's whole publishable delta against its accepted base — and an approval names
@@ -24,13 +31,17 @@ protected copy, not whatever the workspace happens to hold when signing starts.
 | Local signed commit | Sign locally and stop. Nothing is pushed and no pull request is opened. |
 | Pushed branch | Sign, then push to the task's accepted destination. No pull request is opened. |
 | Pull request | Sign, push, and open a pull request. |
+| No publication | The workflow reaches a named ending with no privileged effect at all. |
 
 A local or push-only ending is a **successful delivery**, not a failed pull
-request. A completed ending can be extended later: an operator can authorize
-pushing an existing signed result, or opening a pull request for an existing
-pushed result, without repeating what already completed. Each further ending is
-previewed and confirmed on its own and appends its authorization; the earlier
-one is never rewritten.
+request. So is finishing without publishing: it is an ending an author declared
+and a person chose.
+
+**A completed ending does not grow.** The chain a person authorized is what
+runs, and once it is done there is nothing further to authorize — asking for a
+longer ending is refused, at the preview and at every action endpoint alike. If
+you want a task's work pushed, authorize an answer that says so, or launch it
+under a workflow that declares that ending.
 
 Changing the content requires a fresh review and a new delivery authorization.
 
@@ -38,9 +49,21 @@ Changing the content requires a fresh review and a new delivery authorization.
 
 Nothing privileged happens without two steps.
 
-`POST /api/tasks/{id}/ship/preview` resolves one requested ending read-only. It
-captures nothing, writes no Git state, and authorizes nothing. It returns:
+`POST /api/tasks/{id}/ship/preview` resolves the delivery this run's procedure
+currently permits, read-only. It captures nothing, writes no Git state, and
+authorizes nothing.
 
+The ending and the commit mode are **derived, not requested**: they come from
+the chain the run's own answer would authorize. A caller may still name one, and
+a disagreement is reported rather than obeyed. When the run is waiting at an
+approval, the preview identifies which question and which answer it is about;
+naming neither, or naming a stale attempt, an unknown answer, or an answer that
+publishes nothing, is refused.
+
+It returns:
+
+- which decision it describes — the question, the answer, and the review
+  attempt the grant is bound to;
 - the candidate being delivered — its identity, base branch, base commit, tree,
   and commit count — and whether the approval covers it;
 - the actions still to run and the ones already completed;
@@ -51,15 +74,28 @@ captures nothing, writes no Git state, and authorizes nothing. It returns:
 - **every** reason the delivery is currently refused, not just the first;
 - a `preview_token` fingerprint over those exact inputs.
 
-The confirmation carries that token back. Changing the ending, the mode, the
-metadata, the content, or the destination invalidates it, and a replayed or
-conflicting submission cannot start a second delivery.
+The confirmation carries that token back. Changing the answer, the metadata,
+the content, or the destination invalidates it, and a replayed or conflicting
+submission cannot start a second delivery. The token also covers *which
+decision* this is, so a confirmation prepared against one question cannot be
+replayed against the next one with identical content.
+
+Confirming an approving answer is **one operation**, whichever page it came
+from: the decision, the delivery authorization it produces, and the run's move
+to its first action become durable together. Task detail shows the same pending
+decision and links to it; a generic Resume there cannot answer a publishing
+choice, because without the preview there is no evidence the operator saw the
+content, the target, and the identities the authorization is about.
 
 ### Why a delivery is refused
 
 | Blocker | Meaning |
 |---|---|
+| `no-delivery-vocabulary` | The task's pinned workflow declares no publication steps, so nothing can authorize signing, pushing, or opening a pull request. Launch a new task from a workflow that declares the delivery it should perform. |
+| `not-at-gate` | The run is not waiting at an approval that authorizes publication, and has no authorized action outstanding. |
 | `review-missing` | The task has no approved review. |
+| `review-unrecorded` | The approval names a review attempt with no recorded verdict. Nothing is authorized against a review that did not happen. |
+| `review-not-approved` | The review *this approval is about* ended in something other than approved. |
 | `review-unbound` | The approval predates content-bound review, so it does not identify what was approved. It stays on record; delivering needs a fresh review. |
 | `review-stale` | The content changed after the approval. Review the current content before delivering it. |
 | `empty-candidate` | There is nothing to deliver. Ompire refuses rather than manufacturing a commit. |
@@ -71,6 +107,8 @@ conflicting submission cannot start a second delivery.
 | `unresolved-effect` | A previous privileged action's outcome is unknown; nothing dependent may run. |
 | `already-delivered` | This ending's actions have all completed. |
 | `archived` | The task is archived. |
+| `predecessor-missing` | An action was asked for before the one it consumes completed. No action performs a missing predecessor. |
+| `action-mismatch` / `not-at-action` | The action requested is not the one the run is at. |
 
 ### Credentials by ending
 
@@ -102,9 +140,11 @@ first.
 | Label | Meaning |
 |---|---|
 | Needs a decision | An effect's outcome is unknown and an operator decision is required. |
+| Waiting for your decision | The run is at its approval. The work is reviewed and nothing is published; the answer you give decides what happens. |
 | Review | The recorded handoff has not reached an approved review of the current content. |
-| Draft | Review is approved; publication text and an ending are still to be chosen. |
+| Draft | Review is approved; publication text and an ending are still to be chosen. Only for a workflow that declares no publication of its own. |
 | Deliver | A delivery is authorized or stopped and can be confirmed. |
+| Finished without publishing | The run reached a named ending with no privileged effect — the ending it was written to reach. |
 | Signed locally | A local ending completed. Nothing was pushed. |
 | Pushed | A push ending completed. No pull request was opened. |
 | Wait for merge | A pull request exists but has not resolved. |
@@ -119,30 +159,43 @@ Delivery needs an approved review of the content being delivered. See
 [Review](review.md) for how an approval is bound to a candidate and when it
 stops being usable.
 
-### 2. Draft
+### 2. Publication text
 
-`POST /api/tasks/{id}/ship/draft` is an idempotent **ensure draft** command. It
-asks the task's primary session for a commit message and pull-request title and
-body only when no ready draft exists; repeated bodyless requests return the
-existing draft without another agent turn. Send `{"replace": true}` to
-regenerate, and `PUT /api/tasks/{id}/ship/draft` to store text written by hand.
+**A workflow that declares its own publication declares its own text.** Its
+approval gate renders a suggested commit message, pull-request title, and body
+from the same frozen evidence the question was asked against; they arrive as
+editable fields beside the decision, and what you confirm is what is published.
+`POST /api/tasks/{id}/ship/draft` is refused for such a task — asking an agent
+for a draft during an approval wait would be a turn nobody declared, changing
+the very content the decision is about.
 
-The draft is inert. It is editable at any time, it selects nothing, and it
-authorizes nothing.
+For a workflow that declares no publication of its own, drafting works as
+before. `POST /api/tasks/{id}/ship/draft` is an idempotent **ensure draft**
+command: it asks the task's primary session for a commit message and
+pull-request title and body only when no ready draft exists, and repeated
+bodyless requests return the existing draft without another agent turn. Send
+`{"replace": true}` to regenerate.
 
-Drafting is best-effort. A transport error, timeout, missing agent text, or
-invalid markers leaves the fields intact and records a retryable draft error. A
-daemon restart during a draft turn records it as **interrupted**: nothing is
-sent again on the operator's behalf, and the retry is explicit.
+`PUT /api/tasks/{id}/ship/draft` stores text written by hand, and is available
+either way. Text is inert: it is editable at any time, it selects nothing, and
+it authorizes nothing.
 
-While the primary session is working, reviewing, starting, retrying, or
-waiting, the step says drafting is waiting for it. With no live primary agent,
-every field stays usable for manual text.
+Agent drafting is best-effort. A transport error, timeout, missing agent text,
+or invalid markers leaves the fields intact and records a retryable draft
+error. A daemon restart during a draft turn records it as **interrupted**:
+nothing is sent again on the operator's behalf, and the retry is explicit.
 
 ### 3. Deliver
 
-Choose an ending, choose squash or retain, review the resolved preview, then
-confirm. The confirmation names every effect it permits.
+Answer the question the run is asking. Each publishing answer names the exact
+actions it authorizes; nothing is preselected, and the commit mode is what the
+workflow declared rather than something chosen here. Review the resolved
+preview, then confirm — the confirmation names every effect it permits.
+
+While the run waits for that answer, daemon-managed writers are refused: a turn
+started here would change the content the decision is about. Use the question's
+own "request changes" answer instead, which is what the author declared for
+exactly that.
 
 **Squash** delivers exactly the reviewed candidate tree as one signed commit on
 the candidate's base.
@@ -164,9 +217,10 @@ resetting over new work.
 
 ### 4. Delivered
 
-Completed actions show their concrete results: the signed tip and commit count,
-the pushed branch and head, or the pull-request link. A delivery that ended
-before a pull request says so plainly, and offers the further endings.
+Completed actions show their concrete results, read from the delivery journal
+rather than from what the workflow calls its ending: the signed tip and commit
+count, the pushed branch and head, or the pull-request link. A delivery that
+ended before a pull request says so plainly — it is complete, not truncated.
 
 ### 5. Cleanup
 
@@ -224,6 +278,14 @@ A daemon restart performs no signing, no push, and no forge write. It restores
 safe state, reconciles what it can observe, and requires an explicit
 continuation for remaining work.
 
+For a workflow-authorized chain, that continuation is the run's own. An effect
+that is proven to have happened is **adopted**: the step it belongs to finishes
+with that recorded result and the run carries on, without repeating anything.
+Otherwise the run holds the same attempt open and waits — the grant still
+stands, and nothing is retried on your behalf. Confirm the remaining work
+against a fresh preview of the same delivery, and the run resumes from where it
+was rather than opening a second attempt at the same effect.
+
 ## Upgrading from an earlier Ompire
 
 Existing review iterations and pull-request records are preserved and never
@@ -231,6 +293,17 @@ rewritten. Reviews recorded before content binding carry no candidate: they stay
 visible as history and require a fresh review before a new delivery. A task that
 shipped before the delivery journal existed shows its pull request as a known
 fact with no recorded authorization behind it, which is exactly what is true.
+
+**A task pinned to a workflow that declares no publication cannot publish.**
+Older definitions have no step that could, and nothing infers one from the
+workflow's name, a completed run, or a historical approval. Ship flow says so
+rather than offering an ending it would then refuse. The path forward is to
+launch a new task from a definition that declares the delivery you want; the
+old task keeps its work, its history, and its workspace.
+
+A delivery authorized *before* this rule existed is the one exception: it may
+still finish the prefix it was actually granted, under the same content and
+policy checks. It cannot be extended, and no new such grant can be created.
 
 Clones parked by an older daemon's signing dance are still recognized on
 startup, and are restored only when the restoration verifies; one that cannot be

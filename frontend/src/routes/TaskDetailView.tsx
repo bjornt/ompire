@@ -22,6 +22,7 @@ import type {
   GateChoice,
   GateSnapshot,
   ReviewState,
+  RunAuthority,
   SessionInfo,
   StepRecord,
   Task,
@@ -203,9 +204,15 @@ function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowStat
 
   const selected = choices.find((c) => c.id === choiceId) ?? null;
   const feedbackMissing = selected?.feedback_required === true && note.trim() === "";
+  // An answer that authorizes publication is not answerable from here. It
+  // needs the content, target, and identities the confirmation is checked
+  // against, and those live on one surface rather than two: this card sends
+  // the operator to it instead of offering a shortcut that would be refused.
+  const authorizes = (selected?.authorize?.steps ?? []).length > 0;
   const blocked =
     busy ||
     waiting === undefined ||
+    authorizes ||
     (choices.length > 0 && (selected === null || feedbackMissing));
 
   async function advance() {
@@ -278,10 +285,29 @@ function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowStat
                 {choice.feedback_required && (
                   <span className="gateChoiceRequired">needs a reason</span>
                 )}
+                {(choice.authorize?.steps ?? []).length > 0 && (
+                  <span
+                    className="gateChoiceNext"
+                    data-testid={`gate-choice-authorizes-${choice.id}`}
+                  >
+                    authorizes {(choice.authorize?.steps ?? []).join(" → ")}
+                  </span>
+                )}
               </label>
             );
           })}
         </fieldset>
+      )}
+      {authorizes && (
+        <p className="fieldHint" data-testid="gate-choice-needs-preview">
+          This answer authorizes publication. Confirm it in{" "}
+          <Link to={`/ship/${taskId}`} data-testid="gate-ship-link">
+            Ship flow
+          </Link>
+          , where the exact content, destination, identities, and final text
+          are shown — that preview is what the authorization is checked
+          against.
+        </p>
       )}
       {pause === null && (
         <textarea
@@ -347,14 +373,23 @@ function ReviewPanel({
   primarySession,
   approvalBinding,
   showShipFlow,
+  authority,
 }: {
   taskId: number;
   review: ReviewState | undefined;
   primarySession: SessionInfo | undefined;
   approvalBinding: ApprovalBinding;
   showShipFlow: boolean;
+  /** What this run's own procedure permits. A workflow that declares its own
+   * review starts one at the step that declares it; starting another by hand
+   * would grade content the run is still changing. */
+  authority: RunAuthority | undefined;
 }) {
   const presentation = projectReview(review, primarySession, approvalBinding);
+  // The daemon decides; this only mirrors that answer so the button is not
+  // offered where the service would refuse it.
+  const reviewOwnedByRun =
+    authority?.declares_review === true && authority.review_step_seq === null;
   const [pending, setPending] = useState<"starting" | "cancelling" | null>(null);
   const [error, setError] = useState<{ action: "start" | "cancel"; message: string } | null>(null);
   const commandLocked = useRef(false);
@@ -418,8 +453,15 @@ function ReviewPanel({
           {error.message}
         </div>
       )}
+      {reviewOwnedByRun && (
+        <p className="stepHint" data-testid="review-owned-by-run">
+          This task&apos;s workflow declares its own review step. The run starts
+          the review when it reaches it — reviewing at another moment would
+          grade content the run is still changing.
+        </p>
+      )}
       <div className="reviewActions">
-        {presentation.canStart && (
+        {presentation.canStart && !reviewOwnedByRun && (
           <button
             type="button"
             className="reviewAction"
@@ -725,6 +767,7 @@ export function TaskDetailView() {
         primarySession={primarySession}
         approvalBinding={approvalBindingFor(review, ship)}
         showShipFlow={showShipFlow}
+        authority={ship?.authority}
       />
 
 

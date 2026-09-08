@@ -220,6 +220,7 @@ async def test_launcher_sees_the_selected_source_and_the_clone_is_restored(
         clone_path=str(clone_path),
         prompt="",
         execution_inputs=make_execution_inputs(
+            engine=engine,
             checkout_path=str(git_checkout),
             branch="ompire/additions",
             workshop_additions="global",
@@ -273,6 +274,7 @@ async def test_a_failed_launch_still_restores_the_clone(
         clone_path=str(clone_path),
         prompt="",
         execution_inputs=make_execution_inputs(
+            engine=engine,
             checkout_path=str(git_checkout),
             branch="ompire/failing",
             workshop_additions="global",

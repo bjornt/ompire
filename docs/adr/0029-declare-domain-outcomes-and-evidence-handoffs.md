@@ -3,6 +3,11 @@
 - Status: Accepted
 - Date: 2026-09-06
 
+Extended by
+[ADR-0033](0033-scope-trusted-delivery-authority-to-the-workflow-run.md),
+whose format 3 reuses this evidence and outcome model unchanged and adds
+one engine-produced result — a review verdict — that no agent can write.
+
 Supersedes [ADR-0009](0009-use-structured-git-excluded-outcomes.md)
 for workflow format 2. Extends, and does not replace,
 [ADR-0028](0028-retain-declarative-workflow-revisions.md)'s format boundary:

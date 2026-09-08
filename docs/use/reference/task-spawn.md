@@ -119,9 +119,11 @@ default**. Only the fields you actually changed are sent.
 
 Beside the form, the preview lists every step the workflow declares, in order,
 with its kind, session, abstract role, concrete model, and thinking policy. A
-command, decision, or gate step is shown with no model, because it never
-reaches one. A step a route can pass by, or that carries its own condition, is
-marked *conditional*. Every model consumer is one of these rows — including
+command, decision, gate, review, or delivery step is shown with no model,
+because it never reaches one — the reviewer is an external tool, and a
+publication action is not a turn. A step a route can pass by, or that carries
+its own condition, is marked *conditional*; every delivery step is, because it
+runs only if a person answers its approval with the choice that grants it. Every model consumer is one of these rows — including
 every step a workflow gained in a later revision, so a definition that grew a
 turn discloses it here before you submit rather than after it runs. The list is
 what the run *may* execute, not a prediction that it will.
@@ -130,6 +132,13 @@ what the run *may* execute, not a prediction that it will.
 `reproduce-informed`, `fix`, and `verify`. A task already running an older
 `bugfix` keeps the consumers it accepted; the list describes what a *new*
 launch would pin.
+
+**The preview also states what this workflow could publish** — which privileged
+effects it declares, and which gate's answer would have to authorize each — or
+that it can publish nothing at all, which is a statement rather than an
+absence. Launching accepts the *procedure*, not the future content and not
+permission to publish it: the actual content, the final text, and live
+credential readiness are reviewed at the delivery approval, not guessed here.
 
 The preview also names the **workflow revision** it would pin — the content
 identity of the exact definition — which the `preview_token` covers, so an

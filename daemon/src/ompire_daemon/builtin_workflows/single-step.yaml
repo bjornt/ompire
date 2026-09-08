@@ -1,39 +1,307 @@
-# The pre-workflow behavior, as a definition: one session, one turn, whatever
-# the operator typed. The prompt reproduces the original concatenation exactly
-# — a preamble alone never prompts, and an empty task prompt spends no turn.
-format: 1
+# The simplest complete workflow (format 3): one session does the work, an
+# independent reviewer reads what it would publish, and a person decides what
+# happens to it.
+#
+#   work ──► review ─┬─ approved ──► approve ─┬─ nothing
+#     ▲              │                        ├─ a local signed commit
+#     └── comments ──┘                        ├─ a pushed branch
+#                                             └─ a pull request
+#
+# Two things are deliberately different from the pre-format-3 version.
+#
+# The correction loop is *declared*. Review comments used to be pushed
+# straight into the agent's conversation by the daemon, which meant the loop
+# was invisible in the flow, unbounded, and impossible to route around. Here it
+# is an ordinary edge back to `work`, carrying the reviewer's own report, and
+# the three-visit bound on `work` is what ends it.
+#
+# And publishing is a step. Finishing the work authorizes nothing; the gate
+# asks, and each approving answer grants exactly the chain it names. Choosing
+# to finish without publishing is a real, named ending — not a failure.
+format: 3
 name: single-step
 sessions: [main]
 primary: main
 steps:
+  # 1. The work itself: the operator's prompt, and nothing the engine added.
+  #    The declared result exists so a later step has something to read — and
+  #    so the optional publication text below comes from the session that did
+  #    the work, before review, rather than from a hidden drafting turn at the
+  #    approval.
   - name: work
     kind: agent
     session: main
     role: default
-    expects_outcome: false
+    max_visits: 3
+    on_exhausted: {step: correction-exhausted}
+    evidence:
+      # The reviewer's report, when this is a correction round. `after: work`
+      # anchors it to the round that produced it, so one review's comments can
+      # never be re-served to a later attempt.
+      review: {steps: [review], after: work, required: false}
+    outcome:
+      results:
+        done:
+          required:
+            summary_text: string
+            commit_message: string
+            pr_title: string
+            pr_body: string
     prompt:
       separator: ""
       parts:
         - if:
             op: ne
-            left: {op: input, name: task.prompt}
+            left: {op: input, name: workspace.preamble}
             right: {op: literal, value: ""}
           then:
             separator: ""
             parts:
-              - if:
-                  op: ne
-                  left: {op: input, name: workspace.preamble}
-                  right: {op: literal, value: ""}
-                then:
-                  separator: ""
-                  parts:
-                    - value: {op: input, name: workspace.preamble}
-                      format: text
-                    - text: "\n\n"
-                else:
-                  parts: []
-              - value: {op: input, name: task.prompt}
+              - value: {op: input, name: workspace.preamble}
+                format: text
+              - text: "\n\n"
+          else:
+            parts: []
+        - value: {op: input, name: task.prompt}
+          format: text
+        - if:
+            op: all
+            of:
+              # `exists` is decisive for an absent optional selector, so a
+              # first attempt — with no review behind it — takes the plain
+              # route instead of leaving the whole prompt unrenderable.
+              - op: exists
+                value:
+                  op: get
+                  value: {op: evidence, name: review}
+                  keys: [outcome, findings_state]
+              - op: eq
+                left:
+                  op: get
+                  value: {op: evidence, name: review}
+                  keys: [outcome, findings_state]
+                right: {op: literal, value: "complete"}
+          then:
+            separator: ""
+            parts:
+              - text: |-
+
+
+                  An independent reviewer read your change and left comments. Address them
+                  in the working tree. Their report, verbatim:
+
+              - value:
+                  op: get
+                  value: {op: evidence, name: review}
+                  keys: [outcome, findings]
                 format: text
           else:
             parts: []
+        - text: "\n\n"
+        - text: |-
+            When you are done, commit your work on the current branch. Do not push.
+
+            Also propose the text a human would publish this under: a commit message,
+            a pull-request title, and a pull-request body. They are suggestions — an
+            operator reviews and edits them before anything is published, and nothing
+            you write here authorizes publishing.
+
+  # 2. Independent review of exactly what would be published. Bounded for the
+  #    whole run: three reviews, and no answer anywhere refills them.
+  - name: review
+    kind: review
+    max_visits: 3
+    on_exhausted: {step: review-exhausted}
+    evidence:
+      work: {steps: [work]}
+
+  # 3. Where the verdict goes. Comments with a complete report go back to the
+  #    worker; anything else stops for a person, because "the reviewer could
+  #    not finish" is not an opinion about the code.
+  - name: route-review
+    kind: decision
+    evidence:
+      verdict: {steps: [review]}
+    cases:
+      - when:
+          op: eq
+          left:
+            op: get
+            value: {op: evidence, name: verdict}
+            keys: [outcome, result]
+          right: {op: literal, value: "approved"}
+        next: {step: approve}
+      - when:
+          op: all
+          of:
+            - op: eq
+              left:
+                op: get
+                value: {op: evidence, name: verdict}
+                keys: [outcome, result]
+              right: {op: literal, value: "comments"}
+            # Only a complete report may drive an automatic correction. A
+            # truncated or missing one is handed to a person instead of to an
+            # agent that would treat a fragment as the whole opinion.
+            - op: eq
+              left:
+                op: get
+                value: {op: evidence, name: verdict}
+                keys: [outcome, findings_state]
+              right: {op: literal, value: "complete"}
+        next: {step: work}
+    otherwise: {step: review-exhausted}
+
+  # 4. The decision. Every answer is explicit, none is preselected, and each
+  #    approving one names exactly the actions it permits.
+  - name: approve
+    kind: gate
+    evidence:
+      verdict: {steps: [review]}
+      work: {steps: [work]}
+    delivery:
+      review: verdict
+      metadata:
+        message:
+          parts:
+            - value:
+                op: get
+                value: {op: evidence, name: work}
+                keys: [outcome, artifacts, commit_message]
+              format: text
+        pr_title:
+          parts:
+            - value:
+                op: get
+                value: {op: evidence, name: work}
+                keys: [outcome, artifacts, pr_title]
+              format: text
+        pr_body:
+          parts:
+            - value:
+                op: get
+                value: {op: evidence, name: work}
+                keys: [outcome, artifacts, pr_body]
+              format: text
+    message:
+      separator: ""
+      parts:
+        - text: "The reviewer approved this change.\n\nWhat was done:\n"
+        - value:
+            op: get
+            value: {op: evidence, name: work}
+            keys: [outcome, artifacts, summary_text]
+          format: text
+        - text: |-
+
+
+            Choose what happens to it. Finishing here is a complete, useful ending:
+            the work stays on the branch and nothing is published. The other answers
+            each authorize exactly the actions they name, against the content that
+            was just reviewed, and nothing further.
+    choices:
+      - id: finish
+        label: Finish without publishing
+        next: {complete: true, result: done-unpublished}
+      - id: request-changes
+        label: Send it back with changes
+        feedback_required: true
+        next: {step: work}
+      - id: commit-locally
+        label: Make a local signed commit and stop
+        next: {step: commit-local}
+        authorize: {steps: [commit-local]}
+      - id: push-branch
+        label: Sign and push the branch
+        next: {step: commit-for-push}
+        authorize: {steps: [commit-for-push, push-branch]}
+      - id: open-pr
+        label: Sign, push, and open a pull request
+        next: {step: commit-for-pr}
+        authorize: {steps: [commit-for-pr, push-for-pr, open-pr]}
+
+  # 5. The three chains. They are separate steps rather than one chain the
+  #    operator truncates, because a grant names actions: "sign it" and "sign
+  #    it, push it, and open a pull request" are different permissions, and an
+  #    answer must not be able to grow into the next one.
+  - name: commit-local
+    kind: delivery
+    action: commit
+    mode: squash
+    approval: approve
+    next: {complete: true, result: committed-locally}
+
+  - name: commit-for-push
+    kind: delivery
+    action: commit
+    mode: squash
+    approval: approve
+    next: {step: push-branch}
+  - name: push-branch
+    kind: delivery
+    action: push
+    previous: commit-for-push
+    approval: approve
+    next: {complete: true, result: pushed}
+
+  - name: commit-for-pr
+    kind: delivery
+    action: commit
+    mode: squash
+    approval: approve
+    next: {step: push-for-pr}
+  - name: push-for-pr
+    kind: delivery
+    action: push
+    previous: commit-for-pr
+    approval: approve
+    next: {step: open-pr}
+  - name: open-pr
+    kind: delivery
+    action: pr
+    previous: push-for-pr
+    approval: approve
+    next: {complete: true, result: pull-request-opened}
+
+  # 6. The two exhaustion endings. Both are outside the loops they end, and
+  #    neither offers publication: nothing here was approved.
+  - name: correction-exhausted
+    kind: gate
+    message:
+      parts:
+        - text: |-
+            The work has used up its three attempts for this run, and no answer here
+            refills them. Whatever was done is still in the working tree, and the
+            session stays available if you want to continue by hand.
+
+            Stopping ends this run without publishing anything.
+    choices:
+      - id: stop
+        label: Stop without publishing
+        next: {complete: true, result: stopped-unpublished}
+
+  - name: review-exhausted
+    kind: gate
+    evidence:
+      verdict: {steps: [review], required: false}
+    message:
+      separator: ""
+      parts:
+        - text: "Review did not approve this change. The last attempt ended as "
+        - value:
+            op: coalesce
+            values:
+              - op: get
+                value: {op: evidence, name: verdict}
+                keys: [outcome, result]
+              - {op: literal, value: "(no review was recorded)"}
+          format: text
+        - text: |-
+            .
+
+            Review allows three attempts per run and no answer here refills them.
+            Nothing was approved, so nothing can be published from this run.
+    choices:
+      - id: stop
+        label: Stop without publishing
+        next: {complete: true, result: stopped-unreviewed}

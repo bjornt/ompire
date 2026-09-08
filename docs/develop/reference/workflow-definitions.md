@@ -63,26 +63,36 @@ duplicate step names, undeclared session references, and routes to steps that
 do not exist. Every refusal carries a location like
 `steps[2].prompt.parts[0].value` and a reason.
 
-### The two formats
+### The three formats
 
-Both are implemented and both execute. Format 1 is **frozen**: a retained
-format-1 document is always read under format-1 rules, and its canonical bytes
-— and so its revision — are unchanged by anything format 2 added. A field
-belonging to one format is refused in the other, so the two vocabularies cannot
-be mixed by accident.
+All three are implemented and all three execute. An older format is **frozen**:
+a retained format-1 document is always read under format-1 rules, and its
+canonical bytes — and so its revision — are unchanged by anything format 2 or 3
+added. A field belonging to one format is refused in the others, so the
+vocabularies cannot be mixed by accident.
 
-| | Format 1 | Format 2 |
-|---|---|---|
-| Agent result | `expects_outcome: true\|false` | [`outcome`](#outcome-contracts-format-2), required, `null` or declared results |
-| Reading prior attempts | [`latest`](#value-expressions), evaluated on each read | [`evidence`](#evidence-selectors-format-2) selectors, resolved once at attempt entry |
-| Gate | `message` only | `message` plus [`choices`](#gate) |
-| Completion | `{complete: true}` | `{complete: true, result: <slug>}` |
-| Last step | may fall off the end | rejected at load time |
+| | Format 1 | Format 2 | Format 3 |
+|---|---|---|---|
+| Agent result | `expects_outcome: true\|false` | [`outcome`](#outcome-contracts-format-2), required, `null` or declared results | as format 2 |
+| Reading prior attempts | [`latest`](#value-expressions), evaluated on each read | [`evidence`](#evidence-selectors-format-2) selectors, resolved once at attempt entry | as format 2 |
+| Gate | `message` only | `message` plus [`choices`](#gate) | plus [`delivery`](#delivery-gates-format-3) and `authorize` on a choice |
+| Completion | `{complete: true}` | `{complete: true, result: <slug>}` | as format 2 |
+| Last step | may fall off the end | rejected at load time | as format 2 |
+| Step kinds | agent, command, decision, gate | same | plus [`review`](#review-format-3) and [`delivery`](#delivery-format-3) |
+| Can publish | no | no | only through a declared `delivery` step a person authorizes |
 
 Format 2 has no `latest` and format 1 has no `evidence`: leaving both available
 would leave the unfrozen read path available, and the point of binding evidence
 is that there is only one way to read history
 ([ADR-0029](../../adr/0029-declare-domain-outcomes-and-evidence-handoffs.md)).
+
+Format 3 reuses format 2's evidence, outcome envelope, predicates, text
+documents, and gate semantics unchanged. What it adds is publication: review
+and each trusted effect become steps, and an approving answer names the exact
+chain of effects it permits
+([ADR-0033](../../adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md)).
+A format-1 or format-2 revision therefore cannot publish at all — there is no
+step that could, and nothing infers one from a workflow's name or its result.
 
 ## Steps
 
@@ -96,11 +106,11 @@ Every step has `name` and `kind`, and may declare a visit bound.
 | `role` | `default` | Abstract model role: `default`, `smol`, `slow`, `plan` |
 | `prompt` | required | A [text document](#text-documents) |
 | `expects_outcome` | `false` (format 1 only) | Whether a valid `.ompire/outcome.json` is required |
-| `outcome` | required in format 2 | `null`, or the [results this step may declare](#outcome-contracts-format-2) |
-| `evidence` | `{}` (format 2 only) | [Evidence selectors](#evidence-selectors-format-2) |
+| `outcome` | required from format 2 | `null`, or the [results this step may declare](#outcome-contracts-format-2) |
+| `evidence` | `{}` (format 2 onwards) | [Evidence selectors](#evidence-selectors-format-2) |
 | `when` | `true` | A [predicate](#predicates), or a literal boolean |
 
-`outcome` is required rather than defaulted in format 2. `null` is a real
+`outcome` is required rather than defaulted from format 2 onwards. `null` is a real
 declaration — "this step is not asked for a result" — and a step that silently
 produced no contract would be indistinguishable from one whose author forgot,
 when only one of those should be allowed to finish on nothing.
@@ -110,7 +120,7 @@ put on the accepted policy through the normal boundary, no prompt is sent, no
 outcome file is read, and the attempt records that it was skipped on purpose.
 It does not pause, because nothing was asked.
 
-A prompt that **renders empty** means the same thing in format 1. In format 2
+A prompt that **renders empty** means the same thing in format 1. From format 2 onwards
 it pauses when the step owes a result: a definition that cannot ask for what it
 requires is not a step that produced nothing.
 
@@ -205,7 +215,8 @@ a restart re-runs an interrupted command, and the author has to say they know.
 | Field | Required | Meaning |
 |---|---|---|
 | `message` | yes | A [text document](#text-documents) shown to the operator |
-| `choices` | format 2 only, yes | The answers this gate offers |
+| `choices` | format 2 onwards, yes | The answers this gate offers |
+| `delivery` | no (format 3) | Binds this gate to a review so its answers can [authorize publication](#delivery-gates-format-3) |
 
 ```yaml
 choices:
@@ -231,8 +242,170 @@ makes the decision replayable from the record and refusable when stale
 ([ADR-0030](../../adr/0030-commit-human-decisions-before-advancing.md)).
 
 Choice destinations are **successors for graph validation**, so a loop built
-out of human answers needs a visit bound like any other. A format-2 gate has no
-fall-through: its choices are its only edges.
+out of human answers needs a visit bound like any other. A gate with declared
+choices has no fall-through: its choices are its only edges.
+
+### `review` (format 3)
+
+Independent host-side review of what this task would publish.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `evidence` | no | [Selectors](#evidence-selectors-format-2) like any other step |
+| `max_visits` / `on_exhausted` | together, or neither | A [visit bound](#visit-bounds) over the whole run |
+
+```yaml
+- name: review
+  kind: review
+  max_visits: 3
+  on_exhausted: {step: review-exhausted}
+  evidence:
+    work: {steps: [work], with_outcome: false}
+```
+
+It has no prompt, no session, no role, and no outcome contract. The reviewer is
+the configured external tool reading a *protected candidate* — the task's whole
+publishable delta, captured before it starts — not an agent turn and not the
+live working tree. What the step produces is an engine-defined result that no
+agent can write:
+
+| Field | Meaning |
+|---|---|
+| `result` | `approved`, `comments`, `aborted`, `error`, or `interrupted` |
+| `candidate_id` | The protected candidate the reviewer actually read |
+| `iteration_seq` | Which review iteration this was |
+| `findings` | The reviewer's own report |
+| `findings_state` | `complete`, `empty`, `truncated`, or `unavailable` |
+| `comment_count` | A display count, never the report |
+| `diagnostics` | Reviewer stderr, when there is any |
+
+Ordinary selectors read it exactly as they read an agent step, so routing after
+a review is written in the definition:
+
+```yaml
+- when:
+    op: eq
+    left: {op: get, value: {op: evidence, name: verdict}, keys: [outcome, result]}
+    right: {op: literal, value: "approved"}
+  next: {step: approve}
+```
+
+`findings_state` is separate from `findings` on purpose. A correction that runs
+automatically should require `complete`: a truncated capture handed to an agent
+as though it were the reviewer's whole opinion is worse than no correction. A
+review that could not run at all produces **no result** — the step pauses and
+says so, because an engine that filled in "approved" for an unavailable
+reviewer would be the exact failure independent review exists to prevent.
+
+Review falls through to the following declared step.
+
+### `delivery` (format 3)
+
+One trusted publication effect, and nothing else.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `action` | yes | `commit`, `push`, or `pr` — literal |
+| `mode` | `commit` only | `squash` or `retain` |
+| `previous` | `push` and `pr` only | The delivery step whose result this one consumes |
+| `approval` | yes | The gate whose answer can authorize it |
+| `next` | yes | The next action in the chain, or the named ending it reaches |
+
+```yaml
+- name: commit
+  kind: delivery
+  action: commit
+  mode: squash
+  approval: approve
+  next: {step: push}
+- name: push
+  kind: delivery
+  action: push
+  previous: commit
+  approval: approve
+  next: {step: pr}
+- name: pr
+  kind: delivery
+  action: pr
+  previous: push
+  approval: approve
+  next: {complete: true, result: published}
+```
+
+Deliberately *not* a common-fields step: it has no visit bound, no exhaustion
+route, no evidence, no prompt, no argv, no target, and no idempotence flag. A
+bound would mean repeating a privileged write; evidence would suggest the action
+decides something from a result. It does neither — it performs the one effect
+its approval named, once.
+
+The engine records what actually happened: the action, the mode, the journal row
+id, and the operation's own result (the signed tip, the pushed head, the pull
+request URL). A terminal step's author-written `result` name says what the
+*workflow* calls this ending; it is never what says an effect occurred.
+
+### Delivery gates (format 3)
+
+A gate becomes able to authorize publication by binding itself to a review:
+
+```yaml
+- name: approve
+  kind: gate
+  evidence:
+    verdict: {steps: [review]}
+  delivery:
+    review: verdict
+    metadata:
+      message: {parts: [{value: {op: evidence, name: work}, format: text}]}
+      pr_title: {parts: [{text: "A change"}]}
+  message: {parts: [{text: "Publish?"}]}
+  choices:
+    - id: finish
+      label: Finish without publishing
+      next: {complete: true, result: done-unpublished}
+    - id: publish
+      label: Open a pull request
+      next: {step: commit}
+      authorize: {steps: [commit, push, pr]}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `delivery.review` | yes | One of *this gate's own* evidence aliases |
+| `delivery.metadata.message` | no | Suggested commit message, a [text document](#text-documents) |
+| `delivery.metadata.pr_title` | no | Suggested pull-request title |
+| `delivery.metadata.pr_body` | no | Suggested pull-request body |
+| `<choice>.authorize.steps` | no | The exact contiguous chain that answer permits |
+
+The alias may only select `review` steps. That is the binding the grant is
+content-specific through: the question names the review attempt it is asking
+about, and the confirmation is checked against that attempt's candidate rather
+than against whatever the workspace holds when somebody presses the button.
+
+`metadata` is a *suggestion*. Whatever it renders lands in the immutable
+question snapshot beside the decision, as an editable draft; the operator's
+final text is what the confirmation carries and what gets published. An omitted
+field starts blank. A field the author declared but whose reference cannot be
+rendered pauses the gate rather than arriving empty.
+
+Validation refuses, at load time:
+
+- a choice that authorizes when the gate declares no `delivery` binding, and a
+  `delivery` binding no choice uses;
+- a chain that is not `commit`, `commit → push`, or `commit → push → pr` — no
+  action performs a missing predecessor;
+- an approving choice whose `next` is not the first step it authorizes;
+- a member naming a different `approval`, or the wrong `previous`;
+- an intermediate member whose `next` is not the following member, or a last
+  member that does not end the run at a named result;
+- a delivery step no choice authorizes, or one two choices both authorize;
+- any other edge — a decision case, an exhaustion route, a non-authorizing
+  choice, or a fall-through — that enters a chain; and
+- a gate whose every choice authorizes publication: there must always be an
+  answer that publishes nothing.
+
+None of this replaces runtime admission. A valid graph says the author asked for
+these effects; whether *this run* may perform one is decided against the
+recorded question, review, and candidate, every time.
 
 ## Destinations
 
@@ -242,15 +415,16 @@ Exactly one of:
 |---|---|
 | `{step: <name>}` | Continue at that declared step |
 | `{complete: true}` | Finish the run `complete` (format 1) |
-| `{complete: true, result: <slug>}` | Finish the run with that declared ending (format 2, `result` required) |
+| `{complete: true, result: <slug>}` | Finish the run with that declared ending (format 2 onwards, `result` required) |
 | `{pause: true}` | Stop and wait for a person |
 
 All destinations are static. There is no way to interpolate a step name from
 agent output.
 
-In format 2 a run may only end at a named completion. A step that would fall
-off the end of the step list is rejected at load time, so the last declared
-step must be a `decision` or a `gate` with choices. "The run ended" is not a
+From format 2 onwards a run may only end at a named completion. A step that
+would fall off the end of the step list is rejected at load time, so the last
+declared step must be a `decision`, a `gate` with choices, or a `delivery`
+step — each of which routes explicitly. "The run ended" is not a
 work result, and a reader months later cannot tell a validated fix from an
 abandoned investigation if both simply stopped.
 
@@ -331,7 +505,7 @@ Tagged data nodes, discriminated by `op`. The set is closed.
 | `literal` | `value` | That JSON value |
 | `input` | `name` | One pinned input (below) |
 | `latest` | `steps`, `after`, `with_outcome` | **Format 1 only.** A record view, or missing |
-| `evidence` | `name` | **Format 2 only.** The record view this attempt bound under that alias, or missing |
+| `evidence` | `name` | **Format 2 onwards.** The record view this attempt bound under that alias, or missing |
 | `get` | `value`, `keys` | Literal key/index traversal into JSON data |
 | `count` | `step` | How many attempts that step has |
 | `coalesce` | `values` | The first non-missing, non-null value |
@@ -444,12 +618,18 @@ The full digest is stored, not a prefix: this is a durable identity kept beside
 tasks for as long as they exist, not a short comparison token.
 
 Canonical output is **format-specific**, and format-1 bytes are frozen. A
-format-1 step document carries `expects_outcome` and nothing format 2 added; a
-format-2 one carries `outcome`, `evidence`, a gate's `choices`, and a named
-`result` on every completion. Adding format 2 changed no format-1 byte, so
-every retained format-1 revision still hashes to the identity it was filed
-under — a property `test_workflow_definitions.py` checks directly, because
-silent drift there would invalidate every pinned task at once.
+format-1 step document carries `expects_outcome` and nothing a later format
+added; a format-2 one carries `outcome`, `evidence`, a gate's `choices`, and a
+named `result` on every completion; a format-3 one adds a gate's `delivery`,
+`authorize` on each choice, and the delivery steps' own fields. Adding a format
+changed no earlier byte, so every retained revision still hashes to the
+identity it was filed under — a property `test_workflow_definitions.py` checks
+directly, because silent drift there would invalidate every pinned task at
+once.
+
+A `delivery` step is deliberately not canonicalized with the common fields, and
+carries only the one of `mode`/`previous` its action actually has. Writing the
+others as explicit nulls would say the grammar has fields it does not.
 
 ## Emitting YAML
 

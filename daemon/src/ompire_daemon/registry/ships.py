@@ -37,6 +37,7 @@ from sqlalchemy import Connection, Engine
 from ompire_daemon.db import (
     deliveries,
     delivery_actions,
+    delivery_authority_boundary,
     delivery_candidates,
     delivery_decisions,
 )
@@ -175,6 +176,10 @@ class ActionRecord:
     error: str | None
     created_at: str
     updated_at: str
+    # The workflow delivery-step attempt this action belongs to, written with
+    # the intent and before the effect. None is an operator-driven action,
+    # never "some step, unknown".
+    workflow_seq: int | None = None
 
 
 @dataclass(frozen=True)
@@ -212,8 +217,20 @@ class DeliveryRecord:
     blocked_reason: str | None
     created_at: str
     updated_at: str
+    # Which workflow decision granted this authorization: the answered gate
+    # attempt, the choice, and the review iteration the grant is bound to.
+    # All None for an authorization made outside a workflow decision — which
+    # is a fact about how it was granted, not a gap to be filled in.
+    workflow_gate_seq: int | None = None
+    workflow_choice_id: str | None = None
+    review_seq: int | None = None
     actions: list[ActionRecord] = field(default_factory=list)
     decisions: list[DecisionRecord] = field(default_factory=list)
+
+    @property
+    def workflow_authorized(self) -> bool:
+        """Whether a workflow decision is what granted this delivery."""
+        return self.workflow_gate_seq is not None and self.workflow_choice_id is not None
 
     def action(self, kind: str) -> ActionRecord | None:
         """The latest attempt at `kind`, or None."""
@@ -289,6 +306,7 @@ def _row_to_action(row) -> ActionRecord:
         error=row.error,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        workflow_seq=row.workflow_seq,
     )
 
 
@@ -330,6 +348,9 @@ def _row_to_delivery(
         blocked_reason=row.blocked_reason,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        workflow_gate_seq=row.workflow_gate_seq,
+        workflow_choice_id=row.workflow_choice_id,
+        review_seq=row.review_seq,
         actions=actions,
         decisions=decisions,
     )
@@ -616,6 +637,9 @@ def authorize_delivery(
     request_key: str,
     input_fingerprint: str,
     authorized_by: str = "operator",
+    workflow_gate_seq: int | None = None,
+    workflow_choice_id: str | None = None,
+    review_seq: int | None = None,
 ) -> DeliveryRecord:
     """Accept one operator authorization.
 
@@ -625,45 +649,11 @@ def authorize_delivery(
     normalized inputs — returns the existing record instead of authorizing a
     second time; a *conflicting* reuse of the key is a refusal.
     """
-    if mode not in MODES:
-        raise DeliveryConflictError(f"delivery mode {mode!r} is not supported")
-    if ending not in ENDINGS:
-        raise DeliveryConflictError(f"delivery ending {ending!r} is not supported")
-    now = _now_iso()
     with reserved_write(engine) as conn:
-        row = conn.execute(
-            deliveries.select().where(deliveries.c.id == delivery_id)
-        ).first()
-        if row is None:
-            raise DeliveryConflictError(f"delivery {delivery_id} does not exist")
-        if row.authorized_at is not None:
-            if (
-                row.request_key == request_key
-                and row.input_fingerprint == input_fingerprint
-            ):
-                return _row_to_delivery(row, *_children(conn, delivery_id))
-            raise DeliveryConflictError(
-                "this delivery is already authorized; changing the ending, mode, "
-                "metadata, or content needs a new preview and confirmation"
-            )
-        if expected_version is not None and row.version != expected_version:
-            raise DeliveryConflictError(
-                f"delivery changed since it was previewed "
-                f"(version {row.version}, expected {expected_version})"
-            )
-        conflicting = conn.execute(
-            deliveries.select()
-            .where(deliveries.c.task_id == row.task_id)
-            .where(deliveries.c.request_key == request_key)
-            .where(deliveries.c.id != delivery_id)
-        ).first()
-        if conflicting is not None:
-            raise DeliveryConflictError(
-                "that request identifier already authorized a different delivery"
-            )
-        _bump(
+        authorize_delivery_in(
             conn,
             delivery_id,
+            expected_version=expected_version,
             candidate_id=candidate_id,
             review_candidate_id=review_candidate_id,
             mode=mode,
@@ -671,35 +661,132 @@ def authorize_delivery(
             commit_message=commit_message,
             pr_title=pr_title,
             pr_body=pr_body,
-            routing_json=_dumps(routing),
-            identity_json=_dumps(identity),
-            authorized_at=now,
-            authorized_by=authorized_by,
+            routing=routing,
+            identity=identity,
             request_key=request_key,
             input_fingerprint=input_fingerprint,
-            disposition="authorized",
-            blocked_reason=None,
-        )
-        conn.execute(
-            delivery_decisions.insert().values(
-                delivery_id=delivery_id,
-                action_id=None,
-                kind="authorize",
-                detail_json=_dumps(
-                    {
-                        "ending": ending,
-                        "mode": mode,
-                        "candidate_id": candidate_id,
-                        "review_candidate_id": review_candidate_id,
-                        "actions": list(ENDING_ACTIONS[ending]),
-                    }
-                ),
-                note=None,
-                decided_at=now,
-            )
+            authorized_by=authorized_by,
+            workflow_gate_seq=workflow_gate_seq,
+            workflow_choice_id=workflow_choice_id,
+            review_seq=review_seq,
         )
     record = get_delivery(engine, delivery_id)
     assert record is not None
+    return record
+
+
+def authorize_delivery_in(
+    conn: Connection,
+    delivery_id: int,
+    *,
+    expected_version: int | None,
+    candidate_id: str,
+    review_candidate_id: str | None,
+    mode: str,
+    ending: str,
+    commit_message: str | None,
+    pr_title: str | None,
+    pr_body: str | None,
+    routing: dict[str, Any],
+    identity: dict[str, Any],
+    request_key: str,
+    input_fingerprint: str,
+    authorized_by: str = "operator",
+    workflow_gate_seq: int | None = None,
+    workflow_choice_id: str | None = None,
+    review_seq: int | None = None,
+) -> DeliveryRecord:
+    """The authorization write, on a caller's reserved connection.
+
+    Connection-scoped so a workflow decision and the grant it produces land
+    in *one* transaction. Committing the answer first and the grant afterwards
+    would leave a crash window in which a person has approved publication and
+    nothing on record permits it — or worse, the reverse.
+    """
+    if mode not in MODES:
+        raise DeliveryConflictError(f"delivery mode {mode!r} is not supported")
+    if ending not in ENDINGS:
+        raise DeliveryConflictError(f"delivery ending {ending!r} is not supported")
+    now = _now_iso()
+    row = conn.execute(
+        deliveries.select().where(deliveries.c.id == delivery_id)
+    ).first()
+    if row is None:
+        raise DeliveryConflictError(f"delivery {delivery_id} does not exist")
+    if row.authorized_at is not None:
+        if (
+            row.request_key == request_key
+            and row.input_fingerprint == input_fingerprint
+        ):
+            return _row_to_delivery(row, *_children(conn, delivery_id))
+        raise DeliveryConflictError(
+            "this delivery is already authorized; changing the ending, mode, "
+            "metadata, or content needs a new preview and confirmation"
+        )
+    if expected_version is not None and row.version != expected_version:
+        raise DeliveryConflictError(
+            f"delivery changed since it was previewed "
+            f"(version {row.version}, expected {expected_version})"
+        )
+    conflicting = conn.execute(
+        deliveries.select()
+        .where(deliveries.c.task_id == row.task_id)
+        .where(deliveries.c.request_key == request_key)
+        .where(deliveries.c.id != delivery_id)
+    ).first()
+    if conflicting is not None:
+        raise DeliveryConflictError(
+            "that request identifier already authorized a different delivery"
+        )
+    _bump(
+        conn,
+        delivery_id,
+        candidate_id=candidate_id,
+        review_candidate_id=review_candidate_id,
+        mode=mode,
+        ending=ending,
+        commit_message=commit_message,
+        pr_title=pr_title,
+        pr_body=pr_body,
+        routing_json=_dumps(routing),
+        identity_json=_dumps(identity),
+        authorized_at=now,
+        authorized_by=authorized_by,
+        request_key=request_key,
+        input_fingerprint=input_fingerprint,
+        workflow_gate_seq=workflow_gate_seq,
+        workflow_choice_id=workflow_choice_id,
+        review_seq=review_seq,
+        disposition="authorized",
+        blocked_reason=None,
+    )
+    conn.execute(
+        delivery_decisions.insert().values(
+            delivery_id=delivery_id,
+            action_id=None,
+            kind="authorize",
+            detail_json=_dumps(
+                {
+                    "ending": ending,
+                    "mode": mode,
+                    "candidate_id": candidate_id,
+                    "review_candidate_id": review_candidate_id,
+                    "actions": list(ENDING_ACTIONS[ending]),
+                    "workflow_gate_seq": workflow_gate_seq,
+                    "workflow_choice_id": workflow_choice_id,
+                    "review_seq": review_seq,
+                }
+            ),
+            note=None,
+            decided_at=now,
+        )
+    )
+    record = _row_to_delivery(
+        conn.execute(
+            deliveries.select().where(deliveries.c.id == delivery_id)
+        ).one(),
+        *_children(conn, delivery_id),
+    )
     return record
 
 
@@ -981,6 +1068,7 @@ def prepare_action(
     input_fingerprint: str,
     expected: dict[str, Any],
     identity: dict[str, Any] | None = None,
+    workflow_seq: int | None = None,
 ) -> ActionRecord:
     """Write the attempt's intent before anything runs.
 
@@ -989,6 +1077,15 @@ def prepare_action(
     A new attempt is refused outright while a previous attempt at the same kind
     is still executing or unresolved — that is the rule that keeps a lost
     response from becoming permission to sign or push again.
+
+    `workflow_seq` is the run attempt asking for the effect, and at most one
+    *live* action may carry it. That is what makes a re-driven step adopt its
+    own action instead of dispatching a second one: the second insert is
+    refused rather than merely discouraged, and the check happens here, under
+    the reservation, rather than being left to a constraint this database does
+    not enforce for foreign keys. An attempt whose effect is proven not to
+    have happened is excluded, because continuing after one is a new attempt
+    at the same step, not a second effect.
     """
     if kind not in ACTION_KINDS:
         raise DeliveryConflictError(f"unknown delivery action {kind!r}")
@@ -1011,6 +1108,21 @@ def prepare_action(
             raise DeliveryConflictError(
                 "that request identifier already started a delivery action"
             )
+        if workflow_seq is not None:
+            for row in rows:
+                if row.workflow_seq != workflow_seq or row.phase == "failed":
+                    # A `failed` attempt is one whose effect is *proven* not to
+                    # have happened. Continuing after that is a fresh attempt
+                    # for the same step, which is the whole point of a
+                    # continuation; both stay on record.
+                    continue
+                if row.kind == kind and row.phase == "prepared":
+                    return _row_to_action(row)
+                raise DeliveryConflictError(
+                    f"workflow step {workflow_seq} already has a delivery "
+                    f"action ({row.kind}, {row.phase}); a step performs its "
+                    "effect once"
+                )
         same_kind = [r for r in rows if r.kind == kind]
         for row in same_kind:
             if row.phase in ("executing", "needs_reconciliation"):
@@ -1034,6 +1146,7 @@ def prepare_action(
                 phase="prepared",
                 expected_json=_dumps(expected),
                 identity_json=_dumps(identity),
+                workflow_seq=workflow_seq,
                 created_at=now,
                 updated_at=now,
             )
@@ -1113,34 +1226,59 @@ def complete_action(
     """Land a verified outcome and the delivery state it produces in one
     transaction, so no dependent action can ever be scheduled against a result
     that was not committed first."""
-    now = _now_iso()
     with reserved_write(engine) as conn:
-        row = conn.execute(
-            delivery_actions.select().where(delivery_actions.c.id == action_id)
-        ).first()
-        if row is None:
-            raise DeliveryConflictError(f"delivery action {action_id} does not exist")
-        values: dict[str, Any] = {
-            "phase": "succeeded",
-            "result_json": _dumps(result),
-            "error": None,
-            "updated_at": now,
-        }
-        if identity is not None:
-            values["identity_json"] = _dumps(identity)
-        conn.execute(
-            delivery_actions.update()
-            .where(delivery_actions.c.id == action_id)
-            .values(**values)
+        delivery_id = complete_action_in(
+            conn,
+            action_id,
+            result=result,
+            identity=identity,
+            disposition=disposition,
         )
-        updates: dict[str, Any] = {}
-        if disposition is not None:
-            updates["disposition"] = disposition
-            updates["blocked_reason"] = None
-        _bump(conn, row.delivery_id, **updates)
-    record = get_delivery(engine, row.delivery_id)
+    record = get_delivery(engine, delivery_id)
     assert record is not None
     return record
+
+
+def complete_action_in(
+    conn: Connection,
+    action_id: int,
+    *,
+    result: dict[str, Any],
+    identity: dict[str, Any] | None = None,
+    disposition: str | None = None,
+) -> int:
+    """The success write, on a caller's reserved connection.
+
+    Connection-scoped so a workflow-owned action can land its journal result
+    *and* the run's step transition together. A commit between the two is the
+    window where an effect has happened and the run does not know it, which is
+    exactly the state recovery would otherwise have to guess its way out of.
+    """
+    now = _now_iso()
+    row = conn.execute(
+        delivery_actions.select().where(delivery_actions.c.id == action_id)
+    ).first()
+    if row is None:
+        raise DeliveryConflictError(f"delivery action {action_id} does not exist")
+    values: dict[str, Any] = {
+        "phase": "succeeded",
+        "result_json": _dumps(result),
+        "error": None,
+        "updated_at": now,
+    }
+    if identity is not None:
+        values["identity_json"] = _dumps(identity)
+    conn.execute(
+        delivery_actions.update()
+        .where(delivery_actions.c.id == action_id)
+        .values(**values)
+    )
+    updates: dict[str, Any] = {}
+    if disposition is not None:
+        updates["disposition"] = disposition
+        updates["blocked_reason"] = None
+    _bump(conn, row.delivery_id, **updates)
+    return int(row.delivery_id)
 
 
 def fail_action(
@@ -1314,6 +1452,57 @@ def resolve_action(
 
 
 # --- purge -----------------------------------------------------------------
+
+
+# --- the pre-upgrade authority boundary ------------------------------------
+
+
+@dataclass(frozen=True)
+class AuthorityBoundary:
+    """Where history ends: the last delivery and action ids that existed
+    before workflows owned publication authority."""
+
+    max_delivery_id: int
+    max_action_id: int
+    recorded_at: str
+
+
+def authority_boundary(engine: Engine) -> AuthorityBoundary | None:
+    """The recorded upgrade boundary, or None on a database without one."""
+    with engine.connect() as conn:
+        row = conn.execute(
+            delivery_authority_boundary.select().where(
+                delivery_authority_boundary.c.id == 1
+            )
+        ).first()
+    if row is None:
+        return None
+    return AuthorityBoundary(
+        max_delivery_id=row.max_delivery_id,
+        max_action_id=row.max_action_id,
+        recorded_at=row.recorded_at,
+    )
+
+
+def is_pre_upgrade_grant(
+    boundary: AuthorityBoundary | None, delivery: DeliveryRecord
+) -> bool:
+    """Whether this really is authority granted before the upgrade.
+
+    Three things must hold together, and none of them is sufficient alone: the
+    row predates the boundary, it carries a genuine authorization, and it has
+    no workflow links — because a delivery created afterwards has an id above
+    the boundary no matter what its links say. This is the only reason a
+    workflow with no delivery vocabulary may still finish an action.
+    """
+    if boundary is None:
+        return False
+    return (
+        delivery.id <= boundary.max_delivery_id
+        and delivery.authorized_at is not None
+        and delivery.ending is not None
+        and not delivery.workflow_authorized
+    )
 
 
 def delete_task_deliveries(engine: Engine, task_id: int) -> list[str]:

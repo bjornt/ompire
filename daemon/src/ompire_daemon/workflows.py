@@ -66,6 +66,7 @@ from ompire_daemon.execution_inputs import (
     TaskExecutionInputs,
 )
 from ompire_daemon.projectfiles import mention_tokens, unresolved_mentions
+from ompire_daemon.registry.reviews import ReviewIterationRecord
 from ompire_daemon.registry.sessions import (
     build_applied_policy,
     mark_session_id,
@@ -83,12 +84,16 @@ from ompire_daemon.registry.workflows import (
     GATE_SNAPSHOT_VERSION,
     MAX_FEEDBACK_BYTES,
     PAUSE_CONDITION_UNRESOLVED,
+    PAUSE_DELIVERY_BLOCKED,
+    PAUSE_DELIVERY_CONTINUATION,
     PAUSE_MISSING_EVIDENCE,
     PAUSE_MISSING_OUTCOME,
     PAUSE_PROMPT_UNRENDERABLE,
+    PAUSE_REVIEW_UNAVAILABLE,
     PAUSE_UNRESOLVED_DECISION,
     PAUSE_WORKSPACE_UNAVAILABLE,
     RETRY_NOTE,
+    DeliveryAuthorization,
     StepRecord,
     WorkflowGateChoiceError,
     WorkflowWaitConflictError,
@@ -103,18 +108,22 @@ from ompire_daemon.registry.workflows import (
     park_gate,
     pause_step,
     resolve_gate,
+    resume_paused_attempt,
     retry_paused_step,
     set_run_complete,
     set_run_failed,
     set_run_status,
+    settle_delivery_step,
 )
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.workflow_definitions import (
+    DELIVERY_METADATA_FIELDS,
     AgentStep,
     CommandStep,
     CompleteDestination,
     DecisionStep,
+    DeliveryStep,
     Destination,
     EvaluationContext,
     EvidenceBinding,
@@ -123,6 +132,7 @@ from ompire_daemon.workflow_definitions import (
     OutcomeContract,
     PauseDestination,
     RenderError,
+    ReviewStep,
     Step,
     StepDestination,
     Unresolved,
@@ -142,6 +152,8 @@ from ompire_daemon.workflow_definitions import (
 
 if TYPE_CHECKING:
     from ompire_daemon.registry.tasks import Task
+    from ompire_daemon.review import ReviewManager
+    from ompire_daemon.ship import ShipManager
 
 logger = logging.getLogger(__name__)
 
@@ -306,6 +318,59 @@ _COMMAND_OUTPUT_TAIL = 8 * 1024
 COMPLETE = "__complete__"
 
 
+DELIVERY_RESULT_VERSION = 1
+
+
+def delivery_outcome(
+    step: DeliveryStep, action_id: int, result: dict[str, Any]
+) -> dict[str, Any]:
+    """One privileged effect, as the run records it.
+
+    Says what actually happened, from the operation journal — the signed tip,
+    the pushed head, the pull-request URL — and which journal row it came
+    from. A terminal step's author-written name says what the *workflow* calls
+    this ending; it is never what says an effect occurred.
+    """
+    return {
+        "version": DELIVERY_RESULT_VERSION,
+        "action": step.action,
+        "mode": step.mode,
+        "action_id": action_id,
+        "result": result,
+    }
+
+
+# --- format-3 review results (engine-defined) --------------------------------
+# A review's result is not an agent's declaration and not an author's contract:
+# it is what the trusted reviewer did, recorded by the engine. The shape is
+# fixed so a definition can route on it, and closed so nothing an agent writes
+# can produce one.
+
+REVIEW_RESULT_VERSION = 1
+
+
+def review_outcome(iteration: ReviewIterationRecord) -> dict[str, Any]:
+    """One review iteration, as the definition's expressions read it.
+
+    `result` is the verdict, so `{op: get, keys: [outcome, result]}` reads a
+    review exactly as it reads an agent step. `findings_state` travels beside
+    `findings` on purpose: a route that wants to send comments back to a coder
+    can require the report to be `complete`, rather than handing over whatever
+    happened to be captured.
+    """
+    return {
+        "version": REVIEW_RESULT_VERSION,
+        "result": iteration.outcome,
+        "candidate_id": iteration.candidate_id,
+        "iteration_seq": iteration.seq,
+        "comment_count": iteration.comment_count,
+        "findings": iteration.findings,
+        "findings_state": iteration.findings_state,
+        "diagnostics": iteration.stderr,
+        "recorded_at": iteration.recorded_at,
+    }
+
+
 class WorkflowNotWaitingError(Exception):
     def __init__(self, task_id: int, status: str | None) -> None:
         super().__init__(
@@ -443,6 +508,10 @@ class _StepResult:
     gate_message: str | None = None  # a format-1 gate parks the run here
     gate_snapshot: dict[str, Any] | None = None  # a format-2 gate's question
     pause: _Pause | None = None  # the engine will not guess
+    # A delivery step already committed its own transition, together with the
+    # privileged effect's journal result. The loop reads what was committed
+    # instead of finishing the attempt a second time.
+    settled: bool = False
 
 
 @dataclass(frozen=True)
@@ -558,19 +627,40 @@ class WorkflowRunner:
         # Set by app wiring; steps that touch the workspace are admitted
         # through it so a run and a delivery cannot write at once (ADR-0032).
         self._guard: WorkspaceGuard | None = None
+        # The trusted operation owners a format-3 run asks to act. Set by app
+        # wiring; a run whose definition declares neither never needs them.
+        self._reviews: ReviewManager | None = None
+        self._ships: ShipManager | None = None
 
     def set_guard(self, guard: WorkspaceGuard) -> None:
         self._guard = guard
 
+    def set_operations(self, reviews: ReviewManager, ships: ShipManager) -> None:
+        """Bind the trusted services a format-3 run drives.
+
+        The runner decides *when* an operation is eligible and never how it is
+        performed: capture, signing, push, and forge writes stay behind these
+        managers, which apply their own content, credential, and target checks
+        to a runner exactly as they do to an operator.
+        """
+        self._reviews = reviews
+        self._ships = ships
+
     @contextlib.asynccontextmanager
-    async def _admitted(self, task_id: int) -> AsyncIterator[None]:
+    async def _admitted(self, step: Step, task_id: int) -> AsyncIterator[None]:
         """Own the task workspace for one step attempt.
 
         A step is the task's ordinary writer, so it holds the guard only while
         it actually runs: a run parked at a gate must not keep review or
         delivery waiting on a decision nobody has made yet.
+
+        Review and delivery are *host-side* operations, and their managers take
+        host ownership themselves. Wrapping them in an agent-kind hold here
+        would make the run the owner of the very workspace the operation is
+        about to ask for — either refusing it or, worse, letting it run under
+        the ownership kind that exists to say "an agent is writing".
         """
-        if self._guard is None:
+        if self._guard is None or isinstance(step, (ReviewStep, DeliveryStep)):
             yield
             return
         async with self._guard.hold(
@@ -638,6 +728,7 @@ class WorkflowRunner:
         expected_seq: int,
         choice_id: str,
         note: str | None,
+        authorization: DeliveryAuthorization | None = None,
     ) -> Task:
         """Answer a format-2 gate with one of its declared choices.
 
@@ -650,8 +741,22 @@ class WorkflowRunner:
         Feedback is data. It is recorded verbatim, shown back as text, and
         handed to a later prompt as content — it never names a route, and a
         choice cannot grant authority the definition did not declare.
+
+        `authorization` is a delivery grant the trusted service has already
+        resolved against the current candidate, review, and policy. It is
+        committed here, with the answer and the successor, because the three
+        are one decision: an approval whose grant did not land would send the
+        run to an action nothing permits, and a grant whose answer did not
+        land would permit an action nobody approved. The runner does not
+        decide anything about it — it cannot, and it checks that the choice
+        actually declares the chain before letting it through.
         """
+        from ompire_daemon.registry.tasks import get_task
+
         definition = revision.definition
+        # Read where the run *is*, not where the caller's copy says it was: a
+        # decision is answered against the current question or not at all.
+        task = get_task(self._engine, task.id)
         record = latest_step_record(self._engine, task.id)
         if (
             task.workflow_status != "waiting"
@@ -676,6 +781,29 @@ class WorkflowRunner:
                 f"{choice_id!r} is not one of this gate's choices: "
                 f"{', '.join(c.id for c in step.choices)}"
             )
+        grant = choice.authorize
+        if (authorization is None) != (grant is None):
+            raise WorkflowGateChoiceError(
+                f"the choice {choice_id!r} "
+                + (
+                    "authorizes publication and needs a confirmed delivery"
+                    if authorization is None
+                    else "authorizes no publication, so it cannot carry a "
+                    "delivery confirmation"
+                )
+            )
+        if authorization is not None and grant is not None:
+            actions = tuple(
+                s.action
+                for s in (definition.step_named(name) for name in grant.steps)
+                if isinstance(s, DeliveryStep)
+            )
+            if actions != authorization.actions:
+                raise WorkflowGateChoiceError(
+                    f"the confirmed delivery ({' → '.join(authorization.actions)}) "
+                    f"is not the chain {choice_id!r} authorizes "
+                    f"({' → '.join(actions)})"
+                )
         feedback = note if note is not None and note.strip() else None
         if choice.feedback_required and feedback is None:
             raise WorkflowGateChoiceError(
@@ -724,6 +852,7 @@ class WorkflowRunner:
             feedback=feedback,
             successor=successor,
             terminal_result=terminal_result,
+            authorization=authorization,
         )
         answered = get_step_record(self._engine, task.id, expected_seq)
         self._publish_gate_step(
@@ -740,8 +869,21 @@ class WorkflowRunner:
         elif successor is not None:
             # No coroutine was parked on this gate — a run whose loop is gone
             # while the decision still stands. The state is already committed,
-            # so re-drive from it rather than losing the answer.
-            self._kick(task.id, require_task_inputs(updated), revision, recover=True)
+            # so continue from the attempt this answer just opened.
+            #
+            # Handed over directly rather than through recovery: recovery has
+            # to assume an interrupted attempt may already have had an effect,
+            # and this one demonstrably has not — it was created a moment ago
+            # by the same transaction.
+            self._kick(
+                task.id,
+                require_task_inputs(updated),
+                revision,
+                recover=False,
+                attempt=self._attempt_after_decision(
+                    task.id, definition, expected_seq
+                ),
+            )
         return updated
 
     def retry_step(
@@ -934,8 +1076,10 @@ class WorkflowRunner:
             self._publish_task_updated(updated)
             self._publish_step(task_id, step, "started", seq=current.record.seq)
             try:
-                async with self._admitted(task_id):
-                    result = await self._run_step(current, ctx, task, inputs)
+                async with self._admitted(step, task_id):
+                    result = await self._run_step(
+                        current, ctx, task, inputs, definition
+                    )
             except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
                 # Not started at all. The attempt keeps its own evidence and
                 # says why, and an operator retry re-enters this step once the
@@ -991,6 +1135,18 @@ class WorkflowRunner:
                     if next_step is not None
                     else None
                 )
+                continue
+
+            if result.settled:
+                # A delivery step committed its own transition together with
+                # the effect's journal result. Read what was committed rather
+                # than deciding a second time — the two could only differ if
+                # something moved in between, and then the record is right.
+                current = self._attempt_after_decision(
+                    task_id, definition, current.record.seq
+                )
+                if current is None:
+                    return  # the chain's last action completed the run
                 continue
 
             finish_step_record(
@@ -1312,6 +1468,10 @@ class WorkflowRunner:
             # rather than closing it and opening another: a restart is not a
             # work attempt, and a declared visit bound counts work.
             step = definition.step_named(last.step)
+            if isinstance(step, DeliveryStep):
+                return self._recover_delivery_attempt(
+                    task_id, definition, last, step
+                )
             if step is None:
                 logger.warning(
                     "task %d pinned workflow %r no longer declares step %r; "
@@ -1367,6 +1527,106 @@ class WorkflowRunner:
             self._open(task_id, definition, following) if following is not None else None
         )
 
+    def _recover_delivery_attempt(
+        self,
+        task_id: int,
+        definition: WorkflowDefinition,
+        record: StepRecord,
+        step: DeliveryStep,
+    ) -> _Attempt | None:
+        """A privileged action interrupted mid-flight. Never re-dispatched.
+
+        By the time this runs, `ShipManager.restore` has already looked for
+        the specific result each interrupted attempt intended and either found
+        it, proved it did not happen, or marked it unknown. So there are only
+        two honest moves left.
+
+        If the effect succeeded, it is adopted: the step finishes with that
+        recorded result and the run continues. This is the crash window
+        between the journal write and the step transition, and closing it by
+        performing the action again would sign or push twice.
+
+        Otherwise the run waits. Not a generic retry — a continuation of this
+        exact attempt, which an operator confirms against a fresh preview of
+        the same journal. That covers the window after the grant was committed
+        but before anything ran, where the authorization is real and no
+        effect exists yet.
+        """
+        if self._ships is None:  # pragma: no cover - wired by app startup
+            return _Attempt(record=record, step=step)
+        action = self._ships.workflow_action(task_id, record.seq)
+        if action is not None and action.phase == "succeeded":
+            outcome = delivery_outcome(step, action.id, action.result or {})
+            successor, terminal = self._delivery_successor(task_id, step, definition)
+            _row, updated = settle_delivery_step(
+                self._engine,
+                task_id,
+                record.seq,
+                action_id=None,
+                outcome=outcome,
+                successor=successor,
+                terminal_result=terminal,
+            )
+            logger.info(
+                "task %d adopted the completed %s from step %r; no effect was "
+                "repeated",
+                task_id,
+                step.action,
+                step.name,
+            )
+            self._publish_step(task_id, step, "ok", seq=record.seq)
+            self._publish_task_updated(updated)
+            return self._attempt_after_decision(task_id, definition, record.seq)
+        state = "was never started" if action is None else f"is {action.phase}"
+        self._pause(
+            task_id,
+            step,
+            record.seq,
+            _Pause(
+                reason=PAUSE_DELIVERY_CONTINUATION,
+                message=(
+                    f"The {step.action} step {step.name!r} was interrupted and "
+                    f"its effect {state}. The approval you gave still stands, "
+                    "and nothing is repeated on your behalf: review the "
+                    "current delivery and confirm the remaining work to "
+                    "continue."
+                ),
+                error=f"{step.action} needs an explicit continuation",
+            ),
+        )
+        return None
+
+    def continue_delivery(
+        self, task: Task, revision: WorkflowRevision, *, expected_seq: int
+    ) -> None:
+        """Resume one interrupted delivery attempt after a fresh confirmation.
+
+        Deliberately not `retry_step`: a retry opens a new attempt, and this
+        attempt already owns a journal context — its intent, and possibly a
+        partially observed effect. What resumes is the same row, against the
+        same delivery, so the uniqueness that stops a second effect still
+        applies.
+        """
+        record = latest_step_record(self._engine, task.id)
+        if record is None or record.seq != expected_seq or record.status != "waiting":
+            raise WorkflowWaitConflictError(
+                task.id, expected_seq, record.seq if record is not None else None
+            )
+        step = revision.definition.step_named(record.step)
+        if not isinstance(step, DeliveryStep):
+            raise WorkflowNotWaitingError(task.id, "not-a-delivery-step")
+        if task.id in self._runs:
+            return
+        cleared, updated = resume_paused_attempt(self._engine, task.id, expected_seq)
+        self._publish_task_updated(updated)
+        self._kick(
+            task.id,
+            require_task_inputs(updated),
+            revision,
+            recover=False,
+            attempt=_Attempt(record=cleared, step=step),
+        )
+
     # --- step execution ----------------------------------------------------------
 
     async def _run_step(
@@ -1375,6 +1635,7 @@ class WorkflowRunner:
         ctx: EvaluationContext,
         task: Task,
         inputs: TaskExecutionInputs,
+        definition: WorkflowDefinition,
     ) -> _StepResult:
         step = attempt.step
         if isinstance(step, AgentStep):
@@ -1383,6 +1644,10 @@ class WorkflowRunner:
             return await self._run_command_step(step, task)
         if isinstance(step, DecisionStep):
             return self._run_decision_step(step, ctx)
+        if isinstance(step, ReviewStep):
+            return await self._run_review_step(attempt, step, task)
+        if isinstance(step, DeliveryStep):
+            return await self._run_delivery_step(attempt, step, task, definition)
         assert isinstance(step, GateStep)
         try:
             message = render_text(step.message, ctx)
@@ -1400,8 +1665,26 @@ class WorkflowRunner:
         if not step.choices:
             return _StepResult(gate_message=message)
         # The question, captured whole before anyone can answer it: the text
-        # shown, the options offered, and the records it is asking about.
-        # An answer means nothing without the question it answered.
+        # shown, the options offered, the records it is asking about, and —
+        # for a delivery gate — the publication text the definition suggests
+        # and the review the grant is bound to. An answer means nothing
+        # without the question it answered.
+        delivery: dict[str, Any] | None = None
+        if step.delivery is not None:
+            try:
+                delivery = self._gate_delivery(step, ctx)
+            except RenderError as exc:
+                return _StepResult(
+                    pause=_Pause(
+                        reason=PAUSE_PROMPT_UNRENDERABLE,
+                        message=(
+                            f"The approval {step.name!r} could not prepare the "
+                            f"publication text it declares: {exc.reason}. "
+                            "Nothing is offered with a field silently dropped."
+                        ),
+                        error=exc.reason,
+                    )
+                )
         return _StepResult(
             gate_snapshot=build_gate_snapshot(
                 message=message,
@@ -1411,12 +1694,47 @@ class WorkflowRunner:
                         "label": choice.label,
                         "feedback_required": choice.feedback_required,
                         "next": destination_document(choice.next, 2),
+                        **(
+                            {
+                                "authorize": (
+                                    None
+                                    if choice.authorize is None
+                                    else {"steps": list(choice.authorize.steps)}
+                                )
+                            }
+                            if step.delivery is not None
+                            else {}
+                        ),
                     }
                     for choice in step.choices
                 ],
                 evidence=(attempt.record.evidence or {}).get("bindings", {}),
+                delivery=delivery,
             )
         )
+
+    @staticmethod
+    def _gate_delivery(step: GateStep, ctx: EvaluationContext) -> dict[str, Any]:
+        """A delivery gate's binding and its suggested publication text.
+
+        Rendered once, into the immutable question, from the same frozen
+        evidence everything else at this attempt reads. What the operator then
+        edits is an inert draft beside it: the suggestion is what the workflow
+        proposed, and the final text is what the confirmation carries.
+
+        A field the author declared but whose reference cannot be rendered
+        pauses rather than arriving blank — an empty commit message that was
+        supposed to say something is worse than a stop.
+        """
+        assert step.delivery is not None
+        metadata = step.delivery.metadata
+        suggested: dict[str, str] = {}
+        if metadata is not None:
+            for field in DELIVERY_METADATA_FIELDS:
+                text = getattr(metadata, field)
+                if text is not None:
+                    suggested[field] = render_text(text, ctx)
+        return {"review": step.delivery.review, "suggested": suggested}
 
     def _run_decision_step(
         self, step: DecisionStep, ctx: EvaluationContext
@@ -1711,6 +2029,197 @@ class WorkflowRunner:
                 error=note or "no outcome file written",
             )
         )
+
+    # --- delivery (format 3) ----------------------------------------------------
+
+    async def _run_delivery_step(
+        self,
+        attempt: _Attempt,
+        step: DeliveryStep,
+        task: Task,
+        definition: WorkflowDefinition,
+    ) -> _StepResult:
+        """Perform the one privileged effect this step declares.
+
+        The runner's whole contribution is *when*: this step is next, its
+        predecessor is verified, and its grant is on record. Everything else —
+        the candidate, the signature, the lease, the forge call, the identity
+        checks — stays inside `ShipManager`, which re-resolves the run's
+        authority before it does any of it.
+
+        The result and the run's move to the next step land in one write. A
+        crash before it leaves a succeeded action on a step still open, which
+        recovery adopts; there is no state in which the effect happened and
+        the run believes it did not.
+        """
+        from ompire_daemon.ship import DeliveryBlockedError, ShipError, new_request_id
+
+        assert self._ships is not None, "delivery step without a delivery service"
+        seq = attempt.record.seq
+        settled: list[bool] = []
+
+        def settle(
+            action_id: int,
+            result: dict[str, Any],
+            identity: dict[str, Any] | None,
+            disposition: str | None,
+        ) -> None:
+            outcome = delivery_outcome(step, action_id, result)
+            successor, terminal = self._delivery_successor(task.id, step, definition)
+            _record, updated = settle_delivery_step(
+                self._engine,
+                task.id,
+                seq,
+                action_id=action_id,
+                result=result,
+                identity=identity,
+                disposition=disposition,
+                outcome=outcome,
+                successor=successor,
+                terminal_result=terminal,
+            )
+            settled.append(True)
+            self._publish_step(task.id, step, "ok", seq=seq)
+            self._publish_task_updated(updated)
+
+        try:
+            ok = await self._ships.perform_action(
+                task,
+                action=step.action,
+                workflow_seq=seq,
+                request_id=new_request_id(),
+                settle=settle,
+            )
+        except DeliveryBlockedError as exc:
+            return _StepResult(
+                pause=_Pause(
+                    reason=PAUSE_DELIVERY_BLOCKED,
+                    message=(
+                        f"The {step.action} step {step.name!r} was not "
+                        "performed: "
+                        + "; ".join(b.message for b in exc.blockers)
+                        + "."
+                    ),
+                    error="; ".join(f"{b.code}: {b.message}" for b in exc.blockers),
+                )
+            )
+        except ShipError as exc:
+            return _StepResult(
+                pause=_Pause(
+                    reason=PAUSE_DELIVERY_BLOCKED,
+                    message=(
+                        f"The {step.action} step {step.name!r} could not run: "
+                        f"{exc}. Nothing here is retried automatically."
+                    ),
+                    error=str(exc),
+                )
+            )
+        if settled:
+            # The transition is already committed; the loop reads it back
+            # rather than deciding again.
+            return _StepResult(settled=True)
+        return _StepResult(
+            pause=_Pause(
+                reason=PAUSE_DELIVERY_BLOCKED,
+                message=(
+                    f"The {step.action} step {step.name!r} did not complete. "
+                    "Its outcome is recorded in the delivery journal; nothing "
+                    "dependent runs, and nothing is retried on your behalf."
+                    if ok is False
+                    else f"The {step.action} step {step.name!r} reported no "
+                    "verified result."
+                ),
+                error=f"{step.action} did not complete",
+            )
+        )
+
+    def _delivery_successor(
+        self,
+        task_id: int,
+        step: DeliveryStep,
+        definition: WorkflowDefinition,
+    ) -> tuple[tuple[str, str, str | None, dict[str, Any] | None] | None, str | None]:
+        """Where the run goes once this effect is on record."""
+        if isinstance(step.next, CompleteDestination):
+            return None, step.next.result
+        assert isinstance(step.next, StepDestination)
+        records = list_step_records(self._engine, task_id)
+        target = definition.step_named(step.next.step)
+        assert target is not None  # validated at load
+        target = self._bounded_step(task_id, definition, target, records)
+        _bindings, document = self._entry_evidence(target, records)
+        return (
+            target.name,
+            target.kind,
+            target.session if isinstance(target, AgentStep) else None,
+            document,
+        ), None
+
+    # --- review (format 3) ------------------------------------------------------
+
+    async def _run_review_step(
+        self, attempt: _Attempt, step: ReviewStep, task: Task
+    ) -> _StepResult:
+        """Ask for an independent review of what this task would publish, and
+        record the verdict it produced.
+
+        Nothing is decided here. `ReviewManager` captures the protected
+        candidate, supervises the reviewer, and writes the iteration; this
+        parks until that write lands and then reads it back. A review that
+        never ran produces no result at all — the step pauses and says why,
+        because an engine that filled in "approved" for an unavailable
+        reviewer would be the exact failure independent review exists to
+        prevent.
+        """
+        from ompire_daemon.registry.reviews import iteration_for_step
+        from ompire_daemon.review import (
+            ReviewAlreadyOpenError,
+            ReviewContentError,
+            ReviewError,
+        )
+
+        assert self._reviews is not None, "review step without a review manager"
+        seq = attempt.record.seq
+        existing = iteration_for_step(self._engine, task.id, seq)
+        if existing is not None:
+            # A re-driven attempt whose verdict already landed. Consumed once:
+            # the record is the answer, and re-running the reviewer would grade
+            # a workspace that has moved on.
+            return _StepResult(outcome=review_outcome(existing))
+        completion = self._reviews.watch_completion(task.id)
+        try:
+            await self._reviews.start_review(task, workflow_seq=seq)
+        except (ReviewContentError, ReviewAlreadyOpenError, ReviewError) as exc:
+            completion.cancel()
+            return _StepResult(
+                pause=_Pause(
+                    reason=PAUSE_REVIEW_UNAVAILABLE,
+                    message=(
+                        f"The review step {step.name!r} could not start: {exc}. "
+                        "Nothing was reviewed and no verdict was recorded; "
+                        "retry it once that is resolved."
+                    ),
+                    error=str(exc),
+                )
+            )
+        except (WorkspaceBusyError, WorkspaceBlockedError):
+            completion.cancel()
+            raise
+        await completion
+        iteration = iteration_for_step(self._engine, task.id, seq)
+        if iteration is None:  # pragma: no cover - the manager writes before it wakes
+            return _StepResult(
+                pause=_Pause(
+                    reason=PAUSE_REVIEW_UNAVAILABLE,
+                    message=(
+                        f"The review step {step.name!r} finished without "
+                        "recording a verdict. Retry it; nothing is assumed "
+                        "about content nobody graded."
+                    ),
+                    error="review produced no recorded iteration",
+                )
+            )
+        return _StepResult(outcome=review_outcome(iteration))
 
     async def _await_step_idle(self, task_id: int, session: str) -> None:
         """Wait for the debounced idle turn boundary, watching hub events;

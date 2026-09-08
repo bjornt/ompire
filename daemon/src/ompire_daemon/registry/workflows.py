@@ -35,7 +35,7 @@ from ompire_daemon.registry.tasks import Task, _row_to_task, _update
 
 WORKFLOW_STATUSES = ("running", "waiting", "complete", "failed")
 STEP_STATUSES = ("running", "waiting", "ok", "failed")
-STEP_KINDS = ("agent", "command", "decision", "gate")
+STEP_KINDS = ("agent", "command", "decision", "gate", "review", "delivery")
 
 # Why the engine stopped rather than choosing. Each one names evidence that is
 # absent or unreadable, never a declared negative result: a `failed` outcome
@@ -53,6 +53,19 @@ PAUSE_MISSING_EVIDENCE = "missing_evidence"
 # (ADR-0032). The step is not started, its attempt keeps its own evidence, and
 # an operator retry re-enters it once the workspace is free.
 PAUSE_WORKSPACE_UNAVAILABLE = "workspace_unavailable"
+# A review step could not start: there is nothing to review, the candidate
+# could not be resolved, or the reviewer could not be launched. The engine
+# does not invent a verdict for a review that never ran — an approval nobody
+# gave is the one thing this pause exists to prevent.
+PAUSE_REVIEW_UNAVAILABLE = "review_unavailable"
+# A delivery step is authorized but its effect cannot begin, or a previous
+# effect's outcome is unknown. Nothing privileged is retried automatically;
+# the operator sees why and what would resolve it.
+PAUSE_DELIVERY_BLOCKED = "delivery_blocked"
+# An authorized chain was interrupted between its grant and its effect, or
+# mid-effect. The remaining work resumes only after a fresh confirmation
+# against the same journal, never from a generic retry.
+PAUSE_DELIVERY_CONTINUATION = "delivery_continuation"
 PAUSE_VERSION = 1
 
 # Appended to a paused attempt's error when an operator authorizes a retry.
@@ -362,11 +375,39 @@ class WorkflowGateChoiceError(ValueError):
         self.field = field
 
 
+@dataclass(frozen=True)
+class DeliveryAuthorization:
+    """One approved delivery grant, ready to be committed with its decision.
+
+    A value, not a command: everything here was already resolved and checked
+    by the delivery service against the current candidate, review, and policy.
+    What the workflow registry adds is atomicity — this becomes durable in the
+    same transaction as the answer that permitted it, or neither does.
+    """
+
+    delivery_id: int
+    expected_version: int
+    candidate_id: str
+    review_candidate_id: str | None
+    review_seq: int | None
+    mode: str
+    ending: str
+    actions: tuple[str, ...]
+    commit_message: str | None
+    pr_title: str | None
+    pr_body: str | None
+    routing: dict[str, Any]
+    identity: dict[str, Any]
+    request_key: str
+    input_fingerprint: str
+
+
 def build_gate_snapshot(
     *,
     message: str,
     choices: list[dict[str, Any]],
     evidence: dict[str, Any],
+    delivery: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The question, exactly as it was put to a person.
 
@@ -375,12 +416,19 @@ def build_gate_snapshot(
     records it was asking about, even if the definition has since changed —
     otherwise the recorded choice is an answer to a question nobody can read.
     """
-    return {
+    snapshot = {
         "version": GATE_SNAPSHOT_VERSION,
         "message": message,
         "choices": choices,
         "evidence": evidence,
     }
+    if delivery is not None:
+        # A delivery gate also records the review its grant is bound to and
+        # the publication text the definition suggested. Both belong to the
+        # question: an operator reading it later must see what was proposed,
+        # not only what was finally published.
+        snapshot["delivery"] = delivery
+    return snapshot
 
 
 def gate_decision_document(
@@ -410,6 +458,7 @@ def resolve_gate(
     feedback: str | None,
     successor: tuple[str, str, str | None, dict[str, Any] | None] | None,
     terminal_result: str | None,
+    authorization: DeliveryAuthorization | None = None,
 ) -> tuple[StepRecord, Task]:
     """Record a human's answer and advance the run — in one transaction.
 
@@ -482,67 +531,238 @@ def resolve_gate(
             raise WorkflowGateChoiceError(
                 f"the choice {choice_id!r} requires feedback", field="note"
             )
-        snapshot["decision"] = gate_decision_document(
+        decision = gate_decision_document(
             choice_id=choice_id,
             label=str(choice.get("label", choice_id)),
             feedback=feedback,
             destination=choice.get("next", {}),
             decided_at=now,
         )
+        if authorization is not None:
+            # The grant lands here, on this connection, or not at all. A
+            # decision committed without its authorization would leave a person
+            # having approved publication and nothing on record permitting it;
+            # an authorization committed without its decision would be worse.
+            from ompire_daemon.registry.ships import authorize_delivery_in
+
+            authorize_delivery_in(
+                conn,
+                authorization.delivery_id,
+                expected_version=authorization.expected_version,
+                candidate_id=authorization.candidate_id,
+                review_candidate_id=authorization.review_candidate_id,
+                mode=authorization.mode,
+                ending=authorization.ending,
+                commit_message=authorization.commit_message,
+                pr_title=authorization.pr_title,
+                pr_body=authorization.pr_body,
+                routing=authorization.routing,
+                identity=authorization.identity,
+                request_key=authorization.request_key,
+                input_fingerprint=authorization.input_fingerprint,
+                workflow_gate_seq=seq,
+                workflow_choice_id=choice_id,
+                review_seq=authorization.review_seq,
+            )
+            # Recorded on the answer itself, so the question, the choice, and
+            # what it permitted are one readable record rather than two rows a
+            # reader has to correlate by timestamp.
+            decision["authorization"] = {
+                "delivery_id": authorization.delivery_id,
+                "ending": authorization.ending,
+                "mode": authorization.mode,
+                "actions": list(authorization.actions),
+                "candidate_id": authorization.candidate_id,
+                "review_seq": authorization.review_seq,
+            }
+        snapshot["decision"] = decision
+        record_row, task_row = _advance_in(
+            conn,
+            task_id,
+            seq,
+            now,
+            outcome=snapshot,
+            successor=successor,
+            terminal_result=terminal_result,
+        )
+    return _row_to_record(record_row), _row_to_task(task_row)
+
+
+def _advance_in(
+    conn,
+    task_id: int,
+    seq: int,
+    now: str,
+    *,
+    outcome: dict[str, Any] | None,
+    successor: tuple[str, str, str | None, dict[str, Any] | None] | None,
+    terminal_result: str | None,
+):
+    """Finish one attempt and open its successor, on a caller's connection.
+
+    Shared by every transition that has to be atomic with something else — a
+    human decision and the authority it grants, a privileged effect and the
+    step that consumed it. Splitting either pair across two commits creates a
+    window where the run and the record of what happened disagree, and that
+    window is exactly where a duplicate signature or a lost approval lives.
+    """
+    conn.execute(
+        workflow_step_records.update()
+        .where(workflow_step_records.c.task_id == task_id)
+        .where(workflow_step_records.c.seq == seq)
+        .values(
+            status="ok",
+            outcome_json=json.dumps(outcome) if outcome is not None else None,
+            pause_json=None,
+            finished_at=now,
+        )
+    )
+    if successor is not None:
+        step, kind, session, evidence = successor
+        conn.execute(
+            workflow_step_records.insert().values(
+                task_id=task_id,
+                seq=seq + 1,
+                step=step,
+                kind=kind,
+                session=session,
+                status="running",
+                outcome_json=None,
+                error=None,
+                pause_json=None,
+                evidence_json=(json.dumps(evidence) if evidence is not None else None),
+                prompted_at=None,
+                started_at=now,
+                finished_at=None,
+            )
+        )
+        conn.execute(
+            tasks_table.update()
+            .where(tasks_table.c.id == task_id)
+            .values(workflow_status="running", workflow_step=step, updated_at=now)
+        )
+    else:
+        conn.execute(
+            tasks_table.update()
+            .where(tasks_table.c.id == task_id)
+            .values(
+                workflow_status="complete",
+                workflow_step=None,
+                workflow_result=terminal_result,
+                updated_at=now,
+            )
+        )
+    record_row = conn.execute(
+        workflow_step_records.select()
+        .where(workflow_step_records.c.task_id == task_id)
+        .where(workflow_step_records.c.seq == (seq + 1 if successor else seq))
+    ).one()
+    task_row = conn.execute(
+        tasks_table.select().where(tasks_table.c.id == task_id)
+    ).one()
+    return record_row, task_row
+
+
+def settle_delivery_step(
+    engine: Engine,
+    task_id: int,
+    seq: int,
+    *,
+    action_id: int | None,
+    result: dict[str, Any] | None = None,
+    identity: dict[str, Any] | None = None,
+    disposition: str | None = None,
+    outcome: dict[str, Any],
+    successor: tuple[str, str, str | None, dict[str, Any] | None] | None,
+    terminal_result: str | None,
+) -> tuple[StepRecord, Task]:
+    """Land one privileged effect's journal result and the run's next state.
+
+    The mirror of `resolve_gate` on the other side of the authorization: the
+    action succeeded, and the step that asked for it finishes with the same
+    write. If this ever *does* get interrupted before it runs, recovery finds a
+    succeeded action whose step is still open and attaches that same result —
+    it never dispatches a second effect to fill the gap, because the effect is
+    already on record as having happened.
+    """
+    from ompire_daemon.registry.model_profiles import reserved_write
+    from ompire_daemon.registry.ships import complete_action_in
+
+    now = _now_iso()
+    with reserved_write(engine) as conn:
+        if action_id is not None and result is not None:
+            complete_action_in(
+                conn,
+                action_id,
+                result=result,
+                identity=identity,
+                disposition=disposition,
+            )
+        row = conn.execute(
+            workflow_step_records.select()
+            .where(workflow_step_records.c.task_id == task_id)
+            .where(workflow_step_records.c.seq == seq)
+        ).first()
+        if row is None or row.status != "running" or row.kind != "delivery":
+            raise WorkflowWaitConflictError(
+                task_id, seq, row.seq if row is not None else None
+            )
+        record_row, task_row = _advance_in(
+            conn,
+            task_id,
+            seq,
+            now,
+            outcome=outcome,
+            successor=successor,
+            terminal_result=terminal_result,
+        )
+    return _row_to_record(record_row), _row_to_task(task_row)
+
+
+def resume_paused_attempt(
+    engine: Engine, task_id: int, seq: int
+) -> tuple[StepRecord, Task]:
+    """Return one paused attempt to `running`, on the same row.
+
+    The delivery counterpart of `retry_paused_step`, and deliberately not the
+    same thing. A retry opens a *new* attempt, which is right for work that
+    can simply be done again. A privileged action cannot: its attempt owns a
+    write-ahead intent in the delivery journal and, possibly, a partially
+    observed effect. Resuming the same row keeps that link, so the uniqueness
+    that stops a second signature or a second push still applies.
+
+    The pause's reason is cleared; the error it recorded stays, so history
+    still says the attempt was interrupted and continued rather than having
+    run cleanly.
+    """
+    from ompire_daemon.registry.model_profiles import reserved_write
+
+    now = _now_iso()
+    with reserved_write(engine) as conn:
+        row = conn.execute(
+            workflow_step_records.select()
+            .where(workflow_step_records.c.task_id == task_id)
+            .where(workflow_step_records.c.seq == seq)
+        ).first()
+        if row is None or row.status != "waiting" or row.pause_json is None:
+            raise WorkflowWaitConflictError(
+                task_id, seq, row.seq if row is not None else None
+            )
         conn.execute(
             workflow_step_records.update()
             .where(workflow_step_records.c.task_id == task_id)
             .where(workflow_step_records.c.seq == seq)
-            .values(
-                status="ok",
-                outcome_json=json.dumps(snapshot),
-                pause_json=None,
-                finished_at=now,
-            )
+            .values(status="running", pause_json=None, finished_at=None)
         )
-        if successor is not None:
-            step, kind, session, evidence = successor
-            conn.execute(
-                workflow_step_records.insert().values(
-                    task_id=task_id,
-                    seq=seq + 1,
-                    step=step,
-                    kind=kind,
-                    session=session,
-                    status="running",
-                    outcome_json=None,
-                    error=None,
-                    pause_json=None,
-                    evidence_json=(
-                        json.dumps(evidence) if evidence is not None else None
-                    ),
-                    prompted_at=None,
-                    started_at=now,
-                    finished_at=None,
-                )
-            )
-            conn.execute(
-                tasks_table.update()
-                .where(tasks_table.c.id == task_id)
-                .values(
-                    workflow_status="running", workflow_step=step, updated_at=now
-                )
-            )
-        else:
-            conn.execute(
-                tasks_table.update()
-                .where(tasks_table.c.id == task_id)
-                .values(
-                    workflow_status="complete",
-                    workflow_step=None,
-                    workflow_result=terminal_result,
-                    updated_at=now,
-                )
-            )
+        conn.execute(
+            tasks_table.update()
+            .where(tasks_table.c.id == task_id)
+            .values(workflow_status="running", workflow_step=row.step, updated_at=now)
+        )
         record_row = conn.execute(
             workflow_step_records.select()
             .where(workflow_step_records.c.task_id == task_id)
-            .where(workflow_step_records.c.seq == (seq + 1 if successor else seq))
+            .where(workflow_step_records.c.seq == seq)
         ).one()
         task_row = conn.execute(
             tasks_table.select().where(tasks_table.c.id == task_id)

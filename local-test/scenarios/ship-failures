@@ -3,10 +3,11 @@
 # local-test/scenarios/ship-failures — refusals happen before any effect, and
 # every one of them recovers.
 #
-# Admission is resolved by a read-only preview now (ADR-0032): the operator is
-# told every reason a delivery is refused before anything is signed, pushed, or
-# created. This runbook proves each refusal names itself, leaves the workspace
-# untouched, and clears once its cause is fixed.
+# Admission is resolved by a read-only preview (ADR-0032) against the run's
+# own position (ADR-0033): the operator is told every reason a delivery is
+# refused before anything is signed, pushed, or created. This runbook proves
+# each refusal names itself, leaves the workspace untouched, and clears once
+# its cause is fixed.
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -36,33 +37,35 @@ _no_action_started() { # _no_action_started TASK
 }
 
 tid=$(spawn_task "$(unique_slug fail)" "[[scenario:commit]]\nShip-failures E2E: do the work and commit it.")
-wait_for "work step completes" 180 workflow_complete "$tid"
 clone=$(task_field "$tid" clone_path)
+
+# --- leg 1: nothing can be authorized before the run asks ---------------------
+
+# The run has not reached its approval, so there is no decision to confirm and
+# nothing to preview. The refusal says exactly that rather than describing a
+# delivery nobody has been offered.
+ship_preview "$tid" "" "no-decision-$tid" "m" "t" "b"
+[ "$API_CODE" = 409 ] &&
+	ok "a delivery preview before the decision is refused: $(jq -r '.detail.blockers[0].code // .detail.message // .detail' "/tmp/ship-preview-$tid.json")" ||
+	fail "premature preview refusal" "$API_CODE $(cat "/tmp/ship-preview-$tid.json")"
+assert "the premature preview started no action" _no_action_started "$tid"
+
+approve_run_review "$tid"
+wait_for "the run reaches its publication decision" 180 at_approval "$tid"
 baseline_head=$(git -C "$clone" rev-parse HEAD)
 baseline_status=$(git -C "$clone" status --porcelain)
-
-# --- leg 1: no approved review is a refusal that says so ----------------------
-
-ship_preview "$tid" pr squash "no-review-$tid" "m" "t" "b"
-[ "$API_CODE" = 200 ] || die "preview request failed ($API_CODE)"
-_has_blocker "$tid" review-missing &&
-	ok "an unreviewed task is refused by name (blockers: $(_blockers "$tid"))" ||
-	fail "unreviewed refusal" "$(_blockers "$tid")"
-assert "unreviewed preview started no action" _no_action_started "$tid"
-
-approve_review "$tid"
 
 # --- leg 2: invalid ambient auth blocks a pushing ending, not a local one -----
 
 $GHCTL auth unauthenticated >/dev/null
 $GHCTL token-echo stderr >/dev/null
 fake_token='github_pat_LOCAL_TEST_TOKEN_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-ship_preview "$tid" pr squash "gh-auth-$tid" "m" "t" "b"
+ship_preview "$tid" open-pr "gh-auth-$tid" "m" "t" "b"
 _has_blocker "$tid" github-unavailable &&
 	ok "a pushing ending is refused while GitHub is unauthenticated" ||
 	fail "GitHub auth refusal" "$(_blockers "$tid")"
 $GPGCTL warm
-ship_preview "$tid" commit squash "gh-auth-local-$tid" "m" "" ""
+ship_preview "$tid" commit-locally "gh-auth-local-$tid" "m" "" ""
 jq -e '.deliverable' "/tmp/ship-preview-$tid.json" >/dev/null &&
 	ok "a local signed commit needs no GitHub availability at all" ||
 	fail "local ending independence" "$(_blockers "$tid")"
@@ -78,7 +81,7 @@ $GHCTL auth login ompire-test >/dev/null
 # --- leg 3: repository denial is named before any effect ----------------------
 
 $GHCTL repository deny >/dev/null
-ship_preview "$tid" pr squash "gh-deny-$tid" "m" "t" "b"
+ship_preview "$tid" open-pr "gh-deny-$tid" "m" "t" "b"
 _has_blocker "$tid" github-unavailable &&
 	ok "a denied repository refuses the pull-request ending" ||
 	fail "repository denial refusal" "$(_blockers "$tid")"
@@ -88,7 +91,7 @@ $GHCTL repository allow >/dev/null
 # --- leg 4: a locked signing key refuses, and warming clears it ---------------
 
 $GPGCTL lock
-ship_preview "$tid" commit squash "gpg-locked-$tid" "m" "" ""
+ship_preview "$tid" commit-locally "gpg-locked-$tid" "m" "" ""
 _has_blocker "$tid" signing-unavailable &&
 	ok "a locked signing key refuses by name" ||
 	fail "locked key refusal" "$(_blockers "$tid")"
@@ -108,7 +111,7 @@ api_json POST /api/gpg/recheck >/dev/null
 # --- leg 5: an injected forge push rejection blocks, and a retry delivers -----
 
 $FORGE reject-push local-test/sandbox >/dev/null
-ship_deliver "$tid" push squash "pushfail" "Push fail" "b"
+ship_deliver "$tid" push-branch "pushfail" "Push fail" "b"
 wait_for "the rejected push blocks the delivery" 120 ship_blocked "$tid"
 ok "forge rejection stopped the delivery: $(ship_field "$tid" '.blocked_reason')"
 [ -n "$(ship_field "$tid" '.results.commit.signed_tip')" ] &&
@@ -116,33 +119,45 @@ ok "forge rejection stopped the delivery: $(ship_field "$tid" '.blocked_reason')
 	fail "signed prefix retained" "$(ship_field "$tid" '.results')"
 
 signed_before=$(ship_field "$tid" '.results.commit.signed_tip')
-ship_deliver "$tid" push squash "pushfail-retry" "Push fail" "b"
+ship_continue "$tid" "pushfail-retry" "Push fail" "b"
 wait_for "the retry delivers" 120 ship_done "$tid" push
 [ "$(ship_field "$tid" '.results.commit.signed_tip')" = "$signed_before" ] &&
 	ok "the retry reused the signed result rather than signing again" ||
 	fail "retry reused the signature" "$(ship_field "$tid" '.results.commit')"
 
-# --- leg 6: an injected gh create failure blocks, and a retry opens the PR ----
+# --- leg 6: an injected gh create failure blocks, and a continuation recovers -
 
+tid_pr=$(spawn_task "$(unique_slug prfail)" "[[scenario:commit]]\nPR failure E2E: commit the work.")
+approve_run_review "$tid_pr"
+wait_for "the PR-leg run reaches its decision" 180 at_approval "$tid_pr"
+$GPGCTL warm
 $GHCTL fail-next create >/dev/null
-ship_deliver "$tid" pr squash "" "Fail then recover" "b"
-wait_for "the injected create failure blocks the delivery" 120 ship_blocked "$tid"
-grep -qi "injected create failure" <<<"$(ship_field "$tid" '.blocked_reason')" &&
+ship_deliver "$tid_pr" open-pr "ship: fail then recover" "Fail then recover" "b"
+wait_for "the injected create failure blocks the delivery" 120 ship_blocked "$tid_pr"
+grep -qi "injected create failure" <<<"$(ship_field "$tid_pr" '.blocked_reason')" &&
 	ok "the create failure is reported verbatim" ||
-	fail "create failure detail" "$(ship_field "$tid" '.blocked_reason')"
-ship_deliver "$tid" pr squash "" "Fail then recover" "b"
-wait_for "the retry opens the pull request" 120 ship_done "$tid" pr
-ok "recovered: pull request $(task_field "$tid" pr_url)"
+	fail "create failure detail" "$(ship_field "$tid_pr" '.blocked_reason')"
+ship_continue "$tid_pr" "ship: fail then recover" "Fail then recover" "b"
+wait_for "the continuation opens the pull request" 120 ship_done "$tid_pr" pr
+ok "recovered: pull request $(task_field "$tid_pr" pr_url)"
 
 # --- leg 7: retain refuses a dirty tree -------------------------------------
 
-tid2=$(spawn_task "$(unique_slug retainfail)" "[[scenario:commit]]\nRetain refusal E2E: commit the work.")
-wait_for "work step completes (retain leg)" 180 workflow_complete "$tid2"
+# Retain is a mode an author declares, so this leg launches the workflow that
+# declares it rather than asking a squash chain to behave differently.
+save_workflow retain-flow "$(cat "$(dirname "$0")/retain-flow.yaml")"
+tid2=$(spawn_task "$(unique_slug retainfail)" "[[scenario:commit]]\nRetain refusal E2E: commit the work." retain-flow)
+wait_for "the retain run waits before review" 180 workflow_gate "$tid2" >/dev/null
+# The stray file is left while the run waits, so it is part of the content the
+# review actually reads — which is what makes the refusal about retain rather
+# than about an approval that no longer covers the tree.
 clone2=$(task_field "$tid2" clone_path)
 echo "stray" >"$clone2/uncommitted.txt"
-approve_review "$tid2"
+answer_gate "$tid2" continue
+approve_run_review "$tid2"
+wait_for "the retain run reaches its decision" 180 at_approval "$tid2"
 $GPGCTL warm
-ship_preview "$tid2" commit retain "retain-dirty-$tid2" "" "" ""
+ship_preview "$tid2" open-pr "retain-dirty-$tid2" "" "" ""
 _has_blocker "$tid2" retain-dirty &&
 	ok "retain refuses a dirty tree and says which mode to use" ||
 	fail "retain dirty refusal" "$(_blockers "$tid2")"
@@ -151,23 +166,24 @@ rm -f "$clone2/uncommitted.txt"
 # --- leg 8: content that changed after approval cannot be delivered ----------
 
 tid3=$(spawn_task "$(unique_slug stale)" "[[scenario:commit]]\nStale approval E2E: commit the work.")
-wait_for "work step completes (stale leg)" 180 workflow_complete "$tid3"
 clone3=$(task_field "$tid3" clone_path)
-approve_review "$tid3"
+approve_run_review "$tid3"
+wait_for "the stale-leg run reaches its decision" 180 at_approval "$tid3"
 $GPGCTL warm
-ship_preview "$tid3" commit squash "fresh-$tid3" "m" "" ""
+ship_preview "$tid3" commit-locally "fresh-$tid3" "m" "" ""
 jq -e '.deliverable' "/tmp/ship-preview-$tid3.json" >/dev/null &&
 	ok "the fresh approval covers the current content" ||
 	fail "fresh approval" "$(_blockers "$tid3")"
 echo "unreviewed change" >"$clone3/after-approval.txt"
-ship_preview "$tid3" commit squash "stale-$tid3" "m" "" ""
+ship_preview "$tid3" commit-locally "stale-$tid3" "m" "" ""
 _has_blocker "$tid3" review-stale &&
 	ok "content changed after approval is refused rather than signed" ||
 	fail "stale approval refusal" "$(_blockers "$tid3")"
 assert "the stale-approval task started no action" _no_action_started "$tid3"
 
 assert "task $tid never failed" task_not_failed "$tid"
+assert "task $tid_pr never failed" task_not_failed "$tid_pr"
 assert "task $tid2 never failed" task_not_failed "$tid2"
 assert "task $tid3 never failed" task_not_failed "$tid3"
-[ -n "$(task_field "$tid" pr_url)" ] && ok "task retains its PR URL" ||
+[ -n "$(task_field "$tid_pr" pr_url)" ] && ok "the recovered task retains its PR URL" ||
 	fail "task PR URL" "missing after recovery phases"

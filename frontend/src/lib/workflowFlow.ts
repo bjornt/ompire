@@ -1,5 +1,8 @@
 import {
   COMPARISONS,
+  DELIVERY_ACTIONS,
+  DELIVERY_METADATA_FIELDS,
+  type DeliveryMetadataField,
   asArray,
   asObject,
   asString,
@@ -36,6 +39,12 @@ export type EdgeKind =
   | "case"
   | "otherwise"
   | "choice"
+  /** An approving answer, and the exact chain of privileged actions it
+   * grants. Distinct from an ordinary choice because it is the only edge in
+   * a definition that confers authority. */
+  | "authorize"
+  /** A delivery step continuing once its effect is on record. */
+  | "delivered"
   | "exhausted"
   | "skip";
 
@@ -146,11 +155,26 @@ export function readFlow(document: DraftObject): Flow {
       asArray(step.choices).forEach((entry) => {
         const object = asObject(entry);
         const label = asString(object?.label) ?? asString(object?.id) ?? "an answer";
+        const grant = asArray(asObject(object?.authorize)?.steps)
+          .map((name) => asString(name))
+          .filter((name): name is string => name !== null);
         push({
-          kind: "choice",
-          label: `you answer “${label}”`,
+          kind: grant.length > 0 ? "authorize" : "choice",
+          // What the answer *does*, not just where it goes. An approving
+          // answer is the only thing that can grant publication, so the
+          // diagram says so rather than drawing an ordinary edge.
+          label:
+            grant.length > 0
+              ? `you answer “${label}” — authorizing ${grant.join(" → ")}`
+              : `you answer “${label}”`,
           to: targetFor(object?.next, names),
         });
+      });
+    } else if (kind === "delivery") {
+      push({
+        kind: "delivered",
+        label: `once the ${asString(step.action) ?? "action"} is on record`,
+        to: targetFor(step.next, names),
       });
     } else {
       if (step.when !== undefined && step.when !== true) {
@@ -313,6 +337,67 @@ export function readText(document: DraftValue | undefined): TextReading {
   };
 }
 
+/** A gate's delivery binding, as the editor and the diagram read it. */
+export interface DeliveryGateReading {
+  /** The evidence alias naming the review this approval is about. */
+  review: string | null;
+  /** The publication text the definition suggests, per field. An absent
+   * field starts blank for the operator; it is not a missing value. */
+  metadata: { field: DeliveryMetadataField; text: DraftValue }[];
+}
+
+export function readDeliveryGate(step: DraftObject): DeliveryGateReading | null {
+  const delivery = asObject(step.delivery);
+  if (delivery === null) return null;
+  const metadata = asObject(delivery.metadata);
+  return {
+    review: asString(delivery.review),
+    metadata:
+      metadata === null
+        ? []
+        : DELIVERY_METADATA_FIELDS.filter(
+            (field) => metadata[field] !== undefined && metadata[field] !== null,
+          ).map((field) => ({ field, text: metadata[field] })),
+  };
+}
+
+/** What one privileged action declares. Null for every other kind. */
+export interface DeliveryActionReading {
+  action: string | null;
+  mode: string | null;
+  approval: string | null;
+  previous: string | null;
+  next: FlowTarget;
+}
+
+export function readDeliveryAction(
+  document: DraftObject,
+  step: DraftObject,
+): DeliveryActionReading | null {
+  if (asString(step.kind) !== "delivery") return null;
+  const names = stepObjects(document).map((entry) => asString(entry.name));
+  return {
+    action: asString(step.action),
+    mode: asString(step.mode),
+    approval: asString(step.approval),
+    previous: asString(step.previous),
+    next: targetFor(step.next, names),
+  };
+}
+
+/** Every privileged effect this document can perform, in effect order.
+ *
+ * An empty list is a statement — this workflow publishes nothing — and the
+ * editor says so rather than leaving the reader to infer it from absence. */
+export function declaredActions(document: DraftObject): string[] {
+  const declared = new Set(
+    stepObjects(document)
+      .filter((step) => asString(step.kind) === "delivery")
+      .map((step) => asString(step.action)),
+  );
+  return DELIVERY_ACTIONS.filter((action) => declared.has(action));
+}
+
 export interface EvidenceReading {
   alias: string;
   steps: string[];
@@ -365,7 +450,11 @@ const KNOWN_STEP_FIELDS: Record<string, readonly string[]> = {
   agent: ["name", "kind", "max_visits", "on_exhausted", "evidence", "session", "role", "prompt", "when", "expects_outcome", "outcome"],
   command: ["name", "kind", "max_visits", "on_exhausted", "evidence", "argv", "timeout", "idempotent"],
   decision: ["name", "kind", "max_visits", "on_exhausted", "evidence", "cases", "otherwise"],
-  gate: ["name", "kind", "max_visits", "on_exhausted", "evidence", "message", "choices"],
+  gate: ["name", "kind", "max_visits", "on_exhausted", "evidence", "message", "choices", "delivery"],
+  review: ["name", "kind", "max_visits", "on_exhausted", "evidence"],
+  // Deliberately short: an action has no bound, no evidence, and no prompt.
+  // Anything else on this card is a field the grammar does not have.
+  delivery: ["name", "kind", "action", "mode", "approval", "previous", "next"],
 };
 
 export function unknownStepFields(step: DraftObject): string[] {

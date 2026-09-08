@@ -3,7 +3,8 @@
 ## Overview
 
 `bugfix` is the worked example of a rigorous workflow: try to reproduce the
-bug, diagnose it in the code, fix it, and verify the fix — stopping for a
+bug, diagnose it in the code, fix it, verify the fix, have it reviewed
+independently, and let a person decide what happens to it — stopping for a
 person wherever the evidence does not decide.
 
 The thing it is built around is what happens when QA *cannot* reproduce the
@@ -20,7 +21,7 @@ named alternatives.
 
 ## Definition
 
-A packaged YAML document in workflow **format 2**
+A packaged YAML document in workflow **format 3**
 (`daemon/src/ompire_daemon/builtin_workflows/bugfix.yaml`). Each task pins the
 revision it was accepted under, so the routes below describe *your task's*
 `bugfix` — a later release that edits this definition does not change a run
@@ -47,6 +48,13 @@ task-scoped agent operations target the coder.
 | 13 | `validation-gate` | gate, 2 choices | — |
 | 14 | `investigation-exhausted` | gate, 1 choice | — |
 | 15 | `correction-exhausted` | gate, 1 choice | — |
+| 16 | `review` | review | — |
+| 17 | `route-review` | decision | — |
+| 18 | `approve` | gate, 3 choices, delivery-capable | — |
+| 19–21 | `commit-fix`, `push-fix`, `open-fix-pr` | delivery | — |
+| 22 | `approve-unreproduced` | gate, 3 choices, delivery-capable | — |
+| 23–25 | `commit-unreproduced`, `push-unreproduced`, `open-unreproduced-pr` | delivery | — |
+| 26 | `review-exhausted` | gate, 1 choice | — |
 
 Splitting reproduction and fixing across two sessions is deliberate: the
 session that decides whether the bug still reproduces is not the session that
@@ -77,12 +85,25 @@ flowchart TD
     RS --> V
     V --> RV{route-verification}
     RV -->|script failed, or rejected| F
-    RV -->|validated| OK([validated])
-    RV -->|validated under exception| OKX([validated-without-reproduction])
+    RV -->|validated| REV[review]
     RV -->|inconclusive| VG[validation-gate]
     VG -->|retry-verification| V
     VG -->|stop| SU([stopped-unvalidated])
     CE -->|stop| SU
+    REV --> RR{route-review}
+    RR -->|approved| A[approve]
+    RR -->|approved, no reproduction| AX[approve-unreproduced]
+    RR -->|comments| F
+    RR -->|aborted / error / interrupted| RE[review-exhausted]
+    A -->|publish| P[commit-fix → push-fix → open-fix-pr]
+    A -->|request-changes| F
+    A -->|finish| OK([validated])
+    P --> PUB([published])
+    AX -->|publish| PX[commit-unreproduced → push-unreproduced → open-unreproduced-pr]
+    AX -->|request-changes| F
+    AX -->|finish| OKX([validated-without-reproduction])
+    PX --> PUBX([published-without-reproduction])
+    RE -->|stop| SP([stopped-unpublished])
 ```
 
 ## States and behavior
@@ -206,14 +227,71 @@ Evaluated in order:
 |---|---|
 | The verification checked a different fix than the current one | pause |
 | A script ran for this fix and exited non-zero | back to `fix` |
-| `validated`, under an operator exception | run completes `validated-without-reproduction` |
-| `validated` | run completes `validated` |
+| `validated` | on to `review` |
 | `rejected` | back to `fix`, with the report |
 | `inconclusive` | `validation-gate` |
 | anything else | pause |
 
 **A failing script cannot be overridden by a positive verdict.** If the
 reproducer still fails, the bug is still there whatever the turn concluded.
+
+A validated fix is no longer a finished run. It goes to independent review, and
+then to a person. Whether a reproduction was ever established is carried
+forward and decides *which* approval the run reaches, not whether it reaches
+one.
+
+### 16–17. Review, and where its verdict goes
+
+`review` runs the independent reviewer against the protected candidate — what
+this task would actually publish — and records its verdict. `route-review`
+then routes on it:
+
+| Verdict | Route |
+|---|---|
+| `approved`, with an operator exception on record | `approve-unreproduced` |
+| `approved` | `approve` |
+| `comments`, with a complete report | back to `fix`, carrying the reviewer's own words |
+| `aborted`, `error`, `interrupted`, or an incomplete report | `review-exhausted` |
+
+A comments verdict spends `fix`'s existing three-attempt budget and goes back
+through the ordinary script and QA validation before a fresh review. Only a
+*complete* report drives that automatically: a truncated or missing one is a
+person's problem, not an agent's.
+
+An aborted, errored, or interrupted review is not an opinion about the code,
+and nothing treats it as one.
+
+### 18–25. The approvals, and what they authorize
+
+`approve` and `approve-unreproduced` are the same decision for two different
+situations, and they are separate steps because what differs is the *endings*
+— and an ending is what a reader sees months later.
+
+| Answer | `approve` | `approve-unreproduced` |
+|---|---|---|
+| Publish | signs, pushes, and opens a pull request; run ends `published` | the same, and the pull-request body states the limitation; run ends `published-without-reproduction` |
+| Send it back to the coder | back to `fix` with your words | back to `fix` with your words |
+| Finish without publishing | run ends `validated` | run ends `validated-without-reproduction` |
+
+Each gate binds itself to the review it is asking about, so the authorization
+covers the content that review actually read. The publishing answer names its
+three delivery steps explicitly; the other two authorize nothing. Nothing is
+preselected, and confirming a publishing answer happens against a preview of
+the real content, destination, identities, and final text — see
+[Ship flow](ship-flow.md).
+
+The workflow also suggests the pull-request title and body, rendered from the
+run's own evidence: the reported bug, the reproduction, the change, what QA
+checked, and what it could not cover. Under `approve-unreproduced` the body
+states plainly that the bug was never reproduced and records the operator's
+rationale. It is a suggestion — you edit it, and what you confirm is what is
+published.
+
+### 26. Review exhausted
+
+`review-exhausted` offers `stop` and nothing else, ending the run
+`stopped-unpublished`. Nothing was approved, so nothing can be published from
+that run.
 
 ### 11–13. The gates a person answers
 
@@ -240,14 +318,16 @@ answered back into the loop that exhausted it.
 
 ## Bounds
 
-Five steps carry a **three-attempt budget for the whole run**: `reproduce`,
-`diagnose`, `reproduce-informed`, `fix`, and `verify`. Each is declared on the
-step and enforced by the engine, which counts attempts *before* opening a new
-one — so the route predicate is not what stops a loop, and a mistake in one
-cannot make a loop run forever.
+Six steps carry a **three-attempt budget for the whole run**: `reproduce`,
+`diagnose`, `reproduce-informed`, `fix`, `verify`, and `review`. Each is
+declared on the step and enforced by the engine, which counts attempts *before*
+opening a new one — so the route predicate is not what stops a loop, and a
+mistake in one cannot make a loop run forever.
 
 Exhausting an investigation budget opens `investigation-exhausted`; exhausting
-`fix` or `verify` opens `correction-exhausted`. **No gate answer refills a
+`fix` or `verify` opens `correction-exhausted`; exhausting `review` opens
+`review-exhausted`. Review comments and an operator's requested changes both
+spend `fix`'s budget, so a run cannot be sent back indefinitely. **No gate answer refills a
 budget**: a `retry-diagnosis` answer given after `diagnose` has spent its three
 attempts reaches the exhaustion gate instead of opening a fourth. Verification
 retries consume the same three-attempt budget, so they can reduce how many fix
@@ -259,13 +339,18 @@ A daemon restart mid-attempt costs no visit.
 
 | Result | Meaning |
 |---|---|
-| `validated` | QA verified the fix against a reproduction it established |
-| `validated-without-reproduction` | QA verified what it could, but the bug was never demonstrated and an operator authorized the fix anyway |
+| `validated` | QA verified the fix against a reproduction it established, review approved it, and you chose not to publish |
+| `validated-without-reproduction` | The same, except the bug was never demonstrated and an operator authorized the fix anyway |
+| `published` | Reviewed, approved, and published as a pull request |
+| `published-without-reproduction` | Published, with the limitation stated in the pull-request body and in this result |
 | `stopped-without-fix` | The run stopped before a fix was authorized |
 | `stopped-unvalidated` | A fix exists or was attempted, but nothing validated it |
+| `stopped-unpublished` | Review did not approve, so nothing could be published |
 
 The run's ending is recorded on the task, so a finished bugfix says which of
-these it was rather than only that it stopped.
+these it was rather than only that it stopped. The result is the *workflow's*
+word for its ending; whether anything was actually signed, pushed, or opened is
+read from the delivery journal, and the two are shown separately.
 
 ## Failures and recovery
 
@@ -341,7 +426,13 @@ readable.
 
 A task old enough to predate retained definitions altogether cannot be
 continued onto this one: its results were recorded under format 1's
-success/failed envelope, which the format-2 contract cannot reinterpret, and it
-ran steps this definition does not declare. Ompire says so rather than
-migrating it. See
+success/failed envelope, which a contract that reads results by declared name
+cannot reinterpret, and it ran steps this definition does not declare. Ompire
+says so rather than migrating it.
+
+A task pinned to the earlier format-2 `bugfix` also **cannot publish**: that
+revision declares no delivery step, so nothing can authorize signing, pushing,
+or opening a pull request for it. It still runs to its own endings, and its
+work, history, and workspace are untouched. To get the reviewed-and-published
+procedure, launch a new task on the current `bugfix`. See
 [Compatibility across formats](workflow-engine.md#compatibility-across-formats).

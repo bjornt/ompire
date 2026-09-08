@@ -1310,5 +1310,71 @@ describe("choice gate", () => {
     expect(within(strip).getByTestId("workflow-chip-7")).toBeInTheDocument();
     expect(within(strip).getByTestId("workflow-chip-8")).toBeInTheDocument();
   });
+  it("sends a publishing answer to the one surface that can confirm it", async () => {
+    // A generic Resume cannot answer a privileged choice. The card shows what
+    // the answer would authorize and points at the preview the confirmation
+    // is checked against, rather than offering a button the daemon refuses.
+    stubFetch();
+    await renderDetail(twoSessionSnapshots.sessions, {
+      "1": {
+        name: "single-step",
+        status: "waiting",
+        step: "approve",
+        steps: [
+          {
+            task_id: 1,
+            seq: 2,
+            step: "approve",
+            kind: "gate",
+            session: null,
+            status: "waiting",
+            outcome: {
+              version: 2,
+              message: "Publish?",
+              choices: [
+                {
+                  id: "finish",
+                  label: "Finish without publishing",
+                  feedback_required: false,
+                  next: { complete: true, result: "done" },
+                  authorize: null,
+                },
+                {
+                  id: "publish",
+                  label: "Open a pull request",
+                  feedback_required: false,
+                  next: { step: "commit" },
+                  authorize: { steps: ["commit", "push", "pr"] },
+                },
+              ],
+              evidence: {},
+            },
+            error: null,
+            pause: null,
+            prompted_at: null,
+            started_at: "t1",
+            finished_at: null,
+          },
+        ],
+      },
+    });
+
+    const user = userEvent.setup();
+    expect(screen.getByTestId("gate-choice-authorizes-publish")).toHaveTextContent(
+      "authorizes commit → push → pr",
+    );
+
+    await user.click(
+      screen.getByTestId("gate-choice-publish").querySelector("input")!,
+    );
+    expect(screen.getByTestId("gate-choice-needs-preview")).toBeInTheDocument();
+    expect(screen.getByTestId("gate-ship-link")).toHaveAttribute("href", "/ship/1");
+    expect(screen.getByTestId("gate-answer")).toBeDisabled();
+
+    // The answer that publishes nothing is still answerable right here.
+    await user.click(screen.getByTestId("gate-choice-finish").querySelector("input")!);
+    expect(screen.queryByTestId("gate-choice-needs-preview")).not.toBeInTheDocument();
+    expect(screen.getByTestId("gate-answer")).toBeEnabled();
+  });
 });
 

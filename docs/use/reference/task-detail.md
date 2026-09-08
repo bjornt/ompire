@@ -69,11 +69,17 @@ It does not follow the selected transcript tab or the session currently used
 by a workflow step. This keeps review and the next publishing handoff attached
 to the task that owns them.
 
-Before review starts, the panel says why it is unavailable or offers **Start
-review** only when the primary session is idle and has a live agent. Starting
-locks the action as **Starting…** until the daemon reports the review. If the
-command is refused or fails, its error remains inline and the operator can
-retry when the displayed state permits it.
+**Who starts a review depends on the workflow.** When the task's pinned
+definition declares its own `review` step, the panel is a read-only view of
+what the run is doing: no **Start review** button, and a line saying that the
+run starts the review when it reaches that step — reviewing at another moment
+would grade content the run is still changing.
+
+When the definition declares none, the panel drives review. It says why review
+is unavailable, or offers **Start review** when the primary session is idle and
+has a live agent. Starting locks the action as **Starting…** until the daemon
+reports the review. If the command is refused or fails, its error remains
+inline and the operator can retry when the displayed state permits it.
 
 While independent review is open, the full llmvet URL is a keyboard-accessible
 external link and **Cancel review** is available. Cancellation similarly stays
@@ -85,10 +91,11 @@ has no live reviewer, so the panel offers no llmvet link for it. See
 [Review](review.md#retention-and-restart).
 
 The panel updates from the main daemon stream without a reload. It distinguishes
-an open review, comments returned to the agent, approval, abort, review error,
-and a reviewer interrupted by a daemon restart. When comments are returned, it says the primary agent is addressing
-them; after that session returns to idle, **Start another review** becomes
-available. It exposes the task's Ship flow link when review is approved, the
+an open review, comments, approval, abort, review error, and a reviewer
+interrupted by a daemon restart. Where the workflow declares its own review,
+comments go to the correction step the definition names and the run opens the
+next review itself; where it does not, comments go to the primary agent and
+**Start another review** becomes available once that session returns to idle. It exposes the task's Ship flow link when review is approved, the
 daemon has recorded a delivery, or the task has a pull request. The link reads
 **Continue to Ship flow** only when the approval still covers the content that
 would be published; a superseded approval reads **Open Ship flow**, because the
@@ -224,6 +231,13 @@ leads to. Nothing is selected for you, so opening the card authorizes nothing,
 and the submit action stays disabled until you choose. A choice that declares a
 required reason cannot be submitted without one, and the card says which choice
 is asking. There is no generic Resume to bypass the choices with.
+
+An answer that **authorizes publication** says so: the card names the exact
+actions it would permit, and answering it here is not offered. It needs the
+content, destination, identities, and final text the authorization is checked
+against, so the card links to [Ship flow](ship-flow.md), where that preview and
+the confirmation live. Every other answer at the same question — including
+finishing without publishing — is answerable right here.
 
 A **gate without them** (a format-1 workflow) shows its message, an optional
 note, and a Resume action.

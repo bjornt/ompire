@@ -28,10 +28,10 @@ _prs_with_marker() { # _prs_with_marker MARKER — how many PRs carry it
 		"$STATE_ROOT/gh/prs.json"
 }
 
-_ready() { # _ready TASK
+_ready() { # _ready TASK — up to the run's own publication decision
 	local tid=$1
-	wait_for "work step completes ($tid)" 180 workflow_complete "$tid"
-	approve_review "$tid"
+	approve_run_review "$tid"
+	wait_for "run $tid reaches its publication decision" 180 at_approval "$tid"
 	$GPGCTL warm
 }
 
@@ -42,19 +42,24 @@ _ready "$tid"
 branch=$(task_field "$tid" branch)
 clone=$(task_field "$tid" clone_path)
 
-# Sign locally first, so there is a signed result to talk about.
-ship_deliver "$tid" commit squash "ship: lost push reply" "" ""
-wait_for "the local ending completes" 120 ship_done "$tid" commit
+# Authorize the push chain, and make the first push attempt fail so the run
+# stops holding a signed result with an outstanding action. That is the state
+# a lost reply leaves behind, and the one a continuation has to be safe in.
+$FORGE reject-push local-test/sandbox >/dev/null
+ship_deliver "$tid" push-branch "ship: lost push reply" "" ""
+wait_for "the refused push stops the delivery" 120 ship_blocked "$tid"
 signed_tip=$(ship_field "$tid" '.results.commit.signed_tip')
+[ -n "$signed_tip" ] || fail "signed result before the push" "$(ship_field "$tid" '.results')"
 
-# A previous attempt's push landed and its reply was lost: the destination
-# already holds exactly the head this delivery is authorized to write.
+# The push actually landed; only the reply was lost. The destination already
+# holds exactly the head this delivery is authorized to write.
+# `reject-push` is one-shot, so the destination is writable again.
 git -C "$clone" push --quiet "$BARE" "$signed_tip:refs/heads/$branch" ||
 	die "could not seed the destination with the signed head"
 receives_before=$($FORGE receives local-test/sandbox)
 
-ship_deliver "$tid" push squash "" "" ""
-wait_for "the delivery resolves the already-landed push" 120 ship_done "$tid" push
+ship_continue "$tid" "ship: lost push reply" "" ""
+wait_for "the continuation resolves the already-landed push" 120 ship_done "$tid" push
 
 [ "$(git -C "$BARE" rev-parse "refs/heads/$branch")" = "$signed_tip" ] &&
 	ok "the forge holds exactly the authorized signed head" ||
@@ -72,7 +77,7 @@ tid2=$(spawn_task "$(unique_slug lostpr)" "[[scenario:commit]]\nLost-PR E2E: do 
 _ready "$tid2"
 
 $GHCTL lose-next create >/dev/null
-ship_deliver "$tid2" pr squash "ship: lost create reply" "Lost reply" "b"
+ship_deliver "$tid2" open-pr "ship: lost create reply" "Lost reply" "b"
 wait_for "the delivery resolves the lost pull request" 120 ship_done "$tid2" pr
 
 # The marker Ompire actually authorized, read back from the attempt that used
@@ -99,7 +104,7 @@ _ready "$tid3"
 # The pull request is created and both the reply and the lookup are lost.
 $GHCTL lose-next create >/dev/null
 $GHCTL lose-next list >/dev/null
-ship_deliver "$tid3" pr squash "ship: unknown outcome" "Unknown" "b"
+ship_deliver "$tid3" open-pr "ship: unknown outcome" "Unknown" "b"
 wait_for "the unknown outcome blocks the task" 120 ship_unresolved "$tid3" pr
 ok "the effect is recorded as unresolved: $(ship_field "$tid3" '.blocked_reason')"
 [ -z "$(task_field "$tid3" pr_url)" ] &&

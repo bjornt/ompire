@@ -1,0 +1,49 @@
+# One agent step and a named ending: the work, and nothing after it.
+#
+# Runbooks about agent behavior, session events, mentions, stalls, and crash
+# recovery use this rather than a packaged workflow. The packaged ones are
+# complete procedures — they review, ask, and can publish — which is right for
+# them and wrong as a vehicle for a test about something else entirely.
+format: 3
+name: work-only
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    role: default
+    outcome: null
+    prompt:
+      separator: ""
+      parts:
+        - if:
+            op: ne
+            left: {op: input, name: task.prompt}
+            right: {op: literal, value: ""}
+          then:
+            separator: ""
+            parts:
+              - if:
+                  op: ne
+                  left: {op: input, name: workspace.preamble}
+                  right: {op: literal, value: ""}
+                then:
+                  separator: ""
+                  parts:
+                    - value: {op: input, name: workspace.preamble}
+                      format: text
+                    - text: "\n\n"
+                else:
+                  parts: []
+              - value: {op: input, name: task.prompt}
+                format: text
+          else:
+            parts: []
+
+  - name: finish
+    kind: decision
+    cases:
+      - when: true
+        next: {complete: true, result: done}
+    otherwise: {complete: true, result: done}

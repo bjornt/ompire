@@ -106,6 +106,15 @@ class ReviewContentError(ReviewError):
     about the workspace, not a reviewer failure."""
 
 
+class ReviewNotEligibleError(ReviewError):
+    """The run's own procedure says this is not when review happens."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.detail = detail
+
+
 class ReviewAlreadyOpenError(ReviewError):
     def __init__(self, task_id: int) -> None:
         super().__init__(f"task {task_id} already has an open review")
@@ -119,6 +128,9 @@ class ReviewIteration:
     comment_count: int | None = None
     stderr: str | None = None
     candidate_id: str | None = None
+    workflow_seq: int | None = None
+    findings: str | None = None
+    findings_state: str | None = None
     recorded_at: str = field(default_factory=_now_iso)
 
 
@@ -132,6 +144,7 @@ class ReviewState:
     url: str | None
     port: int | None
     candidate_id: str | None = None
+    workflow_seq: int | None = None
     iterations: list[ReviewIteration] = field(default_factory=list)
 
 
@@ -160,6 +173,47 @@ class ReviewManager:
         self._watchers: dict[int, asyncio.Task] = {}
         self._port_lock = asyncio.Lock()
         self._event_task: asyncio.Task | None = None
+        # Runtime only: futures a workflow run parks on while its review step
+        # is outstanding. They carry nothing — the durable iteration is the
+        # verdict — so a restart that loses them loses no decision.
+        self._completions: dict[int, asyncio.Future[None]] = {}
+
+    def _mark_session_reviewing(self, task: Task, reason: str) -> None:
+        """Show the primary session as reviewing, when there is one.
+
+        A workflow may reach review with no agent alive — a command-only flow,
+        or one whose sessions are between turns. The review is a host-side
+        operation on the workspace, not something an agent does, so the absence
+        of a session is not a reason to refuse it; the display simply has
+        nothing to mark.
+        """
+        primary = self._primary_session(task)
+        if self._sessions.get(task.id, primary) is not None:
+            self._sessions.review_opened(task.id, primary, reason)
+
+    def _mark_session_reviewed(self, task: Task, reason: str) -> None:
+        primary = self._primary_session(task)
+        if self._sessions.get(task.id, primary) is not None:
+            self._sessions.review_closed(task.id, primary, reason)
+
+    def watch_completion(self, task_id: int) -> asyncio.Future[None]:
+        """A future resolved when this task's review round lands durably.
+
+        Deliberately valueless. The runner reads the recorded iteration after
+        it wakes, so an answer written while nobody was parked is not lost and
+        a duplicate wake-up cannot advance anything twice.
+        """
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        existing = self._completions.get(task_id)
+        if existing is not None and not existing.done():
+            existing.cancel()
+        self._completions[task_id] = future
+        return future
+
+    def _notify_completion(self, task_id: int) -> None:
+        future = self._completions.pop(task_id, None)
+        if future is not None and not future.done():
+            future.set_result(None)
 
     def _primary_session(self, task: Task) -> str:
         """Review attaches to the primary session *this task's pinned
@@ -193,15 +247,9 @@ class ReviewManager:
                 "url": url,
                 "port": port,
                 "candidate_id": record.candidate_id,
+                "workflow_seq": record.workflow_seq,
                 "iterations": [
-                    {
-                        "outcome": it.outcome,
-                        "comment_count": it.comment_count,
-                        "stderr": it.stderr,
-                        "candidate_id": it.candidate_id,
-                        "recorded_at": it.recorded_at,
-                    }
-                    for it in record.iterations
+                    self._iteration_payload(it) for it in record.iterations
                 ],
             }
         return payload
@@ -216,12 +264,16 @@ class ReviewManager:
             url=url,
             port=port,
             candidate_id=record.candidate_id,
+            workflow_seq=record.workflow_seq,
             iterations=[
                 ReviewIteration(
                     outcome=it.outcome,
                     comment_count=it.comment_count,
                     stderr=it.stderr,
                     candidate_id=it.candidate_id,
+                    workflow_seq=it.workflow_seq,
+                    findings=it.findings,
+                    findings_state=it.findings_state,
                     recorded_at=it.recorded_at,
                 )
                 for it in record.iterations
@@ -287,7 +339,9 @@ class ReviewManager:
 
     # --- public lifecycle ---------------------------------------------------
 
-    async def start_review(self, task: Task) -> ReviewState:
+    async def start_review(
+        self, task: Task, *, workflow_seq: int | None = None
+    ) -> ReviewState:
         """Capture what this task would publish, then review exactly that.
 
         The workspace guard is taken before the capture and held by the
@@ -295,10 +349,25 @@ class ReviewManager:
         its candidate is being resolved. Ownership is explicit rather than
         scoped to this coroutine because the reviewer outlives the call; the
         watcher releases it.
+
+        `workflow_seq` names the review step waiting on this round. It is
+        persisted with the process marker, before llmvet starts, so an
+        interrupted reviewer can be resolved against the attempt that asked
+        for it rather than against wherever the run happens to be later. A
+        review with no step behind it is an operator's own, and says so.
         """
         task_id = task.id
         if task_id in self._processes:
             raise ReviewAlreadyOpenError(task_id)
+        if workflow_seq is None:
+            # A direct call gets the same admission a REST request does: a
+            # workflow that owns its review starts it at the step that
+            # declares one, and nowhere else.
+            from ompire_daemon.runauthority import resolve_authority, review_admission
+
+            refusal = review_admission(resolve_authority(self._engine, task), task)
+            if refusal is not None:
+                raise ReviewNotEligibleError(refusal[0], refusal[1])
 
         base_branch = self._base_branch(task)
         self._guard.acquire(task_id, "review")
@@ -323,14 +392,18 @@ class ReviewManager:
         # is grading, and stamps the write-ahead process marker, so a crash
         # between here and the first frame is recoverable as an interrupted
         # review rather than a lost one.
-        open_review(self._engine, task_id, candidate_id=candidate.candidate_id)
+        open_review(
+            self._engine,
+            task_id,
+            candidate_id=candidate.candidate_id,
+            workflow_seq=workflow_seq,
+        )
         self._runtime[task_id] = (url, port)
         self._views[task_id] = str(view)
         state = self.get(task_id)
         assert state is not None
 
-        primary = self._primary_session(task)
-        self._sessions.review_opened(task_id, primary, f"llmvet review on {url}")
+        self._mark_session_reviewing(task, f"llmvet review on {url}")
         self._hub.publish(
             "review_started",
             {
@@ -338,11 +411,14 @@ class ReviewManager:
                 "url": url,
                 "port": port,
                 "candidate_id": candidate.candidate_id,
+                "workflow_seq": workflow_seq,
             },
         )
 
         watcher = asyncio.create_task(
-            self._watch_review(task_id, task, port, str(view), candidate)
+            self._watch_review(
+                task_id, task, port, str(view), candidate, workflow_seq
+            )
         )
         self._watchers[task_id] = watcher
         watcher.add_done_callback(lambda t: self._pop_watcher(task_id, t))
@@ -433,6 +509,7 @@ class ReviewManager:
         port: int,
         view_path: str,
         candidate: CandidateRecord,
+        workflow_seq: int | None = None,
     ) -> None:
         process: asyncio.subprocess.Process | None = None
         try:
@@ -462,6 +539,7 @@ class ReviewManager:
                 task,
                 outcome="error",
                 candidate_id=candidate.candidate_id,
+                workflow_seq=workflow_seq,
                 stderr=f"failed to launch llmvet: {exc}",
                 close_session=True,
             )
@@ -484,7 +562,13 @@ class ReviewManager:
         assert code is not None
         try:
             await self._interpret_exit(
-                task_id, task, code, stdout, stderr, candidate.candidate_id
+                task_id,
+                task,
+                code,
+                stdout,
+                stderr,
+                candidate.candidate_id,
+                workflow_seq,
             )
         finally:
             self._guard.release(task_id, "review")
@@ -497,6 +581,7 @@ class ReviewManager:
         stdout: str,
         stderr: str,
         candidate_id: str | None = None,
+        workflow_seq: int | None = None,
     ) -> None:
         if get_review(self._engine, task_id) is None:
             return
@@ -509,59 +594,41 @@ class ReviewManager:
                     outcome="approved",
                     comment_count=0,
                     candidate_id=candidate_id,
+                    workflow_seq=workflow_seq,
+                    findings="",
                     close_session=True,
                 )
                 return
             # Comments: count `> `-blockquoted segments as a best-effort
-            # display number; fall back to a generic label.
+            # display number; fall back to a generic label. The report itself
+            # is retained whole — the count was never the reviewer's opinion.
             comment_count = stdout.count("> ")
-            # Durable before broadcast. The review stays `open` — its comments
-            # are with the agent — but its process marker is already cleared,
-            # so a restart restores this as comments rather than interrupted.
+            # Durable before broadcast, and before anything is told about it.
+            # The review stays `open` — a correction and a re-review are the
+            # same review — but its process marker is already cleared, so a
+            # restart restores this as comments rather than interrupted.
             record = append_iteration(
                 self._engine,
                 task_id,
                 outcome="comments",
                 comment_count=comment_count if comment_count > 0 else None,
                 candidate_id=candidate_id,
+                workflow_seq=workflow_seq,
+                findings=stdout,
             )
             self._hub.publish(
                 "review_iteration",
                 {"task_id": task_id, "iteration": self._iteration_payload(record)},
             )
-            # Comments loop back to the primary session (workflow-engine D-8),
-            # on whatever model policy that session last applied (ADR-0027) —
-            # taken inside the session boundary so a concurrent policy handoff
-            # cannot hand back a child it is already retiring.
-            # Ownership goes back before the agent is prompted. The reviewer
-            # is finished with the workspace, and the correction turn has to be
-            # admitted on its own — inheriting the reviewer's hold would let it
-            # write during a review, and holding it would deadlock the handoff.
-            with self._guard.released(task_id, "review"):
-                handle = await self._agents.acquire(
-                    task_id, self._primary_session(task)
-                )
-                if handle is None:
-                    await self._finalize(
-                        task_id,
-                        task,
-                        outcome="error",
-                        candidate_id=candidate_id,
-                        stderr="no live agent to receive review comments",
-                        close_session=False,
-                    )
-                    return
-                try:
-                    await handle.prompt(stdout)
-                except (AgentGoneError, RequestFailedError) as exc:
-                    await self._finalize(
-                        task_id,
-                        task,
-                        outcome="error",
-                        candidate_id=candidate_id,
-                        stderr=f"failed to send review comments to agent: {exc}",
-                        close_session=False,
-                    )
+            if workflow_seq is not None:
+                # A workflow owns what happens next. The findings are recorded
+                # evidence its declared correction step reads; pushing them
+                # into an agent from here would be a turn nobody declared,
+                # against a session the definition may not even route to.
+                self._mark_session_reviewed(task, "review returned comments")
+                self._notify_completion(task_id)
+                return
+            await self._loop_back_comments(task_id, task, stdout, candidate_id)
             return
 
         if code == 130:
@@ -570,6 +637,7 @@ class ReviewManager:
                 task,
                 outcome="aborted",
                 candidate_id=candidate_id,
+                workflow_seq=workflow_seq,
                 close_session=True,
             )
             return
@@ -579,9 +647,50 @@ class ReviewManager:
             task,
             outcome="error",
             candidate_id=candidate_id,
+            workflow_seq=workflow_seq,
             stderr=stderr if stderr.strip() else f"llmvet exited with code {code}",
             close_session=True,
         )
+
+    async def _loop_back_comments(
+        self, task_id: int, task: Task, stdout: str, candidate_id: str | None
+    ) -> None:
+        """Hand review comments straight to the primary session.
+
+        The pre-format-3 behavior, kept for the definitions that were written
+        against it: a format-1 or format-2 run has no `review` step and no
+        declared correction route, so comments reaching nobody would strand
+        the task. A format-3 run never comes here — its correction is a step
+        an author wrote, which is the whole point of making review declarable.
+
+        Ownership goes back before the agent is prompted. The reviewer is
+        finished with the workspace, and the correction turn has to be admitted
+        on its own: inheriting the reviewer's hold would let it write during a
+        review, and holding it would deadlock the handoff.
+        """
+        with self._guard.released(task_id, "review"):
+            handle = await self._agents.acquire(task_id, self._primary_session(task))
+            if handle is None:
+                await self._finalize(
+                    task_id,
+                    task,
+                    outcome="error",
+                    candidate_id=candidate_id,
+                    stderr="no live agent to receive review comments",
+                    close_session=False,
+                )
+                return
+            try:
+                await handle.prompt(stdout)
+            except (AgentGoneError, RequestFailedError) as exc:
+                await self._finalize(
+                    task_id,
+                    task,
+                    outcome="error",
+                    candidate_id=candidate_id,
+                    stderr=f"failed to send review comments to agent: {exc}",
+                    close_session=False,
+                )
 
     async def _finalize(
         self,
@@ -592,6 +701,8 @@ class ReviewManager:
         comment_count: int | None = None,
         stderr: str | None = None,
         candidate_id: str | None = None,
+        workflow_seq: int | None = None,
+        findings: str | None = None,
         close_session: bool,
     ) -> None:
         if get_review(self._engine, task_id) is None:
@@ -608,6 +719,8 @@ class ReviewManager:
             stderr=stderr,
             status=outcome,
             candidate_id=candidate_id,
+            workflow_seq=workflow_seq,
+            findings=findings,
         )
         self._hub.publish(
             "review_iteration",
@@ -615,17 +728,29 @@ class ReviewManager:
         )
         self._hub.publish("review_finished", {"task_id": task_id, "status": outcome})
         if close_session:
-            self._sessions.review_closed(
-                task_id, self._primary_session(task), f"review {outcome}"
-            )
+            self._mark_session_reviewed(task, f"review {outcome}")
+        # Last, and always: the run parked on this review is woken only after
+        # its verdict is durable, so what it reads is what was committed.
+        self._notify_completion(task_id)
 
     @staticmethod
-    def _iteration_payload(iteration: ReviewIteration | ReviewIterationRecord) -> dict[str, Any]:
+    def _iteration_payload(
+        iteration: ReviewIteration | ReviewIterationRecord,
+    ) -> dict[str, Any]:
+        """One iteration as every reader sees it.
+
+        `findings` travels with `findings_state`, never alone: a client that
+        showed the text without knowing whether it is the whole report would
+        present a truncated capture as the reviewer's complete opinion.
+        """
         return {
             "outcome": iteration.outcome,
             "comment_count": iteration.comment_count,
             "stderr": iteration.stderr,
             "candidate_id": iteration.candidate_id,
+            "workflow_seq": iteration.workflow_seq,
+            "findings": iteration.findings,
+            "findings_state": iteration.findings_state,
             "recorded_at": iteration.recorded_at,
         }
 
@@ -763,11 +888,17 @@ def restore_reviews(engine: Engine) -> list[int]:
     """
     interrupted: list[int] = []
     for record in list_interrupted_candidates(engine):
+        # Bound to the attempt that asked for it, and to the candidate it was
+        # reading. An interrupted review is an honest result for *that* step:
+        # its declared retry-or-stop route can then be taken without anyone
+        # relaunching a reviewer on the operator's behalf.
         append_iteration(
             engine,
             record.task_id,
             outcome="interrupted",
             status="aborted",
+            candidate_id=record.candidate_id,
+            workflow_seq=record.workflow_seq,
         )
         clear_process_marker(engine, record.task_id)
         interrupted.append(record.task_id)

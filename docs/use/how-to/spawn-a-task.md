@@ -47,10 +47,17 @@ the prompt, and submit.
 
 Beside the form, Ompire lists every step the workflow declares with the model
 and thinking level each one would use. Steps that never reach a model — a
-command, a decision, a human gate — are shown without one. A step a route can
-pass by, or that has its own condition, is marked *conditional*. It is a list
-of what the run *may* do, not a promise about the path it will take. Every
-model consumer is one of these rows; nothing runs a model outside them.
+command, a decision, a human gate, a review, a publication action — are shown
+without one. A step a route can pass by, or that has its own condition, is
+marked *conditional*. It is a list of what the run *may* do, not a promise
+about the path it will take. Every model consumer is one of these rows; nothing
+runs a model outside them.
+
+It also states **what this workflow could publish**: which privileged effects
+it declares and which decision would have to authorize each — or that it
+publishes nothing, which is worth knowing before you launch rather than after.
+Launching accepts the procedure, not permission to publish; that decision is
+made later, against the real content.
 
 The preview also names the workflow **revision** it would pin: the content
 identity of the exact definition, which the task then executes for its whole
@@ -237,7 +244,8 @@ not a new conversation and not a failure.
 
 Open **Workflows**. There is no daemon release and no restart in this loop.
 
-1. **Start from something.** *New workflow* opens a minimal format-2 example;
+1. **Start from something.** *New workflow* opens a minimal format-3 example
+   that publishes nothing;
    *Duplicate* copies a saved revision — including a packaged one — under a name
    you choose; *Import YAML…* reads a local file into the editor. You can also
    paste. The name is permanent and cannot collide with a built-in or with an
@@ -285,6 +293,37 @@ the text editor to write a branching workflow.
   a reason.
 - **Visit bounds** are declared with the gate they reach when they run out, so
   a loop that stops asks somebody rather than ending quietly.
+- **Review** is a card with no instruction and no model: independent review of
+  what the task would publish. Its verdict — approved, comments, aborted,
+  error, interrupted — is evidence the steps after it route on, so you decide
+  what a comments verdict does rather than the daemon deciding for you.
+- **Publication** is one card per effect: a local signed commit, a push, a pull
+  request. Each names the approval that can permit it and the action whose
+  result it consumes.
+
+### Ending a workflow with a publication
+
+A workflow publishes nothing until you say how. Four cards:
+
+1. A **review** step, reading the work.
+2. A **gate** whose *delivery binding* names which of its own evidence aliases
+   is that review. That binding is what makes the decision about the content
+   the reviewer actually read. Here you can also write the commit message and
+   pull-request text the workflow suggests — built from the run's own evidence,
+   and editable by the operator before anything is published.
+3. One **answer** on that gate that names the exact actions it authorizes:
+   `commit`, then optionally `push`, then optionally `pr`. There must always be
+   another answer that publishes nothing.
+4. The **delivery** cards themselves, in that order, the last of which ends the
+   run at a named result.
+
+The editor and the daemon check the shape for you: an answer must go straight
+to the first action it grants, every action must name the same approval and its
+own predecessor, and nothing else in the workflow may route into the chain. If
+you want two endings — say "commit locally" and "open a pull request" — write
+two answers with two separate chains. An answer authorizes the actions it
+names, never publication in general, and never grows into a longer ending
+afterwards.
 
 Renaming a step or an agent moves the routes, selectors, and assignments that
 name it, and leaves instructions and literal values alone. Removing a step
@@ -293,8 +332,11 @@ visible as broken ones instead of being quietly repaired.
 
 Two things are the same in both views and editable in neither. The workflow's
 **name** is the entry's identity — renaming means creating a separate workflow
-— and its **format** is the rules it is read under, so an existing format-1
-workflow keeps being read as format 1 rather than being upgraded.
+— and its **format** is the rules it is read under, so an existing format-1 or
+format-2 workflow keeps being read under its own format rather than being
+upgraded. That includes not being able to publish: review and delivery steps
+exist only in format 3, so to publish from an older workflow, duplicate it into
+a new one and add them.
 
 Once you change something visually, saving rewrites the document: its layout is
 normalized and YAML comments are dropped. What it means does not change.

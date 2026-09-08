@@ -9,6 +9,13 @@ import type {
 } from "../types";
 
 export type ShipFlowStage =
+  /** The run is at its approval: the work is reviewed, and a person decides
+   * what happens to it. Distinct from `deliver`, which is an authorization
+   * already given and now being carried out. */
+  | "approval"
+  /** A named ending with no publication in it. Complete work, not a stalled
+   * delivery — an author-chosen result, and the Ship index says so. */
+  | "no-publication"
   | "review"
   | "draft"
   | "deliver"
@@ -42,6 +49,8 @@ export interface ShipIndexEntry extends ShipFlowPresentation {
 
 const STAGE_LABELS: Record<ShipFlowStage, string> = {
   review: "Review",
+  approval: "Waiting for your decision",
+  "no-publication": "Finished without publishing",
   draft: "Draft",
   deliver: "Deliver",
   unresolved: "Needs a decision",
@@ -155,6 +164,7 @@ function stageFor(
   ship: ShipProjection | undefined,
 ): ShipFlowStage {
   if (unresolvedActions(ship).length > 0) return "unresolved";
+  const authority = ship?.authority;
 
   const prUrl = task.pr_url ?? ship?.pr_url ?? null;
   if (prUrl) {
@@ -176,6 +186,20 @@ function stageFor(
 
   if (ship?.disposition === "authorized" || ship?.disposition === "blocked") {
     return "deliver";
+  }
+  // Nothing has been published, and the run is asking. This is the one stage
+  // where the next move is a person's, so it is named for the decision rather
+  // than for a drafting step nobody asked for.
+  if (authority?.source === "workflow-gate") return "approval";
+  // A workflow that declares no publication is finished when its run is, and
+  // that is a real ending rather than a delivery nobody got round to.
+  if (
+    authority !== undefined &&
+    authority.declared_actions.length === 0 &&
+    authority.format !== null &&
+    (task.workflow_status === "complete" || task.workflow_status === "failed")
+  ) {
+    return "no-publication";
   }
   if (ship?.draft != null) return "draft";
   return review?.status === "approved" ? "draft" : "review";
@@ -207,6 +231,18 @@ function detailFor(
   if (error !== null) return `Delivery stopped: ${error}`;
 
   switch (stage) {
+    case "approval": {
+      const grants = (ship?.authority?.choices ?? []).filter(
+        (choice) => choice.authorizes !== null,
+      );
+      return grants.length === 0
+        ? "This run is waiting for your decision. None of its answers publishes anything."
+        : `This run is waiting for your decision. Publishing answers: ${grants
+            .map((choice) => choice.label)
+            .join("; ")}.`;
+    }
+    case "no-publication":
+      return "This workflow declares no publication. Its work is complete and nothing was published — which is the ending it was written to reach.";
     case "review":
       return "An approved review of the current content is required before delivering.";
     case "draft":

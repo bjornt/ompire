@@ -2581,6 +2581,45 @@ describe("ShipFlowView", () => {
     actions: [],
     decisions: [],
     history: [],
+    authority: authorityAtApproval(),
+    ...overrides,
+  });
+
+  /** A run waiting at an approval that can publish through a pull request.
+   *
+   * Every ship projection carries one now: the page reads what the run's own
+   * procedure permits rather than offering a menu of endings. */
+  const authorityAtApproval = (overrides: Record<string, unknown> = {}) => ({
+    format: 3,
+    source: "workflow-gate",
+    declared_actions: ["commit", "push", "pr"],
+    declares_review: true,
+    gate_seq: 5,
+    gate_step: "approve",
+    review_seq: 4,
+    review_outcome: "approved",
+    choices: [
+      {
+        id: "finish",
+        label: "Finish without publishing",
+        feedback_required: false,
+        authorizes: null,
+      },
+      {
+        id: "publish",
+        label: "Open a pull request",
+        feedback_required: false,
+        authorizes: ["commit", "push", "pr"],
+      },
+    ],
+    suggested: {},
+    action_seq: null,
+    action_step: null,
+    action_kind: null,
+    awaiting_continuation: false,
+    review_step_seq: null,
+    refusal_code: null,
+    refusal: null,
     ...overrides,
   });
 
@@ -2607,6 +2646,11 @@ describe("ShipFlowView", () => {
     ending: "commit",
     mode: "squash",
     request_id: "req-x",
+    source: "workflow-gate",
+    gate_seq: 5,
+    choice_id: "publish",
+    review_seq: 4,
+    actions: ["commit"],
     candidate_id: "cand-1",
     candidate: {
       candidate_id: "cand-1",
@@ -2675,7 +2719,9 @@ describe("ShipFlowView", () => {
 
     const row = await screen.findByTestId("ship-index-row-1");
     expect(row).toHaveAttribute("href", "/ship/1");
-    expect(row).toHaveTextContent("Next: Draft");
+    // The run is waiting for a person, and the index says so rather than
+    // calling it a drafting step nobody asked for.
+    expect(row).toHaveTextContent("Next: Waiting for your decision");
   });
 
   it("waits for the daemon snapshot before rendering the bare Ship flow index", () => {
@@ -2947,24 +2993,13 @@ describe("ShipFlowView", () => {
     );
   });
 
-  it("shows the concrete signed result and offers a later push", async () => {
-    const user = userEvent.setup();
-    const fetchMock = vi.fn().mockImplementation((url: string) => {
-      if (url === "/api/tasks/1/ship/preview") {
-        return Promise.resolve({
-          ok: true,
-          json: () =>
-            Promise.resolve(
-              previewBody({
-                ending: "push",
-                completed_actions: ["commit"],
-                remaining_actions: ["push"],
-              }),
-            ),
-        });
-      }
-      return Promise.resolve({ ok: true, json: () => Promise.resolve(projection()) });
-    });
+  it("shows the concrete signed result and refuses to widen the ending", async () => {
+    // The old page let an operator turn a finished commit into a push. That
+    // is gone: how far a delivery goes is what the workflow declared and what
+    // a person authorized, and a completed narrower ending stays narrow.
+    const fetchMock = vi.fn().mockImplementation(() =>
+      Promise.resolve({ ok: true, json: () => Promise.resolve(projection()) }),
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     await renderAt("/ship/1", {
@@ -2985,38 +3020,32 @@ describe("ShipFlowView", () => {
               installed: true,
             },
           },
+          authority: authorityAtApproval({
+            source: null,
+            declared_actions: ["commit"],
+            gate_seq: null,
+            gate_step: null,
+            choices: [],
+            refusal_code: "not-at-gate",
+            refusal:
+              "this run is not waiting at an approval that authorizes publication, and has no authorized action outstanding.",
+          }),
         }),
       },
     });
 
     expect(screen.getByTestId("result-commit")).toHaveTextContent("Signed commit at ssssssssssss");
     expect(screen.getByTestId("no-pr-notice")).toHaveTextContent("No pull request was opened");
-    // The commit ending is done, so it cannot be chosen again.
-    expect(screen.getByTestId("ending-commit")).toBeDisabled();
-
-    await user.click(screen.getByTestId("ending-push"));
-    await user.click(screen.getByTestId("preview-delivery-button"));
-    await screen.findByTestId("delivery-preview");
-    // A continuation must not claim it will sign: that already happened.
-    expect(screen.getByTestId("confirm-delivery-button")).toHaveTextContent(
-      "Confirm: push",
+    // There is no ending menu to widen, and the refusal says why.
+    expect(screen.queryByTestId("ending-chooser")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("ending-push")).not.toBeInTheDocument();
+    expect(screen.getByTestId("delivery-refusal")).toHaveTextContent(
+      "not waiting at an approval",
     );
-    expect(screen.getByTestId("confirm-delivery-button")).not.toHaveTextContent("sign");
-    await user.click(screen.getByTestId("confirm-delivery-button"));
-
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/push")).toHaveLength(
-        1,
-      ),
-    );
-    const body = JSON.parse(
-      fetchMock.mock.calls.find(([url]) => url === "/api/tasks/1/ship/push")?.[1].body as string,
-    );
-    expect(body).toMatchObject({ ending: "push", delivery_id: 10, expected_version: 1 });
-    // Continuation never re-enters the commit action.
-    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/commit")).toHaveLength(
-      0,
-    );
+    // And nothing was asked of the daemon on the operator's behalf.
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url).includes("/ship/")),
+    ).toHaveLength(0);
   });
 
   it("offers explicit decisions for an effect whose outcome is unknown", async () => {
@@ -3098,12 +3127,94 @@ describe("ShipFlowView", () => {
             state: "interrupted",
             error: "the daemon restarted while the agent was drafting",
           },
+          // A workflow that declares no publication of its own is the only
+          // one that still drafts through an agent.
+          authority: authorityAtApproval({
+            source: null,
+            declared_actions: [],
+            gate_seq: null,
+            gate_step: null,
+            choices: [],
+          }),
         }),
       },
     });
 
     expect(screen.getByTestId("draft-status")).toHaveTextContent("Nothing was sent again");
     expect(screen.getByTestId("commit-message")).toHaveValue("half a message");
+  });
+
+  it("asks the run's own question, and publishes only what an answer grants", async () => {
+    // The whole slice, from the operator's side: the page shows the decision
+    // the run is at, nothing is preselected, and the confirmation carries the
+    // question and the answer rather than an ending somebody typed.
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url === "/api/tasks/1/ship/preview") {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve(
+              previewBody({
+                ending: "pr",
+                actions: ["commit", "push", "pr"],
+                remaining_actions: ["commit", "push", "pr"],
+                pr_title: "A change",
+              }),
+            ),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(projection()) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      reviews: { "1": approvedReview() },
+      ships: {
+        "1": projection({
+          authority: authorityAtApproval({
+            suggested: { pr_title: "A change", message: "ship: it" },
+          }),
+        }),
+      },
+    });
+
+    // No ending menu, and no answer chosen for the operator.
+    expect(screen.queryByTestId("ending-chooser")).not.toBeInTheDocument();
+    expect(screen.getByTestId("approval-choice-publish")).not.toBeChecked();
+    // The answer that publishes nothing is not offered here as a publication.
+    expect(screen.queryByTestId("approval-choice-finish")).not.toBeInTheDocument();
+    // The workflow's suggestion is a starting point in an editable field.
+    expect(screen.getByTestId("pr-title")).toHaveValue("A change");
+    expect(screen.getByTestId("commit-message")).toHaveValue("ship: it");
+    // Nothing can be previewed until an answer is chosen.
+    expect(screen.getByTestId("preview-delivery-button")).toBeDisabled();
+
+    await user.click(screen.getByTestId("approval-choice-publish"));
+    await user.click(screen.getByTestId("preview-delivery-button"));
+    await screen.findByTestId("delivery-preview");
+    expect(screen.getByTestId("preview-decision")).toHaveTextContent(
+      "Answering attempt 5 with publish",
+    );
+
+    await user.click(screen.getByTestId("confirm-delivery-button"));
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/commit"),
+      ).toHaveLength(1),
+    );
+    const body = JSON.parse(
+      fetchMock.mock.calls.find(([url]) => url === "/api/tasks/1/ship/commit")?.[1]
+        .body as string,
+    );
+    expect(body).toMatchObject({ gate_seq: 5, choice_id: "publish" });
+    // Neither page ever asks an agent to write the publication text.
+    expect(
+      fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/ship/draft")),
+    ).toHaveLength(0);
+    expect(screen.queryByTestId("redraft-button")).toBeDisabled();
   });
 
   it("blocks a pushing ending on GitHub eligibility and offers a re-check", async () => {

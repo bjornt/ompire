@@ -543,8 +543,17 @@ export function saveShipDraft(
 export function previewShip(
   id: number,
   body: {
-    ending: ShipEnding;
-    mode?: "squash" | "retain";
+    /** Which question is being previewed, and with which answer. Required
+     * when the run is waiting at an approval: a preview that did not name
+     * them would describe "whatever this task could publish", which is not a
+     * decision anyone can confirm. */
+    gate_seq?: number | null;
+    choice_id?: string | null;
+    /** Not requests. The run's pinned chain decides how far a delivery goes
+     * and how it composes history; supplying either states what the caller
+     * believes, and a disagreement is reported rather than obeyed. */
+    ending?: ShipEnding | null;
+    mode?: "squash" | "retain" | null;
     message?: string;
     pr_title?: string;
     pr_body?: string;
@@ -559,8 +568,12 @@ export function previewShip(
 export function shipCommit(
   id: number,
   body: {
-    ending: ShipEnding;
-    mode?: "squash" | "retain";
+    gate_seq?: number | null;
+    choice_id?: string | null;
+    /** Feedback recorded with the decision, exactly as a gate answer's is. */
+    note?: string | null;
+    ending?: ShipEnding | null;
+    mode?: "squash" | "retain" | null;
     message?: string;
     pr_title?: string;
     pr_body?: string;
@@ -577,7 +590,7 @@ export function shipCommit(
 export function shipPush(
   id: number,
   body: {
-    ending: ShipEnding;
+    ending?: ShipEnding | null;
     pr_title?: string;
     pr_body?: string;
     request_id: string;
@@ -593,7 +606,7 @@ export function shipPush(
 export function shipPr(
   id: number,
   body: {
-    ending: ShipEnding;
+    ending?: ShipEnding | null;
     pr_title?: string;
     pr_body?: string;
     request_id: string;

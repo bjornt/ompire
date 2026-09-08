@@ -1,5 +1,8 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import {
+  DELIVERY_ACTIONS,
+  DELIVERY_METADATA_FIELDS,
+  DELIVERY_MODES,
   MODEL_ROLES,
   REQUIRED_TYPES,
   STEP_KINDS,
@@ -75,6 +78,14 @@ function blankStep(kind: StepKindName, format: number | null, session: string): 
       cases: [{ when: true, next: { step: "" } }],
       otherwise: format === 1 ? { complete: true } : { complete: true, result: "" },
     };
+  }
+  if (kind === "review") {
+    return { name, kind };
+  }
+  if (kind === "delivery") {
+    // A commit, because a chain always starts at one: no action performs a
+    // missing predecessor, so a fresh card cannot usefully be a push.
+    return { name, kind, action: "commit", mode: "squash", approval: "", next: { step: "" } };
   }
   return {
     name,
@@ -309,7 +320,11 @@ export function WorkflowEditor({
                   <SelectField
                     label="Kind"
                     value={kind}
-                    options={STEP_KINDS.map((option) => ({ value: option, label: option }))}
+                    options={STEP_KINDS.filter(
+                      (option) =>
+                        (option !== "review" && option !== "delivery") ||
+                        (format ?? 0) >= 3,
+                    ).map((option) => ({ value: option, label: option }))}
                     disabled={readOnly}
                     location={`steps[${index}].kind`}
                     testId={`editor-kind-${index}`}
@@ -780,6 +795,30 @@ function StepBody({
     );
   }
 
+  if (kind === "review") {
+    return (
+      <p className="hint" data-testid={`editor-review-${index}`}>
+        An independent reviewer reads exactly what this task would publish —
+        the protected candidate, not the live working tree. It has no
+        instruction and no model of its own: what it produces is a recorded
+        verdict (approved, comments, aborted, error, or interrupted) that the
+        steps after it route on, like any other evidence.
+      </p>
+    );
+  }
+
+  if (kind === "delivery") {
+    return (
+      <DeliveryEditor
+        step={step}
+        index={index}
+        grammar={grammar}
+        readOnly={readOnly}
+        onEdit={onEdit}
+      />
+    );
+  }
+
   return (
     <>
       <TextDocumentField
@@ -793,12 +832,244 @@ function StepBody({
         <ChoicesEditor
           step={step}
           index={index}
+          format={format}
+          grammar={grammar}
+          readOnly={readOnly}
+          onEdit={onEdit}
+        />
+      )}
+      {(format ?? 0) >= 3 && (
+        <DeliveryGateEditor
+          step={step}
+          index={index}
           grammar={grammar}
           readOnly={readOnly}
           onEdit={onEdit}
         />
       )}
     </>
+  );
+}
+
+function DeliveryEditor({
+  step,
+  index,
+  grammar,
+  readOnly,
+  onEdit,
+}: {
+  step: DraftObject;
+  index: number;
+  grammar: GrammarContext;
+  readOnly: boolean;
+  onEdit: (update: (step: DraftObject) => DraftObject) => void;
+}) {
+  const at = `steps[${index}]`;
+  const action = asString(step.action) ?? "";
+  const set = (key: string, value: DraftValue | undefined) =>
+    onEdit((current) => withKey(current, key, value));
+
+  return (
+    <fieldset className="editorSection" data-testid={`editor-delivery-${index}`}>
+      <legend>Publication</legend>
+      <p className="hint">
+        One effect, once. This step performs exactly the action named here and
+        nothing else — it runs only if a person answers its approval with the
+        choice that grants it, and it never performs a predecessor that has
+        not completed.
+      </p>
+      <SelectField
+        label="Action"
+        value={action}
+        options={DELIVERY_ACTIONS.map((option) => ({
+          value: option,
+          label:
+            option === "commit"
+              ? "commit — sign locally"
+              : option === "push"
+                ? "push — write the branch"
+                : "pr — open a pull request",
+        }))}
+        disabled={readOnly}
+        location={`${at}.action`}
+        testId={`editor-delivery-action-${index}`}
+        onChange={(next) =>
+          onEdit((current) => {
+            // The two fields are per-action: a commit composes history, and
+            // the others consume a result. Swapping the action swaps which
+            // one the card has, rather than leaving a field the grammar has
+            // no place for.
+            const cleared = withKey(withKey(current, "mode", undefined), "previous", undefined);
+            return next === "commit"
+              ? withKey(cleared, "mode", "squash")
+              : withKey(cleared, "previous", "");
+          })
+        }
+      />
+      {action === "commit" ? (
+        <SelectField
+          label="How it composes history"
+          value={asString(step.mode) ?? "squash"}
+          options={DELIVERY_MODES.map((option) => ({
+            value: option,
+            label:
+              option === "squash"
+                ? "squash — one signed commit"
+                : "retain — keep the existing commits",
+          }))}
+          disabled={readOnly}
+          location={`${at}.mode`}
+          testId={`editor-delivery-mode-${index}`}
+          onChange={(next) => set("mode", next)}
+        />
+      ) : (
+        <SelectField
+          label="Consumes the result of"
+          value={asString(step.previous) ?? ""}
+          options={grammar.steps.map((name) => ({ value: name, label: name }))}
+          disabled={readOnly}
+          location={`${at}.previous`}
+          testId={`editor-delivery-previous-${index}`}
+          onChange={(next) => set("previous", next)}
+        />
+      )}
+      <SelectField
+        label="Authorized by"
+        value={asString(step.approval) ?? ""}
+        options={grammar.steps.map((name) => ({ value: name, label: name }))}
+        disabled={readOnly}
+        location={`${at}.approval`}
+        testId={`editor-delivery-approval-${index}`}
+        onChange={(next) => set("approval", next)}
+      />
+      <DestinationField
+        value={step.next}
+        location={`${at}.next`}
+        grammar={grammar}
+        label="Once it is on record, go to"
+        allowPause={false}
+        onChange={(next) => set("next", next)}
+      />
+    </fieldset>
+  );
+}
+
+function DeliveryGateEditor({
+  step,
+  index,
+  grammar,
+  readOnly,
+  onEdit,
+}: {
+  step: DraftObject;
+  index: number;
+  grammar: GrammarContext;
+  readOnly: boolean;
+  onEdit: (update: (step: DraftObject) => DraftObject) => void;
+}) {
+  const at = `steps[${index}].delivery`;
+  const delivery = asObject(step.delivery);
+  const metadata = asObject(delivery?.metadata) ?? {};
+  const aliases = evidenceAliases(step);
+  const setDelivery = (next: DraftObject | undefined) =>
+    onEdit((current) => withKey(current, "delivery", next));
+
+  if (delivery === null) {
+    return (
+      <div className="editorSection" data-testid={`editor-gate-delivery-${index}`}>
+        <p className="hint">
+          This question authorizes no publication. To let one of its answers
+          publish, bind it to the review it is asking about — the grant rests
+          on that verdict, not on the question having been reached.
+        </p>
+        <button
+          type="button"
+          className="ghostButton"
+          disabled={readOnly}
+          data-testid={`editor-add-gate-delivery-${index}`}
+          onClick={() => setDelivery({ review: aliases[0] ?? "" })}
+        >
+          Let answers here authorize publication
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <fieldset className="editorSection" data-testid={`editor-gate-delivery-${index}`}>
+      <legend>What this approval is about</legend>
+      <SelectField
+        label="The review it rests on"
+        value={asString(delivery.review) ?? ""}
+        options={aliases.map((alias) => ({ value: alias, label: alias }))}
+        disabled={readOnly}
+        location={`${at}.review`}
+        testId={`editor-gate-review-${index}`}
+        onChange={(next) => setDelivery(withKey(delivery, "review", next))}
+      />
+      <p className="hint">
+        One of this card&apos;s own evidence aliases, and it may only select
+        review steps: the grant rests on a trusted verdict, never on an
+        agent&apos;s own claim.
+      </p>
+      <p className="hint">
+        Publication text the workflow suggests. Whatever it renders arrives as
+        an editable draft beside the decision — the operator's final text is
+        what gets published. An omitted field simply starts blank.
+      </p>
+      {DELIVERY_METADATA_FIELDS.map((field) => {
+        const present = metadata[field] !== undefined && metadata[field] !== null;
+        const setField = (next: DraftValue | undefined) =>
+          setDelivery(
+            withKey(delivery, "metadata", withKey(metadata, field, next)),
+          );
+        return present ? (
+          <div key={field}>
+            <TextDocumentField
+              value={metadata[field]}
+              location={`${at}.metadata.${field}`}
+              grammar={grammar}
+              label={
+                field === "message"
+                  ? "Suggested commit message"
+                  : field === "pr_title"
+                    ? "Suggested pull-request title"
+                    : "Suggested pull-request body"
+              }
+              onChange={setField}
+            />
+            <button
+              type="button"
+              className="ghostButton"
+              disabled={readOnly}
+              onClick={() => setField(undefined)}
+            >
+              Leave {field} blank instead
+            </button>
+          </div>
+        ) : (
+          <button
+            key={field}
+            type="button"
+            className="ghostButton"
+            disabled={readOnly}
+            data-testid={`editor-add-metadata-${field}-${index}`}
+            onClick={() => setField({ parts: [{ text: "" }] })}
+          >
+            Suggest {field}
+          </button>
+        );
+      })}
+      <button
+        type="button"
+        className="ghostButton"
+        disabled={readOnly}
+        onClick={() => setDelivery(undefined)}
+      >
+        Stop letting answers here authorize publication
+      </button>
+      <FieldProblem location={at} />
+    </fieldset>
   );
 }
 
@@ -983,12 +1254,14 @@ function CasesEditor({
 function ChoicesEditor({
   step,
   index,
+  format,
   grammar,
   readOnly,
   onEdit,
 }: {
   step: DraftObject;
   index: number;
+  format: number | null;
   grammar: GrammarContext;
   readOnly: boolean;
   onEdit: (update: (step: DraftObject) => DraftObject) => void;
@@ -1049,6 +1322,16 @@ function ChoicesEditor({
                 allowPause={false}
                 onChange={(next) => replace(withKey(object, "next", next))}
               />
+              {(format ?? 0) >= 3 && (
+                <GrantField
+                  choice={object}
+                  location={`${choiceAt}.authorize`}
+                  grammar={grammar}
+                  readOnly={readOnly}
+                  testId={`editor-choice-authorize-${index}-${choiceIndex}`}
+                  onChange={replace}
+                />
+              )}
               <button
                 type="button"
                 className="ghostButton"
@@ -1078,6 +1361,70 @@ function ChoicesEditor({
       </button>
       <FieldProblem location={at} />
     </fieldset>
+  );
+}
+
+function GrantField({
+  choice,
+  location,
+  grammar,
+  readOnly,
+  testId,
+  onChange,
+}: {
+  choice: DraftObject;
+  location: string;
+  grammar: GrammarContext;
+  readOnly: boolean;
+  testId: string;
+  onChange: (choice: DraftObject) => void;
+}) {
+  const grant = asObject(choice.authorize);
+  const steps = asArray(grant?.steps)
+    .map((name) => asString(name))
+    .filter((name): name is string => name !== null);
+
+  if (grant === null) {
+    return (
+      <div data-testid={testId}>
+        <p className="hint">This answer publishes nothing.</p>
+        <button
+          type="button"
+          className="ghostButton"
+          disabled={readOnly}
+          data-testid={`${testId}-add`}
+          onClick={() => onChange(withKey(choice, "authorize", { steps: [] }))}
+        >
+          Let this answer authorize publication
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="editorSection" data-testid={testId}>
+      <p className="hint">
+        The exact actions this answer permits, in the order they run. It must
+        start where the answer goes and name the whole chain: a grant is a list
+        of actions, never permission to publish in general.
+      </p>
+      <StepListField
+        label="Authorizes"
+        value={steps}
+        options={grammar.steps}
+        location={`${location}.steps`}
+        onChange={(next) => onChange(withKey(choice, "authorize", { steps: next }))}
+      />
+      <button
+        type="button"
+        className="ghostButton"
+        disabled={readOnly}
+        onClick={() => onChange(withKey(choice, "authorize", undefined))}
+      >
+        Make this answer publish nothing
+      </button>
+      <FieldProblem location={location} />
+    </div>
   );
 }
 

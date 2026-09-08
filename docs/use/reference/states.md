@@ -145,17 +145,42 @@ This check is GitHub **API** identity and repository eligibility. It is not
 proof of the SSH key or HTTPS credential `git push` uses, and Ompire records
 that transport identity as explicitly unattributed rather than inventing one.
 
+## Where a run stands with publication
+
+Four things are distinct, and Ompire reports them separately rather than
+collapsing them into one "shipped or not"
+([ADR-0033](../../adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md)):
+
+| Observation | Meaning |
+|---|---|
+| Working | The run is executing its own steps. Nothing has been reviewed or authorized. |
+| Waiting for review | A `review` step is running: an independent reviewer is reading the protected candidate. |
+| Waiting for your decision | The run is at an approval. The work is reviewed, nothing is published, and the answer you give decides what happens. |
+| Published, so far as it went | One or more privileged effects are on record — a signed commit, a pushed branch, a pull request. |
+
+And two endings that are complete rather than stalled:
+
+| Observation | Meaning |
+|---|---|
+| Completed work without publication | The run reached a named ending with no privileged effect, because that is the ending it was written to reach or the answer a person gave. |
+| Blocked publication | Something stopped a publication that was authorized. Its reason and the eligible recovery action are shown. |
+
+A run's own result name — `validated`, `published`, `stopped-unpublished` — is
+the *workflow's* word for its ending. It is never what says an effect happened:
+whether anything was signed, pushed, or opened is read from the delivery
+journal, which records what actually occurred.
+
 ## Delivery states
 
 A delivery is the operator's authorization to publish one reviewed candidate as
-far as one selected ending. Its disposition is durable
+far as the chain their answer named. Its disposition is durable
 ([ADR-0032](../../adr/0032-bind-trusted-delivery-to-retained-candidates.md)):
 
 | Disposition | Meaning |
 |---|---|
-| `open` | A draft exists. Nothing is authorized. |
+| `open` | A record exists with nothing authorized. |
 | `authorized` | A confirmation stands and actions remain. |
-| `completed` | The selected ending was reached. A further ending can still be authorized. |
+| `completed` | Every action the answer authorized is on record. Nothing further can be authorized for this run. |
 | `blocked` | A safe stop: nothing is in an unknown state, and a fresh preview and confirmation may continue. |
 | `unresolved` | An effect's outcome could not be established. Nothing dependent runs and cleanup is refused. |
 | `abandoned` | The operator granted no further authority. |
@@ -164,6 +189,12 @@ Each action attempt has its own phase: `prepared`, `executing`, `succeeded`,
 `failed`, or `needs_reconciliation`. `failed` means Ompire established that the
 effect did not happen; `needs_reconciliation` means it could not tell, which is
 neither success nor failure.
+
+An attempt also names the workflow step that asked for it, so an effect belongs
+to a decision rather than to a task in general. An interrupted attempt whose
+effect is proven to have happened is *adopted* by that step; one whose effect
+did not happen waits for an explicit continuation, keeping the grant it already
+has.
 
 ## Pull-request states
 

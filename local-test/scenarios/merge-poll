@@ -26,8 +26,8 @@ daemon_start
 ws_start
 
 tid=$(spawn_task "$(unique_slug poll)" "[[scenario:commit]]\nMerge-poll E2E: do the work and commit it.")
-wait_for "work step completes" 180 workflow_complete "$tid"
-approve_review "$tid"
+approve_run_review "$tid"
+wait_for "the run reaches its publication decision" 180 at_approval "$tid"
 ship_squash "$tid"
 
 pr_url=$(task_field "$tid" pr_url)

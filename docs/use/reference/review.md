@@ -15,15 +15,31 @@ An approval **names the content it graded** (ADR-0032). That binding is what
 delivery checks: an approval whose content has since changed stays on record as
 history and cannot authorize publishing.
 
+**Who starts a review depends on the task's workflow.** A workflow that
+declares a `review` step starts the review when it reaches that step, records
+the verdict as evidence, and routes on it — so what happens after a review is
+written in the definition. A workflow that declares none is reviewed by the
+operator, exactly as before. Task detail says which of the two you are looking
+at.
+
 ## Using review
 
 ### Operator interface
 
-The task-detail Review panel is the normal operator interface. It always uses
-the workflow's primary session, even when another session tab is selected.
-When that session is idle with a live agent, use **Start review**. The action
-locks until daemon state reports the result; a command failure is shown inline
-and can be retried only after the panel returns to an eligible observed state.
+The task-detail Review panel is the normal operator interface.
+
+For a workflow that declares its own `review` step, the panel is a read-only
+view of what the run is doing: it shows the open reviewer's link, the ordered
+iterations, and each verdict. There is no **Start review** button, and the
+panel says why — the run starts the review when it reaches the step that
+declares one, and reviewing at another moment would grade content the run is
+still changing.
+
+For a workflow that declares none, the panel drives review. It always uses the
+workflow's primary session, even when another session tab is selected. When
+that session is idle with a live agent, use **Start review**. The action locks
+until daemon state reports the result; a command failure is shown inline and
+can be retried only after the panel returns to an eligible observed state.
 
 An open review is labelled **Review open**, keeps the full llmvet URL as its
 external action, and offers **Cancel review**. If an iteration submits
@@ -39,9 +55,15 @@ count, and expandable captured stderr.
 
 ### REST interface
 
-`POST /api/tasks/{id}/review` opens a review for a task whose **primary
-session** is `idle` with a live agent and no review already open. Other
-sessions of the task neither gate nor block it.
+`POST /api/tasks/{id}/review` opens a review by hand. It is refused with
+`409 not-at-review` when the task's workflow declares its own review step and
+the run is not at it — the run owns that decision. When the workflow declares
+none, it requires the **primary session** to be `idle` with a live agent and no
+review already open; other sessions of the task neither gate nor block it.
+
+A review a *run* starts needs no live agent at all: it is a host-side operation
+on the workspace, so a command-only workflow can review without inventing an
+agent to hold the review open.
 
 The daemon fetches the clone, captures the task's candidate, builds an isolated
 checkout of it, and launches the configured llmvet command with
@@ -117,29 +139,46 @@ The outcome is interpreted from the **process**, never from the agent:
 | `130` | any | aborted |
 | anything else | any | error, with captured stderr |
 
-For comments, the raw stdout *is* the review prompt. A comment count is
-derived best-effort for display only — the count is cosmetic, the text is
-authoritative.
+For comments, the raw stdout *is* the reviewer's report. It is retained whole
+on the iteration, together with a state saying what was kept:
 
-Each outcome is recorded as a review iteration and drives the `reviewing`
-transition on the primary session.
+| `findings_state` | Meaning |
+|---|---|
+| `complete` | The whole report |
+| `empty` | An approval with nothing to say |
+| `truncated` | A report too large to retain whole |
+| `unavailable` | No report could be captured |
 
-### Comment loop-back
+A comment count is derived best-effort for display only — the count is
+cosmetic, the text is authoritative, and a correction that runs automatically
+should require `complete` rather than acting on a fragment.
 
-When an iteration reports comments and the primary session still has a live
-agent, the daemon sends the raw stdout to that agent as a prompt over RPC. The
-agent addresses the comments in its own session, moving from `reviewing` to
-`working` through normal frame handling, and returns to `idle` when the turn
-ends — ready for a fresh review.
+Each outcome is recorded as a review iteration. Where the task's workflow
+declares a review step, the iteration also names the attempt that asked for it,
+so a verdict belongs to a question rather than to a task in general.
 
-Re-triggering review records a further iteration in the same review's history,
-so the loop is visible rather than being a sequence of unrelated reviews. Each
-round captures the corrected content and binds its own iteration to it, so a
-second approval covers what the agent actually changed.
+### Where comments go
 
-Ownership of the workspace is released before the comments are handed to the
-agent: the reviewer is finished with it, and the correction turn is admitted on
-its own.
+**A workflow that declares review** routes them. The report is evidence, and
+the definition's own edge carries it back to a working step — so the loop is
+visible in the flow, spends that step's declared visit budget, and can be
+routed around, bounded, or sent somewhere else entirely. Nothing prompts an
+agent behind the run's back.
+
+**A workflow that declares none** keeps the older behavior: when an iteration
+reports comments and the primary session still has a live agent, the daemon
+sends the raw stdout to that agent as a prompt over RPC. The agent addresses
+them in its own session and returns to `idle`, ready for a fresh review. Those
+definitions have no correction route of their own, so comments reaching nobody
+would strand the task.
+
+Either way, re-reviewing records a further iteration in the same review's
+history, so the loop is visible rather than being a sequence of unrelated
+reviews. Each round captures the corrected content and binds its own iteration
+to it, so a second approval covers what actually changed.
+
+Ownership of the workspace is released before any correction turn: the reviewer
+is finished with it, and the turn is admitted on its own.
 
 ## Failures and recovery
 

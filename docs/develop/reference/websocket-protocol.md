@@ -60,7 +60,7 @@ full current registry state:
 |---|---|
 | `projects` | All projects |
 | `workflow_library` | Every library entry (ADR-0031): `name`, `origin`, `archived`, edit `version`, `has_draft`, `current_revision`/`current_format`, `available` with `unavailable_reason`/`unavailable_detail`, timestamps, and a `descriptor` present exactly when the entry is a valid launch choice. Raw draft text and revision history are fetched over REST, never carried here |
-| `workflow_catalog` | Only the workflows a new launch may select: each one's current revision and format, its sessions, and each declared step with its kind, session, abstract role and conditional flag. Every model consumer is one of those steps. Derived from the same library read as `workflow_library`, so the two cannot disagree |
+| `workflow_catalog` | Only the workflows a new launch may select: each one's current revision and format, its sessions, whether it declares review, the privileged effects it could perform (empty when it can perform none), and each declared step with its kind, session, abstract role, conditional flag, and — for a delivery step — its one action and the approval that can authorize it. Every model consumer is one of those steps. Derived from the same library read as `workflow_library`, so the two cannot disagree |
 | `model_profiles` | All model profiles, sorted by name, each with its four role bindings |
 | `tasks` | All non-purged tasks, each carrying its workflow fields, its pinned `workflow_revision` and readiness, the primary session *its* definition declares, its accepted `execution_inputs`, and `needs_configuration` |
 | `sessions` | Per task, a per-session map of current status, plus the native model a live session reports |
@@ -68,8 +68,8 @@ full current registry state:
 | `settings` | The effective settings map |
 | `gpg` | Current signing status: `state`, `selected` key, `candidates`, `cache_ttl`, `detail`, `checked_at` — public identifiers only |
 | `gh` | Current in-memory GitHub CLI identity plus canonical target eligibility map; no credential value or token fragment |
-| `reviews` | Per task, durable review status and iterations, each naming the candidate it graded, plus the live reviewer's URL and port when one is running (`null` otherwise) |
-| `ships` | Per task, the durable delivery projection: `version`, disposition, selected ending and mode, candidate and review identity, draft, completed and remaining actions, concrete results, every action attempt and reconciliation decision, and the delivery history |
+| `reviews` | Per task, durable review status and iterations, each naming the candidate it graded, the workflow attempt that asked for it, and the reviewer's own report with the state of what was retained, plus the live reviewer's URL and port when one is running (`null` otherwise) |
+| `ships` | Per task, the durable delivery projection: `version`, disposition, ending and mode, candidate and review identity, draft, completed and remaining actions, concrete results, every action attempt and reconciliation decision, the delivery history, and an `authority` block saying what the run's own procedure currently permits |
 | attention | Current attention entries |
 
 Every frame after the snapshot is a delta.
@@ -172,6 +172,15 @@ are broadcast as `project_updated` and are what a reconnecting client renders.
 
 `spawn_step` payloads carry `status` — `started`, `ok`, or `failed` — and a
 failure carries the relevant detail.
+
+A task's `authority` block is the same resolution the trusted service admits
+against, projected: how authority would be established right now — an
+unanswered approval, an already-authorized action, a pre-upgrade grant, or
+nothing — the question and the answers it offers with what each would
+authorize, the publication text the workflow suggested, and, when nothing is
+possible, the reason. Both decision surfaces read it, so neither can offer a
+control the service would refuse or hide one it would accept
+([ADR-0033](../../adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md)).
 
 `ship_updated` is the delivery surface, and it is deliberately not a step event
 ([ADR-0032](../../adr/0032-bind-trusted-delivery-to-retained-candidates.md)). It

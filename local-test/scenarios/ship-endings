@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 #
-# local-test/scenarios/ship-endings — the operator chooses how far a delivery
-# goes, and can go further later (ADR-0032).
+# local-test/scenarios/ship-endings — a workflow's ending is what its author
+# declared and what a person authorized, and it does not grow afterwards
+# (ADR-0032, ADR-0033).
 #
 #   leg 1  stop at a local signed commit: nothing is pushed, no PR exists, and
 #          the delivery is complete rather than half-finished
-#   leg 2  authorize a push of that existing signed result — without signing
-#          again and without opening a pull request
-#   leg 3  authorize a pull request for that existing pushed result
-#   leg 4  cleanup of a local-only delivery warns about the copy it removes
+#   leg 2  that completed ending cannot be widened — not by asking for a
+#          longer one, and not through the action endpoints
+#   leg 3  a different run authorizes the pull-request chain, and gets all
+#          three effects from the one answer that granted them
+#   leg 4  cleanup of a local-only delivery keeps the journal it produced
+#
+# The three chains are separate answers to the same question, so each leg is
+# its own run: "sign it" and "sign it, push it, and open a pull request" are
+# different permissions, and no answer may grow into the next one.
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -22,17 +28,21 @@ _forge_has_branch() { # _forge_has_branch BRANCH
 }
 
 tid=$(spawn_task "$(unique_slug endings)" "[[scenario:commit]]\nSelectable-endings E2E: do the work and commit it.")
-wait_for "work step completes" 180 workflow_complete "$tid"
 clone=$(task_field "$tid" clone_path)
 branch=$(task_field "$tid" branch)
-approve_review "$tid"
+approve_run_review "$tid"
+wait_for "the run reaches its publication decision" 180 at_approval "$tid"
 $GPGCTL warm
 
 # --- leg 1: a local signed commit is a complete delivery ----------------------
 
 receives_before=$($FORGE receives local-test/sandbox)
-ship_deliver "$tid" commit squash "ship: local only" "" ""
+ship_deliver "$tid" commit-locally "ship: local only" "" ""
 wait_for "the local ending completes" 120 ship_done "$tid" commit
+wait_for "the run completes at its local ending" 60 workflow_complete "$tid"
+[ "$(task_field "$tid" workflow_result)" = "committed-locally" ] &&
+	ok "the run's result names the ending the answer authorized" ||
+	fail "workflow result" "$(task_field "$tid" workflow_result)"
 
 signed_tip=$(ship_field "$tid" '.results.commit.signed_tip')
 [ "$signed_tip" = "$(git -C "$clone" rev-parse HEAD)" ] &&
@@ -56,57 +66,73 @@ _forge_has_branch "$branch" &&
 	ok "the delivery reports a completed local ending, not a failed PR" ||
 	fail "local ending result" "$(ship_field "$tid" '.results')"
 
-# --- leg 2: push that existing signed result, later, on its own authorization -
+# --- leg 2: that ending stays the ending --------------------------------------
 
-ship_deliver "$tid" push squash "" "" ""
-wait_for "the later push completes" 120 ship_done "$tid" push
-[ "$(ship_field "$tid" '.results.push.head')" = "$signed_tip" ] &&
-	ok "the push published exactly the already-signed result" ||
-	fail "pushed head" "$(ship_field "$tid" '.results.push')"
-[ "$(ship_field "$tid" '.results.commit.signed_tip')" = "$signed_tip" ] &&
-	ok "the signed result was reused, not produced again" ||
-	fail "signature reuse" "$(ship_field "$tid" '.results.commit')"
-[ "$(git -C "$BARE" rev-parse "refs/heads/$branch")" = "$signed_tip" ] &&
-	ok "the forge branch holds the signed tip" ||
-	fail "forge branch tip" "$(git -C "$BARE" rev-parse "refs/heads/$branch")"
-[ -z "$(task_field "$tid" pr_url)" ] &&
-	ok "a pushed branch is still not a pull request" ||
-	fail "push ending opened a PR" "$(task_field "$tid" pr_url)"
+# Nothing is waiting to be answered any more, so there is nothing to authorize.
+[ "$(ship_field "$tid" '.authority.source // "none"')" = "none" ] &&
+	ok "a completed run offers no further authorization" ||
+	fail "authority after completion" "$(ship_field "$tid" '.authority')"
+ship_preview "$tid" "" "widen-$tid" "m" "t" "b"
+[ "$API_CODE" = 409 ] &&
+	ok "a preview with nothing to authorize is refused ($(jq -r '.detail.blockers[0].code // .detail.message // .detail' /tmp/ship-preview-$tid.json))" ||
+	fail "widening refused at preview" "$API_CODE $(cat /tmp/ship-preview-$tid.json)"
+# And the action endpoints refuse it just as plainly: there is no second door.
+delivery=$(ship_field "$tid" '.delivery_id')
+version=$(ship_field "$tid" '.version')
+api_json POST "/api/tasks/$tid/ship/push" \
+	"$(jq -n --argjson d "$delivery" --argjson v "$version" \
+		'{ending: "push", request_id: "widen-push", preview_token: "no",
+		  delivery_id: $d, expected_version: $v}')" >/dev/null
+[ "$API_CODE" = 409 ] &&
+	ok "the push endpoint refuses a completed narrower ending" ||
+	fail "push endpoint refusal" "$API_CODE $API_BODY"
+_forge_has_branch "$branch" &&
+	fail "no push happened" "the forge has $branch" ||
+	ok "still nothing on the forge"
 
-# --- leg 3: open the pull request for that pushed result ----------------------
+# --- leg 3: a run whose answer authorizes the whole chain ----------------------
 
-ship_deliver "$tid" pr squash "" "Selectable endings" "opened last"
-wait_for "the later pull request completes" 120 ship_done "$tid" pr
-pr_url=$(task_field "$tid" pr_url)
-[ -n "$pr_url" ] && ok "pull request opened: $pr_url" || fail "pr url" "empty"
-# One authorization per ending, appended — the first is never rewritten.
-[ "$(ship_field "$tid" '[.decisions[] | select(.kind == "authorize")] | length')" = 1 ] &&
-	[ "$(ship_field "$tid" '[.decisions[] | select(.kind == "extend")] | length')" = 2 ] &&
-	ok "each further ending appended its own authorization" ||
-	fail "authorization history" "$(ship_field "$tid" '[.decisions[].kind]')"
-[ "$(ship_field "$tid" '[.actions[] | select(.kind == "commit")] | length')" = 1 ] &&
-	ok "the commit action ran exactly once across all three endings" ||
-	fail "commit attempts" "$(ship_field "$tid" '[.actions[] | {kind, attempt, phase}]')"
-
-# --- leg 4: cleanup of a local-only delivery names what it removes ------------
-
-tid2=$(spawn_task "$(unique_slug localonly)" "[[scenario:commit]]\nLocal-only E2E: do the work and commit it.")
-wait_for "work step completes (local-only leg)" 180 workflow_complete "$tid2"
-approve_review "$tid2"
+tid2=$(spawn_task "$(unique_slug pr-ending)" "[[scenario:commit]]\nPull-request ending E2E: do the work and commit it.")
+branch2=$(task_field "$tid2" branch)
+approve_run_review "$tid2"
+wait_for "the second run reaches its decision" 180 at_approval "$tid2"
 $GPGCTL warm
-ship_deliver "$tid2" commit squash "ship: local only, cleaned up" "" ""
-wait_for "the local-only delivery completes" 120 ship_done "$tid2" commit
+ship_deliver "$tid2" open-pr "ship: the whole chain" "Selectable endings" "opened last"
+wait_for "the pull-request ending completes" 180 ship_done "$tid2" pr
+pr_url=$(task_field "$tid2" pr_url)
+[ -n "$pr_url" ] && ok "pull request opened: $pr_url" || fail "pr url" "empty"
+# One answer, one authorization, three effects — and no extension anywhere.
+[ "$(ship_field "$tid2" '[.decisions[] | select(.kind == "authorize")] | length')" = 1 ] &&
+	[ "$(ship_field "$tid2" '[.decisions[] | select(.kind == "extend")] | length')" = 0 ] &&
+	ok "one authorization covered the whole declared chain" ||
+	fail "authorization history" "$(ship_field "$tid2" '[.decisions[].kind]')"
+[ "$(ship_field "$tid2" '[.actions[] | select(.kind == "commit")] | length')" = 1 ] &&
+	ok "the commit action ran exactly once" ||
+	fail "commit attempts" "$(ship_field "$tid2" '[.actions[] | {kind, attempt, phase}]')"
+[ "$(git -C "$BARE" rev-parse "refs/heads/$branch2")" = "$(ship_field "$tid2" '.results.commit.signed_tip')" ] &&
+	ok "the forge branch holds the signed tip" ||
+	fail "forge branch tip" "$(git -C "$BARE" rev-parse "refs/heads/$branch2")"
 
-api_json POST "/api/tasks/$tid2/cleanup" >/dev/null
-[ "$API_CODE" = 200 ] || die "cleanup of a local-only delivery rejected ($API_CODE)"
-[ "$(task_field "$tid2" state)" = archived ] &&
+# --- leg 4: cleanup of a local-only delivery keeps its journal ----------------
+
+tid3=$(spawn_task "$(unique_slug localonly)" "[[scenario:commit]]\nLocal-only E2E: do the work and commit it.")
+approve_run_review "$tid3"
+wait_for "the third run reaches its decision" 180 at_approval "$tid3"
+$GPGCTL warm
+ship_deliver "$tid3" commit-locally "ship: local only, cleaned up" "" ""
+wait_for "the local-only delivery completes" 120 ship_done "$tid3" commit
+
+api_json POST "/api/tasks/$tid3/cleanup" >/dev/null
+[ "$API_CODE" = 200 ] || die "cleanup of a local-only delivery rejected ($API_CODE): $API_BODY"
+[ "$(task_field "$tid3" state)" = archived ] &&
 	ok "a local-only delivery can be cleaned up" ||
-	fail "cleanup archived the task" "$(task_field "$tid2" state)"
+	fail "cleanup archived the task" "$(task_field "$tid3" state)"
 # The journal outlives the workspace: what was published, and under whose
 # authorization, is still answerable after the clone is gone.
-[ -n "$(ship_field "$tid2" '.results.commit.signed_tip')" ] &&
+[ -n "$(ship_field "$tid3" '.results.commit.signed_tip')" ] &&
 	ok "the delivery record survives cleanup" ||
-	fail "retained delivery record" "$(ship_projection "$tid2")"
+	fail "retained delivery record" "$(ship_projection "$tid3")"
 
 assert "task $tid never failed" task_not_failed "$tid"
 assert "task $tid2 never failed" task_not_failed "$tid2"
+assert "task $tid3 never failed" task_not_failed "$tid3"

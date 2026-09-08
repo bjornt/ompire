@@ -184,8 +184,13 @@ function GitHubBanner({ taskId, detail }: { taskId: number; detail: string }) {
   );
 }
 
-/** The authorization step: choose an ending, see exactly what it permits, then
- * confirm that resolution and nothing else. */
+/** The authorization step: read what the run is asking, see exactly what an
+ * answer would permit, then confirm that resolution and nothing else.
+ *
+ * How far a delivery goes is not chosen here any more. The workflow's own
+ * chain decides it, and each approving answer names the exact actions it
+ * grants — so this page shows the decision the run is at rather than offering
+ * a menu of endings the procedure may never have declared. */
 function DeliverStep({
   task,
   session,
@@ -200,6 +205,14 @@ function DeliverStep({
   gpg: GpgStatus | null;
 }) {
   const taskId = task.id;
+  const authority = ship?.authority;
+  const atApproval = authority?.source === "workflow-gate";
+  const grants = useMemo(
+    () => (authority?.choices ?? []).filter((choice) => choice.authorizes !== null),
+    [authority?.choices],
+  );
+  const [choiceId, setChoiceId] = useState<string | null>(null);
+  const [note, setNote] = useState("");
   const [ending, setEnding] = useState<ShipEnding>("pr");
   const [mode, setMode] = useState<"squash" | "retain">("squash");
   const [message, setMessage] = useState("");
@@ -244,7 +257,32 @@ function DeliverStep({
 
   useEffect(() => {
     invalidate();
-  }, [ending, mode, message, prTitle, prBody, ship?.version, invalidate]);
+  }, [ending, mode, message, prTitle, prBody, choiceId, ship?.version, invalidate]);
+
+  // Nothing is preselected. An approval with one publishing answer still has
+  // to be chosen: a default would make publication the thing that happens
+  // when somebody clicks past a screen.
+  useEffect(() => {
+    if (!atApproval) setChoiceId(null);
+    else if (choiceId !== null && !grants.some((c) => c.id === choiceId)) {
+      setChoiceId(null);
+    }
+  }, [atApproval, grants, choiceId]);
+
+  // The workflow's suggestion is a starting point, not the published text.
+  const suggested = authority?.suggested;
+  useEffect(() => {
+    if (suggested === undefined) return;
+    if (suggested.message !== undefined) {
+      setMessage((prev) => (touched.message ? prev : suggested.message ?? ""));
+    }
+    if (suggested.pr_title !== undefined) {
+      setPrTitle((prev) => (touched.prTitle ? prev : suggested.pr_title ?? ""));
+    }
+    if (suggested.pr_body !== undefined) {
+      setPrBody((prev) => (touched.prBody ? prev : suggested.pr_body ?? ""));
+    }
+  }, [suggested]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // A delivery that already has a signed result fixed its mode when it was
   // authorized; a continuation cannot re-choose it.
@@ -296,8 +334,12 @@ function DeliverStep({
     setCommandError(null);
     try {
       const resolved = await previewShip(taskId, {
-        ending,
-        mode,
+        // At an approval the decision identifies itself; everywhere else the
+        // run's own position does, and neither needs an ending from here.
+        gate_seq: atApproval ? authority?.gate_seq ?? null : null,
+        choice_id: atApproval ? choiceId : null,
+        ending: authority === undefined ? ending : null,
+        mode: authority === undefined ? mode : null,
         message,
         pr_title: prTitle,
         pr_body: prBody,
@@ -324,7 +366,21 @@ function DeliverStep({
       preview_token: preview.preview_token,
     };
     try {
-      if (hasSignedResult && ship?.delivery_id != null) {
+      if (preview.source !== "legacy-continuation") {
+        // One confirmation operation, whichever page it came from: the
+        // decision, the grant it produces, and the run's move to its first
+        // action land together.
+        await shipCommit(taskId, {
+          ...body,
+          gate_seq: preview.gate_seq,
+          choice_id: preview.choice_id,
+          note: note.trim() === "" ? null : note,
+          mode: preview.mode,
+          message,
+          delivery_id: preview.delivery_id,
+          expected_version: preview.version,
+        });
+      } else if (hasSignedResult && ship?.delivery_id != null) {
         const continuation = {
           ...body,
           delivery_id: ship.delivery_id,
@@ -352,14 +408,22 @@ function DeliverStep({
   }
 
   const sessionIdle = session?.status === "idle";
-  const canDraft = !published && !delivering && !unresolved && sessionIdle && !drafting;
+  // A workflow that declares its own publication also declares its own text.
+  // Asking an agent for a draft here would be a turn nobody declared, during
+  // a wait whose whole point is that the content stops changing.
+  const declaresDelivery = (authority?.declared_actions.length ?? 0) > 0;
+  const canDraft =
+    !declaresDelivery && !published && !delivering && !unresolved && sessionIdle && !drafting;
   const busy = delivering || confirming || previewing;
   const githubBlocker = preview?.blockers.find(
     (blocker) => blocker.code === "github-unavailable",
   );
 
   let draftStatus: string;
-  if (draft?.state === "drafting" || drafting) {
+  if (declaresDelivery) {
+    draftStatus =
+      "This workflow declares its own publication text. Edit the fields below — what you confirm is what gets published.";
+  } else if (draft?.state === "drafting" || drafting) {
     draftStatus = "Drafting… Keep editing; fields you change will not be overwritten.";
   } else if (draft?.state === "interrupted") {
     draftStatus =
@@ -397,29 +461,96 @@ function DeliverStep({
         {draftStatus}
       </p>
 
-      <fieldset className="endingChooser" data-testid="ending-chooser">
-        <legend>Ending</legend>
-        {ENDINGS.map((candidate) => {
-          const done = completed.includes(candidate);
-          return (
-            <label className="endingOption" key={candidate}>
+      {authority?.refusal != null && (
+        <p className="shipRefusal" data-testid="delivery-refusal">
+          {authority.refusal}
+        </p>
+      )}
+
+      {atApproval ? (
+        <fieldset className="endingChooser" data-testid="approval-chooser">
+          <legend>{authority?.gate_step ?? "This decision"}</legend>
+          <p className="fieldHint">
+            Each answer authorizes exactly the actions it names, against the
+            content the review read — and nothing further. Answers that publish
+            nothing are on the task, beside the question itself.
+          </p>
+          {grants.length === 0 && (
+            <p className="fieldHint" data-testid="approval-no-publishing">
+              None of this question&apos;s answers publishes anything.
+            </p>
+          )}
+          {grants.map((choice) => (
+            <label className="endingOption" key={choice.id}>
               <input
                 type="radio"
-                name={`ship-ending-${taskId}`}
-                value={candidate}
-                checked={ending === candidate}
-                disabled={busy || done}
-                onChange={() => setEnding(candidate)}
-                data-testid={`ending-${candidate}`}
+                name={`ship-choice-${taskId}`}
+                value={choice.id}
+                checked={choiceId === choice.id}
+                disabled={busy}
+                onChange={() => setChoiceId(choice.id)}
+                data-testid={`approval-choice-${choice.id}`}
               />
-              <span className="endingLabel">{ENDING_LABELS[candidate]}</span>
-              <span className="endingEffects">{ENDING_EFFECTS[candidate]}</span>
-              {done && <span className="endingDone">already completed</span>}
+              <span className="endingLabel">{choice.label}</span>
+              <span className="endingEffects">
+                authorizes {(choice.authorizes ?? []).join(" → ")}
+              </span>
             </label>
-          );
-        })}
-      </fieldset>
+          ))}
+          <label>
+            Why (recorded with your decision)
+            <textarea
+              rows={2}
+              value={note}
+              disabled={busy}
+              onChange={(e) => setNote(e.target.value)}
+              data-testid="approval-note"
+            />
+          </label>
+        </fieldset>
+      ) : authority !== undefined ? (
+        <p className="fieldHint" data-testid="delivery-derived">
+          {authority.source === "workflow-action"
+            ? `Continuing the ${authority.action_kind ?? "authorized"} action this run already authorized. Nothing is repeated on your behalf.`
+            : authority.source === "legacy-continuation"
+              ? "Finishing an authorization made before workflows owned publication. It cannot be extended."
+              : `This run publishes ${
+                  authority.declared_actions.length === 0
+                    ? "nothing"
+                    : authority.declared_actions.join(", ")
+                }.`}
+        </p>
+      ) : (
+        <fieldset className="endingChooser" data-testid="ending-chooser">
+          <legend>Ending</legend>
+          {ENDINGS.map((candidate) => {
+            const done = completed.includes(candidate);
+            return (
+              <label className="endingOption" key={candidate}>
+                <input
+                  type="radio"
+                  name={`ship-ending-${taskId}`}
+                  value={candidate}
+                  checked={ending === candidate}
+                  disabled={busy || done}
+                  onChange={() => setEnding(candidate)}
+                  data-testid={`ending-${candidate}`}
+                />
+                <span className="endingLabel">{ENDING_LABELS[candidate]}</span>
+                <span className="endingEffects">{ENDING_EFFECTS[candidate]}</span>
+                {done && <span className="endingDone">already completed</span>}
+              </label>
+            );
+          })}
+        </fieldset>
+      )}
 
+      {authority !== undefined ? (
+        <p className="fieldHint" data-testid="commit-mode-derived">
+          Commits are {ship?.mode ?? preview?.mode ?? "squash"} — the workflow
+          says how this delivery composes history.
+        </p>
+      ) : (
       <div className="commitMode" data-testid="commit-mode">
         <label className="modeOption">
           <input
@@ -444,6 +575,7 @@ function DeliverStep({
           Retain
         </label>
       </div>
+      )}
 
       <div className="commitFields">
         {!hasSignedResult && (
@@ -466,7 +598,14 @@ function DeliverStep({
             )}
           </label>
         )}
-        {ending === "pr" && (
+        {(authority === undefined
+          ? ending === "pr"
+          : (authority.action_kind === "pr" ||
+             (atApproval
+               ? grants.some((choice) =>
+                   (choice.authorizes ?? []).some((step) => step.includes("pr")),
+                 )
+               : authority.declared_actions.includes("pr")))) && (
           <>
             <label>
               PR title
@@ -517,7 +656,9 @@ function DeliverStep({
         </button>
         <button
           type="button"
-          disabled={busy || published || unresolved}
+          disabled={
+            busy || published || unresolved || (atApproval && choiceId === null)
+          }
           onClick={() => void onPreview()}
           data-testid="preview-delivery-button"
         >
@@ -564,6 +705,17 @@ function PreviewPanel({
   return (
     <div className="deliveryPreview" data-testid="delivery-preview">
       <h3>This confirmation permits</h3>
+      {preview.gate_seq !== null && (
+        <p className="fieldHint" data-testid="preview-decision">
+          Answering attempt {preview.gate_seq} with{" "}
+          <code className="mono">{preview.choice_id}</code>, against the review
+          recorded at attempt {preview.review_seq ?? "—"}
+          {preview.review.question_review_outcome == null
+            ? ""
+            : ` (${preview.review.question_review_outcome})`}
+          .
+        </p>
+      )}
       <ul data-testid="preview-actions">
         {preview.remaining_actions.map((action) => (
           <li key={action} data-testid={`preview-action-${action}`}>

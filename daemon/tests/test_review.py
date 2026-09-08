@@ -548,6 +548,13 @@ class TestReviewManagerLifecycle:
         from ompire_daemon.registry.tasks import get_task
 
         engine = app.state.engine
+        seeded_inputs = encode_execution_inputs(
+            make_execution_inputs(
+                engine=engine,
+                checkout_path=str(git_checkout),
+                branch="ompire/task1",
+            )
+        )
         # Seed project/task directly; review manager only needs the task row.
         with engine.begin() as conn:
             from ompire_daemon.db import projects, tasks
@@ -566,11 +573,7 @@ class TestReviewManagerLifecycle:
             result = conn.execute(
                 tasks.insert().values(
                     project_name="demo",
-                    execution_inputs_json=encode_execution_inputs(
-                        make_execution_inputs(
-                            checkout_path=str(git_checkout), branch="ompire/task1"
-                        )
-                    ),
+                    execution_inputs_json=seeded_inputs,
                     slug="task1",
                     branch="ompire/task1",
                     clone_path=str(git_checkout),
@@ -578,7 +581,7 @@ class TestReviewManagerLifecycle:
                     prompt="hello",
                     error=None,
                     workshop_id=None,
-                    workflow_name="single-step",
+                    workflow_name="plain",
                     workflow_status=None,
                     workflow_step=None,
                     spawn_completed_at=None,
@@ -628,6 +631,13 @@ class TestReviewManagerLifecycle:
         from ompire_daemon.registry.tasks import get_task
 
         engine = app.state.engine
+        seeded_inputs = encode_execution_inputs(
+            make_execution_inputs(
+                engine=engine,
+                checkout_path=str(git_checkout),
+                branch="ompire/task1",
+            )
+        )
         with engine.begin() as conn:
             conn.execute(
                 projects.insert().values(
@@ -643,11 +653,7 @@ class TestReviewManagerLifecycle:
             result = conn.execute(
                 tasks.insert().values(
                     project_name="demo",
-                    execution_inputs_json=encode_execution_inputs(
-                        make_execution_inputs(
-                            checkout_path=str(git_checkout), branch="ompire/task1"
-                        )
-                    ),
+                    execution_inputs_json=seeded_inputs,
                     slug="task1",
                     branch="ompire/task1",
                     clone_path=str(git_checkout),
@@ -655,7 +661,7 @@ class TestReviewManagerLifecycle:
                     prompt="hello",
                     error=None,
                     workshop_id=None,
-                    workflow_name="single-step",
+                    workflow_name="plain",
                     workflow_status=None,
                     workflow_step=None,
                     spawn_completed_at=None,
@@ -704,6 +710,13 @@ class TestReviewManagerLifecycle:
         from ompire_daemon.registry.tasks import get_task
 
         engine = app.state.engine
+        seeded_inputs = encode_execution_inputs(
+            make_execution_inputs(
+                engine=engine,
+                checkout_path=str(git_checkout),
+                branch="ompire/task1",
+            )
+        )
         with engine.begin() as conn:
             conn.execute(
                 projects.insert().values(
@@ -719,11 +732,7 @@ class TestReviewManagerLifecycle:
             result = conn.execute(
                 tasks.insert().values(
                     project_name="demo",
-                    execution_inputs_json=encode_execution_inputs(
-                        make_execution_inputs(
-                            checkout_path=str(git_checkout), branch="ompire/task1"
-                        )
-                    ),
+                    execution_inputs_json=seeded_inputs,
                     slug="task1",
                     branch="ompire/task1",
                     clone_path=str(git_checkout),
@@ -731,7 +740,7 @@ class TestReviewManagerLifecycle:
                     prompt="hello",
                     error=None,
                     workshop_id=None,
-                    workflow_name="single-step",
+                    workflow_name="plain",
                     workflow_status=None,
                     workflow_step=None,
                     spawn_completed_at=None,
@@ -769,6 +778,13 @@ def _seed_project_and_task(engine, git_checkout: Path, slug: str = "task1") -> i
     task id."""
     from ompire_daemon.db import projects, tasks
 
+    # Retaining the pinned definition is itself a write, so it happens before
+    # the seeding transaction rather than inside it.
+    seeded_inputs = encode_execution_inputs(
+        make_execution_inputs(
+            engine=engine, checkout_path=str(git_checkout), branch=f"ompire/{slug}"
+        )
+    )
     with engine.begin() as conn:
         if conn.execute(projects.select().where(projects.c.name == "demo")).first() is None:
             conn.execute(
@@ -785,11 +801,7 @@ def _seed_project_and_task(engine, git_checkout: Path, slug: str = "task1") -> i
         result = conn.execute(
             tasks.insert().values(
                 project_name="demo",
-                execution_inputs_json=encode_execution_inputs(
-                    make_execution_inputs(
-                        checkout_path=str(git_checkout), branch=f"ompire/{slug}"
-                    )
-                ),
+                execution_inputs_json=seeded_inputs,
                 slug=slug,
                 branch=f"ompire/{slug}",
                 clone_path=str(git_checkout),
@@ -797,7 +809,7 @@ def _seed_project_and_task(engine, git_checkout: Path, slug: str = "task1") -> i
                 prompt="hello",
                 error=None,
                 workshop_id=None,
-                workflow_name="single-step",
+                workflow_name="plain",
                 workflow_status=None,
                 workflow_step=None,
                 spawn_completed_at=None,

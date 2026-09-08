@@ -305,6 +305,12 @@ def create_app(
         app.state.gh,
         app.state.workspace_guard,
     )
+    # A format-3 run drives review and delivery as steps, but it never
+    # performs either itself: the managers stay the only trusted operation
+    # owners, and the runner asks them. Wired after construction because the
+    # dependency runs both ways — the managers admit against the run's
+    # position, and the run asks the managers to act.
+    app.state.workflow_runner.set_operations(app.state.reviews, app.state.ships)
     app.state.notifications = AttentionNotifier(
         app.state.events,
         bind=config.bind,

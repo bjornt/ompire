@@ -96,7 +96,7 @@ after=$(api_json GET /api/tasks | jq 'length')
 
 # --- delivery: the literal mention reaches the agent -------------------------
 
-tid=$(spawn_task "$slug" "Read @README.md and summarize it.")
+tid=$(spawn_work_only "$slug" "Read @README.md and summarize it.")
 wait_for "work step completes (session idle)" 180 workflow_complete "$tid"
 assert "task never failed" task_not_failed "$tid"
 

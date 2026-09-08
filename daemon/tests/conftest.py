@@ -60,6 +60,58 @@ def isolated_revision_cache():
     clear_cache()
 
 
+# The engine's baseline workflow for tests that are about something else.
+#
+# The packaged `single-step` declares review, an approval, and delivery — it
+# is a complete procedure, which is the point of it. That makes it the wrong
+# vehicle for a test about prompt bytes, session events, or a REST route: such
+# a test would drive a reviewer subprocess and a publication decision it never
+# meant to ask about. `plain` is one agent step and nothing else.
+PLAIN_WORKFLOW_YAML = r"""
+format: 1
+name: plain
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    role: default
+    expects_outcome: false
+    prompt:
+      separator: ""
+      parts:
+        - if:
+            op: ne
+            left: {op: input, name: task.prompt}
+            right: {op: literal, value: ""}
+          then:
+            separator: ""
+            parts:
+              - if:
+                  op: ne
+                  left: {op: input, name: workspace.preamble}
+                  right: {op: literal, value: ""}
+                then:
+                  separator: ""
+                  parts:
+                    - value: {op: input, name: workspace.preamble}
+                      format: text
+                    - text: "\n\n"
+                else:
+                  parts: []
+              - value: {op: input, name: task.prompt}
+                format: text
+          else:
+            parts: []
+"""
+
+
+def install_plain_workflow(engine):
+    """Make `plain` launchable in this test's catalog."""
+    return install_test_workflow(engine, PLAIN_WORKFLOW_YAML)
+
+
 def register_builtin_workflows(engine):
     """Install the packaged definitions, exactly as daemon startup does.
 
@@ -259,7 +311,14 @@ def demo_project(
     demo_profile: dict,
 ) -> dict:
     """Project `demo` on the git checkout, defaulting to the `demo` profile —
-    the minimum a launch needs now that templates are gone (ADR-0026)."""
+    the minimum a launch needs now that templates are gone (ADR-0026).
+
+    Also retains the `plain` engine baseline, which is what a launch selects
+    unless a test names a packaged workflow: the packaged ones are complete
+    procedures with review and delivery in them, and most REST tests are about
+    something else entirely.
+    """
+    install_plain_workflow(client.app.state.engine)
     response = client.post(
         "/api/projects",
         headers=auth_headers,
@@ -280,7 +339,7 @@ def launch_body(
     prompt: str = "do the thing",
     *,
     project_name: str = "demo",
-    workflow_name: str = "single-step",
+    workflow_name: str = "plain",
     **extra,
 ) -> dict:
     body = {
@@ -299,6 +358,8 @@ def spawn_task(
     """Preview then accept, the way the UI does. Returns the POST response so
     a test can assert on status and body."""
     body = launch_body(**kwargs)
+    if body["workflow_name"] == "plain":
+        install_plain_workflow(client.app.state.engine)
     preview = client.post("/api/tasks/preview", headers=auth_headers, json=body)
     assert preview.status_code == 200, preview.text
     return client.post(
@@ -312,7 +373,7 @@ def make_execution_inputs(
     *,
     checkout_path: str,
     project_name: str = "demo",
-    workflow_name: str = "single-step",
+    workflow_name: str = "plain",
     model_profile: str | None = "demo",
     roles: dict | None = None,
     base_branch: str = "main",
@@ -358,11 +419,21 @@ def make_execution_inputs(
     from ompire_daemon.registry.workflow_library import resolve_current
     from ompire_daemon.workflows import load_packaged_workflows
 
+    if engine is not None and workflow_name == "plain" and revision is None:
+        # Retained on demand: a task pinned to the engine baseline has to be
+        # able to resolve it, and only the caller knows which database that is.
+        install_plain_workflow(engine)
     if revision is not None:
         pinned = revision
     elif engine is not None:
         with engine.connect() as conn:
             pinned = resolve_current(conn, workflow_name)
+    elif workflow_name == "plain":
+        # The engine baseline is a test document, not a packaged one, so it
+        # is loaded from its own source rather than from the catalog.
+        from ompire_daemon.workflow_definitions import load_definition
+
+        pinned = load_definition(PLAIN_WORKFLOW_YAML)
     else:
         pinned = load_packaged_workflows()[workflow_name]
 
@@ -457,3 +528,193 @@ def fake_argv_builder(scenario: dict | str = "happy"):
         return fake_omp_argv(name, *real[real.index("--no-title") + 1 :])
 
     return build
+
+
+# --- format-3 delivery fixtures -----------------------------------------------
+# What a task that has reached its approval gate actually looks like: a pinned
+# format-3 revision, an approved review bound to the candidate it graded, and
+# a persisted question with the frozen evidence binding that ties the two
+# together. Tests build this rather than a bare task, because a delivery has
+# no meaning without the decision that would authorize it.
+
+
+_DELIVERY_STEP_TEMPLATE = {
+    "commit": (
+        "  - name: commit\n    kind: delivery\n    action: commit\n"
+        "    mode: {mode}\n    approval: approve\n    next: {next}\n"
+    ),
+    "push": (
+        "  - name: push\n    kind: delivery\n    action: push\n"
+        "    previous: commit\n    approval: approve\n    next: {next}\n"
+    ),
+    "pr": (
+        "  - name: pr\n    kind: delivery\n    action: pr\n"
+        "    previous: push\n    approval: approve\n    next: {next}\n"
+    ),
+}
+
+_ENDING_CHAIN = {
+    "commit": ("commit",),
+    "push": ("commit", "push"),
+    "pr": ("commit", "push", "pr"),
+}
+
+
+def delivery_workflow_yaml(
+    *, name: str = "delivering", ending: str = "pr", mode: str = "squash"
+) -> str:
+    """A minimal format-3 workflow whose approval authorizes one chain."""
+    chain = _ENDING_CHAIN[ending]
+    steps = ""
+    for index, action in enumerate(chain):
+        following = (
+            f"{{step: {chain[index + 1]}}}"
+            if index + 1 < len(chain)
+            else "{complete: true, result: published}"
+        )
+        steps += _DELIVERY_STEP_TEMPLATE[action].format(mode=mode, next=following)
+    return f"""
+format: 3
+name: {name}
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    outcome: null
+    prompt: {{parts: [{{text: "do it"}}]}}
+
+  - name: review
+    kind: review
+    evidence:
+      work: {{steps: [work], with_outcome: false}}
+
+  - name: approve
+    kind: gate
+    evidence:
+      verdict: {{steps: [review]}}
+    delivery:
+      review: verdict
+    message: {{parts: [{{text: "Publish?"}}]}}
+    choices:
+      - id: publish
+        label: Publish
+        next: {{step: {chain[0]}}}
+        authorize: {{steps: [{", ".join(chain)}]}}
+      - id: finish
+        label: Finish without publishing
+        next: {{complete: true, result: done-unpublished}}
+
+{steps}"""
+
+
+def install_delivery_workflow(
+    engine, *, name: str = "delivering", ending: str = "pr", mode: str = "squash"
+):
+    """Retain the workflow and return its revision, as a save would."""
+    from ompire_daemon.workflow_definitions import load_definition
+
+    document = delivery_workflow_yaml(name=name, ending=ending, mode=mode)
+    install_test_workflow(engine, document, name=name)
+    return load_definition(document)
+
+
+def park_at_delivery_gate(
+    engine,
+    task,
+    *,
+    candidate_id: str | None,
+    outcome: str = "approved",
+    findings: str | None = "",
+) -> int:
+    """Drive the run's records to its approval, and return the question's seq.
+
+    Writes exactly what the runner would have: a finished work attempt, a
+    review attempt carrying its trusted verdict, and a parked gate whose
+    frozen evidence names that review attempt. The binding is the point — an
+    approval that named "the task's review" could be answered against a
+    different one.
+    """
+    from ompire_daemon.registry.reviews import append_iteration, open_review
+    from ompire_daemon.registry.workflows import (
+        append_step_record,
+        build_gate_snapshot,
+        finish_step_record,
+        park_gate,
+    )
+    from ompire_daemon.workflows import review_outcome
+
+    work = append_step_record(
+        engine, task.id, step="work", kind="agent", session="main", evidence=None
+    )
+    finish_step_record(engine, task.id, work.seq, status="ok", outcome=None)
+    review = append_step_record(
+        engine,
+        task.id,
+        step="review",
+        kind="review",
+        session=None,
+        evidence={
+            "version": 1,
+            "bindings": {"work": {"step": "work", "seq": work.seq}},
+        },
+    )
+    open_review(
+        engine, task.id, candidate_id=candidate_id, workflow_seq=review.seq
+    )
+    iteration = append_iteration(
+        engine,
+        task.id,
+        outcome=outcome,
+        status=outcome if outcome != "comments" else None,
+        candidate_id=candidate_id,
+        workflow_seq=review.seq,
+        findings=findings,
+    )
+    finish_step_record(
+        engine,
+        task.id,
+        review.seq,
+        status="ok",
+        outcome=review_outcome(iteration),
+    )
+    gate = append_step_record(
+        engine,
+        task.id,
+        step="approve",
+        kind="gate",
+        session=None,
+        evidence={
+            "version": 1,
+            "bindings": {"verdict": {"step": "review", "seq": review.seq}},
+        },
+    )
+    park_gate(
+        engine,
+        task.id,
+        gate.seq,
+        step="approve",
+        message="Publish?",
+        snapshot=build_gate_snapshot(
+            message="Publish?",
+            choices=[
+                {
+                    "id": "publish",
+                    "label": "Publish",
+                    "feedback_required": False,
+                    "next": {"step": "commit"},
+                    "authorize": {"steps": list(_ENDING_CHAIN["pr"])},
+                },
+                {
+                    "id": "finish",
+                    "label": "Finish without publishing",
+                    "feedback_required": False,
+                    "next": {"complete": True, "result": "done-unpublished"},
+                    "authorize": None,
+                },
+            ],
+            evidence={"verdict": {"step": "review", "seq": review.seq}},
+        ),
+    )
+    return gate.seq

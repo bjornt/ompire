@@ -3,12 +3,13 @@
 # local-test/scenarios/happy-path — LOCAL-TESTING.PLAN.md Part 9, flow 1.
 #
 # The primary E2E flow: spawn → agent works (fake omp) → session idle →
-# review approve (real llmvet UI) → ship draft (parsed from the agent's
-# reply) → squash sign+commit+push → PR open on the fake gh. Asserts the
+# the run reaches its own review step → approve through the real llmvet UI →
+# the run reaches its approval → the operator authorizes the pull-request
+# chain → the run signs, pushes, and opens the PR on the fake gh. Asserts the
 # externally visible results: the forge branch's new tip carries a valid
 # signature from the ephemeral key, the PR exists OPEN with matching head,
-# and the daemon's own states agree (review approved, ship shipped, task
-# never failed).
+# and the daemon's own states agree (review approved, delivery completed,
+# task never failed).
 #
 # Preconditions: `local-test/env up` (daemon + project + model profile).
 
@@ -16,40 +17,43 @@ set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
 BARE=$STATE_ROOT/forge/github.com/local-test/sandbox.git
-DRAFT_FILE=$(mktemp /tmp/ompire-happy-draft-XXXXXX.json)
-_happy_cleanup() { rm -f "$DRAFT_FILE"; }
-register_cleanup _happy_cleanup
 
 slug=$(unique_slug happy)
 ws_start   # record everything from here on
 
 tid=$(spawn_task "$slug" "[[scenario:commit]]\nHappy-path E2E: do the work and commit it.")
-wait_for "work step completes (session idle)" 180 workflow_complete "$tid"
+
+# --- review: the run starts it, and llmvet approves --------------------------
+
+approve_run_review "$tid"
+wait_for "review concluded approved" 60 \
+	_ws_seen '.type == "review_finished" and .payload.status == "approved"' "$tid"
 assert "task never failed" task_not_failed "$tid"
 
-# --- review: approve through the real llmvet UI -----------------------------
+# --- decide: the run asks, and the operator answers --------------------------
 
-approve_review "$tid"
+wait_for "the run reaches its publication decision" 120 at_approval "$tid"
+jq -e '.authority.choices | map(select(.authorizes != null)) | length > 0' \
+	<<<"$(ship_projection "$tid")" >/dev/null &&
+	ok "the question offers publishing answers" ||
+	fail "approval choices" "$(ship_field "$tid" '.authority.choices')"
+# Finishing the work authorized nothing: there is no delivery record at all
+# until the operator confirms one.
+jq -e '.delivery_id == null and .disposition == null and .completed_actions == []' \
+	<<<"$(ship_projection "$tid")" >/dev/null &&
+	ok "reaching the decision authorized nothing" ||
+	fail "nothing authorized yet" "$(ship_projection "$tid")"
+_api_run POST "/api/tasks/$tid/ship/draft"
+[ "$API_CODE" = 409 ] &&
+	ok "agent drafting is refused: this workflow declares its own text" ||
+	fail "drafting refused" "$API_CODE $API_BODY"
 
-# --- deliver: draft (agent-authored), preview, then the pull-request ending ----
-
-# The draft route awaits the agent's reply synchronously and returns the whole
-# committed delivery projection — no separate wait needed. The draft is inert:
-# it authorizes nothing (ADR-0032).
-api_json POST "/api/tasks/$tid/ship/draft" >"$DRAFT_FILE"
-[ "$API_CODE" = 200 ] || die "ship draft failed ($API_CODE): $(cat "$DRAFT_FILE")"
-jq -e '.draft.state == "ready" and .draft.commit_message and .draft.pr_title' "$DRAFT_FILE" >/dev/null &&
-	ok "draft ready + parsed (title: $(jq -r .draft.pr_title "$DRAFT_FILE"))" ||
-	fail "draft state" "$(cat "$DRAFT_FILE")"
-jq -e '.disposition == "open" and .completed_actions == []' "$DRAFT_FILE" >/dev/null &&
-	ok "drafting authorized nothing" ||
-	fail "draft authorized nothing" "$(cat "$DRAFT_FILE")"
-message=$(jq -r '.draft.commit_message' "$DRAFT_FILE")
-pr_title=$(jq -r '.draft.pr_title' "$DRAFT_FILE")
-pr_body=$(jq -r '.draft.pr_body // ""' "$DRAFT_FILE")
+message=$(ship_field "$tid" '.authority.suggested.message // "ship: local-test delivery"')
+pr_title=$(ship_field "$tid" '.authority.suggested.pr_title // "Local test"')
+pr_body=$(ship_field "$tid" '.authority.suggested.pr_body // "why"')
 
 $GPGCTL warm
-ship_preview "$tid" pr squash "happy-$tid" "$message" "$pr_title" "$pr_body"
+ship_preview "$tid" open-pr "happy-$tid" "$message" "$pr_title" "$pr_body"
 [ "$API_CODE" = 200 ] || die "ship preview rejected ($API_CODE): $(cat /tmp/ship-preview-$tid.json)"
 jq -e '.deliverable and .remaining_actions == ["commit","push","pr"]' /tmp/ship-preview-$tid.json >/dev/null &&
 	ok "preview names every action the confirmation permits" ||
@@ -65,8 +69,12 @@ jq -e --arg m "$marker" '.pr_body | test("ompire-delivery: " + $m)' /tmp/ship-pr
 	ok "the previewed PR body carries the recovery correlation marker" ||
 	fail "preview marker" "$(jq -r .pr_body /tmp/ship-preview-$tid.json)"
 
-ship_deliver "$tid" pr squash "$message" "$pr_title" "$pr_body"
-wait_for "delivery finishes" 120 ship_done "$tid" pr
+ship_deliver "$tid" open-pr "$message" "$pr_title" "$pr_body"
+wait_for "delivery finishes" 180 ship_done "$tid" pr
+wait_for "the run completes at its published ending" 60 workflow_complete "$tid"
+[ "$(task_field "$tid" workflow_result)" = "pull-request-opened" ] &&
+	ok "the run's own result names the ending it reached" ||
+	fail "workflow result" "$(task_field "$tid" workflow_result)"
 
 # --- assertions ---------------------------------------------------------------
 

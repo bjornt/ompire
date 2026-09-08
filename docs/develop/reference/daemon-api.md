@@ -111,18 +111,35 @@ caller-supplied snapshot. A direct service call is admitted exactly as a REST
 request is, and there is no no-review path and no tokenless path.
 
 The shape is the same preview-then-confirm boundary as task creation, with two
-differences. `ship/preview` resolves a *requested ending* — `commit`, `push` or
-`pr` — and returns the actions still to run alongside every reason the delivery
-is refused, so an operator fixes them together rather than one attempt at a
-time. And its token covers only the inputs that ending will actually use: a
-commit message means nothing once the commit is done, and pull-request text
-means nothing for an ending that opens none, so including them would invalidate
-a continuation over a field it cannot act on.
+differences. `ship/preview` resolves the delivery the *run's own procedure*
+permits and returns the actions still to run alongside every reason it is
+refused, so an operator fixes them together rather than one attempt at a time.
+The ending and the mode are derived from the chain the run's answer would
+authorize; a caller may state one, and a disagreement is reported rather than
+obeyed. And its token covers only the inputs that chain will actually use — plus
+*which decision* this is, so a confirmation prepared against one question cannot
+be replayed against the next one with identical content.
 
-`ship/push` and `ship/pr` continue an existing verified result and never start
-an implicit earlier action. `ship/reconcile` records one decision about an
+`ship/commit` is the single confirmation operation. When the run is waiting at
+an approval it commits the answer, the delivery authorization it produces, and
+the run's move to its first action in one transaction, and the run then performs
+the actions the answer authorized. `POST /api/tasks/{id}/workflow/resume` makes
+the *same* call for an approving answer given from task detail; a generic resume
+without a preview token is refused, because without it there is no evidence the
+operator saw what they were authorizing.
+
+`ship/push` and `ship/pr` exist for a grant made before workflows owned
+publication: they continue that grant's own prefix and never start an implicit
+earlier action or extend it. `ship/reconcile` records one decision about an
 unresolved effect and writes nothing privileged: `retry` only makes a
 proven-not-executed action eligible for a fresh preview and confirmation.
+
+Admission itself lives in `runauthority.py`, above both managers. It reads the
+pinned revision, the run's current attempt, the persisted question and its
+committed decision, the review iteration that question froze, and the delivery
+journal — and its refusals drive the UI projections, so a page cannot offer a
+control the service would decline
+([ADR-0033](../../adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md)).
 
 Every one of these responds with the task's whole versioned delivery
 projection, the same document the WebSocket publishes — so a response and its

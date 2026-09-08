@@ -3,6 +3,11 @@
 - Status: Accepted
 - Date: 2026-09-05
 
+Extended by
+[ADR-0033](0033-scope-trusted-delivery-authority-to-the-workflow-run.md),
+which adds the privileged effects a pinned procedure could perform to what
+launch resolution discloses — including that it could perform none.
+
 Extended by [ADR-0031](0031-let-operators-own-a-workflow-library-above-retained-revisions.md),
 which makes the prospective name lookup below a transactional read of an
 editable library rather than of a fixed packaged catalog.

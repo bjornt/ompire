@@ -23,7 +23,7 @@ _stopped_by_operator() { # _stopped_by_operator TASK
 
 # --- big: a 200 KB frame flows through ------------------------------------------
 
-tid=$(spawn_task "$(unique_slug big)" "[[scenario:big]]
+tid=$(spawn_work_only "$(unique_slug big)" "[[scenario:big]]
 Stream something huge.")
 wait_for "big turn completes (workflow complete)" 180 workflow_complete "$tid"
 assert "session went working during big" \
@@ -49,7 +49,7 @@ assert "task never entered daemon task failure after stall" task_not_failed "$ti
 
 # --- auto-retry-hang: retrying state surfaces ------------------------------------
 
-tid2=$(spawn_task "$(unique_slug retry)" "[[scenario:auto-retry-hang]]
+tid2=$(spawn_work_only "$(unique_slug retry)" "[[scenario:auto-retry-hang]]
 Enter the retry loop and stay there.")
 wait_for "auto-retry surfaces retrying state" 90 \
 	_ws_seen '.type == "status_changed" and .payload.to == "retrying"' "$tid2"

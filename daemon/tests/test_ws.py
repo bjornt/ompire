@@ -185,20 +185,22 @@ def test_workflow_catalog_rides_the_snapshot_with_no_change_event(
         catalog = {w["name"]: w for w in snapshot["payload"]["workflow_catalog"]}
         assert catalog["single-step"]["primary_session"] == "main"
         assert catalog["single-step"]["sessions"] == ["main"]
-        assert catalog["single-step"]["steps"] == [
-            {
-                "name": "work",
-                "kind": "agent",
-                "session": "main",
-                "role": "default",
-                "conditional": False,
-            }
-        ]
+        # A client can see, before launching anything, exactly which
+        # privileged effects a workflow can perform.
+        assert catalog["single-step"]["actions"] == ["commit", "push", "pr"]
+        assert catalog["single-step"]["reviews"] is True
+        # A delivery step names its effect and the gate that can authorize it,
+        # and is always conditional: it runs only if a person says so.
+        steps = {step["name"]: step for step in catalog["single-step"]["steps"]}
+        assert steps["work"]["action"] is None
+        assert steps["commit-local"]["action"] == "commit"
+        assert steps["commit-local"]["approval"] == "approve"
+        assert steps["commit-local"]["conditional"] is True
         # The catalog names the revision a new launch of this name would pin,
         # so a client can tell "the same workflow" from "the same name"
         # (ADR-0028).
         assert catalog["single-step"]["revision"].startswith("sha256:")
-        assert catalog["single-step"]["format"] == 1
+        assert catalog["single-step"]["format"] == 3
 
 
 def test_reconnect_gets_fresh_snapshot(
@@ -252,7 +254,7 @@ def test_task_events_and_snapshot(
         # Tasks carry workflow run state, never a session id (the engine owns
         # sessions now).
         assert "session_id" not in created["payload"]
-        assert created["payload"]["workflow_name"] == "single-step"
+        assert created["payload"]["workflow_name"] == "plain"
 
         # Drain until the pipeline settles. `spawn_step` covers the four
         # workspace steps only (fetch/clone/branch/workshop); session spawn
@@ -314,7 +316,7 @@ def test_task_events_and_snapshot(
         # The workflows map carries the run: name/status/step plus the
         # step-record history.
         workflow = snapshot["payload"]["workflows"][str(task_id)]
-        assert workflow["name"] == "single-step"
+        assert workflow["name"] == "plain"
         assert workflow["status"] == "complete"
         assert workflow["step"] is None
         assert [

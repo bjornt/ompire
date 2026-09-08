@@ -155,34 +155,51 @@ notification with sound if it needs an approval or has failed.
 
 Go do something else. Ompire will tell you when it needs you.
 
-## 9. Review the work
+## 9. The review happens by itself
 
-When the agent is idle, start a review from the task detail view.
+You do not start it. When the agent's turn finishes, the `single-step`
+workflow's next step is **review**, and the run opens one.
 
-Ompire opens a review against the host side of the clone — the agent does not
-run it and cannot influence the verdict. The review shows the complete task
-delta, not just the last commit.
+Ompire runs the review against the host side of the clone — the agent does not
+run it and cannot influence the verdict — and it reads the complete task delta,
+not just the last commit. Open the reviewer from the task's Review panel.
 
-If you want changes, send a review comment back to the agent. It becomes the
-agent's next prompt and the session returns to `working`. Repeat until you are
-satisfied.
+If you want changes, leave a comment. Its report goes back to the work step as
+that step's next prompt, the session returns to `working`, and the run opens a
+fresh review when it finishes. That loop is part of the workflow, and it is
+bounded: three attempts, and no answer refills them.
 
-## 10. Ship it
+## 10. Decide what happens to it
 
-Shipping is two steps, so you see what will be published before it is.
+Once the review approves, the run stops and asks you. This is the whole point:
+finishing the work is not permission to publish it.
 
-**Draft.** Ompire asks the agent to write the commit message and pull-request
-title and body. This is the last thing the agent does.
+Open **Ship flow** from the task. The question offers:
 
-**Commit.** You edit the drafted text, choose `squash`, and confirm. From here
-the daemon does everything itself: signed commit, push, pull request — using
-credentials the agent never had access to.
+- finish without publishing — a complete ending, and the work stays on the
+  branch;
+- send it back with changes;
+- make a local signed commit and stop;
+- sign and push the branch;
+- sign, push, and open a pull request.
+
+Nothing is preselected. Pick the last one.
+
+Ompire shows the publication text the workflow suggested — edit it; what you
+confirm is what gets published — and then, when you select **Review this
+delivery**, exactly what your answer would permit: the content that was
+reviewed, the signing key, the destination, and the pull-request body it will
+write. Confirm it.
+
+From here the daemon does everything itself: signed commit, push, pull request
+— using credentials the agent never had access to, and performing only the
+three actions your answer named.
 
 If the commit is refused with a GPG error, your cached passphrase expired.
 Re-cache it and try again; nothing was written, so there is nothing to undo.
 
-When it succeeds, the pull-request URL is attached to the task. Check GitHub:
-the commit should show as **Verified**.
+When it succeeds, the pull-request URL is attached to the task and the run ends
+at `pull-request-opened`. Check GitHub: the commit should show as **Verified**.
 
 ## 11. Clean up
 
@@ -193,8 +210,9 @@ history remain.
 ## What you just did
 
 You gave a probabilistic process an isolated workspace, let it work
-unsupervised, reviewed its output through a channel it could not influence,
-and published the result with a key it never held.
+unsupervised, had its output reviewed through a channel it could not influence,
+decided yourself what should happen to the result, and published it with a key
+the agent never held.
 
 That is the whole idea. Everything else is more workflows, more steps, and
 better evidence between them.

@@ -4,8 +4,13 @@
 #
 # Retain mode: build a multi-commit agent history in the task clone (the
 # fake omp's `commit` scenario authors real git commits via follow-up
-# prompts), ship in retain mode, and assert the rewrite contract — commit
-# count preserved and every commit re-signed with the ephemeral key.
+# prompts), publish it in retain mode, and assert the rewrite contract —
+# commit count preserved and every commit re-signed with the ephemeral key.
+#
+# Retain is a mode an *author* declares on a commit action, so this scenario
+# authors the workflow it needs, exactly as an operator would: work, a gate
+# that waits while the history is built, review, and an approval whose one
+# publishing answer authorizes a retain commit, a push, and a pull request.
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -15,17 +20,18 @@ set -euo pipefail
 
 BARE=$STATE_ROOT/forge/github.com/local-test/sandbox.git
 AGENT_COMMITS=2
-DRAFT_FILE=$(mktemp /tmp/ompire-retain-draft-XXXXXX.json)
-_retain_cleanup() { rm -f "$DRAFT_FILE"; }
-register_cleanup _retain_cleanup
+WORKFLOW=retain-flow
 
-ws_start ship_updated
+RETAIN_YAML=$(cat "$(dirname "$0")/retain-flow.yaml")
+
+ws_start
 _agent_idle_after() { # _agent_idle_after TASK PREVIOUS_IDLE_EVENTS
 	[ "$(ws_count '.type == "status_changed" and .payload.task_id == '"$1"' and .payload.session == "main" and .payload.to == "idle"')" -gt "$2" ]
 }
 
-tid=$(spawn_task "$(unique_slug retain)" "Retain-mode E2E: do the initial work.")
-wait_for "work step completes" 180 workflow_complete "$tid"
+save_workflow "$WORKFLOW" "$RETAIN_YAML"
+tid=$(spawn_task "$(unique_slug retain)" "Retain-mode E2E: do the initial work." "$WORKFLOW")
+wait_for "the run waits while history is built" 180 workflow_gate "$tid" >/dev/null
 
 # --- agent history: one commit per follow-up ---------------------------------
 
@@ -43,23 +49,23 @@ ok "$AGENT_COMMITS agent commits authored"
 
 # --- retain ship ---------------------------------------------------------------
 
-approve_review "$tid"
-api_json POST "/api/tasks/$tid/ship/draft" >"$DRAFT_FILE"
-[ "$API_CODE" = 200 ] || die "draft failed: $(cat "$DRAFT_FILE")"
-message=$(jq -r '.draft.commit_message' "$DRAFT_FILE")
-pr_title=$(jq -r '.draft.pr_title' "$DRAFT_FILE")
-pr_body=$(jq -r '.draft.pr_body // ""' "$DRAFT_FILE")
+answer_gate "$tid" continue
+approve_run_review "$tid"
+wait_for "the run reaches its publication decision" 180 at_approval "$tid"
+message="ship: retained history"
+pr_title="Retained history"
+pr_body="each commit kept"
 $GPGCTL warm
 
 # The preview reports the range it would retain before anything is signed.
-ship_preview "$tid" pr retain "retain-$tid" "$message" "$pr_title" "$pr_body"
+ship_preview "$tid" open-pr "retain-$tid" "$message" "$pr_title" "$pr_body"
 [ "$API_CODE" = 200 ] || die "retain preview rejected ($API_CODE): $(cat /tmp/ship-preview-$tid.json)"
 jq -e --argjson n "$AGENT_COMMITS" '.deliverable and .candidate.commit_count == $n' \
 	/tmp/ship-preview-$tid.json >/dev/null &&
 	ok "preview names the $AGENT_COMMITS commits retain would publish" ||
 	fail "retain preview range" "$(jq -c '{deliverable, candidate, blockers}' /tmp/ship-preview-$tid.json)"
 
-ship_deliver "$tid" pr retain "$message" "$pr_title" "$pr_body"
+ship_deliver "$tid" open-pr "$message" "$pr_title" "$pr_body"
 wait_for "retain delivery finishes" 120 ship_done "$tid" pr
 [ "$(ship_field "$tid" '.results.commit.commit_count')" = "$AGENT_COMMITS" ] &&
 	ok "the recorded result keeps the retained commit count" ||

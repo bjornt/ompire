@@ -3,6 +3,12 @@
 - Status: Proposed
 - Date: 2026-08-23
 
+Its run/review/decision/action linkage is advanced by
+[ADR-0033](0033-scope-trusted-delivery-authority-to-the-workflow-run.md):
+every review iteration and privileged action now names the workflow attempt
+that asked for it. This record stays Proposed for its outstanding commit
+lineage and transcript-retention gaps.
+
 ## Context
 
 Ompire owns work that crosses several failure and trust boundaries. A task can survive browser disconnection, span daemon restarts, resume agent sessions and workflow steps, obtain human decisions, run independent review, rewrite Git history, push a branch, and create or observe a pull request. Some of those actions are repeatable; others have external effects that cannot be made safe merely by restarting the same code. The daemon therefore needs more than enough current state to redraw the UI. It needs durable evidence from which it can resume without duplicating authority-bearing effects and later explain what happened.

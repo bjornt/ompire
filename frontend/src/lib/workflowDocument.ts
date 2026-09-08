@@ -32,8 +32,26 @@ export interface DraftObject {
   [key: string]: DraftValue;
 }
 
-export const STEP_KINDS = ["agent", "command", "decision", "gate"] as const;
+export const STEP_KINDS = [
+  "agent",
+  "command",
+  "decision",
+  "gate",
+  "review",
+  "delivery",
+] as const;
 export type StepKindName = (typeof STEP_KINDS)[number];
+
+/** The privileged effects a delivery step may name, in the only order a
+ * chain may run them. Mirrored from the daemon's closed grammar so the editor
+ * can offer exactly these — never so it can decide what is valid. */
+export const DELIVERY_ACTIONS = ["commit", "push", "pr"] as const;
+export type DeliveryAction = (typeof DELIVERY_ACTIONS)[number];
+export const DELIVERY_MODES = ["squash", "retain"] as const;
+/** The publication text a delivery gate may suggest. Each is an ordinary
+ * text document over the gate's own frozen evidence. */
+export const DELIVERY_METADATA_FIELDS = ["message", "pr_title", "pr_body"] as const;
+export type DeliveryMetadataField = (typeof DELIVERY_METADATA_FIELDS)[number];
 
 /** The closed vocabularies the daemon's loader accepts. Mirrored here so the
  * editor can offer exactly them — never so it can decide what is valid. */
@@ -528,17 +546,116 @@ function rewriteStep(step: DraftObject, index: number, rewrite: Rewrite, visit: 
       asArray(step.choices).map((entry, choiceIndex) => {
         const object = asObject(entry);
         if (object === null) return entry;
-        return withKey(
+        const choiceLocation = `${location}.choices[${choiceIndex}]`;
+        let choice = withKey(
           object,
           "next",
           rewriteDestination(
             object.next,
-            `${location}.choices[${choiceIndex}].next`,
+            `${choiceLocation}.next`,
             context,
             "is where an answer to this gate goes",
           ),
         );
+        // An approving answer names the exact actions it permits. Renaming a
+        // delivery step has to move the *grant* with it, or the answer would
+        // authorize a step that no longer exists.
+        const grant = asObject(choice.authorize);
+        if (grant !== null) {
+          choice = withKey(
+            choice,
+            "authorize",
+            withKey(
+              grant,
+              "steps",
+              asArray(grant.steps).map((name, grantIndex) =>
+                rewriteName(
+                  name,
+                  "step",
+                  context.rewrite.step,
+                  `${choiceLocation}.authorize.steps[${grantIndex}]`,
+                  "is an action this answer authorizes",
+                  context,
+                ),
+              ),
+            ),
+          );
+        }
+        return choice;
       }),
+    );
+  }
+  // A gate's delivery binding: the review its grant rests on, and the
+  // publication text it suggests. Both are references into this same card.
+  const delivery = asObject(step.delivery);
+  if (delivery !== null) {
+    let bound = withKey(
+      delivery,
+      "review",
+      rewriteName(
+        delivery.review,
+        "evidence",
+        context.rewrite.evidenceAlias,
+        `${location}.delivery.review`,
+        "is the review this approval is about",
+        context,
+      ),
+    );
+    const metadata = asObject(delivery.metadata);
+    if (metadata !== null) {
+      let rewritten = metadata;
+      for (const field of DELIVERY_METADATA_FIELDS) {
+        if (metadata[field] === undefined) continue;
+        rewritten = withKey(
+          rewritten,
+          field,
+          rewriteText(metadata[field], `${location}.delivery.metadata.${field}`, context),
+        );
+      }
+      bound = withKey(bound, "metadata", rewritten);
+    }
+    next = withKey(next, "delivery", bound);
+  }
+  // A delivery step's own references: the gate that can authorize it, the
+  // action it consumes, and where the chain goes next.
+  if (step.approval !== undefined) {
+    next = withKey(
+      next,
+      "approval",
+      rewriteName(
+        step.approval,
+        "step",
+        context.rewrite.step,
+        `${location}.approval`,
+        "is the approval that can authorize this action",
+        context,
+      ),
+    );
+  }
+  if (step.previous !== undefined) {
+    next = withKey(
+      next,
+      "previous",
+      rewriteName(
+        step.previous,
+        "step",
+        context.rewrite.step,
+        `${location}.previous`,
+        "is the action whose result this one consumes",
+        context,
+      ),
+    );
+  }
+  if (step.next !== undefined) {
+    next = withKey(
+      next,
+      "next",
+      rewriteDestination(
+        step.next,
+        `${location}.next`,
+        context,
+        "is where this action goes once it is on record",
+      ),
     );
   }
   return next;

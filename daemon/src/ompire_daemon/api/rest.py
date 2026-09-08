@@ -178,6 +178,12 @@ from ompire_daemon.review import (
     ReviewManager,
 )
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
+from ompire_daemon.runauthority import (
+    SOURCE_LEGACY_CONTINUATION,
+    resolve_authority,
+    review_admission,
+    writer_refusal,
+)
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import (
     DeliveryBlockedError,
@@ -192,6 +198,7 @@ from ompire_daemon.taskdefinition import (
     resolve_task_definition,
 )
 from ompire_daemon.workflow_definitions import (
+    GateStep,
     UnsupportedWorkflowFormatError,
     WorkflowDefinition,
     WorkflowDocumentError,
@@ -968,6 +975,10 @@ class StepDescriptorOut(BaseModel):
     # A declared route can pass this step by, or its own `when` can hold it
     # back, so it may not run.
     conditional: bool
+    # Format 3: the one privileged effect a delivery step performs, and the
+    # gate whose answer is the only thing that can authorize it.
+    action: str | None = None
+    approval: str | None = None
 
 
 class WorkflowOut(BaseModel):
@@ -979,6 +990,12 @@ class WorkflowOut(BaseModel):
     primary_session: str
     sessions: list[str]
     steps: list[StepDescriptorOut]
+    # Every privileged effect this definition can perform, in effect order.
+    # An empty list is a statement — this workflow cannot publish anything —
+    # not an absence of information.
+    actions: list[str] = []
+    # Whether the definition declares independent review at all.
+    reviews: bool = False
 
 
 @router.get("/workflows", response_model=list[WorkflowOut])
@@ -1076,14 +1093,23 @@ def export_workflow_revision_route(
 
 
 # The starter a new workflow opens on: the smallest thing that is a real
-# format-2 definition. One agent step that gets the operator's prompt, and an
-# ending that says what finishing meant — because format 2 does not let a run
-# stop by falling off the end of the list.
+# format-3 definition. One agent step that gets the operator's prompt, and an
+# ending that says what finishing meant — because format 2 onwards does not
+# let a run stop by falling off the end of the list.
+#
+# It publishes nothing. Review, an approval gate, and the delivery actions it
+# authorizes are things an author adds deliberately; a new workflow that could
+# already sign and push would make publication the default rather than a
+# decision somebody made.
 STARTER_TEMPLATE = """\
 # A new workflow. Edit it, Validate it, then save an executable revision.
 # Saving a draft keeps your text; only an executable save makes this
 # launchable.
-format: 2
+#
+# This workflow publishes nothing. To publish, add a `review` step, a gate
+# whose `delivery` binds that review, and the `delivery` actions one of its
+# choices authorizes.
+format: 3
 name: {name}
 sessions: [main]
 primary: main
@@ -2265,6 +2291,10 @@ async def cleanup_task_route(
             f"task {task_id} has a delivery that is still {active.disposition}; "
             "finish or reconcile it before cleaning up",
         )
+    # And refused while the run is at a decision or an action: destroying the
+    # workspace mid-publication would leave the effect on record with nothing
+    # to reconcile it against (ADR-0033).
+    _refuse_run_writer(engine, task_id)
 
     clone_path = Path(task.clone_path).resolve()
     task_root = config.task_dir_root.expanduser().resolve()
@@ -2398,11 +2428,25 @@ class AgentMessage(BaseModel):
     message: str
 
 
+def _refuse_run_writer(engine: Engine, task_id: int) -> None:
+    """Refuse a daemon-managed writer the run's current position forbids."""
+    try:
+        task = get_task(engine, task_id)
+    except TaskNotFoundError:
+        return
+    refusal = writer_refusal(engine, task)
+    if refusal is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, {"code": refusal[0], "message": refusal[1]}
+        )
+
+
 async def _require_live_agent(
     supervisor: AgentSupervisor,
     task_id: int,
     session: str,
     guard: WorkspaceGuard | None = None,
+    engine: Engine | None = None,
 ) -> AgentHandle:
     """The session's live agent, taken inside its own boundary (ADR-0027).
 
@@ -2415,12 +2459,19 @@ async def _require_live_agent(
     review, a delivery, or a workflow step takes (ADR-0032): the daemon refuses
     the new turn rather than interrupting whoever holds the workspace, and
     refuses it outright while an unresolved privileged effect is outstanding.
+
+    And it is admitted against the run's *position* as well (ADR-0033). A run
+    parked at a publication decision holds no lock — it is waiting for a
+    person — so the guard alone would let a turn change the very content that
+    decision is about.
     """
     if guard is not None:
         try:
             guard.assert_host_free(task_id)
         except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    if engine is not None:
+        _refuse_run_writer(engine, task_id)
     handle = await supervisor.acquire(task_id, session)
     if handle is None:
         raise HTTPException(
@@ -2458,7 +2509,9 @@ async def steer_agent_route(
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     _require_declared_session(engine, task, session)
-    handle = await _require_live_agent(supervisor, task_id, session, guard)
+    handle = await _require_live_agent(
+        supervisor, task_id, session, guard, engine
+    )
     return await _agent_request(handle, "steer", message=body.message)
 
 
@@ -2473,7 +2526,9 @@ async def follow_up_agent_route(
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     _require_declared_session(engine, task, session)
-    handle = await _require_live_agent(supervisor, task_id, session, guard)
+    handle = await _require_live_agent(
+        supervisor, task_id, session, guard, engine
+    )
     return await _agent_request(handle, "follow_up", message=body.message)
 
 
@@ -2489,7 +2544,9 @@ async def interrupt_agent_route(
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     _require_declared_session(engine, task, session)
-    handle = await _require_live_agent(supervisor, task_id, session, guard)
+    handle = await _require_live_agent(
+        supervisor, task_id, session, guard, engine
+    )
     # Any pending question is moot once the turn is aborted (design D-6); the
     # abort's own agent_start/agent_end then drives state normally.
     sessions.clear_pending(task_id, session)
@@ -2614,6 +2671,90 @@ class WorkflowResumeBody(BaseModel):
     # Feedback for the choice, and the note a format-1 resume already carried.
     # Data either way: it is recorded and shown, and it never names a route.
     note: str | None = None
+    # An answer that authorizes publication carries the delivery it confirmed.
+    # A generic resume cannot answer one: without the token there is no
+    # evidence the operator saw the content, the target, and the identities
+    # the confirmation is about, and that evidence is the authorization.
+    preview_token: str | None = None
+    request_id: str | None = None
+    message: str = ""
+    pr_title: str = ""
+    pr_body: str = ""
+
+
+def _authorizes_delivery(
+    revision: WorkflowRevision, waiting: Any, choice_id: str
+) -> bool:
+    """Whether this answer would grant publication, per the pinned document."""
+    step = revision.definition.step_named(waiting.step)
+    if not isinstance(step, GateStep):
+        return False
+    choice = step.choice_named(choice_id)
+    return choice is not None and choice.authorize is not None
+
+
+async def _answer_with_delivery(
+    task: Task, body: WorkflowResumeBody, request: Request, engine: Engine
+) -> dict[str, Any]:
+    """Answer an approving choice, with the delivery it authorizes.
+
+    Deliberately the same operation Ship flow's confirm button calls. Two
+    surfaces, one authorization: whichever page the operator is on, the
+    decision, the grant, and the run's move to its first action are one
+    transaction over the same checked preview.
+    """
+    ships: ShipManager = request.app.state.ships
+    if not body.preview_token or not body.request_id:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {
+                "field": "preview_token",
+                "detail": (
+                    "this answer authorizes publication; confirm it against a "
+                    "delivery preview ('request_id' and 'preview_token') so "
+                    "what is authorized is what was shown"
+                ),
+            },
+        )
+    assert body.choice_id is not None
+    try:
+        resolved = await ships.preview(
+            task,
+            commit_message=body.message,
+            pr_title=body.pr_title,
+            pr_body=body.pr_body,
+            request_id=body.request_id,
+            gate_seq=body.expected_seq,
+            choice_id=body.choice_id,
+        )
+        if resolved.fingerprint != body.preview_token:
+            raise PreviewMismatchError(
+                "the delivery changed since it was previewed; review the new "
+                "preview before confirming"
+            )
+        _delivery_id, _projection = await ships.confirm(
+            task,
+            resolved,
+            runner=request.app.state.workflow_runner,
+            note=body.note,
+        )
+    except PreviewMismatchError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+    except DeliveryBlockedError as exc:
+        raise _delivery_conflict(exc) from exc
+    except DeliveryConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+    except ShipError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+    updated = get_task(engine, task.id)
+    return {
+        "task_id": task.id,
+        "workflow": "answered",
+        "choice_id": body.choice_id,
+        "step": updated.workflow_step,
+        "result": updated.workflow_result,
+        "delivery": resolved.ending,
+    }
 
 
 @router.post("/tasks/{task_id}/workflow/resume")
@@ -2661,6 +2802,8 @@ async def resume_workflow_route(
         if offers_choices:
             assert body.choice_id is not None
             revision = resolve_task_definition(engine, task)
+            if _authorizes_delivery(revision, waiting, body.choice_id):
+                return await _answer_with_delivery(task, body, request, engine)
             updated = runner.answer_gate(
                 task,
                 revision,
@@ -2706,22 +2849,37 @@ async def start_review_route(
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
-    # Review gates on the workflow's primary session (workflow-engine D-8).
-    primary = _primary_session(engine, task)
-    session_info = sessions.get(task_id, primary)
-    if session_info is None or session_info.status != "idle":
+    # Whether a review may start is a property of the run, not of an agent
+    # (ADR-0033). A format-3 workflow starts its own review when it reaches
+    # the step that declares one, and starting a second by hand would grade
+    # content the run is still changing.
+    authority = resolve_authority(engine, task)
+    refusal = review_admission(authority, task)
+    if refusal is not None:
         raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"task {task_id} session {primary!r} is not idle",
+            status.HTTP_409_CONFLICT, {"code": refusal[0], "message": refusal[1]}
         )
-    if await supervisor.acquire(task_id, primary) is None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"task {task_id} session {primary!r} has no live agent",
-        )
+    if not authority.declares_review:
+        # An older definition has no review step, so the operator drives it —
+        # and the primary session is the conversation the comments go back to,
+        # which is why it has to be there and idle.
+        primary = _primary_session(engine, task)
+        session_info = sessions.get(task_id, primary)
+        if session_info is None or session_info.status != "idle":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"task {task_id} session {primary!r} is not idle",
+            )
+        if await supervisor.acquire(task_id, primary) is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"task {task_id} session {primary!r} has no live agent",
+            )
 
     try:
-        state = await reviews.start_review(task)
+        state = await reviews.start_review(
+            task, workflow_seq=authority.review_seq
+        )
     except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except (ReviewAlreadyOpenError, ReviewContentError) as exc:
@@ -2797,23 +2955,35 @@ class ShipDraftSaveBody(BaseModel):
 
 
 class ShipPreviewBody(BaseModel):
-    """A requested ending and its inputs, resolved read-only."""
+    """The decision being previewed, and the text it would publish.
 
-    ending: str
-    mode: str = "squash"
+    `ending` and `mode` are *not* requests. The run's pinned chain decides how
+    far a delivery goes and how it composes history; supplying either is a
+    caller stating what it believes, and a disagreement is reported rather
+    than silently resolved in the caller's favour.
+    """
+
+    ending: str | None = None
+    mode: str | None = None
     message: str = ""
     pr_title: str = ""
     pr_body: str = ""
     request_id: str
     delivery_id: int | None = None
+    # Which question is being answered, and with which answer. Required when
+    # the run is waiting at an approval: a preview that did not name them
+    # would describe "whatever this task could publish", which is not a
+    # decision anyone can confirm.
+    gate_seq: int | None = None
+    choice_id: str | None = None
 
 
 class ShipCommitBody(BaseModel):
     """One authorization. Every field the preview fingerprinted is required —
     there is no omitted-ending legacy shape and no tokenless path."""
 
-    ending: str
-    mode: str = "squash"
+    ending: str | None = None
+    mode: str | None = None
     message: str = ""
     pr_title: str = ""
     pr_body: str = ""
@@ -2821,12 +2991,16 @@ class ShipCommitBody(BaseModel):
     preview_token: str
     delivery_id: int | None = None
     expected_version: int | None = None
+    gate_seq: int | None = None
+    choice_id: str | None = None
+    # Feedback recorded with the decision, exactly as a gate answer's is.
+    note: str | None = None
 
 
 class ShipContinueBody(BaseModel):
-    """Authorize a further ending for an existing verified result."""
+    """Continue an interrupted or pre-upgrade chain for a verified result."""
 
-    ending: str
+    ending: str | None = None
     pr_title: str = ""
     pr_body: str = ""
     request_id: str
@@ -2925,7 +3099,11 @@ async def preview_ship_route(
             pr_body=body.pr_body,
             request_id=body.request_id,
             delivery_id=body.delivery_id,
+            gate_seq=body.gate_seq,
+            choice_id=body.choice_id,
         )
+    except DeliveryBlockedError as exc:
+        raise _delivery_conflict(exc) from exc
     except PreviewMismatchError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except TaskConfigurationRequiredError as exc:
@@ -2949,6 +3127,7 @@ async def commit_ship_route(
     same admission the UI does.
     """
     task = _require_task(engine, task_id)
+    runner: WorkflowRunner = request.app.state.workflow_runner
     try:
         resolved = await ships.preview(
             task,
@@ -2959,21 +3138,32 @@ async def commit_ship_route(
             pr_body=body.pr_body,
             request_id=body.request_id,
             delivery_id=body.delivery_id,
+            gate_seq=body.gate_seq,
+            choice_id=body.choice_id,
         )
         if resolved.fingerprint != body.preview_token:
             raise PreviewMismatchError(
                 "the delivery changed since it was previewed; review the new "
                 "preview before confirming"
             )
-        if resolved.blockers:
-            raise DeliveryBlockedError(resolved.blockers)
-        delivery_id, projection = await ships.authorize(
-            task, resolved, expected_version=body.expected_version
+        delivery_id, projection = await ships.confirm(
+            task,
+            resolved,
+            runner=runner,
+            note=body.note,
+            expected_version=body.expected_version,
         )
     except PreviewMismatchError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
     except DeliveryBlockedError as exc:
         raise _delivery_conflict(exc) from exc
+    except WorkflowGateChoiceError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {"field": exc.field, "detail": exc.detail},
+        ) from exc
+    except (WorkflowWaitConflictError, WorkflowNotWaitingError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
     except DeliveryConflictError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
     except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
@@ -2981,9 +3171,13 @@ async def commit_ship_route(
     except ShipError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
 
-    ships.start_delivery(
-        task, delivery_id, body.request_id, request.app.state.spawn_jobs
-    )
+    if resolved.source == SOURCE_LEGACY_CONTINUATION:
+        # Only a pre-upgrade grant is scheduled here. A workflow decision —
+        # an approval, or a continuation of an interrupted action — moved the
+        # run itself, and the run performs its own steps.
+        ships.start_delivery(
+            task, delivery_id, body.request_id, request.app.state.spawn_jobs
+        )
     return projection
 
 
@@ -3006,7 +3200,6 @@ async def _continue_delivery(
         resolved = await ships.preview(
             task,
             ending=body.ending,
-            mode="squash",
             commit_message="",
             pr_title=body.pr_title,
             pr_body=body.pr_body,
@@ -3022,10 +3215,11 @@ async def _continue_delivery(
                 "the delivery changed since it was previewed; review the new "
                 "preview before confirming"
             )
-        if resolved.blockers:
-            raise DeliveryBlockedError(resolved.blockers)
-        delivery_id, projection = await ships.authorize(
-            task, resolved, expected_version=body.expected_version
+        delivery_id, projection = await ships.confirm(
+            task,
+            resolved,
+            runner=request.app.state.workflow_runner,
+            expected_version=body.expected_version,
         )
     except PreviewMismatchError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc

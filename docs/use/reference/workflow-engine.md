@@ -19,6 +19,12 @@ Two definitions ship with the daemon as read-only examples:
 You add your own in the [workflow library](#the-workflow-library) — no daemon
 release, and no restart.
 
+A workflow also owns its ending. [Review](#review-steps) and each trusted
+publication effect — a local signed commit, a push, a pull request — are steps
+a definition declares, and a person authorizes exactly the chain one of its
+answers names. Finishing the work is not permission to publish it
+([ADR-0033](../../adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md)).
+
 ## Definitions and revisions
 
 A definition declares:
@@ -29,26 +35,30 @@ A definition declares:
 | `name` | The library entry's name; a launch selects it. Permanent — renaming means creating a separate workflow |
 | `sessions` | Slug-format session names, declared up front, unique per task |
 | `primary` | Session targeted by task-scoped operations |
-| steps | Ordered, uniquely named, of four kinds. An `agent` step also declares the abstract model role it consumes. |
+| steps | Ordered, uniquely named, of six kinds. An `agent` step also declares the abstract model role it consumes. |
 
 Steps fall through to the next declared step on success. A `decision` step
-routes explicitly, and in format 2 a `gate` step's chosen answer routes too.
+routes explicitly, a `gate` step's chosen answer routes too, and a `delivery`
+step routes to the next action or to the ending its chain reaches.
 
-Two formats are installed and both execute. **Format 1** is frozen: a
+Three formats are installed and all execute. **Format 1** is frozen: a
 definition retained under it is always read under its original rules, so a task
 accepted years ago keeps meaning what it meant. **Format 2** adds declared
 results, recorded evidence, and gates with named choices, and removes the two
-places format 1 left meaning implicit. `single-step` is format 1;
-[`bugfix`](bugfix-workflow.md) is format 2.
+places format 1 left meaning implicit. **Format 3** adds the ending: review and
+each trusted publication effect become steps, and an approving answer names the
+exact chain it permits. Both packaged workflows are format 3.
 
-| | Format 1 | Format 2 |
-|---|---|---|
-| Agent result | `status: "success" \| "failed"` plus an untyped artifact bag | a [declared result](#declared-results-format-2) with required artifact fields |
-| Reading prior attempts | `latest`, re-scanned on every evaluation | [evidence bound once](#evidence-format-2) at attempt entry and recorded |
-| Gate | Resume, with an optional note | [named choices](#gate-steps) with declared destinations |
-| Ending | falling off the last step | `{complete: true, result: <name>}` |
+| | Format 1 | Format 2 | Format 3 |
+|---|---|---|---|
+| Agent result | `status: "success" \| "failed"` plus an untyped artifact bag | a [declared result](#declared-results-format-2-onwards) with required artifact fields | as format 2 |
+| Reading prior attempts | `latest`, re-scanned on every evaluation | [evidence bound once](#evidence-format-2-onwards) at attempt entry and recorded | as format 2 |
+| Gate | Resume, with an optional note | [named choices](#gate-steps) with declared destinations | plus answers that authorize publication |
+| Ending | falling off the last step | `{complete: true, result: <name>}` | as format 2 |
+| Review | an operator command beside the run | same | a [declared step](#review-steps) whose verdict routes |
+| Publishing | an operator command beside the run | same | [declared steps](#publication-steps) a person authorizes |
 
-A format-2 definition cannot be offered as a continuation candidate for a task
+A newer definition cannot be offered as a continuation candidate for a task
 whose history was recorded under format 1: those results were written under a
 different contract and cannot be reinterpreted. See
 [Compatibility](#compatibility-across-formats).
@@ -137,8 +147,9 @@ hidden behind the text editor.
 Two things are deliberately not editable in either view. A workflow's **name**
 is the library entry's identity, so renaming means creating a separate entry.
 A workflow's **format** is the rules its document is read under, so an existing
-format-1 workflow stays format 1 and keeps its own outcome, history, gate, and
-completion rules; new workflows are format 2.
+format-1 or format-2 workflow stays on its own format and keeps its own
+outcome, history, gate, and completion rules — including being unable to
+publish. New workflows are format 3.
 
 What switching costs you:
 
@@ -191,8 +202,10 @@ will succeed. A failed executable save leaves the last one exactly where it was.
 
 Four ways in, all of which produce a draft and nothing else:
 
-- **New workflow** opens a minimal format-2 example with one agent step and a
-  named ending, which you can then build out in either editor.
+- **New workflow** opens a minimal format-3 example with one agent step and a
+  named ending, which you can then build out in either editor. It publishes
+  nothing: review, an approval, and the actions it authorizes are things you
+  add deliberately.
 - **Duplicate** copies a saved revision into a new entry under a name you
   choose. This is how you customize a built-in.
 - **Import YAML** reads a local file into the editor. The file is read by your
@@ -354,14 +367,14 @@ definition's own routes.
 
 An outcome-bearing step whose prompt renders empty records a null outcome
 without reading the file and without pausing *in format 1*: no outcome
-instruction was given, so anything on disk is stale by definition. In format 2
+instruction was given, so anything on disk is stale by definition. From format 2 onwards
 a step that owes a result and rendered an empty prompt pauses instead — a
 definition that cannot ask for what it requires is not a step that produced
 nothing. An explicit `when: false` remains a deliberate skip in both.
 
-### Declared results (format 2)
+### Declared results (format 2 onwards)
 
-A format-2 agent step declares `outcome: null` — no result is asked for — or
+A format-2 or format-3 agent step declares `outcome: null` — no result is asked for — or
 the results it may produce and, per result, the artifact fields that result
 must carry with their JSON types:
 
@@ -383,7 +396,7 @@ What this establishes is structure and attribution — that the step declared
 this result and wrote the evidence it promised. It says nothing about whether
 that evidence is *true*, and nothing in an artifact is ever an instruction.
 
-### Evidence (format 2)
+### Evidence (format 2 onwards)
 
 A step declares which prior attempts it needs, by alias:
 
@@ -450,7 +463,7 @@ gate's outcome, finishes the gate `ok`, and continues at the next declared
 step. Resuming a gate that is the last declared step completes the run —
 including when the gate was re-armed by restart recovery.
 
-A **format-2 gate** asks a question with named answers
+A **gate with declared choices** (format 2 onwards) asks a question with named answers
 ([ADR-0030](../../adr/0030-commit-human-decisions-before-advancing.md)):
 
 ```yaml
@@ -499,7 +512,7 @@ unreadable, the run stops and says what it was waiting for.
 
 A pause is not a gate, and the UI keeps them apart. A **gate** is the
 definition asking a person to look — to continue, in format 1, or to choose
-among declared answers, in format 2. A **pause** is the engine refusing to
+among declared answers, from format 2 onwards. A **pause** is the engine refusing to
 guess; the action retries the step that could not be decided, and it never
 continues past it.
 
@@ -509,9 +522,9 @@ Six things pause a run:
 |---|---|
 | `missing_outcome` | A prompted step that requires a result left none that could be read |
 | `unresolved_decision` | A route could not be decided from the recorded evidence, or the definition declared a pause for this case |
-| `prompt_unrenderable` | A prompt or gate message referenced a value that is missing and has no declared fallback, or a format-2 step that owes a result rendered an empty prompt |
+| `prompt_unrenderable` | A prompt or gate message referenced a value that is missing and has no declared fallback, or a result-bearing step whose prompt rendered empty |
 | `condition_unresolved` | A step's own condition could not be decided |
-| `missing_evidence` | A format-2 step declared a required evidence selector that matched nothing |
+| `missing_evidence` | A step declared a required evidence selector that matched nothing |
 | `workspace_unavailable` | Another daemon-managed writer owned the task's workspace, or an unresolved privileged effect made writing to it unsafe |
 
 None of these is a *negative result*. A `"failed"` outcome, a nonzero command
@@ -553,52 +566,125 @@ set. A retry counts against the step's declared visit bound like any other
 attempt, and once that bound is spent the retry sends the run to the step's
 declared exhaustion gate instead of opening another attempt.
 
+### Review steps
+
+A `review` step runs the independent host-side reviewer against the *protected
+candidate* — the whole delta this task would publish, captured before the
+reviewer starts — and records its verdict. See [Review](review.md) for what the
+reviewer is and how you drive it.
+
+The verdict is ordinary evidence, so what happens next is written in the
+definition rather than done for you:
+
+- **approved** routes wherever the author said, typically to an approval gate.
+- **comments** carries the reviewer's own report back to a working step, whose
+  visit bound is what ends the loop. The report is retained whole, with a state
+  saying whether it is complete — a definition can require a complete report
+  before correcting automatically.
+- **aborted**, **error**, and **interrupted** are not opinions about the code.
+  A definition usually routes them to a gate; nothing treats them as approval.
+
+A review that could not run at all produces no verdict: the step stops and says
+why. Nothing is assumed about content nobody graded.
+
+Review is a host-side operation on the workspace, not something an agent does,
+so it does not need a live idle agent. On a workflow that declares its own
+review step, starting one by hand is refused: the run starts the review when it
+reaches it, and reviewing at another moment would grade content the run is
+still changing.
+
+### Publication steps
+
+A `delivery` step performs exactly one effect — a local signed commit, a push
+to the task's accepted destination, or a pull request. Each names the approval
+that can permit it and the result it consumes. A run performs an action only
+when a person answers that approval with the choice that grants it, and only in
+the order the chain declares: no action performs a missing predecessor.
+
+An approval gate binds itself to the review it is asking about. Each of its
+answers either publishes nothing or names the exact chain it authorizes, and
+there is always an answer that publishes nothing. Confirming a publishing
+answer happens against a preview of the real content, destination, identities,
+and final text — see [Ship flow](ship-flow.md).
+
+The definition can also suggest the publication text, rendered from the same
+frozen evidence the question was asked against. It is a suggestion: it arrives
+as an editable draft beside the decision, and what you confirm is what is
+published.
+
 ### Compatibility across formats
 
-Both formats execute, side by side, indefinitely. A task runs whatever its
+All three formats execute, side by side, indefinitely. A task runs whatever its
 pinned revision says, and nothing about a new format reaches it.
 
-- A retained format-1 definition keeps its grammar, its canonical bytes and so
-  its revision identity, its outcome protocol, its gate semantics, its routes,
-  and its recovery behavior. Adding format 2 changed none of them.
+- A retained format-1 or format-2 definition keeps its grammar, its canonical
+  bytes and so its revision identity, its outcome protocol, its gate semantics,
+  its routes, and its recovery behavior. Adding a format changed none of them.
 - Existing accepted tasks are never rebound. A new `bugfix` launch pins the
-  format-2 revision; a task already running the older one keeps running it.
+  format-3 revision; a task already running an older one keeps running it.
 - Editing a prompt, a result contract, a gate choice, or a route produces a
   different revision and invalidates the affected launch preview.
 - A format version this daemon does not implement is refused rather than read
   under the newest rules it happens to know.
 
+**An older definition cannot publish.** A format-1 or format-2 revision has no
+step that could, so the trusted service refuses new publication authority for a
+task pinned to one — and it refuses rather than inferring one from the
+workflow's name, a `complete` status, or a historical approval. Task detail and
+Ship flow say so in words. There is no in-place upgrade and no automatic
+conversion: launching a new task from a definition that declares the delivery
+you want is the supported path. A delivery authorized before this format
+existed can still finish the prefix it was actually granted.
+
 A task created before definitions were retained is offered the current
 definition of its own workflow name as a *continuation candidate*, with a
-compatibility check. Because `bugfix` is now format 2, that check **refuses**:
+compatibility check. Because `bugfix` is now format 3, that check **refuses**:
 its history recorded results under the older success/failed envelope, which a
 contract that reads results by declared name cannot reinterpret, and it ran
 steps the new definition does not declare. The refusal names both reasons. No
 automatic upgrade is offered, the history is left exactly as recorded, and the
 task stays readable, stoppable, and cleanable.
 
-### Terminal work results (format 2)
+### Terminal work results
 
-`workflow_status` says a run stopped. In format 2 the run also records *what
-stopping meant*, as the `result` named by the destination that ended it. The
-packaged `bugfix` declares `validated`, `validated-without-reproduction`,
-`stopped-without-fix`, and `stopped-unvalidated`.
+`workflow_status` says a run stopped. From format 2 onwards the run also
+records *what stopping meant*, as the `result` named by the destination that
+ended it. The packaged `bugfix` declares `validated`,
+`validated-without-reproduction`, `published`,
+`published-without-reproduction`, `stopped-without-fix`, `stopped-unvalidated`,
+and `stopped-unpublished`.
+
+A result name is the *workflow's* word for its ending. It is never what says an
+effect happened: whether anything was signed, pushed, or opened is read from
+the delivery journal, and the two are shown separately.
 
 A format-1 run has no name for its ending and none is invented for it: the
 field is null, which reads as *not recorded* rather than as an empty verdict.
 
 ### The single-step workflow
 
-Sessions `('main',)`, primary `main`. One agent step named `work` on role
-`default`, not outcome-bearing, whose prompt is the accepted preamble prepended
-to the task's stored prompt separated by a blank line.
+Sessions `('main',)`, primary `main`. The simplest *complete* procedure: one
+session does the work, an independent reviewer reads what it would publish, and
+a person decides what happens to it.
 
-The preamble alone is never sent for an empty prompt; the step completes once
-the session is ready and the session lands `idle`.
+- `work` — one agent step on role `default`, whose prompt is the accepted
+  preamble prepended to the task's stored prompt. It also proposes the
+  publication text, so the suggestion at the approval comes from the session
+  that did the work rather than from a drafting turn at the decision. Bounded
+  to three visits.
+- `review` — independent review of the candidate, bounded to three visits for
+  the whole run.
+- A comments verdict with a complete report routes back to `work`, carrying the
+  reviewer's own words. That loop is a declared edge, and `work`'s bound is
+  what ends it.
+- `approve` — the decision. Its answers are: finish without publishing, send it
+  back with changes, make a local signed commit and stop, sign and push the
+  branch, or sign, push, and open a pull request. Each publishing answer names
+  its own chain; none is preselected.
+- Exhausting either bound reaches a gate that offers only stopping.
 
-Operator-visible behavior matches the pre-workflow daemon exactly, including
-byte-identical prompt construction. Review, ship, composer actions, and escape
-hatches all operate on session `main`.
+Nothing is published unless you answer `approve` with a publishing choice, and
+"finish without publishing" is a complete, named ending rather than a failure.
 
 ### Restart recovery
 
@@ -619,7 +705,7 @@ appending another. A restart is not a work attempt, so it costs nothing against
 a step's declared visit bound, and it re-binds no evidence: an attempt keeps
 the records it froze when it opened.
 
-An unanswered format-2 gate is re-armed as **the same question** — the stored
+An unanswered gate with declared choices is re-armed as **the same question** — the stored
 snapshot is re-broadcast, not re-rendered from today's history. An answered one
 is never re-armed: because the decision and its successor commit together, a
 restart finds either the untouched question or the successor the answer already
@@ -652,8 +738,9 @@ before its prompt went out is the one exception: its accepted binding is the
 decision the run is about to make anyway.
 
 A run that was `complete` or `failed` is never re-driven. Its sessions are
-only resumed — on that same last-applied policy, which is what a follow-up,
-review feedback, or ship drafting then continues with.
+only resumed — on that same last-applied policy, which is what a follow-up
+continues with, and, for a run pinned to a pre-format-3 definition, what its
+review feedback and ship drafting continue with too.
 
 ### Reading a run against its procedure
 
@@ -795,6 +882,8 @@ it. A refused configuration, a timeout, a resumed session whose identity does
 not match, or a failed record leaves no process that may be prompted: the step
 fails with the workspace and history intact.
 
-Repeated visits to a step use that step's accepted binding again. Follow-ups,
-review feedback, and ship drafting continue on the session's last applied
-policy until another declared consumer takes it over.
+Repeated visits to a step use that step's accepted binding again. A
+follow-up continues on the session's last applied policy until another
+declared consumer takes it over; so do the review feedback and ship drafting
+turns of a run pinned to a pre-format-3 definition, which are the only turns
+no step declares.

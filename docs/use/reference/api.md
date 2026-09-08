@@ -277,15 +277,15 @@ All paths are under `/api/tasks/{id}/sessions/{session}/agent`.
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/api/tasks/{id}/workflow/resume` | Advance a waiting run: answer a gate with one of its declared choices, resume a gate that offers none, or retry a paused step |
-| `POST` | `/api/tasks/{id}/review` | Open a review |
+| `POST` | `/api/tasks/{id}/review` | Open a review by hand. Refused when the task's workflow declares its own review step and the run is not at it |
 | `POST` | `/api/tasks/{id}/review/cancel` | Cancel an open review |
 | `GET` | `/api/tasks/{id}/ship` | The task's current delivery projection — the same document the snapshot and every command response carry |
-| `POST` | `/api/tasks/{id}/ship/draft` | Ensure one agent draft, or explicitly replace it with `{"replace": true}`. A new or replacement request requires a live, `idle` primary agent; an ordinary repeated request returns the observed delivery projection without a second agent turn. |
+| `POST` | `/api/tasks/{id}/ship/draft` | Ensure one agent draft, or explicitly replace it with `{"replace": true}`. Only for a workflow that declares no publication of its own; otherwise refused. A new or replacement request requires a live, `idle` primary agent; an ordinary repeated request returns the observed delivery projection without a second agent turn. |
 | `PUT` | `/api/tasks/{id}/ship/draft` | Store operator-written publication text |
-| `POST` | `/api/tasks/{id}/ship/preview` | Resolve one requested ending read-only. Authorizes nothing |
-| `POST` | `/api/tasks/{id}/ship/commit` | Authorize a delivery and run its authorized action prefix |
-| `POST` | `/api/tasks/{id}/ship/push` | Push an existing verified signed result |
-| `POST` | `/api/tasks/{id}/ship/pr` | Open a pull request for an existing verified pushed result |
+| `POST` | `/api/tasks/{id}/ship/preview` | Resolve the delivery this run permits, read-only. Authorizes nothing |
+| `POST` | `/api/tasks/{id}/ship/commit` | Confirm one authorization — the decision, its grant, and the run's next step, together |
+| `POST` | `/api/tasks/{id}/ship/push` | Continue a pre-upgrade grant at its push action |
+| `POST` | `/api/tasks/{id}/ship/pr` | Continue a pre-upgrade grant at its pull-request action |
 | `POST` | `/api/tasks/{id}/ship/reconcile` | Record one decision about an unresolved delivery effect |
 
 `workflow/resume` takes a required `expected_seq` — the waiting attempt's
@@ -295,9 +295,17 @@ what the caller sent**, and there are three:
 
 | The run is waiting at | `choice_id` | What happens |
 |---|---|---|
-| A gate with declared choices (format 2) | required | The named choice is recorded and its declared destination taken; `note` is that choice's feedback |
+| A gate with declared choices (format 2 onwards) | required | The named choice is recorded and its declared destination taken; `note` is that choice's feedback |
 | A gate without them (format 1) | refused | `note` becomes the gate's outcome and the run continues at its fall-through |
 | An uncertainty pause | refused | A new attempt of the blocked step opens; the run never continues past it |
+
+An answer that **authorizes publication** additionally requires `request_id`
+and `preview_token` from a delivery preview of that same question and answer,
+plus the final publication fields. Without them the answer is refused with
+`422`: a generic resume carries no evidence that the operator saw the content,
+the destination, and the identities the authorization is about. Such an answer
+is the same operation `ship/commit` performs, and either entry point may make
+it.
 
 Refusals separate what the operator can fix from what they cannot:
 
@@ -318,18 +326,28 @@ request.
 Delivery is preview-then-confirm, and every response is the task's whole
 versioned delivery projection.
 
-`ship/preview` takes `ending` (`commit`, `push`, or `pr`), `mode`, the
-publication fields, a client-stable `request_id`, and an optional
-`delivery_id`. It resolves that ending read-only and returns the candidate and
-review identity, the completed and remaining actions, the safe destination and
-identities, the exact pull-request body Ompire would write, every `blockers`
-entry, and a `preview_token`. It captures nothing and authorizes nothing.
+`ship/preview` names the *decision*: `gate_seq` and `choice_id` when the run is
+waiting at an approval, plus the publication fields and a client-stable
+`request_id`. The `ending` and `mode` are derived from the chain that answer
+authorizes; a caller may still supply them, and a disagreement is reported
+rather than obeyed. It returns which question, answer, and review attempt it
+describes, the candidate and review identity, the completed and remaining
+actions, the safe destination and identities, the exact pull-request body
+Ompire would write, every `blockers` entry, and a `preview_token`. It captures
+nothing and authorizes nothing.
 
-`ship/commit` requires `ending`, the final fields, `request_id`,
-`preview_token`, and — when continuing an existing delivery — `delivery_id` and
-`expected_version`. There is no omitted-ending shape and no tokenless path.
-`ship/push` and `ship/pr` continue an existing verified result and never start
-an implicit earlier action.
+`ship/commit` requires `preview_token`, `request_id`, the final fields, and —
+for an approval — `gate_seq` and `choice_id`, with an optional `note` recorded
+as the decision's feedback. There is no tokenless path. When the run is waiting
+at an approval, this one call commits the answer, the authorization it
+produces, and the run's move to its first action together; the run then
+performs the actions the answer authorized.
+
+`ship/push` and `ship/pr` exist for a delivery authorized before workflows
+owned publication. They continue that grant's own prefix and never start an
+implicit earlier action or extend it. For a workflow-authorized chain the run
+performs its own actions, and an interrupted one is continued through
+`ship/commit` against the same delivery.
 
 `ship/reconcile` takes `delivery_id`, `action_id`, `expected_version`, a
 `decision` of `recheck`, `adopt`, `retry`, or `abandon`, and an optional `note`.
@@ -338,16 +356,17 @@ None of them writes anything privileged.
 | Code | When |
 |---|---|
 | `404` | Unknown task |
-| `422` | Unsupported ending or mode on a preview; an unknown reconciliation decision |
+| `422` | A preview that does not name the question the run is waiting at, names a stale attempt, an unknown answer, or one that authorizes nothing; an ending or mode that disagrees with the run's declared chain; an unknown reconciliation decision |
 | `409` | The preview token no longer matches, the delivery moved on, a request identifier was reused with different inputs, an action is refused, or an adoption or retry cannot be justified by what Ompire can observe |
 
 A refused confirmation returns `{"detail":{"message":...}}`, and a blocked one
 adds `blockers` — every reason at once, so they are fixed together rather than
 one attempt at a time. Neither creates a delivery record or touches Git.
 
-`ship/draft` returns `404` for an unknown task and `409` for an unavailable or
-non-idle primary agent, an archived task, a draft already in flight, or a
-delivery that is already authorized. See [Ship flow](ship-flow.md) for the
+`ship/draft` returns `404` for an unknown task and `409` for a workflow that
+declares its own publication text, an unavailable or non-idle primary agent, an
+archived task, a draft already in flight, or a delivery that is already
+authorized. See [Ship flow](ship-flow.md) for the
 delivery contract, the blocker vocabulary, and recovery.
 
 The same admission runs for the UI, the authenticated API, and a direct service

@@ -76,8 +76,8 @@ from ompire_daemon.model_config import MODEL_ROLES
 # statement that the meaning of a document changed, not that a field was
 # added: a retained format-1 document keeps being read under format-1 rules
 # forever, and an unsupported version is refused rather than reinterpreted.
-FORMAT_VERSION = 2
-SUPPORTED_FORMATS = (1, 2)
+FORMAT_VERSION = 3
+SUPPORTED_FORMATS = (1, 2, 3)
 
 # Loader bounds. They protect the daemon from a hostile or accidental
 # document; every packaged built-in is orders of magnitude below them.
@@ -92,7 +92,32 @@ MAX_RENDERED_BYTES = 1024 * 1024
 # collide with the retired session name still present in legacy history.
 RESERVED_NAMES = ("judge",)
 
-STEP_KINDS = ("agent", "command", "decision", "gate")
+STEP_KINDS = ("agent", "command", "decision", "gate", "review", "delivery")
+
+# Which kinds each format admits. A kind is part of a format's meaning, not a
+# field a newer loader may quietly accept in an older document: a retained
+# format-2 revision that suddenly parsed a `delivery` step would be a
+# different procedure than the one its task accepted.
+FORMAT_STEP_KINDS: dict[int, tuple[str, ...]] = {
+    1: ("agent", "command", "decision", "gate"),
+    2: ("agent", "command", "decision", "gate"),
+    3: STEP_KINDS,
+}
+
+# Format 3's trusted operations. Each names exactly one effect; there is no
+# generic "run a privileged thing" step and no top-level capability list.
+DELIVERY_ACTIONS = ("commit", "push", "pr")
+# The one legal shape of an authorized chain, longest first. A chain always
+# starts at the local signed commit: no action performs a missing predecessor.
+DELIVERY_CHAINS = (("commit", "push", "pr"), ("commit", "push"), ("commit",))
+DELIVERY_MODES = ("squash", "retain")
+# The publication text a delivery gate may suggest. Each is an ordinary text
+# document over frozen evidence; the operator edits what it produces.
+DELIVERY_METADATA_FIELDS = ("message", "pr_title", "pr_body")
+# What a review step records. Engine-defined: an agent cannot declare these,
+# and nothing an agent writes can produce one.
+REVIEW_RESULTS = ("approved", "comments", "aborted", "error", "interrupted")
+
 VALUE_FORMATS = ("text", "json")
 JSON_TYPES = ("null", "boolean", "integer", "number", "string", "array", "object")
 COMPARISONS = ("eq", "ne", "lt", "lte", "gt", "gte")
@@ -585,6 +610,53 @@ class EvidenceSelector:
     required: bool
 
 
+# --- format 3: review, delivery, and the authority that connects them --------
+
+
+@dataclass(frozen=True)
+class DeliveryMetadata:
+    """Publication text a delivery gate offers the operator to start from.
+
+    Suggestions, not authority. Each field is an ordinary text document over
+    the gate's frozen evidence; whatever it renders lands in the question
+    snapshot as an editable draft beside the decision, and the operator's
+    final text is what the confirmation carries. An omitted field starts
+    blank.
+    """
+
+    message: TextDocument | None = None
+    pr_title: TextDocument | None = None
+    pr_body: TextDocument | None = None
+
+
+@dataclass(frozen=True)
+class GateDelivery:
+    """What makes a gate able to authorize publication.
+
+    `review` is one of the gate's own evidence aliases, and it may only select
+    `review` steps. That is the binding the grant is content-specific through:
+    the question names the review attempt it is asking about, and the
+    confirmation is checked against that attempt's candidate rather than
+    against whatever the workspace holds when somebody presses the button.
+    """
+
+    review: str
+    metadata: DeliveryMetadata | None = None
+
+
+@dataclass(frozen=True)
+class DeliveryGrant:
+    """The exact contiguous action chain one approving choice authorizes.
+
+    Enumerated in the definition rather than derived from an ending name, so
+    what a person is agreeing to is readable in the document, in the launch
+    preview, and in the question they answered — and so no later edge can
+    enter the chain partway and inherit the grant.
+    """
+
+    steps: tuple[str, ...]
+
+
 @dataclass(frozen=True)
 class GateChoice:
     """One answer a person may give, and where it goes.
@@ -592,12 +664,17 @@ class GateChoice:
     The destination is static: a choice cannot compute a route, and it cannot
     pause. Answering a gate is picking a declared edge, which is what makes
     the decision replayable from the record and refusable when stale.
+
+    `authorize` (format 3) is the only way a choice can grant privileged
+    authority, and it grants exactly the chain it names — never "delivery" in
+    general, and never anything a later step could widen.
     """
 
     id: str
     label: str
     feedback_required: bool
     next: Destination
+    authorize: DeliveryGrant | None = None
 
 
 @dataclass(frozen=True)
@@ -651,6 +728,7 @@ class GateStep:
     on_exhausted: StepDestination | None
     choices: tuple[GateChoice, ...] = ()  # format 2; empty means fall-through
     evidence: tuple[EvidenceSelector, ...] = ()
+    delivery: GateDelivery | None = None  # format 3: a delivery-capable gate
     kind: str = "gate"
 
     def choice_named(self, choice_id: str) -> GateChoice | None:
@@ -660,7 +738,53 @@ class GateStep:
         return None
 
 
-Step = AgentStep | CommandStep | DecisionStep | GateStep
+@dataclass(frozen=True)
+class ReviewStep:
+    """Independent host-side review of what this task would publish.
+
+    It has no prompt, no session, and no model: the reviewer is the configured
+    external tool reading a protected candidate, not an agent turn and not the
+    coder wearing a different hat. What it produces is an engine-defined
+    trusted result — approved, comments, aborted, error, or interrupted — that
+    ordinary evidence selectors read like any other attempt, so routing after
+    a review is written in the definition rather than hidden in the engine.
+    """
+
+    name: str
+    max_visits: int | None
+    on_exhausted: StepDestination | None
+    evidence: tuple[EvidenceSelector, ...] = ()
+    kind: str = "review"
+
+
+@dataclass(frozen=True)
+class DeliveryStep:
+    """One trusted publication effect, and nothing else.
+
+    `action` is literal and total: a local signed commit, a push to the task's
+    accepted destination, or a pull request. There is no argv, no target, no
+    prompt, and no idempotence flag an author could use to make the engine
+    repeat a privileged write — the effect is named, its predecessor is named,
+    and the approval that permits it is named.
+
+    `next` is static and required, so a delivery chain's ending is part of the
+    document rather than something the run discovers: an intermediate action
+    goes to the next action, and the last one ends the run at a named result.
+    """
+
+    name: str
+    action: str
+    approval: str
+    next: Destination
+    mode: str | None = None  # commit only: squash | retain
+    previous: str | None = None  # push names its commit; pr names its push
+    max_visits: int | None = None
+    on_exhausted: StepDestination | None = None
+    evidence: tuple[EvidenceSelector, ...] = ()
+    kind: str = "delivery"
+
+
+Step = AgentStep | CommandStep | DecisionStep | GateStep | ReviewStep | DeliveryStep
 
 
 @dataclass(frozen=True)
@@ -688,6 +812,36 @@ class WorkflowDefinition:
 
     def agent_steps(self) -> tuple[AgentStep, ...]:
         return tuple(step for step in self.steps if isinstance(step, AgentStep))
+
+    def review_steps(self) -> tuple[ReviewStep, ...]:
+        return tuple(step for step in self.steps if isinstance(step, ReviewStep))
+
+    def delivery_steps(self) -> tuple[DeliveryStep, ...]:
+        return tuple(step for step in self.steps if isinstance(step, DeliveryStep))
+
+    def grant_for(self, gate: str, choice_id: str) -> DeliveryGrant | None:
+        """The chain one answer authorizes, read from the definition.
+
+        Nothing derives authority from an ending name or a delivery record:
+        the grant is whatever the pinned document says this exact choice
+        grants, and `None` means this answer publishes nothing.
+        """
+        step = self.step_named(gate)
+        if not isinstance(step, GateStep):
+            return None
+        choice = step.choice_named(choice_id)
+        return choice.authorize if choice is not None else None
+
+    @property
+    def declared_actions(self) -> tuple[str, ...]:
+        """Every privileged effect this definition can perform, in effect order.
+
+        A launch preview says exactly this, and says "no publication" when it
+        is empty. It is derived from the typed steps, never from a capability
+        list an author could disagree with.
+        """
+        declared = {step.action for step in self.delivery_steps()}
+        return tuple(action for action in DELIVERY_ACTIONS if action in declared)
 
 
 @dataclass(frozen=True)
@@ -1179,6 +1333,59 @@ def _parse_evidence(data: Any, location: str) -> tuple[EvidenceSelector, ...]:
     return tuple(selectors)
 
 
+def _parse_gate_delivery(data: Any, location: str, version: int) -> GateDelivery:
+    """A gate's binding to the review it is asking about (format 3)."""
+    data = _require_mapping(data, location)
+    _reject_unknown(data, ("review", "metadata"), location)
+    review = _require_slug(data, "review", location)
+    raw_metadata = data.get("metadata")
+    if raw_metadata is None:
+        return GateDelivery(review=review, metadata=None)
+    raw_metadata = _require_mapping(raw_metadata, f"{location}.metadata")
+    _reject_unknown(
+        raw_metadata, DELIVERY_METADATA_FIELDS, f"{location}.metadata"
+    )
+    fields: dict[str, TextDocument | None] = {}
+    for field in DELIVERY_METADATA_FIELDS:
+        raw = raw_metadata.get(field)
+        fields[field] = (
+            None
+            if raw is None
+            else _parse_text(raw, f"{location}.metadata.{field}", version)
+        )
+    return GateDelivery(review=review, metadata=DeliveryMetadata(**fields))
+
+
+def _parse_grant(data: Any, location: str) -> DeliveryGrant:
+    """The exact action chain one approving choice authorizes (format 3)."""
+    data = _require_mapping(data, location)
+    _reject_unknown(data, ("steps",), location)
+    raw_steps = data.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise WorkflowDocumentError(
+            f"{location}.steps",
+            "must be a nonempty ordered list of this workflow's delivery steps",
+        )
+    if len(raw_steps) > len(DELIVERY_ACTIONS):
+        raise WorkflowDocumentError(
+            f"{location}.steps",
+            f"a chain runs at most {len(DELIVERY_ACTIONS)} actions",
+        )
+    steps: list[str] = []
+    for index, item in enumerate(raw_steps):
+        if not isinstance(item, str):
+            raise WorkflowDocumentError(
+                f"{location}.steps[{index}]", "must be a delivery step name"
+            )
+        if item in steps:
+            raise WorkflowDocumentError(
+                f"{location}.steps[{index}]",
+                f"duplicate delivery step {item!r}; an action runs once per chain",
+            )
+        steps.append(item)
+    return DeliveryGrant(steps=tuple(steps))
+
+
 def _parse_choices(data: Any, location: str, version: int) -> tuple[GateChoice, ...]:
     """A format-2 gate's declared answers, in the order they are offered."""
     if not isinstance(data, list) or not data:
@@ -1193,7 +1400,15 @@ def _parse_choices(data: Any, location: str, version: int) -> tuple[GateChoice, 
         choice_location = f"{location}[{index}]"
         item = _require_mapping(item, choice_location)
         _reject_unknown(
-            item, ("id", "label", "feedback_required", "next"), choice_location
+            item,
+            (
+                "id",
+                "label",
+                "feedback_required",
+                "next",
+                *(("authorize",) if version >= 3 else ()),
+            ),
+            choice_location,
         )
         choice_id = _require_slug(item, "id", choice_location)
         if choice_id in seen:
@@ -1213,6 +1428,7 @@ def _parse_choices(data: Any, location: str, version: int) -> tuple[GateChoice, 
             raise WorkflowDocumentError(
                 choice_location, "a choice needs an explicit 'next' destination"
             )
+        raw_authorize = item.get("authorize")
         choices.append(
             GateChoice(
                 id=choice_id,
@@ -1220,6 +1436,11 @@ def _parse_choices(data: Any, location: str, version: int) -> tuple[GateChoice, 
                 feedback_required=feedback_required,
                 next=_parse_destination(
                     item["next"], f"{choice_location}.next", version, allow_pause=False
+                ),
+                authorize=(
+                    None
+                    if raw_authorize is None
+                    else _parse_grant(raw_authorize, f"{choice_location}.authorize")
                 ),
             )
         )
@@ -1230,9 +1451,18 @@ def _parse_step(data: Any, location: str, version: int) -> Step:
     data = _require_mapping(data, location)
     name = _require_slug(data, "name", location)
     kind = _require_str(data, "kind", location)
-    if kind not in STEP_KINDS:
+    allowed_kinds = FORMAT_STEP_KINDS[version]
+    if kind not in allowed_kinds:
         raise WorkflowDocumentError(
-            f"{location}.kind", f"must be one of {', '.join(STEP_KINDS)}"
+            f"{location}.kind",
+            f"must be one of {', '.join(allowed_kinds)}"
+            + (
+                f"; {kind!r} exists only in format "
+                f"{min(v for v, kinds in FORMAT_STEP_KINDS.items() if kind in kinds)}"
+                " and later"
+                if kind in STEP_KINDS
+                else ""
+            ),
         )
     max_visits, on_exhausted = _parse_bound(data, location, version)
     # Format 2 adds `evidence` to every kind: a decision routes on the same
@@ -1375,11 +1605,74 @@ def _parse_step(data: Any, location: str, version: int) -> Step:
             on_exhausted=on_exhausted,
             evidence=evidence,
         )
+    if kind == "review":
+        # No prompt, no session, no model, no result contract: what a review
+        # produces is the engine's own trusted record, and an author who could
+        # declare its results could declare an approval.
+        _reject_unknown(data, common, location)
+        return ReviewStep(
+            name=name,
+            max_visits=max_visits,
+            on_exhausted=on_exhausted,
+            evidence=evidence,
+        )
+    if kind == "delivery":
+        # Deliberately not a common-fields step. A bound would mean repeating
+        # a privileged write, and evidence would suggest the action decides
+        # something from a result — it does neither: it performs the one
+        # effect its approval named, once.
+        allowed: tuple[str, ...] = ("name", "kind", "action", "approval", "next")
+        action = _require_str(data, "action", location)
+        if action not in DELIVERY_ACTIONS:
+            raise WorkflowDocumentError(
+                f"{location}.action",
+                f"must be one of {', '.join(DELIVERY_ACTIONS)}",
+            )
+        if action == "commit":
+            allowed = (*allowed, "mode")
+        else:
+            allowed = (*allowed, "previous")
+        _reject_unknown(data, allowed, location)
+        mode: str | None = None
+        previous: str | None = None
+        if action == "commit":
+            mode = _require_str(data, "mode", location)
+            if mode not in DELIVERY_MODES:
+                raise WorkflowDocumentError(
+                    f"{location}.mode",
+                    f"a commit action declares 'mode': {' or '.join(DELIVERY_MODES)}",
+                )
+        else:
+            previous = _require_str(data, "previous", location)
+        if "next" not in data:
+            raise WorkflowDocumentError(
+                location,
+                "a delivery step needs an explicit 'next': the following action, "
+                "or the named ending this chain reaches",
+            )
+        return DeliveryStep(
+            name=name,
+            action=action,
+            approval=_require_str(data, "approval", location),
+            next=_parse_destination(
+                data["next"], f"{location}.next", version, allow_pause=False
+            ),
+            mode=mode,
+            previous=previous,
+        )
     _reject_unknown(
-        data, (*common, "message", *(() if version == 1 else ("choices",))), location
+        data,
+        (
+            *common,
+            "message",
+            *(() if version == 1 else ("choices",)),
+            *(("delivery",) if version >= 3 else ()),
+        ),
+        location,
     )
     if "message" not in data:
         raise WorkflowDocumentError(location, "a gate step needs a 'message'")
+    raw_delivery = data.get("delivery")
     return GateStep(
         name=name,
         message=_parse_text(data["message"], f"{location}.message", version),
@@ -1391,6 +1684,11 @@ def _parse_step(data: Any, location: str, version: int) -> Step:
             else _parse_choices(data.get("choices"), f"{location}.choices", version)
         ),
         evidence=evidence,
+        delivery=(
+            None
+            if raw_delivery is None
+            else _parse_gate_delivery(raw_delivery, f"{location}.delivery", version)
+        ),
     )
 
 
@@ -1566,9 +1864,270 @@ def _validate_references(definition: WorkflowDefinition) -> None:
                 check_destination(
                     choice.next, f"{location}.choices[{choice_index}].next"
                 )
+            if step.delivery is not None and step.delivery.metadata is not None:
+                for field in DELIVERY_METADATA_FIELDS:
+                    text = getattr(step.delivery.metadata, field)
+                    if text is not None:
+                        check_text(
+                            text, f"{location}.delivery.metadata.{field}", aliases
+                        )
+        elif isinstance(step, DeliveryStep):
+            check_destination(step.next, f"{location}.next")
 
     if definition.format >= 2:
         _validate_named_endings(definition)
+    if definition.format >= 3:
+        _validate_delivery(definition)
+
+
+def _validate_delivery(definition: WorkflowDefinition) -> None:
+    """Format 3: every privileged action has one declared, reachable grant.
+
+    This is where a structurally plausible document stops being able to
+    describe authority it does not actually have. Four things are checked
+    together, because each alone is bypassable:
+
+    * a gate that can authorize is bound to a *review* it is asking about,
+      and always offers a way out that publishes nothing;
+    * an approving choice enumerates one exact contiguous chain, starting at
+      the local signed commit and ending the run;
+    * every action names that same gate and its own predecessor, so no step
+      can be borrowed by a second chain; and
+    * nothing else in the document routes into a chain, so an edge cannot
+      enter partway and inherit a grant meant for its head.
+
+    None of this replaces runtime admission. A valid graph says the author
+    asked for these effects; whether *this run* may perform one is decided
+    against the recorded question, review, and candidate, every time.
+    """
+    steps_by_name = {step.name: step for step in definition.steps}
+    delivery_steps = definition.delivery_steps()
+    gates = {
+        step.name: step for step in definition.steps if isinstance(step, GateStep)
+    }
+
+    # chain head/member → the grant that owns it, for the entry-edge check.
+    owned: dict[str, tuple[str, str, int]] = {}
+
+    for index, step in enumerate(definition.steps):
+        if not isinstance(step, GateStep):
+            continue
+        location = f"steps[{index}]"
+        aliases = {selector.name: selector for selector in step.evidence}
+        authorizing = [choice for choice in step.choices if choice.authorize is not None]
+        if step.delivery is None:
+            if authorizing:
+                raise WorkflowDocumentError(
+                    f"{location}.choices",
+                    f"the choice {authorizing[0].id!r} authorizes delivery, but "
+                    f"the gate {step.name!r} declares no 'delivery' binding "
+                    "naming the review it is asking about",
+                )
+            continue
+        if not authorizing:
+            raise WorkflowDocumentError(
+                f"{location}.delivery",
+                f"the gate {step.name!r} binds a review for delivery but no "
+                "choice authorizes any action; drop the binding or add an "
+                "approving choice",
+            )
+        selector = aliases.get(step.delivery.review)
+        if selector is None:
+            raise WorkflowDocumentError(
+                f"{location}.delivery.review",
+                f"names evidence {step.delivery.review!r}, which this gate does "
+                "not declare"
+                + (
+                    f"; it declares {', '.join(sorted(aliases))}"
+                    if aliases
+                    else "; it declares none"
+                ),
+            )
+        for source in selector.steps:
+            if not isinstance(steps_by_name.get(source), ReviewStep):
+                raise WorkflowDocumentError(
+                    f"{location}.evidence.{selector.name}.steps",
+                    f"{source!r} is not a review step; a delivery gate's review "
+                    "binding may only select declared 'review' steps, so the "
+                    "grant is bound to a trusted verdict rather than to an "
+                    "agent's own claim",
+                )
+        if not selector.required:
+            raise WorkflowDocumentError(
+                f"{location}.evidence.{selector.name}.required",
+                "a delivery gate's review binding must be required; an optional "
+                "one would let the gate authorize publication with no review "
+                "attached at all",
+            )
+        if not any(choice.authorize is None for choice in step.choices):
+            raise WorkflowDocumentError(
+                f"{location}.choices",
+                f"every choice at {step.name!r} authorizes publication; a "
+                "delivery gate must also offer a way out that publishes nothing",
+            )
+        for choice_index, choice in enumerate(step.choices):
+            grant = choice.authorize
+            if grant is None:
+                continue
+            choice_location = f"{location}.choices[{choice_index}].authorize"
+            _validate_grant(
+                step, choice, grant, choice_location, steps_by_name, owned
+            )
+
+    for step in delivery_steps:
+        if step.name not in owned:
+            raise WorkflowDocumentError(
+                "steps",
+                f"the delivery step {step.name!r} is never authorized by any "
+                "choice; a privileged action nothing can grant is unreachable, "
+                "and leaving it in the document suggests an authority the "
+                "workflow does not have",
+            )
+        if step.approval not in gates:
+            raise WorkflowDocumentError(
+                "steps",
+                f"the delivery step {step.name!r} names approval "
+                f"{step.approval!r}, which is not a declared gate step",
+            )
+
+    _validate_delivery_entries(definition, owned)
+
+
+def _validate_grant(
+    gate: GateStep,
+    choice: GateChoice,
+    grant: DeliveryGrant,
+    location: str,
+    steps_by_name: dict[str, Step],
+    owned: dict[str, tuple[str, str, int]],
+) -> None:
+    """One approving choice's chain: shape, ownership, and its ending."""
+    members: list[DeliveryStep] = []
+    for position, name in enumerate(grant.steps):
+        target = steps_by_name.get(name)
+        if not isinstance(target, DeliveryStep):
+            raise WorkflowDocumentError(
+                f"{location}.steps[{position}]",
+                f"{name!r} is not a declared delivery step",
+            )
+        previous_owner = owned.get(name)
+        if previous_owner is not None:
+            raise WorkflowDocumentError(
+                f"{location}.steps[{position}]",
+                f"the delivery step {name!r} is already authorized by "
+                f"{previous_owner[0]!r}/{previous_owner[1]!r}; each action "
+                "belongs to exactly one chain, so a second grant cannot reuse "
+                "a verified result it did not authorize",
+            )
+        members.append(target)
+
+    actions = tuple(member.action for member in members)
+    if actions not in DELIVERY_CHAINS:
+        raise WorkflowDocumentError(
+            f"{location}.steps",
+            f"authorizes {' → '.join(actions)}; a chain must be one of "
+            + " or ".join(" → ".join(chain) for chain in reversed(DELIVERY_CHAINS))
+            + ". No action performs a missing predecessor",
+        )
+
+    if not isinstance(choice.next, StepDestination) or choice.next.step != members[0].name:
+        raise WorkflowDocumentError(
+            f"{location}.steps[0]",
+            f"the choice {choice.id!r} authorizes {members[0].name!r} but routes "
+            "somewhere else; an approving answer must go straight to the first "
+            "action it grants",
+        )
+
+    for position, member in enumerate(members):
+        member_location = f"{location}.steps[{position}]"
+        if member.approval != gate.name:
+            raise WorkflowDocumentError(
+                member_location,
+                f"the delivery step {member.name!r} names approval "
+                f"{member.approval!r}, but this grant comes from {gate.name!r}",
+            )
+        expected_previous = members[position - 1].name if position else None
+        if member.previous != expected_previous:
+            raise WorkflowDocumentError(
+                member_location,
+                f"the delivery step {member.name!r} names predecessor "
+                f"{member.previous!r}; this chain gives it "
+                + (f"{expected_previous!r}" if expected_previous else "none"),
+            )
+        if position + 1 < len(members):
+            following = members[position + 1].name
+            if (
+                not isinstance(member.next, StepDestination)
+                or member.next.step != following
+            ):
+                raise WorkflowDocumentError(
+                    member_location,
+                    f"the delivery step {member.name!r} must continue to "
+                    f"{following!r}, the next action this chain authorizes",
+                )
+        elif not isinstance(member.next, CompleteDestination):
+            raise WorkflowDocumentError(
+                member_location,
+                f"the last action of this chain ({member.name!r}) must end the "
+                "run at a named result; nothing runs in the workspace after it "
+                "is signed and published",
+            )
+        owned[member.name] = (gate.name, choice.id, position)
+
+
+def _validate_delivery_entries(
+    definition: WorkflowDefinition, owned: dict[str, tuple[str, str, int]]
+) -> None:
+    """No edge may enter a chain except its grant or the action before it."""
+    for index, step in enumerate(definition.steps):
+        location = f"steps[{index}]"
+        edges: list[tuple[str, Destination]] = []
+        if step.on_exhausted is not None:
+            edges.append((f"{location}.on_exhausted", step.on_exhausted))
+        if isinstance(step, DecisionStep):
+            for case_index, case in enumerate(step.cases):
+                edges.append((f"{location}.cases[{case_index}].next", case.next))
+            edges.append((f"{location}.otherwise", step.otherwise))
+        elif isinstance(step, GateStep):
+            for choice_index, choice in enumerate(step.choices):
+                if choice.authorize is not None:
+                    continue  # the grant's own entry, checked with the chain
+                edges.append((f"{location}.choices[{choice_index}].next", choice.next))
+        elif isinstance(step, DeliveryStep):
+            continue  # a chain member's `next` is checked against its own chain
+        for edge_location, destination in edges:
+            if not isinstance(destination, StepDestination):
+                continue
+            if destination.step in owned:
+                raise WorkflowDocumentError(
+                    edge_location,
+                    f"routes into the delivery step {destination.step!r}; a "
+                    "privileged action is reachable only from the choice that "
+                    "authorizes its chain, or from the action before it",
+                )
+        # A fall-through is an edge too: the step declared before an action
+        # would otherwise walk into it with no grant at all.
+        following = definition.step_after(step.name)
+        if (
+            following is not None
+            and following.name in owned
+            and _falls_through(step)
+        ):
+            raise WorkflowDocumentError(
+                location,
+                f"the step {step.name!r} falls through into the delivery step "
+                f"{following.name!r}; declare the action after the gate that "
+                "authorizes it, or route this step somewhere explicit",
+            )
+
+
+def _falls_through(step: Step) -> bool:
+    """Whether finishing this step walks to the following declared step."""
+    if isinstance(step, DecisionStep):
+        return False
+    if isinstance(step, GateStep):
+        return not step.choices
+    return not isinstance(step, DeliveryStep)
 
 
 def _validate_named_endings(definition: WorkflowDefinition) -> None:
@@ -1581,7 +2140,7 @@ def _validate_named_endings(definition: WorkflowDefinition) -> None:
     """
     for index, step in enumerate(definition.steps):
         location = f"steps[{index}]"
-        if isinstance(step, DecisionStep):
+        if isinstance(step, (DecisionStep, DeliveryStep)):
             continue
         if isinstance(step, GateStep) and step.choices:
             continue
@@ -1607,6 +2166,8 @@ def _successors(definition: WorkflowDefinition, step: Step) -> list[str]:
         destinations.append(step.otherwise)
     elif isinstance(step, GateStep) and step.choices:
         destinations = [choice.next for choice in step.choices]
+    elif isinstance(step, DeliveryStep):
+        destinations = [step.next]
     else:
         following = definition.step_after(step.name)
         return [following.name] if following is not None else []
@@ -1783,6 +2344,31 @@ def _outcome_document(outcome: OutcomeContract | None) -> dict[str, Any] | None:
     }
 
 
+def _gate_delivery_document(delivery: GateDelivery | None) -> dict[str, Any] | None:
+    if delivery is None:
+        return None
+    metadata = delivery.metadata
+    return {
+        "review": delivery.review,
+        "metadata": (
+            None
+            if metadata is None
+            else {
+                field: (
+                    None
+                    if getattr(metadata, field) is None
+                    else _text_document(getattr(metadata, field))
+                )
+                for field in DELIVERY_METADATA_FIELDS
+            }
+        ),
+    }
+
+
+def _grant_document(grant: DeliveryGrant | None) -> dict[str, Any] | None:
+    return None if grant is None else {"steps": list(grant.steps)}
+
+
 def _evidence_document(
     selectors: tuple[EvidenceSelector, ...],
 ) -> dict[str, dict[str, Any]]:
@@ -1808,6 +2394,25 @@ def destination_document(destination: Destination, version: int) -> dict[str, An
 
 
 def _step_document(step: Step, version: int) -> dict[str, Any]:
+    if isinstance(step, DeliveryStep):
+        # Deliberately not a common-fields step: it has no bound, no
+        # exhaustion route, and no evidence, and writing those as explicit
+        # nulls would say it could have them.
+        delivery: dict[str, Any] = {
+            "name": step.name,
+            "kind": step.kind,
+            "action": step.action,
+        }
+        # Only the field this action actually has. A `previous` on a commit or
+        # a `mode` on a push is not a defaulted field — it is not a field, and
+        # writing it as null would say the grammar has one.
+        if step.action == "commit":
+            delivery["mode"] = step.mode
+        else:
+            delivery["previous"] = step.previous
+        delivery["approval"] = step.approval
+        delivery["next"] = _destination_document(step.next, version)
+        return delivery
     document: dict[str, Any] = {
         "name": step.name,
         "kind": step.kind,
@@ -1848,6 +2453,8 @@ def _step_document(step: Step, version: int) -> dict[str, Any]:
             ],
             otherwise=_destination_document(step.otherwise, version),
         )
+    elif isinstance(step, ReviewStep):
+        pass  # the common fields are the whole step
     else:
         document.update(message=_text_document(step.message))
         if version >= 2:
@@ -1857,9 +2464,16 @@ def _step_document(step: Step, version: int) -> dict[str, Any]:
                     "label": choice.label,
                     "feedback_required": choice.feedback_required,
                     "next": _destination_document(choice.next, version),
+                    **(
+                        {"authorize": _grant_document(choice.authorize)}
+                        if version >= 3
+                        else {}
+                    ),
                 }
                 for choice in step.choices
             ]
+        if version >= 3:
+            document["delivery"] = _gate_delivery_document(step.delivery)
     return document
 
 
@@ -2080,6 +2694,15 @@ def _export_outcome(document: Mapping[str, Any] | None) -> dict[str, Any] | None
 
 def _export_step(document: Mapping[str, Any], version: int) -> dict[str, Any]:
     out: dict[str, Any] = {"name": document["name"], "kind": document["kind"]}
+    if document["kind"] == "delivery":
+        out["action"] = document["action"]
+        if "mode" in document:
+            out["mode"] = document["mode"]
+        if "previous" in document:
+            out["previous"] = document["previous"]
+        out["approval"] = document["approval"]
+        out["next"] = dict(document["next"])
+        return out
     if document["max_visits"] is not None:
         out["max_visits"] = document["max_visits"]
         out["on_exhausted"] = document["on_exhausted"]
@@ -2111,10 +2734,40 @@ def _export_step(document: Mapping[str, Any], version: int) -> dict[str, Any]:
             for case in document["cases"]
         ]
         out["otherwise"] = dict(document["otherwise"])
+    elif kind == "review":
+        pass  # nothing beyond the common fields
     else:
         if version >= 2:
-            out["choices"] = [dict(choice) for choice in document["choices"]]
+            out["choices"] = [_export_choice(choice) for choice in document["choices"]]
+        if version >= 3 and document["delivery"] is not None:
+            out["delivery"] = _export_gate_delivery(document["delivery"])
         out["message"] = _export_text(document["message"])
+    return out
+
+
+def _export_choice(document: Mapping[str, Any]) -> dict[str, Any]:
+    out = {
+        key: value
+        for key, value in document.items()
+        if key != "authorize" and not isinstance(value, dict)
+    }
+    out["next"] = dict(document["next"])
+    if document.get("authorize") is not None:
+        out["authorize"] = {"steps": list(document["authorize"]["steps"])}
+    return out
+
+
+def _export_gate_delivery(document: Mapping[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {"review": document["review"]}
+    metadata = document.get("metadata")
+    if metadata is not None:
+        emitted = {
+            field: _export_text(metadata[field])
+            for field in DELIVERY_METADATA_FIELDS
+            if metadata.get(field) is not None
+        }
+        if emitted:
+            out["metadata"] = emitted
     return out
 
 
@@ -2766,6 +3419,11 @@ class StepDescriptor:
     session: str | None
     role: str | None
     conditional: bool
+    # Format 3: the one privileged effect a delivery step performs, and the
+    # gate whose answer is the only thing that can authorize it. Both None for
+    # every other kind — a step that publishes nothing says so.
+    action: str | None = None
+    approval: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2776,6 +3434,13 @@ class WorkflowDescriptor:
     primary_session: str
     sessions: tuple[str, ...]
     steps: tuple[StepDescriptor, ...]
+    # Every privileged effect this definition can perform, in effect order.
+    # Empty means the workflow cannot publish anything at all, which a launch
+    # preview states rather than leaving the reader to infer from absence.
+    actions: tuple[str, ...] = ()
+    # Whether this definition can ask a person to authorize publication. A
+    # format-1 or format-2 revision never can, whatever its name suggests.
+    reviews: bool = False
 
 
 def describe(revision: WorkflowRevision) -> WorkflowDescriptor:
@@ -2793,13 +3458,18 @@ def describe(revision: WorkflowRevision) -> WorkflowDescriptor:
     for step in definition.steps:
         agent = step if isinstance(step, AgentStep) else None
         gated = agent is not None and agent.when != LiteralPredicate(value=True)
+        delivery = step if isinstance(step, DeliveryStep) else None
         steps.append(
             StepDescriptor(
                 name=step.name,
                 kind=step.kind,
                 session=agent.session if agent else None,
                 role=agent.role if agent else None,
-                conditional=after_branch or gated,
+                # A privileged action is always conditional: it runs only if a
+                # person answers its gate with the choice that grants it.
+                conditional=after_branch or gated or delivery is not None,
+                action=delivery.action if delivery else None,
+                approval=delivery.approval if delivery else None,
             )
         )
         if isinstance(step, DecisionStep) or (
@@ -2813,4 +3483,6 @@ def describe(revision: WorkflowRevision) -> WorkflowDescriptor:
         primary_session=definition.primary,
         sessions=definition.sessions,
         steps=tuple(steps),
+        actions=definition.declared_actions,
+        reviews=bool(definition.review_steps()),
     )

@@ -3,6 +3,11 @@
 - Status: Accepted
 - Date: 2026-09-06
 
+Extended by
+[ADR-0033](0033-scope-trusted-delivery-authority-to-the-workflow-run.md),
+which adds workflow format 3 — review and delivery steps — under the same
+revision rules, leaving format-1 and format-2 canonical bytes untouched.
+
 Supersedes [ADR-0018](0018-keep-built-in-workflows-in-python-until-portable-versioning-is-required.md).
 Extended by [ADR-0031](0031-let-operators-own-a-workflow-library-above-retained-revisions.md),
 which lifts the packaged-only catalog boundary below while keeping every

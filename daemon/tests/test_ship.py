@@ -40,11 +40,7 @@ from ompire_daemon.gh import (
 )
 from ompire_daemon.gpg import GpgProbe, GpgSelection, GpgStatus, parse_candidates
 from ompire_daemon.registry.projects import create_project
-from ompire_daemon.registry.reviews import (
-    append_iteration,
-    clear_process_marker,
-    open_review,
-)
+from ompire_daemon.registry.reviews import clear_process_marker
 from ompire_daemon.registry.ships import (
     get_delivery,
     get_latest_delivery,
@@ -54,6 +50,11 @@ from ompire_daemon.registry.tasks import (
     create_task,
     get_task,
     mark_pr_url,
+)
+from ompire_daemon.registry.workflows import (
+    WorkflowGateChoiceError,
+    WorkflowWaitConflictError,
+    list_step_records,
 )
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import (
@@ -69,7 +70,14 @@ from ompire_daemon.ship import (
     body_with_marker,
     correlation_marker,
 )
-from tests.conftest import make_execution_inputs, register_builtin_workflows
+from ompire_daemon.taskdefinition import resolve_task_definition
+from ompire_daemon.workflows import WorkflowNotWaitingError, WorkflowRunner
+from tests.conftest import (
+    install_delivery_workflow,
+    make_execution_inputs,
+    park_at_delivery_gate,
+    register_builtin_workflows,
+)
 
 
 @pytest.fixture
@@ -202,6 +210,11 @@ def ships(
     guard: WorkspaceGuard,
 ) -> ShipManager:
     return ShipManager(config, engine, hub, sessions, agents, gpg, gh, guard)
+
+
+@pytest.fixture
+def runner(config: Config, engine, hub: EventHub, sessions: SessionTracker):
+    return _StubRunner(engine, config, hub, sessions)
 
 
 @pytest.fixture
@@ -395,6 +408,8 @@ def _make_project_and_task(
     tmp_root: Path,
     upstream_url: str = "https://github.com/owner/repo",
     fork_url: str | None = None,
+    ending: str = "pr",
+    mode: str = "squash",
 ) -> tuple:
     checkout_dir = tmp_root / "proj" / "myproject"
     checkout_dir.mkdir(parents=True, exist_ok=True)
@@ -409,6 +424,10 @@ def _make_project_and_task(
     )
     clone_path = tmp_root / "tasks" / "myproject" / "task-1"
     clone_path.parent.mkdir(parents=True, exist_ok=True)
+    # The task is pinned to a workflow that actually declares the delivery
+    # under test. Nothing else can authorize one: publication is a step an
+    # author wrote, not something a task acquires by being finished.
+    revision = install_delivery_workflow(engine, ending=ending, mode=mode)
     task = create_task(
         engine,
         project_name="myproject",
@@ -416,12 +435,15 @@ def _make_project_and_task(
         branch="ompire/task-1",
         clone_path=str(clone_path),
         prompt="do the thing",
+        workflow_name=revision.name,
         execution_inputs=make_execution_inputs(
             checkout_path=str(checkout_dir),
             project_name="myproject",
             branch="ompire/task-1",
             upstream_url=upstream_url,
             fork_url=fork_url,
+            workflow_name=revision.name,
+            revision=revision,
         ),
     )
     return project, task
@@ -432,25 +454,69 @@ def _make_project_and_task(
 
 
 async def _approve_current(config, engine, task, base_branch: str = "main"):
-    """Capture the task's current content and record an approval bound to it.
+    """Capture the task's current content and reach its approval with it.
 
-    Exactly what a real review leaves behind: the candidate it graded, plus a
-    terminal `approved` iteration naming that candidate. Delivery reads the
-    binding, never the status alone.
+    Exactly what a real run leaves behind: the candidate the review graded, a
+    terminal `approved` iteration naming that candidate, and a parked question
+    whose frozen evidence names that review attempt. Delivery reads the
+    binding, never the status alone — and never a question nobody is at.
     """
     candidate = await capture_candidate(
         config, engine, task, base_branch=base_branch
     )
-    open_review(engine, task.id, candidate_id=candidate.candidate_id)
-    append_iteration(
-        engine,
-        task.id,
-        outcome="approved",
-        status="approved",
-        candidate_id=candidate.candidate_id,
-    )
+    park_at_delivery_gate(engine, task, candidate_id=candidate.candidate_id)
     clear_process_marker(engine, task.id)
     return candidate
+
+
+def _repin_workflow(engine, task, workflow_name: str) -> None:
+    """Repin a task to a different workflow, as an older launch would have.
+
+    Used to build the compatibility case: a task whose accepted procedure has
+    no publication vocabulary at all.
+    """
+    from ompire_daemon.execution_inputs import encode_execution_inputs
+    from ompire_daemon.registry.tasks import _update
+    from tests.conftest import install_plain_workflow
+
+    if workflow_name == "plain":
+        install_plain_workflow(engine)
+    inputs = make_execution_inputs(
+        engine=engine,
+        checkout_path=str(Path(task.clone_path).parent),
+        project_name="myproject",
+        branch=task.branch,
+        workflow_name=workflow_name,
+    )
+    _update(
+        engine,
+        task.id,
+        execution_inputs_json=encode_execution_inputs(inputs),
+        workflow_name=workflow_name,
+    )
+
+
+def _reset_run(engine, task) -> None:
+    """Clear the run's records so a test can reach its approval differently."""
+    from ompire_daemon.registry.reviews import delete_review
+    from ompire_daemon.registry.workflows import delete_step_records
+
+    delete_step_records(engine, task.id)
+    delete_review(engine, task.id)
+
+
+def _gate(engine, task) -> dict:
+    """The pending approval's identity, as preview keyword arguments.
+
+    Empty when the run is not at one, so a test that expects a refusal passes
+    exactly what a caller with nothing to name would.
+    """
+    from ompire_daemon.runauthority import resolve_authority
+
+    authority = resolve_authority(engine, get_task(engine, task.id))
+    if authority.approval is None:
+        return {}
+    return {"gate_seq": authority.approval.seq, "choice_id": "publish"}
 
 
 def _local_destination(ships: ShipManager, remote: Path, monkeypatch) -> None:
@@ -480,38 +546,74 @@ def _git_out(cwd: Path, *args: str) -> str:
     ).stdout.strip()
 
 
+class _StubRunner:
+    """The real gate transaction, without the loop that would then run it.
+
+    `answer_gate` is what commits the decision, the grant, and the run's move
+    to its first action together, and it is the real method here — including
+    its check that the confirmed chain is the one the choice declares. What is
+    held back is only the scheduling: this file exercises the trusted
+    operations themselves, and drives them explicitly so a failure names the
+    operation rather than the loop.
+    """
+
+    def __init__(self, engine, config, hub, sessions) -> None:
+        self._runner = WorkflowRunner(
+            engine, config, hub, AgentSupervisor(config, hub, sessions), sessions
+        )
+
+    def answer_gate(self, task, revision, **kwargs):
+        loop = asyncio.get_running_loop()
+        # A pending wait is what a parked run has; with one present the answer
+        # is committed and handed to that run instead of starting a new one.
+        self._runner._gate_waits[task.id] = loop.create_future()
+        try:
+            return self._runner.answer_gate(task, revision, **kwargs)
+        finally:
+            self._runner._gate_waits.pop(task.id, None)
+
+
 async def _deliver(
     ships: ShipManager,
     task,
     *,
-    ending: str,
-    mode: str = "squash",
+    engine,
+    runner,
     message: str = "ship: the work",
     pr_title: str = "The work",
     pr_body: str = "why",
     request_id: str = "req-1",
 ):
-    """Preview, then confirm exactly what the preview offered."""
+    """Preview the decision this run is at, then confirm exactly that.
+
+    No ending is requested: the pinned chain decides how far the delivery
+    goes, and asking for a different one is a refusal rather than an override.
+    """
     preview = await ships.preview(
         task,
-        ending=ending,
-        mode=mode,
+        **_gate(engine, task),
         commit_message=message,
         pr_title=pr_title,
         pr_body=pr_body,
         request_id=request_id,
     )
     assert preview.deliverable, [b.code for b in preview.blockers]
-    return await ships.deliver(
+    projection = await ships.deliver(
         task,
-        ending=ending,
-        mode=mode,
+        **_gate(engine, task),
         commit_message=message,
         pr_title=pr_title,
         pr_body=pr_body,
         request_id=request_id,
         preview_token=preview.fingerprint,
+        runner=runner,
     )
+    # The run would perform its authorized actions as steps; here they are
+    # driven explicitly, against the delivery the confirmation just recorded.
+    delivery = get_latest_delivery(engine, task.id)
+    assert delivery is not None
+    await ships._run_prefix(task, delivery.id, request_id)
+    return ships.projection(get_task(engine, task.id)) or projection
 
 
 # --- parsing (unchanged contracts) ------------------------------------------
@@ -633,18 +735,52 @@ async def test_capture_leaves_the_task_index_and_worktree_untouched(
 # --- admission --------------------------------------------------------------
 
 
+async def test_a_workflow_without_delivery_steps_cannot_publish_at_all(
+    tmp_root, engine, ships, config
+):
+    """The compatibility rule, at the service boundary.
+
+    A task pinned to a definition that never declared publication does not
+    acquire it by finishing, by being reviewed, or by an operator asking
+    firmly. There is no ending to name, so there is nothing to preview.
+    """
+    _project, task = _make_project_and_task(engine, tmp_root, ending="pr")
+    _setup_git_clone(tmp_root / "legacyfmt-origin.git", Path(task.clone_path))
+    _repin_workflow(engine, task, "plain")
+    await _approve_current(config, engine, task)
+
+    with pytest.raises(DeliveryBlockedError) as excinfo:
+        await ships.preview(
+            task,
+            commit_message="m",
+            pr_title="t",
+            pr_body="b",
+            request_id="r1",
+        )
+    assert [b.code for b in excinfo.value.blockers] == ["no-delivery-vocabulary"]
+
+
 async def test_delivery_requires_an_approval_bound_to_the_current_content(
     tmp_root, engine, ships, config, monkeypatch
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     _setup_git_clone(tmp_root / "review-origin.git", Path(task.clone_path))
     clone = Path(task.clone_path)
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe())
 
+    # The run reached its approval, but the review it is bound to did not
+    # approve. Reaching the question is not the same as passing review.
+    candidate = await capture_candidate(config, engine, task, base_branch="main")
+    park_at_delivery_gate(
+        engine,
+        task,
+        candidate_id=candidate.candidate_id,
+        outcome="comments",
+        findings="> fix it",
+    )
     unreviewed = await ships.preview(
         task,
-        ending="commit",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="",
         pr_body="",
@@ -652,11 +788,11 @@ async def test_delivery_requires_an_approval_bound_to_the_current_content(
     )
     assert "review-missing" in [b.code for b in unreviewed.blockers]
 
+    _reset_run(engine, task)
     await _approve_current(config, engine, task)
     ready = await ships.preview(
         task,
-        ending="commit",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="",
         pr_body="",
@@ -669,8 +805,7 @@ async def test_delivery_requires_an_approval_bound_to_the_current_content(
     (clone / "after-approval.txt").write_text("new\n", encoding="utf-8")
     stale = await ships.preview(
         task,
-        ending="commit",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="",
         pr_body="",
@@ -686,16 +821,14 @@ async def test_a_legacy_unbound_approval_is_history_not_authorization(
 ):
     """An approval recorded before content binding cannot deliver, and is not
     backfilled from today's workspace."""
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     _setup_git_clone(tmp_root / "legacy-origin.git", Path(task.clone_path))
-    open_review(engine, task.id)
-    append_iteration(engine, task.id, outcome="approved", status="approved")
+    park_at_delivery_gate(engine, task, candidate_id=None)
     clear_process_marker(engine, task.id)
 
     preview = await ships.preview(
         task,
-        ending="commit",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="",
         pr_body="",
@@ -705,13 +838,20 @@ async def test_a_legacy_unbound_approval_is_history_not_authorization(
     assert preview.review["content_bound"] is False
 
 
-async def test_a_blocked_preview_cannot_be_confirmed(tmp_root, engine, ships):
-    _project, task = _make_project_and_task(engine, tmp_root)
+async def test_a_blocked_preview_cannot_be_confirmed(
+    tmp_root, engine, ships, config, runner
+):
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     _setup_git_clone(tmp_root / "blocked-origin.git", Path(task.clone_path))
+    # At the approval, with an unapproved review behind it: deliverable is
+    # false, and confirming anyway is refused rather than authorized.
+    candidate = await capture_candidate(config, engine, task, base_branch="main")
+    park_at_delivery_gate(
+        engine, task, candidate_id=candidate.candidate_id, outcome="comments"
+    )
     preview = await ships.preview(
         task,
-        ending="commit",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="",
         pr_body="",
@@ -720,27 +860,26 @@ async def test_a_blocked_preview_cannot_be_confirmed(tmp_root, engine, ships):
     with pytest.raises(DeliveryBlockedError):
         await ships.deliver(
             task,
-            ending="commit",
-            mode="squash",
+            **_gate(engine, task),
             commit_message="m",
             pr_title="",
             pr_body="",
             request_id="r1",
             preview_token=preview.fingerprint,
+            runner=runner,
         )
     assert list_deliveries(engine, task.id)[-1].authorized_at is None
 
 
 async def test_changing_the_inputs_invalidates_the_preview_token(
-    tmp_root, engine, ships, config
+    tmp_root, engine, ships, config, runner
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     _setup_git_clone(tmp_root / "token-origin.git", Path(task.clone_path))
     await _approve_current(config, engine, task)
     preview = await ships.preview(
         task,
-        ending="commit",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="one message",
         pr_title="",
         pr_body="",
@@ -749,21 +888,29 @@ async def test_changing_the_inputs_invalidates_the_preview_token(
     with pytest.raises(PreviewMismatchError):
         await ships.deliver(
             task,
-            ending="commit",
-            mode="squash",
+            **_gate(engine, task),
             commit_message="a different message",
             pr_title="",
             pr_body="",
             request_id="r1",
             preview_token=preview.fingerprint,
+            runner=runner,
         )
 
 
+@pytest.mark.parametrize(
+    ("ending", "expect_github"),
+    [("commit", False), ("pr", True)],
+)
 async def test_a_local_ending_needs_no_github_availability(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, ending, expect_github
 ):
-    """Signing locally is not publishing, and does not wait on the forge."""
-    project, task = _make_project_and_task(engine, tmp_root)
+    """Signing locally is not publishing, and does not wait on the forge.
+
+    Two workflows, because how far a delivery goes is a property of the
+    procedure the task accepted — not a choice made at the confirmation.
+    """
+    project, task = _make_project_and_task(engine, tmp_root, ending=ending)
     _setup_git_clone(tmp_root / "offline-origin.git", Path(task.clone_path))
     await _approve_current(config, engine, task)
     error = _blocked_preflight_error(project.upstream_url)
@@ -774,45 +921,36 @@ async def test_a_local_ending_needs_no_github_availability(
     monkeypatch.setattr(ships._gh, "probe_target", blocked)
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe())
 
-    local = await ships.preview(
+    preview = await ships.preview(
         task,
-        ending="commit",
-        mode="squash",
-        commit_message="m",
-        pr_title="",
-        pr_body="",
-        request_id="r1",
-    )
-    assert local.deliverable, [b.code for b in local.blockers]
-
-    published = await ships.preview(
-        task,
-        ending="pr",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="t",
         pr_body="b",
         request_id="r1",
     )
-    assert "github-unavailable" in [b.code for b in published.blockers]
+    codes = [b.code for b in preview.blockers]
+    assert ("github-unavailable" in codes) is expect_github
+    if not expect_github:
+        assert preview.deliverable, codes
 
 
 # --- endings ----------------------------------------------------------------
 
 
 async def test_commit_ending_signs_the_reviewed_content_and_stops(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
     """A local signed commit is a complete delivery: nothing is pushed and no
     pull request is created."""
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     _setup_git_clone(tmp_root / "commit-origin.git", Path(task.clone_path))
     clone = Path(task.clone_path)
     _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
     candidate = await _approve_current(config, engine, task)
 
-    projection = await _deliver(ships, task, ending="commit")
+    projection = await _deliver(ships, task, engine=engine, runner=runner)
 
     assert projection["ending"] == "commit"
     assert projection["disposition"] == "completed"
@@ -843,10 +981,17 @@ async def test_commit_ending_signs_the_reviewed_content_and_stops(
     assert "ompire/task-1" not in origin_branches
 
 
-async def test_a_signed_commit_can_be_pushed_later_without_signing_again(
-    tmp_root, engine, ships, config, monkeypatch
+async def test_a_push_reuses_the_signed_result_and_signs_nothing_again(
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    """One signature per chain. The push writes the object the commit made.
+
+    This is what the old manual "extend a finished commit into a push" path
+    was for; the extension itself is gone — a completed ending is the ending
+    the operator authorized — but the property it protected is not, so it is
+    checked here on the chain that actually declares both actions.
+    """
+    _project, task = _make_project_and_task(engine, tmp_root, ending="push")
     _setup_git_clone(tmp_root / "later-origin.git", Path(task.clone_path))
     remote = _bare(tmp_root / "later-remote.git")
     _local_destination(ships, remote, monkeypatch)
@@ -854,47 +999,73 @@ async def test_a_signed_commit_can_be_pushed_later_without_signing_again(
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
     await _approve_current(config, engine, task)
 
-    first = await _deliver(ships, task, ending="commit", request_id="req-commit")
-    signed_tip = first["results"]["commit"]["signed_tip"]
-    delivery_id = first["delivery_id"]
+    signings: list[int] = []
+    original_sign = ships._sign
 
-    # Signing is no longer available. The later push must not need it.
-    monkeypatch.setattr(ships._gpg, "probe", _blocked_gpg_probe("locked"))
+    async def counted(*args, **kwargs):
+        signings.append(1)
+        return await original_sign(*args, **kwargs)
 
-    preview = await ships.preview(
-        task,
-        ending="push",
-        mode="squash",
-        commit_message="",
-        pr_title="",
-        pr_body="",
-        request_id="req-push",
-        delivery_id=delivery_id,
-    )
-    assert preview.remaining_actions == ["push"]
-    assert preview.deliverable, [b.code for b in preview.blockers]
-    delivery_id, _projection = await ships.authorize(
-        task, preview, expected_version=preview.version
-    )
-    await ships._run_prefix(task, delivery_id, "req-push")
+    monkeypatch.setattr(ships, "_sign", counted)
 
-    record = get_delivery(engine, delivery_id)
-    assert record.disposition == "completed"
-    assert record.succeeded("commit").result["signed_tip"] == signed_tip
+    projection = await _deliver(ships, task, engine=engine, runner=runner)
+    record = get_delivery(engine, projection["delivery_id"])
+
+    assert len(signings) == 1
+    signed_tip = record.succeeded("commit").result["signed_tip"]
     assert record.succeeded("push").result["head"] == signed_tip
     assert record.succeeded("pr") is None
     assert _git_out(remote, "rev-parse", "refs/heads/ompire/task-1") == signed_tip
-    # The original authorization was not rewritten; the extension is its own
-    # decision.
+    # One decision authorized the whole chain; there is no second grant.
     kinds = [d.kind for d in record.decisions]
     assert kinds.count("authorize") == 1
-    assert "extend" in kinds
+    assert "extend" not in kinds
+
+
+async def test_a_completed_ending_cannot_be_widened_afterwards(
+    tmp_root, engine, ships, config, monkeypatch, runner
+):
+    """A local-commit workflow stays a local-commit workflow.
+
+    Once its chain is done there is nothing left to authorize, and no request
+    turns "this was signed" into permission to push it. Widening an ending is
+    a decision only an author can make, in a new procedure.
+    """
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "narrow-origin.git", Path(task.clone_path))
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    projection = await _deliver(ships, task, engine=engine, runner=runner)
+    assert projection["completed_actions"] == ["commit"]
+
+    exhausted = await ships.preview(
+        task,
+        commit_message="m",
+        pr_title="t",
+        pr_body="b",
+        request_id="req-widen",
+        delivery_id=projection["delivery_id"],
+    )
+    assert exhausted.ending == "commit"
+    assert "already-delivered" in [b.code for b in exhausted.blockers]
+    # And asking for a longer ending by name is refused rather than obeyed.
+    with pytest.raises(PreviewMismatchError, match="not 'pr'"):
+        await ships.preview(
+            task,
+            ending="pr",
+            commit_message="m",
+            pr_title="t",
+            pr_body="b",
+            request_id="req-widen-2",
+        )
 
 
 async def test_pr_ending_signs_pushes_and_opens_one_pull_request(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="pr")
     _setup_git_clone(tmp_root / "pr-origin.git", Path(task.clone_path))
     remote = _bare(tmp_root / "pr-remote.git")
     _local_destination(ships, remote, monkeypatch)
@@ -911,7 +1082,7 @@ async def test_pr_ending_signs_pushes_and_opens_one_pull_request(
 
     monkeypatch.setattr(ships._gh, "run", recording)
 
-    projection = await _deliver(ships, task, ending="pr")
+    projection = await _deliver(ships, task, engine=engine, runner=runner)
 
     assert projection["disposition"] == "completed"
     assert projection["completed_actions"] == ["commit", "push", "pr"]
@@ -926,9 +1097,9 @@ async def test_pr_ending_signs_pushes_and_opens_one_pull_request(
 
 
 async def test_retain_preserves_messages_trees_and_count_under_new_signatures(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit", mode="retain")
     _setup_git_clone(tmp_root / "retain-origin.git", Path(task.clone_path))
     clone = Path(task.clone_path)
     # Retain publishes existing commits, so the pending edit is committed.
@@ -939,7 +1110,7 @@ async def test_retain_preserves_messages_trees_and_count_under_new_signatures(
     candidate = await _approve_current(config, engine, task)
     assert candidate.commit_count == 3
 
-    projection = await _deliver(ships, task, ending="commit", mode="retain")
+    projection = await _deliver(ships, task, engine=engine, runner=runner)
     assert projection["results"]["commit"]["commit_count"] == 3
 
     log = _git_out(
@@ -965,16 +1136,15 @@ async def test_retain_preserves_messages_trees_and_count_under_new_signatures(
 async def test_retain_refuses_a_dirty_tree_and_an_empty_range(
     tmp_root, engine, ships, config, monkeypatch
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit", mode="retain")
     _setup_git_clone(tmp_root / "retain-refuse-origin.git", Path(task.clone_path))
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe())
     await _approve_current(config, engine, task)
 
     dirty = await ships.preview(
         task,
-        ending="commit",
-        mode="retain",
-        commit_message="",
+        **_gate(engine, task),
+        commit_message="m",
         pr_title="",
         pr_body="",
         request_id="r1",
@@ -985,7 +1155,7 @@ async def test_retain_refuses_a_dirty_tree_and_an_empty_range(
 async def test_an_empty_delta_is_refused_rather_than_manufactured(
     tmp_root, engine, ships
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     clone = Path(task.clone_path)
     origin = tmp_root / "empty-origin.git"
     origin.mkdir(parents=True, exist_ok=True)
@@ -998,11 +1168,12 @@ async def test_an_empty_delta_is_refused_rather_than_manufactured(
     _run_git(clone, "add", ".")
     _run_git(clone, "commit", "-m", "base")
     _run_git(clone, "push", "origin", "HEAD:main")
+    # The run is at its approval; what is missing is content, not authority.
+    park_at_delivery_gate(engine, task, candidate_id="never-captured")
 
     preview = await ships.preview(
         task,
-        ending="commit",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="",
         pr_body="",
@@ -1015,23 +1186,22 @@ async def test_an_empty_delta_is_refused_rather_than_manufactured(
 
 
 async def test_a_replayed_confirmation_does_not_start_a_second_delivery(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     _setup_git_clone(tmp_root / "replay-origin.git", Path(task.clone_path))
     _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
     await _approve_current(config, engine, task)
 
-    first = await _deliver(ships, task, ending="commit", request_id="same-request")
+    first = await _deliver(ships, task, engine=engine, runner=runner, request_id="same-request")
     signed_tip = first["results"]["commit"]["signed_tip"]
 
     # The same confirmation arrives again — a double submit, or a retried
     # request. It must not sign a second time.
     preview = await ships.preview(
         task,
-        ending="commit",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="ship: the work",
         pr_title="The work",
         pr_body="why",
@@ -1055,8 +1225,7 @@ async def test_a_delivery_is_refused_while_another_writer_owns_the_workspace(
     try:
         preview = await ships.preview(
             task,
-            ending="commit",
-            mode="squash",
+            **_gate(engine, task),
             commit_message="m",
             pr_title="",
             pr_body="",
@@ -1094,11 +1263,11 @@ async def test_clone_local_signing_config_cannot_redirect_the_commit(
 
 
 async def test_a_workspace_that_moved_on_blocks_installation_of_the_signed_result(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
     """The signed content is still the reviewed content, so it is kept — but
     a branch that moved under the delivery is not overwritten."""
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     _setup_git_clone(tmp_root / "moved-origin.git", Path(task.clone_path))
     clone = Path(task.clone_path)
     _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
@@ -1119,14 +1288,13 @@ async def test_a_workspace_that_moved_on_blocks_installation_of_the_signed_resul
 
     preview = await ships.preview(
         task,
-        ending="commit",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="",
         pr_body="",
         request_id="r1",
     )
-    delivery_id, _p = await ships.authorize(task, preview, expected_version=preview.version)
+    delivery_id, _p = await ships.confirm(task, preview, runner=runner)
     await ships._run_prefix(task, delivery_id, "r1")
 
     record = get_delivery(engine, delivery_id)
@@ -1147,9 +1315,9 @@ async def test_a_workspace_that_moved_on_blocks_installation_of_the_signed_resul
 
 
 async def test_push_writes_the_authorized_object_under_the_recorded_lease(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="push")
     _setup_git_clone(tmp_root / "lease-origin.git", Path(task.clone_path))
     remote = _bare(tmp_root / "lease-remote.git")
     _local_destination(ships, remote, monkeypatch)
@@ -1157,7 +1325,7 @@ async def test_push_writes_the_authorized_object_under_the_recorded_lease(
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
     await _approve_current(config, engine, task)
 
-    projection = await _deliver(ships, task, ending="push")
+    projection = await _deliver(ships, task, engine=engine, runner=runner)
     push = projection["results"]["push"]
     assert push["pre_push_oid"] is None
     assert push["head"] == projection["results"]["commit"]["signed_tip"]
@@ -1166,11 +1334,11 @@ async def test_push_writes_the_authorized_object_under_the_recorded_lease(
 
 
 async def test_an_unexpected_remote_head_is_a_conflict_not_permission_to_force(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
     """The lease is the head Ompire observed and recorded, not whatever the
     destination holds by the time the write goes out."""
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="push")
     _setup_git_clone(tmp_root / "conflict-origin.git", Path(task.clone_path))
     remote = _bare(tmp_root / "conflict-remote.git")
     _local_destination(ships, remote, monkeypatch)
@@ -1201,16 +1369,13 @@ async def test_an_unexpected_remote_head_is_a_conflict_not_permission_to_force(
     monkeypatch.setattr(ships, "_push", push_after_a_race)
     preview = await ships.preview(
         task,
-        ending="push",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="",
         pr_body="",
         request_id="r1",
     )
-    delivery_id, _p = await ships.authorize(
-        task, preview, expected_version=preview.version
-    )
+    delivery_id, _p = await ships.confirm(task, preview, runner=runner)
     await ships._run_prefix(task, delivery_id, "r1")
 
     record = get_delivery(engine, delivery_id)
@@ -1244,10 +1409,10 @@ async def test_ssh_authentication_classification_is_narrow(
 
 
 async def test_restart_adopts_a_push_that_actually_landed(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
     """A lost response is not a reason to push again."""
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="push")
     _setup_git_clone(tmp_root / "adopt-origin.git", Path(task.clone_path))
     remote = _bare(tmp_root / "adopt-remote.git")
     _local_destination(ships, remote, monkeypatch)
@@ -1264,14 +1429,13 @@ async def test_restart_adopts_a_push_that_actually_landed(
     monkeypatch.setattr(ships, "_push", push_then_die)
     preview = await ships.preview(
         task,
-        ending="push",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="",
         pr_body="",
         request_id="r1",
     )
-    delivery_id, _p = await ships.authorize(task, preview, expected_version=preview.version)
+    delivery_id, _p = await ships.confirm(task, preview, runner=runner)
     with pytest.raises(asyncio.CancelledError):
         await ships._run_prefix(task, delivery_id, "r1")
 
@@ -1296,9 +1460,9 @@ async def test_restart_adopts_a_push_that_actually_landed(
 
 
 async def test_restart_proves_a_signing_attempt_never_produced_anything(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     _setup_git_clone(tmp_root / "nosig-origin.git", Path(task.clone_path))
     _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
@@ -1310,14 +1474,13 @@ async def test_restart_proves_a_signing_attempt_never_produced_anything(
     monkeypatch.setattr(ships, "_sign", die_before_signing)
     preview = await ships.preview(
         task,
-        ending="commit",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="",
         pr_body="",
         request_id="r1",
     )
-    delivery_id, _p = await ships.authorize(task, preview, expected_version=preview.version)
+    delivery_id, _p = await ships.confirm(task, preview, runner=runner)
     with pytest.raises(asyncio.CancelledError):
         await ships._run_prefix(task, delivery_id, "r1")
     assert get_delivery(engine, delivery_id).action("commit").phase == "executing"
@@ -1340,10 +1503,10 @@ async def test_restart_proves_a_signing_attempt_never_produced_anything(
 
 
 async def test_an_unreadable_destination_leaves_a_push_unresolved_and_blocks_the_task(
-    tmp_root, engine, ships, config, guard, monkeypatch
+    tmp_root, engine, ships, config, guard, monkeypatch, runner
 ):
     """Not being able to look is not evidence that nothing happened."""
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="push")
     _setup_git_clone(tmp_root / "unknown-origin.git", Path(task.clone_path))
     remote = _bare(tmp_root / "unknown-remote.git")
     _local_destination(ships, remote, monkeypatch)
@@ -1353,14 +1516,13 @@ async def test_an_unreadable_destination_leaves_a_push_unresolved_and_blocks_the
 
     preview = await ships.preview(
         task,
-        ending="push",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="",
         pr_body="",
         request_id="r1",
     )
-    delivery_id, _p = await ships.authorize(task, preview, expected_version=preview.version)
+    delivery_id, _p = await ships.confirm(task, preview, runner=runner)
 
     original_remote_head = ships._remote_head
     calls = {"n": 0}
@@ -1399,9 +1561,9 @@ async def test_an_unreadable_destination_leaves_a_push_unresolved_and_blocks_the
 
 
 async def test_a_lost_pull_request_response_is_found_by_its_correlation_marker(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="pr")
     _setup_git_clone(tmp_root / "marker-origin.git", Path(task.clone_path))
     remote = _bare(tmp_root / "marker-remote.git")
     _local_destination(ships, remote, monkeypatch)
@@ -1446,7 +1608,7 @@ async def test_a_lost_pull_request_response_is_found_by_its_correlation_marker(
         return GitHubCommandResult(returncode=1, stdout="", stderr="unexpected")
 
     monkeypatch.setattr(ships._gh, "run", gh_run)
-    projection = await _deliver(ships, task, ending="pr", request_id="r1")
+    projection = await _deliver(ships, task, engine=engine, runner=runner, request_id="r1")
 
     assert created == ["create"]
     assert projection["results"]["pr"]["adopted"] is True
@@ -1481,8 +1643,7 @@ async def test_an_incomplete_pr_search_leaves_the_outcome_unknown(
     monkeypatch.setattr(ships._gh, "run", gh_run)
     preview = await ships.preview(
         task,
-        ending="pr",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="t",
         pr_body="b",
@@ -1527,25 +1688,25 @@ async def test_a_legacy_publication_is_a_known_fact_with_no_invented_journal(
 
 
 async def test_the_projection_version_advances_with_every_committed_change(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     _setup_git_clone(tmp_root / "version-origin.git", Path(task.clone_path))
     _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
     await _approve_current(config, engine, task)
 
     before = ships.projection(task)
-    after = await _deliver(ships, task, ending="commit")
+    after = await _deliver(ships, task, engine=engine, runner=runner)
     assert before is None or after["version"] > before["version"]
     assert get_latest_delivery(engine, task.id).version == after["version"]
 
 
 async def test_a_refused_first_action_can_be_corrected_and_confirmed_again(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
     """Nothing succeeded, so there is no terminal prefix to protect."""
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     _setup_git_clone(tmp_root / "correct-origin.git", Path(task.clone_path))
     _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
@@ -1559,24 +1720,30 @@ async def test_a_refused_first_action_can_be_corrected_and_confirmed_again(
     monkeypatch.setattr(ships, "_sign", refuse)
     preview = await ships.preview(
         task,
-        ending="commit",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="first attempt",
         pr_title="",
         pr_body="",
         request_id="r1",
     )
-    delivery_id, _p = await ships.authorize(
-        task, preview, expected_version=preview.version
-    )
+    delivery_id, _p = await ships.confirm(task, preview, runner=runner)
     await ships._run_prefix(task, delivery_id, "r1")
     assert get_delivery(engine, delivery_id).disposition == "blocked"
 
-    # Signing works again, and the operator corrects the message.
+    # Signing works again. The decision stands, so the correction re-confirms
+    # the same authorization rather than asking for a second approval.
     monkeypatch.setattr(ships, "_sign", original_sign)
-    projection = await _deliver(
-        ships, task, ending="commit", message="corrected message", request_id="r2"
+    corrected = await ships.preview(
+        task,
+        commit_message="corrected message",
+        pr_title="",
+        pr_body="",
+        request_id="r2",
     )
+    assert corrected.source == "workflow-action"
+    delivery_id, _p = await ships.confirm(task, corrected, runner=runner)
+    await ships._run_prefix(task, delivery_id, "r2")
+    projection = ships.projection(get_task(engine, task.id))
 
     assert projection["disposition"] == "completed"
     assert len(list_deliveries(engine, task.id)) == 1
@@ -1585,9 +1752,9 @@ async def test_a_refused_first_action_can_be_corrected_and_confirmed_again(
 
 
 async def test_a_completed_prefix_survives_a_refusal_and_resumes_without_re_signing(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="push")
     _setup_git_clone(tmp_root / "resume-origin.git", Path(task.clone_path))
     remote = _bare(tmp_root / "resume-remote.git")
     _local_destination(ships, remote, monkeypatch)
@@ -1607,16 +1774,13 @@ async def test_a_completed_prefix_survives_a_refusal_and_resumes_without_re_sign
     monkeypatch.setattr(ships, "_push", flaky_push)
     preview = await ships.preview(
         task,
-        ending="push",
-        mode="squash",
+        **_gate(engine, task),
         commit_message="m",
         pr_title="",
         pr_body="",
         request_id="r1",
     )
-    delivery_id, _p = await ships.authorize(
-        task, preview, expected_version=preview.version
-    )
+    delivery_id, _p = await ships.confirm(task, preview, runner=runner)
     await ships._run_prefix(task, delivery_id, "r1")
 
     blocked = get_delivery(engine, delivery_id)
@@ -1630,7 +1794,7 @@ async def test_a_completed_prefix_survives_a_refusal_and_resumes_without_re_sign
         raise AssertionError("a resumed delivery must not sign again")
 
     monkeypatch.setattr(ships, "_sign", must_not_sign)
-    projection = await _deliver(ships, task, ending="push", request_id="r2")
+    projection = await _deliver(ships, task, engine=engine, runner=runner, request_id="r2")
 
     assert signings == []
     assert projection["disposition"] == "completed"
@@ -1643,11 +1807,11 @@ async def test_a_completed_prefix_survives_a_refusal_and_resumes_without_re_sign
 
 
 async def test_adopting_an_unresolved_final_action_completes_the_delivery(
-    tmp_root, engine, ships, config, guard, monkeypatch
+    tmp_root, engine, ships, config, guard, monkeypatch, runner
 ):
     """Recovering from an unknown effect is not authorization to keep writing,
     but an adopted result that finishes the ending finishes the delivery."""
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="pr")
     _setup_git_clone(tmp_root / "settle-origin.git", Path(task.clone_path))
     remote = _bare(tmp_root / "settle-remote.git")
     _local_destination(ships, remote, monkeypatch)
@@ -1684,7 +1848,7 @@ async def test_adopting_an_unresolved_final_action_completes_the_delivery(
     from ompire_daemon.ship import PullRequestError
 
     monkeypatch.setattr(ships._gh, "run", gh_run)
-    projection = await _deliver(ships, task, ending="pr", request_id="r1")
+    projection = await _deliver(ships, task, engine=engine, runner=runner, request_id="r1")
 
     assert projection["disposition"] == "unresolved"
     assert guard.blocked_reason(task.id) is not None
@@ -1709,17 +1873,17 @@ async def test_adopting_an_unresolved_final_action_completes_the_delivery(
 
 
 async def test_a_delivery_records_the_workflow_revision_it_published_from(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
     """Attribution, not policy: a delivery says which pinned procedure produced
     the work it published, and that stays true after the library moves on."""
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     _setup_git_clone(tmp_root / "attribution-origin.git", Path(task.clone_path))
     _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
     await _approve_current(config, engine, task)
 
-    await _deliver(ships, task, ending="commit")
+    await _deliver(ships, task, engine=engine, runner=runner)
 
     record = get_latest_delivery(engine, task.id)
     expected = task.execution_inputs.workflow_binding.revision
@@ -1728,13 +1892,13 @@ async def test_a_delivery_records_the_workflow_revision_it_published_from(
 
 
 async def test_terminal_candidate_storage_is_released_and_unresolved_storage_is_kept(
-    tmp_root, engine, ships, config, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch, runner
 ):
     """Candidate objects are temporary operation evidence: they go once nothing
     still needs them, and they stay while something might."""
     from ompire_daemon.registry.ships import list_task_candidates
 
-    _project, task = _make_project_and_task(engine, tmp_root)
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
     _setup_git_clone(tmp_root / "lifecycle-origin.git", Path(task.clone_path))
     _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
@@ -1742,10 +1906,573 @@ async def test_terminal_candidate_storage_is_released_and_unresolved_storage_is_
     store = Path(candidate.storage_path)
     assert store.exists()
 
-    await _deliver(ships, task, ending="commit")
+    await _deliver(ships, task, engine=engine, runner=runner)
 
     # The delivery is terminal, so its evidence has served its purpose.
     assert not store.exists()
     retained = [c for c in list_task_candidates(engine, task.id)]
     assert retained, "the manifest is history and stays"
     assert all(c.storage_path is None for c in retained)
+
+
+# --- workflow-scoped authority (format 3) ------------------------------------
+
+
+async def test_authority_comes_from_the_question_not_from_an_agent_claim(
+    tmp_root, engine, ships, config, monkeypatch
+):
+    """A result that *looks* like a review verdict establishes nothing.
+
+    The gate's frozen binding names a step and an attempt, and the verdict is
+    read from the review journal for that attempt. An agent step that writes
+    `{"result": "approved"}` into its own outcome is writing data, and the
+    binding it is not named by cannot be satisfied by it.
+    """
+    from ompire_daemon.registry.workflows import (
+        append_step_record,
+        build_gate_snapshot,
+        finish_step_record,
+        park_gate,
+    )
+
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "forged-origin.git", Path(task.clone_path))
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe())
+
+    forged = append_step_record(
+        engine, task.id, step="work", kind="agent", session="main", evidence=None
+    )
+    finish_step_record(
+        engine,
+        task.id,
+        forged.seq,
+        status="ok",
+        outcome={"version": 2, "result": "approved", "summary": "all good"},
+    )
+    gate = append_step_record(
+        engine,
+        task.id,
+        step="approve",
+        kind="gate",
+        session=None,
+        evidence={
+            "version": 1,
+            # Pointed at the agent's own attempt, which is the substitution
+            # under test.
+            "bindings": {"verdict": {"step": "work", "seq": forged.seq}},
+        },
+    )
+    park_gate(
+        engine,
+        task.id,
+        gate.seq,
+        step="approve",
+        message="Publish?",
+        snapshot=build_gate_snapshot(
+            message="Publish?",
+            choices=[
+                {
+                    "id": "publish",
+                    "label": "Publish",
+                    "feedback_required": False,
+                    "next": {"step": "commit"},
+                    "authorize": {"steps": ["commit"]},
+                }
+            ],
+            evidence={"verdict": {"step": "work", "seq": forged.seq}},
+        ),
+    )
+
+    preview = await ships.preview(
+        task,
+        gate_seq=gate.seq,
+        choice_id="publish",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    codes = [b.code for b in preview.blockers]
+    assert "review-unrecorded" in codes
+    assert not preview.deliverable
+
+
+async def test_a_preview_must_name_the_question_it_is_about(
+    tmp_root, engine, ships, config
+):
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "named-origin.git", Path(task.clone_path))
+    await _approve_current(config, engine, task)
+    gate = _gate(engine, task)
+
+    with pytest.raises(PreviewMismatchError, match="must name the question"):
+        await ships.preview(
+            task, commit_message="m", pr_title="", pr_body="", request_id="r1"
+        )
+    with pytest.raises(PreviewMismatchError, match="reload the question"):
+        await ships.preview(
+            task,
+            gate_seq=gate["gate_seq"] + 5,
+            choice_id="publish",
+            commit_message="m",
+            pr_title="",
+            pr_body="",
+            request_id="r1",
+        )
+    with pytest.raises(PreviewMismatchError, match="not one of this question"):
+        await ships.preview(
+            task,
+            gate_seq=gate["gate_seq"],
+            choice_id="nope",
+            commit_message="m",
+            pr_title="",
+            pr_body="",
+            request_id="r1",
+        )
+    with pytest.raises(PreviewMismatchError, match="authorizes no publication"):
+        await ships.preview(
+            task,
+            gate_seq=gate["gate_seq"],
+            choice_id="finish",
+            commit_message="m",
+            pr_title="",
+            pr_body="",
+            request_id="r1",
+        )
+
+
+async def test_answering_the_question_twice_authorizes_once(
+    tmp_root, engine, ships, config, monkeypatch, runner
+):
+    """The decision, the grant, and the successor are one transaction.
+
+    A replayed confirmation is answering a question that no longer has an
+    unanswered form, so it is refused before anything else happens — there is
+    no window in which it could open a second chain.
+    """
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "twice-origin.git", Path(task.clone_path))
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    gate = _gate(engine, task)
+    preview = await ships.preview(
+        task,
+        **gate,
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    delivery_id, _p = await ships.confirm(task, preview, runner=runner)
+
+    with pytest.raises((WorkflowWaitConflictError, WorkflowNotWaitingError)):
+        await ships.confirm(task, preview, runner=runner)
+    assert len(list_deliveries(engine, task.id)) == 1
+    record = get_delivery(engine, delivery_id)
+    assert [d.kind for d in record.decisions].count("authorize") == 1
+    assert record.workflow_authorized is True
+    assert record.workflow_choice_id == "publish"
+    assert record.workflow_gate_seq == gate["gate_seq"]
+    # The run moved to its first action in the same write.
+    from ompire_daemon.registry.workflows import list_step_records
+
+    assert list_step_records(engine, task.id)[-1].step == "commit"
+
+
+async def test_a_confirmation_cannot_smuggle_a_chain_the_choice_never_granted(
+    tmp_root, engine, ships, config, monkeypatch, runner
+):
+    """The runner checks the confirmed chain against the pinned document."""
+    from dataclasses import replace as dc_replace
+
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "smuggle-origin.git", Path(task.clone_path))
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe())
+    await _approve_current(config, engine, task)
+
+    preview = await ships.preview(
+        task,
+        **_gate(engine, task),
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    widened = dc_replace(preview, ending="pr")
+    with pytest.raises(WorkflowGateChoiceError, match="is not the chain"):
+        await ships.confirm(task, widened, runner=runner)
+    assert list_deliveries(engine, task.id)[-1].authorized_at is None
+
+
+async def test_the_run_performs_its_authorized_chain_and_ends_where_it_declared(
+    tmp_root, engine, ships, config, hub, sessions, monkeypatch
+):
+    """The whole slice, end to end, driven by the run itself.
+
+    The operator answers one question; the run performs commit, push, and the
+    pull request as three declared steps, consuming each verified predecessor,
+    and ends at the named result its last action routes to. Nothing schedules
+    a prefix behind the run's back, and each effect is linked to the attempt
+    that asked for it.
+    """
+    from ompire_daemon.registry.workflows import list_step_records
+    from ompire_daemon.taskdefinition import resolve_task_definition
+
+    _project, task = _make_project_and_task(engine, tmp_root, ending="pr")
+    _setup_git_clone(tmp_root / "chain-origin.git", Path(task.clone_path))
+    remote = _bare(tmp_root / "chain-remote.git")
+    _local_destination(ships, remote, monkeypatch)
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    live = WorkflowRunner(
+        engine, config, hub, AgentSupervisor(config, hub, sessions), sessions
+    )
+    live.set_guard(ships._guard)
+    live.set_operations(None, ships)
+    try:
+        preview = await ships.preview(
+            task,
+            **_gate(engine, task),
+            commit_message="ship: it",
+            pr_title="The work",
+            pr_body="why",
+            request_id="r1",
+        )
+        assert preview.deliverable, [b.code for b in preview.blockers]
+        await ships.confirm(task, preview, runner=live)
+
+        deadline = asyncio.get_running_loop().time() + 30
+        while asyncio.get_running_loop().time() < deadline:
+            current = get_task(engine, task.id)
+            if current.workflow_status in ("complete", "failed"):
+                break
+            await asyncio.sleep(0.02)
+    finally:
+        await live.shutdown()
+
+    finished = get_task(engine, task.id)
+    assert finished.workflow_status == "complete"
+    assert finished.workflow_result == "published"
+
+    record = get_latest_delivery(engine, task.id)
+    assert record.disposition == "completed"
+    signed_tip = record.succeeded("commit").result["signed_tip"]
+    assert record.succeeded("push").result["head"] == signed_tip
+    assert record.succeeded("pr").result["url"].startswith("https://github.com/")
+    assert _git_out(remote, "rev-parse", "refs/heads/ompire/task-1") == signed_tip
+
+    # Each effect is attributable to the step attempt that asked for it, and
+    # each step records what actually happened rather than its own label.
+    steps = {r.step: r for r in list_step_records(engine, task.id)}
+    for name in ("commit", "push", "pr"):
+        attempt = steps[name]
+        assert attempt.status == "ok"
+        assert attempt.outcome["action"] == name
+        action = record.succeeded(name)
+        assert action.workflow_seq == attempt.seq
+        assert attempt.outcome["action_id"] == action.id
+    assert resolve_task_definition(engine, task).format == 3
+
+
+async def test_an_action_refuses_a_step_its_grant_does_not_cover(
+    tmp_root, engine, ships, config, monkeypatch, runner
+):
+    """A step is not a grant. Being at one proves only where the run is."""
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "cover-origin.git", Path(task.clone_path))
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    preview = await ships.preview(
+        task,
+        **_gate(engine, task),
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    await ships.confirm(task, preview, runner=runner)
+    from ompire_daemon.registry.workflows import list_step_records
+
+    seq = list_step_records(engine, task.id)[-1].seq
+
+    # The run is at the commit action. Asking for a push there is refused
+    # before anything is prepared, let alone written.
+    with pytest.raises(DeliveryBlockedError) as excinfo:
+        await ships.perform_action(
+            task,
+            action="push",
+            workflow_seq=seq,
+            request_id="r2",
+            settle=lambda *_args: None,
+        )
+    assert [b.code for b in excinfo.value.blockers] == ["action-mismatch"]
+
+    # And an attempt number nobody is at is refused just as plainly.
+    with pytest.raises(DeliveryBlockedError) as excinfo:
+        await ships.perform_action(
+            task,
+            action="commit",
+            workflow_seq=seq + 7,
+            request_id="r3",
+            settle=lambda *_args: None,
+        )
+    assert [b.code for b in excinfo.value.blockers] == ["not-at-action"]
+    assert get_latest_delivery(engine, task.id).actions == []
+
+
+# --- no alternate authority path (format 3) ----------------------------------
+
+
+async def test_no_manual_writer_is_admitted_while_a_decision_is_pending(
+    tmp_root, engine, ships, config
+):
+    """An approval wait holds no lock, and must still exclude writers.
+
+    A turn started here would change the content the decision is about, and
+    the decision would then be about something that no longer exists. The
+    refusal points at the way forward the author declared.
+    """
+    from ompire_daemon.runauthority import writer_refusal
+
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "writer-origin.git", Path(task.clone_path))
+    assert writer_refusal(engine, get_task(engine, task.id)) is None
+
+    await _approve_current(config, engine, task)
+    refusal = writer_refusal(engine, get_task(engine, task.id))
+    assert refusal is not None
+    assert refusal[0] == "awaiting-approval"
+    assert "request changes" in refusal[1]
+
+
+async def test_a_declaring_workflow_does_not_draft_through_an_agent(
+    tmp_root, engine, ships, config
+):
+    """No hidden turn at the approval, in either direction.
+
+    The old Ship page asked the primary session for publication text. A
+    format-3 run gets that text from its gate's own declared metadata, or from
+    the operator typing it — both inert. Editing by hand stays available.
+    """
+    from ompire_daemon.ship import DraftNotDeclaredError
+
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "draft-origin.git", Path(task.clone_path))
+    await _approve_current(config, engine, task)
+
+    with pytest.raises(DraftNotDeclaredError):
+        await ships.draft(task)
+
+    projection = ships.save_manual_draft(
+        task,
+        {"commit_message": "typed by hand", "pr_title": "t", "pr_body": "b"},
+    )
+    assert projection["draft"]["commit_message"] == "typed by hand"
+    assert projection["draft"]["source"] == "operator"
+
+
+async def test_a_declaring_workflow_reviews_only_at_its_review_step(
+    tmp_root, engine, ships, config, hub, sessions, agents, guard
+):
+    """Review is where the workflow says, for a direct caller too."""
+    from ompire_daemon.review import ReviewManager, ReviewNotEligibleError
+
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "reviewstep-origin.git", Path(task.clone_path))
+    await _approve_current(config, engine, task)
+    reviews = ReviewManager(config, engine, hub, sessions, agents, guard)
+
+    with pytest.raises(ReviewNotEligibleError) as excinfo:
+        await reviews.start_review(task)
+    assert excinfo.value.code == "not-at-review"
+
+
+# --- interrupted delivery, adopted or continued ------------------------------
+
+
+def _restored_sign(ships):
+    """The manager's real signing implementation, unpatched."""
+    return ShipManager._sign.__get__(ships, ShipManager)
+
+
+def _live_runner(engine, config, hub, sessions, ships):
+    """A real runner wired to the trusted services, as app startup wires it."""
+    live = WorkflowRunner(
+        engine, config, hub, AgentSupervisor(config, hub, sessions), sessions
+    )
+    live.set_guard(ships._guard)
+    live.set_operations(None, ships)
+    return live
+
+
+async def _settle(engine, task_id, statuses, timeout=30.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        task = get_task(engine, task_id)
+        if task.workflow_status in statuses:
+            return task
+        await asyncio.sleep(0.02)
+    return get_task(engine, task_id)
+
+
+async def test_a_restart_adopts_a_completed_effect_instead_of_repeating_it(
+    tmp_root, engine, ships, config, hub, sessions, monkeypatch
+):
+    """The crash window between the journal write and the step transition.
+
+    The commit really happened. A restart that re-ran the step would sign a
+    second time, so recovery attaches the recorded result to the attempt that
+    asked for it and lets the run continue from there.
+    """
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "adoptstep-origin.git", Path(task.clone_path))
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    live = _live_runner(engine, config, hub, sessions, ships)
+    # Land the journal result, then die before the step can be told.
+    original_land = ships._land
+
+    def land_then_die(action_id, *, result, identity=None, disposition=None, settle=None):
+        original_land(
+            action_id, result=result, identity=identity, disposition=disposition
+        )
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(ships, "_land", land_then_die)
+    try:
+        preview = await ships.preview(
+            task,
+            **_gate(engine, task),
+            commit_message="ship: it",
+            pr_title="",
+            pr_body="",
+            request_id="r1",
+        )
+        await ships.confirm(task, preview, runner=live)
+        await _settle(engine, task.id, {"complete", "failed", "waiting"})
+    finally:
+        await live.shutdown()
+
+    record = get_latest_delivery(engine, task.id)
+    assert record.succeeded("commit") is not None
+    signed_tip = record.succeeded("commit").result["signed_tip"]
+
+    # Next startup: nothing may sign again.
+    monkeypatch.setattr(ships, "_land", original_land)
+
+    async def must_not_sign(*args, **kwargs):
+        raise AssertionError("recovery must not sign")
+
+    monkeypatch.setattr(ships, "_sign", must_not_sign)
+    restarted = _live_runner(engine, config, hub, sessions, ships)
+    try:
+        restarted.recover_run(
+            get_task(engine, task.id),
+            resolve_task_definition(engine, get_task(engine, task.id)),
+        )
+        finished = await _settle(engine, task.id, {"complete", "failed"})
+    finally:
+        await restarted.shutdown()
+
+    assert finished.workflow_status == "complete"
+    assert finished.workflow_result == "published"
+    actions = [a for a in get_latest_delivery(engine, task.id).actions]
+    assert len(actions) == 1
+    step = next(
+        r for r in list_step_records(engine, task.id) if r.step == "commit"
+    )
+    assert step.status == "ok"
+    assert step.outcome["result"]["signed_tip"] == signed_tip
+
+
+async def test_an_interrupted_action_waits_for_an_explicit_continuation(
+    tmp_root, engine, ships, config, hub, sessions, monkeypatch
+):
+    """A restart before the effect neither performs it nor forgets the grant."""
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "continue-origin.git", Path(task.clone_path))
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    live = _live_runner(engine, config, hub, sessions, ships)
+    async def die_before_signing(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(ships, "_sign", die_before_signing)
+    try:
+        preview = await ships.preview(
+            task,
+            **_gate(engine, task),
+            commit_message="ship: it",
+            pr_title="",
+            pr_body="",
+            request_id="r1",
+        )
+        await ships.confirm(task, preview, runner=live)
+        await _settle(engine, task.id, {"complete", "failed", "waiting"})
+    finally:
+        await live.shutdown()
+
+    # Startup proves the attempt produced nothing, then the run waits.
+    signings: list[tuple] = []
+
+    async def must_not_sign(*args, **kwargs):
+        signings.append(args)
+        raise AssertionError("recovery must not sign")
+
+    monkeypatch.setattr(ships, "_sign", must_not_sign)
+    assert await ships.restore() == []
+    assert signings == []
+
+    restarted = _live_runner(engine, config, hub, sessions, ships)
+    try:
+        restarted.recover_run(
+            get_task(engine, task.id),
+            resolve_task_definition(engine, get_task(engine, task.id)),
+        )
+        waiting = await _settle(engine, task.id, {"waiting", "complete", "failed"})
+        assert waiting.workflow_status == "waiting"
+        record = list_step_records(engine, task.id)[-1]
+        assert record.step == "commit"
+        assert record.pause["reason"] == "delivery_continuation"
+        assert signings == []
+
+        # The operator confirms the remaining work; the same attempt resumes
+        # against the same delivery, and no second one is opened.
+        monkeypatch.setattr(ships, "_sign", _restored_sign(ships))
+        current = get_task(engine, task.id)
+        again = await ships.preview(
+            task,
+            commit_message="ship: it",
+            pr_title="",
+            pr_body="",
+            request_id="r2",
+        )
+        assert again.source == "workflow-action"
+        await ships.confirm(current, again, runner=restarted)
+        finished = await _settle(engine, task.id, {"complete", "failed"})
+
+    finally:
+        await restarted.shutdown()
+
+    assert finished.workflow_status == "complete"
+    record = get_latest_delivery(engine, task.id)
+    assert record.disposition == "completed"
+    # Two attempts at the same step, and exactly one effect: the interrupted
+    # one stays on record as proven-not-to-have-happened, and the continuation
+    # is what actually signed.
+    attempts = [a for a in record.actions if a.kind == "commit"]
+    assert [a.phase for a in attempts] == ["failed", "succeeded"]
+    assert {a.workflow_seq for a in attempts} == {
+        next(r for r in list_step_records(engine, task.id) if r.step == "commit").seq
+    }
