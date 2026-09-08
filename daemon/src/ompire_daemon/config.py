@@ -89,8 +89,8 @@ DEFAULT_SHUTDOWN_GRACE = 10.0
 DEFAULT_RECOVERY_CONCURRENCY = 4
 # Retired keys: still accepted by the parser so an existing `config.toml`
 # keeps loading, but they configure nothing. `judge_model` was the engine's
-# separate LLM-judge model; the judge now runs on the task profile's `slow`
-# binding like any other disclosed model consumer (ADR-0026). The value is
+# separate LLM-judge model; the engine-reserved judge itself was removed rather
+# than rebound (ADR-0028), so there is no binding to move it to. The value is
 # carried on `Config.retired` purely so startup can record it as migration
 # evidence and ask the operator to acknowledge its replacement. Nothing reads
 # it to run anything, and the daemon never rewrites the operator's TOML.
