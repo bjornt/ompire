@@ -34,7 +34,7 @@ tool-enforced structure. It also explains the shape of this documentation.
 | Isolation and credentials | 0006, 0015, 0022 |
 | Agent integration | 0007 |
 | Work model | 0008, 0009, 0010, 0018, 0028 |
-| Review and publishing | 0011, 0017 |
+| Review and publishing | 0011, 0017, 0032 |
 | Attention | 0012 |
 | Settings | 0013, 0021, 0023 |
 | Testing | 0014 |
@@ -69,7 +69,10 @@ disagree:
   ADR-0015 proposes replacing raw environment injection with narrow brokers.
 - **[The durability boundary](../../adr/0016-persist-authority-bearing-task-history-and-provenance.md)** —
   ADR-0016 proposes durable authority-bearing history and provenance for safe
-  recovery and explanation.
+  recovery and explanation. Review history and delivery authorization, intent
+  and outcomes are now inside that boundary
+  ([ADR-0032](../../adr/0032-bind-trusted-delivery-to-retained-candidates.md));
+  full commit lineage and transcript retention are not, so it stays `Proposed`.
 - **[Publishing identity](../../adr/0017-use-dedicated-bot-as-default-publishing-identity.md)** —
   ADR-0017 proposes a dedicated bot as the default while current shipping
   inherits host identity.
@@ -87,6 +90,16 @@ it and did what ADR-0018 had required of its successor.
 [ADR-0009](../../adr/0009-use-structured-git-excluded-outcomes.md) stayed
 `Proposed` for one named reason — a hidden LLM judge it could not accept — and
 became `Accepted` only when ADR-0028 removed that judge.
+
+[ADR-0011](../../adr/0011-keep-review-and-publishing-authority-outside-agent-sandbox.md)
+shows the other shape a supersession can take. Its trusted boundary — review and
+publishing on the host, control-plane key selection, credentials outside the
+sandbox — is intact and carried forward unchanged. What
+[ADR-0032](../../adr/0032-bind-trusted-delivery-to-retained-candidates.md)
+replaced is narrower: the mechanics of reviewing and signing a task's *live*
+workspace, which made an approval a status rather than a statement about
+content. A supersession can correct a mechanism without disturbing the principle
+it was serving.
 
 ADR-0018 is the one to copy when a decision is knowingly provisional: it
 commits to the current choice while naming, in advance, what would overturn

@@ -20,6 +20,8 @@
 # Commands:
 #   api ...             identity and read-only repository probe contracts
 #   pr create ...       the daemon's create invocation (ship.py:_create_pr)
+#   pr list ...         the daemon's correlated lookup after a lost reply
+#                       (ship.py:_find_correlated_pr)
 #   pr view ...         the daemon's view invocation (prwatch.py:_poll_task)
 #   selfcheck           prove the whole contract offline in a temp root
 #   --version           plausible banner (marked fake)
@@ -41,12 +43,12 @@ command -v jq >/dev/null 2>&1 || die "jq is required but not on PATH"
 state_init() {
 	mkdir -p "$(dirname "$PRS_JSON")"
 	if [ ! -f "$PRS_JSON" ]; then
-		printf '%s\n' '{"repos":{},"auth":{"state":"ready","login":"ompire-test","detail":null},"repository":{"archived":false,"disabled":false,"has_issues":true,"pull_request_creation_policy":"all","role_name":"write","permissions":{"pull":true}},"inject":{"fail_next":{"create":null,"view":null},"token_echo":"off"}}' >"$PRS_JSON"
+		printf '%s\n' '{"repos":{},"auth":{"state":"ready","login":"ompire-test","detail":null},"repository":{"archived":false,"disabled":false,"has_issues":true,"pull_request_creation_policy":"all","role_name":"write","permissions":{"pull":true}},"inject":{"fail_next":{"create":null,"view":null},"lose_next":{"create":null,"list":null},"token_echo":"off"}}' >"$PRS_JSON"
 		return
 	fi
 	# A local state root from an earlier harness version may lack the new
 	# observation controls. Upgrade it once without changing existing PR data.
-	if ! jq -e '.auth and .repository and .inject.fail_next and (.inject | has("token_echo"))' "$PRS_JSON" >/dev/null; then
+	if ! jq -e '.auth and .repository and .inject.fail_next and .inject.lose_next and (.inject | has("token_echo"))' "$PRS_JSON" >/dev/null; then
 		local tmp
 		tmp=$(mktemp "$PRS_JSON.XXXXXX")
 		jq '.repos //= {} |
@@ -54,6 +56,7 @@ state_init() {
 			.repository //= {archived: false, disabled: false, has_issues: true, pull_request_creation_policy: "all", role_name: "write", permissions: {pull: true}} |
 			.inject //= {} |
 			.inject.fail_next //= {create: null, view: null} |
+			.inject.lose_next //= {create: null, list: null} |
 			.inject.token_echo //= "off"' "$PRS_JSON" >"$tmp"
 		state_write "$tmp"
 	fi
@@ -65,6 +68,20 @@ state_init() {
 # create error / deferred poll tick).
 state_write() { # state_write <tmp-path>
 	mv "$1" "$PRS_JSON"
+}
+
+# The lost-reply boundary: the effect happens and the caller never learns.
+# `create` writes the pull request and then exits nonzero with no URL, which
+# is exactly what a dropped response looks like from the daemon's side.
+# `list` makes the correlated lookup unavailable, so the outcome stays unknown.
+consume_lose_next() { # consume_lose_next <create|list>: 0 when armed
+	local key=$1 armed tmp
+	armed=$(jq -r --arg k "$key" '.inject.lose_next[$k] // empty' "$PRS_JSON")
+	[ -n "$armed" ] || return 1
+	tmp=$(mktemp "$PRS_JSON.XXXXXX")
+	jq --arg k "$key" '.inject.lose_next[$k] = null' "$PRS_JSON" >"$tmp"
+	state_write "$tmp"
+	printf '%s' "$armed"
 }
 
 consume_fail_next() { # consume_fail_next <create|view>: print armed line, or fail
@@ -206,7 +223,62 @@ cmd_pr_create() {
 		})' "$PRS_JSON" >"$tmp"
 	state_write "$tmp"
 
+	# The pull request now exists. A lost reply means the caller is told
+	# nothing about it — the daemon has to find it by its correlation marker
+	# rather than guess, and must not create a second one.
+	if lost=$(consume_lose_next create); then
+		printf '%s\n' "$lost" >&2
+		exit 1
+	fi
+
 	printf 'https://github.com/%s/pull/%s\n' "$slug" "$n"
+}
+
+# --- pr list ---------------------------------------------------------------------
+
+# The correlated lookup the daemon runs when a create call's outcome is
+# unknown. Every state is listed, because a pull request that was created and
+# immediately closed is still one Ompire created.
+cmd_pr_list() {
+	state_init
+	if lost=$(consume_lose_next list); then
+		printf '%s\n' "$lost" >&2
+		exit 1
+	fi
+
+	local slug="" base="" head="" state="" limit="" fields=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--repo | -R) slug=$2; shift 2 ;;
+		--base) base=$2; shift 2 ;;
+		--head) head=$2; shift 2 ;;
+		--state) state=$2; shift 2 ;;
+		--limit) limit=$2; shift 2 ;;
+		--json) fields=$2; shift 2 ;;
+		-*) unsupported "pr list (unknown option $1)" ;;
+		*) unsupported "pr list (unexpected argument '$1')" ;;
+		esac
+	done
+	[ -n "$slug" ] || die "pr list: missing --repo"
+	[ "$state" = "all" ] ||
+		unsupported "pr list (--state must be 'all', got '${state:-none}')"
+	# A different field list means the daemon changed what it asks for.
+	[ "$fields" = "number,url,body,state,headRefName,baseRefName" ] ||
+		unsupported "pr list (--json must be exactly 'number,url,body,state,headRefName,baseRefName', got '${fields:-none}')"
+	[ -n "$limit" ] || die "pr list: missing --limit"
+
+	jq -c --arg repo "$slug" --arg head "$head" --arg base "$base" \
+		--argjson limit "$limit" '
+		[.repos[$repo].prs[]?
+		 | select(($head == "") or (.head == $head))
+		 | select(($base == "") or (.base == $base))
+		 | {number: .number,
+		    url: ("https://github.com/" + $repo + "/pull/" + (.number | tostring)),
+		    body: .body,
+		    state: .state,
+		    headRefName: .head,
+		    baseRefName: .base}]
+		| .[0:$limit]' "$PRS_JSON"
 }
 
 # --- pr view ---------------------------------------------------------------------
@@ -297,7 +369,7 @@ cmd_selfcheck() {
 	gh_run() { LOCAL_TEST_STATE=$root "$0" "$@"; }
 
 	# ---- 1/10 discovery and read-only API argv ---------------------------------
-	log "1/10 version, identity, repository, and pull-request API calls"
+	log "1/12 version, identity, repository, and pull-request API calls"
 	out=$(gh_run --version 2>"$err") || fail "version exits 0" "$(cat "$err")"
 	[ "$out" = "gh version 2.97.0 (fake, local-test)" ] || fail "version banner" "got: $out"
 	out=$(gh_run api --hostname github.com user 2>"$err") || fail "api user exits 0" "$(cat "$err")"
@@ -311,7 +383,7 @@ cmd_selfcheck() {
 	ok "version and exact read-only API contracts"
 
 	# ---- 2/10 identity/policy and token-echo fault states ----------------------
-	log "2/10 identity, repository policy, and token-echo faults"
+	log "2/12 identity, repository policy, and token-echo faults"
 	local api_tmp
 	api_tmp=$(mktemp "$root/gh/prs.json.XXXXXX")
 	jq '.auth = {state: "unauthenticated", login: null, detail: null}' "$root/gh/prs.json" >"$api_tmp" &&
@@ -341,7 +413,7 @@ cmd_selfcheck() {
 	ok "identity, denial, and credential-shaped output controls"
 
 	# ---- 3/10 create: the daemon's exact argv, body captured, URL on stdout
-	log "3/10 pr create (daemon argv, body capture, URL on stdout)"
+	log "3/12 pr create (daemon argv, body capture, URL on stdout)"
 	local bodyf=$SELF_TMP/body.md
 	printf 'probe body line 1\nline 2\n' >"$bodyf"
 	local out
@@ -358,7 +430,7 @@ cmd_selfcheck() {
 	ok "pr create: URL on stdout, OPEN recorded, body captured"
 
 	# ---- 4/10 create: monotonic per-repo numbering
-	log "4/10 monotonic PR numbering"
+	log "4/12 monotonic PR numbering"
 	out=$(gh_run pr create --repo "$slug" --base main --head ompire/two \
 		--title "Two" --body-file "$bodyf" 2>"$err") ||
 		fail "create #2 exits 0" "$(cat "$err")"
@@ -367,7 +439,7 @@ cmd_selfcheck() {
 	ok "pr create: numbers increase monotonically"
 
 	# ---- 5/10 create: already-exists failure, URL recoverable from combined output
-	log "5/10 already-exists failure with recoverable URL"
+	log "5/12 already-exists failure with recoverable URL"
 	local rc=0
 	out=$(gh_run pr create --repo "$slug" --base main --head ompire/one \
 		--title "Dup" --body-file "$bodyf" 2>"$err") || rc=$?
@@ -387,7 +459,7 @@ cmd_selfcheck() {
 	ok "pr create: already-exists fails with a recoverable URL"
 
 	# ---- 6/10 view: OPEN
-	log "6/10 pr view OPEN"
+	log "6/12 pr view OPEN"
 	out=$(gh_run pr view "https://github.com/$slug/pull/1" --json state,mergedAt 2>"$err") ||
 		fail "view #1 exits 0" "$(cat "$err")"
 	[ "$out" = '{"mergedAt":null,"state":"OPEN"}' ] ||
@@ -395,7 +467,7 @@ cmd_selfcheck() {
 	ok "pr view: OPEN with null mergedAt"
 
 	# ---- 7/10 view: MERGED and CLOSED via state mutation
-	log "7/10 pr view MERGED/CLOSED via state mutation"
+	log "7/12 pr view MERGED/CLOSED via state mutation"
 	local tmpjq
 	tmpjq=$(mktemp "$root/gh/prs.json.XXXXXX")
 	jq --arg repo "$slug" '.repos[$repo].prs[1].state = "MERGED" |
@@ -416,7 +488,7 @@ cmd_selfcheck() {
 	ok "pr view: state transitions visible through the state file"
 
 	# ---- 8/10 view: both GraphQL not-found errors
-	log "8/10 not-found errors"
+	log "8/12 not-found errors"
 	rc=0
 	gh_run pr view "https://github.com/$slug/pull/999" --json state,mergedAt \
 		>"$SELF_TMP/o" 2>"$err" || rc=$?
@@ -432,7 +504,7 @@ cmd_selfcheck() {
 	ok "pr view: both not-found errors, exit 1"
 
 	# ---- 9/10 one-shot fail_next for view and create
-	log "9/10 one-shot fail_next injection"
+	log "9/12 one-shot fail_next injection"
 	jq '.inject.fail_next.view = "GraphQL: injected view failure (fake)"' \
 		"$root/gh/prs.json" >"$tmpjq" && mv "$tmpjq" "$root/gh/prs.json"
 	rc=0
@@ -464,13 +536,70 @@ cmd_selfcheck() {
 		fail "create after injection continues the numbering" "got: $out"
 	ok "fail_next: one-shot by consumption, both subcommands"
 
-	# ---- 10/10 loud rejection of an unsupported invocation
-	log "10/10 unsupported invocation fails loudly"
+	# ---- 10/12 correlated pr list, across every state
+	log "10/12 pr list: correlated lookup across all states"
+	jq --arg repo "$slug" '
+		.repos[$repo].prs = [
+			{number: 1, head: "ompire/one", base: "main", title: "one",
+			 body: "why\n\n<!-- ompire-delivery: aaaa1111 -->", state: "CLOSED",
+			 mergedAt: null, createdAt: "2026-09-01T00:00:00Z"},
+			{number: 2, head: "ompire/one", base: "main", title: "two",
+			 body: "unrelated", state: "OPEN",
+			 mergedAt: null, createdAt: "2026-09-01T00:00:00Z"}
+		]' "$root/gh/prs.json" >"$SELF_TMP/l" && mv "$SELF_TMP/l" "$root/gh/prs.json"
+	out=$(gh_run pr list --repo "$slug" --state all --base main --head ompire/one \
+		--limit 100 --json number,url,body,state,headRefName,baseRefName 2>"$err") ||
+		fail "pr list exits 0" "$(cat "$err")"
+	jq -e 'length == 2 and (.[0].state == "CLOSED") and
+		([.[] | select(.body | test("aaaa1111"))] | length == 1) and
+		(.[0].url == "https://github.com/local-test/sandbox/pull/1")' <<<"$out" >/dev/null ||
+		fail "pr list returns every state with bodies and urls" "$out"
+	out=$(gh_run pr list --repo "$slug" --state all --base main --head ompire/other \
+		--limit 100 --json number,url,body,state,headRefName,baseRefName 2>"$err") ||
+		fail "pr list exits 0 for an unmatched head" "$(cat "$err")"
+	[ "$out" = "[]" ] || fail "pr list filters by head" "$out"
+	ok "pr list: all states, exact head/base filtering, marker-bearing bodies"
+
+	# ---- 11/12 lost replies: the effect happens and the caller is not told
+	log "11/12 lose_next create and list"
+	jq --arg repo "$slug" '.repos[$repo].prs = [] | .repos[$repo].next_number = 7 |
+		.inject.lose_next.create = "connection reset (fake, after the write)"' \
+		"$root/gh/prs.json" >"$SELF_TMP/l" && mv "$SELF_TMP/l" "$root/gh/prs.json"
+	printf 'body with <!-- ompire-delivery: bbbb2222 -->\n' >"$SELF_TMP/body.md"
 	rc=0
-	gh_run pr list >"$SELF_TMP/o" 2>"$err" || rc=$?
-	[ "$rc" -ne 0 ] || fail "pr list exits non-zero"
+	gh_run pr create --repo "$slug" --base main --head ompire/lost \
+		--title "lost" --body-file "$SELF_TMP/body.md" >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "lose_next create reports failure"
+	[ ! -s "$SELF_TMP/o" ] || fail "lose_next create prints no URL" "$(cat "$SELF_TMP/o")"
+	jq -e --arg repo "$slug" '[.repos[$repo].prs[] | select(.head == "ompire/lost")] | length == 1' \
+		"$root/gh/prs.json" >/dev/null ||
+		fail "lose_next create still wrote the pull request" "$(jq -c .repos "$root/gh/prs.json")"
+	jq -e '.inject.lose_next.create == null' "$root/gh/prs.json" >/dev/null ||
+		fail "lose_next create is one-shot"
+	# The correlated lookup then finds exactly what was written.
+	out=$(gh_run pr list --repo "$slug" --state all --base main --head ompire/lost \
+		--limit 100 --json number,url,body,state,headRefName,baseRefName 2>"$err") ||
+		fail "pr list after a lost create exits 0" "$(cat "$err")"
+	jq -e '[.[] | select(.body | test("bbbb2222"))] | length == 1' <<<"$out" >/dev/null ||
+		fail "the lost pull request is findable by its marker" "$out"
+
+	jq '.inject.lose_next.list = "connection reset (fake)"' "$root/gh/prs.json" \
+		>"$SELF_TMP/l" && mv "$SELF_TMP/l" "$root/gh/prs.json"
+	rc=0
+	gh_run pr list --repo "$slug" --state all --base main --head ompire/lost \
+		--limit 100 --json number,url,body,state,headRefName,baseRefName >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "lose_next list reports failure"
+	jq -e '.inject.lose_next.list == null' "$root/gh/prs.json" >/dev/null ||
+		fail "lose_next list is one-shot"
+	ok "lose_next: the write lands, the reply does not, and the lookup can fail too"
+
+	# ---- 12/12 loud rejection of an unsupported invocation
+	log "12/12 unsupported invocation fails loudly"
+	rc=0
+	gh_run pr merge 1 >"$SELF_TMP/o" 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "pr merge exits non-zero"
 	grep -q 'unsupported invocation' "$err" ||
-		fail "pr list names the unsupported invocation" "$(cat "$err")"
+		fail "pr merge names the unsupported invocation" "$(cat "$err")"
 	ok "unsupported invocations fail loudly"
 
 	printf 'selfcheck: all %d checks passed\n' "$SELF_CHECKS"
@@ -485,6 +614,7 @@ pr)
 	case "${2:-}" in
 	create) shift 2; cmd_pr_create "$@" ;;
 	view) shift 2; cmd_pr_view "$@" ;;
+	list) shift 2; cmd_pr_list "$@" ;;
 	*) unsupported "pr ${2:-}" ;;
 	esac
 	;;

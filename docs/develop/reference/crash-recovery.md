@@ -147,15 +147,11 @@ shutdown-driven agent exit is not reported as a crash.
 Without this, every restart would produce a screen of red failures for work
 that was fine.
 
-### Review and ship recovery
+### Review recovery
 
-Review and ship protect their temporary Git state with durable refs —
-`refs/ompire/review-orig` and `refs/ompire/ship-orig` — written before any
-rewrite.
-
-On startup, any non-archived task whose clone still carries a review ref is
-restored before serving: reset to the ref, ref deleted. A crash mid-review
-never leaves a detached or parked `HEAD`.
+The reviewer reads an isolated checkout of the task's candidate, not the task
+clone, so a crash mid-review leaves nothing in the workspace to restore. The
+disposable checkout is simply gone.
 
 Review status and iteration history are durable rows (`reviews` and
 `review_iterations`, behind `registry/reviews.py`) and are restored before the
@@ -180,21 +176,74 @@ A recovered task's primary session presents as `starting`, `idle`, or
 same history. Operator-facing detail is in
 [Review](../../use/reference/review.md#retention-and-restart).
 
-Ship progress other than `pr_url` remains transient.
+### Delivery recovery
+
+Delivery is journaled
+([ADR-0032](../../adr/0032-bind-trusted-delivery-to-retained-candidates.md)).
+Every action attempt records what it is about to write and commits that *before*
+the effect runs, so an interrupted attempt is a row that says what was tried and
+against which exact refs — not silence that looks identical to "never started".
+
+Reconciliation runs in `ShipManager.restore()` before the parked-clone pass and
+before task classification hands anything to session recovery, so a completed
+signed result is never reset away before something has looked at it, and no
+agent turn can be prompted into a task whose delivery is unresolved.
+
+**Startup performs no signing, no push, and no forge write.** It observes, and
+each action kind has its own evidence:
+
+| Attempt | How it is classified |
+|---|---|
+| `commit` | The attempt writes its signed result under its own protected ref before it can return, so the absence of that ref proves no signature landed. A result that exists is verified against the reviewed tree, range structure, count, and signer before it is adopted. |
+| `push` | The exact destination ref is compared with the authorized head and the recorded pre-push value. Equal to the authorized head is a completed push; equal to the pre-push value proves non-execution; anything else is a conflict. A destination that cannot be read is unknown, not absent. |
+| `pr` | The authorized body carries a deterministic correlation marker, looked for across every pull-request state — closed and merged included — with a bounded search that reports its own incompleteness. Exactly one verified match is adoptable. `gh pr create` is never replayed because a listing found nothing. |
+
+An outcome that cannot be established becomes `needs_reconciliation` and blocks
+the task: no dependent action runs, cleanup is refused, and the projection shows
+the action, its expected target, the observed evidence, and why Ompire will not
+continue. The operator resolves it explicitly with a recheck, a verified
+adoption, a retry that only becomes available once non-execution is proven, or
+an abandonment that leaves an unknown effect on record as still unknown.
+
+Authorized work that simply did not finish is *not* resumed on the operator's
+behalf. The delivery moves to `blocked`, and a fresh preview and confirmation
+decide whether the rest still applies. A draft interrupted mid-turn becomes an
+explicit retryable interruption rather than a new agent turn.
+
+### Legacy parked clones
+
+A clone parked by an older Ompire's in-clone review or signing still carries
+`refs/ompire/review-orig` or `refs/ompire/ship-orig`. Startup answers one of
+three ways for each, and the distinction matters:
+
+| Outcome | Meaning |
+|---|---|
+| `absent` | There is no legacy ref. Nothing to do. |
+| `restored` | The clone verifiably came back to its parked head; only then is the marker removed. |
+| `unsafe` | A ref survives that could not be honoured. The marker is **kept**, and the task is blocked with a reason. |
+
+A boolean would conflate "no legacy ref" with "a legacy ref Ompire could not
+honour", and only the second is a reason to stop working on a task. An `unsafe`
+outcome blocks that task alone: its workspace is not trustworthy, so review,
+drafting, delivery and cleanup all refuse and say why, while every other task is
+unaffected.
+
+New deliveries never park the clone — signing happens in the candidate's own
+repository — and reviews never park it either.
 
 ## What is not recovered
 
 | State | Behavior after restart |
 |---|---|
 | Session status | Rebuilt by recovery, not replayed |
-| Reviewer process, its URL and port | Discarded; the review's history is restored, the clone's Git state too |
-| Ship progress other than `pr_url` | Discarded |
+| Reviewer process, its URL and port | Discarded; the review's history and its candidate binding are restored, and the task clone was never modified |
+| A delivery's in-flight coordination | Discarded; the journal, its authorization, and every action attempt are restored and reconciled |
 | Attention entries | Rebuilt from recovered session status |
 | A task with no confirmed launch configuration | Skipped, not failed; run position, sessions and workspace are kept until the operator confirms |
 
 The durable boundary is still narrower than [`VISION.md`](../../VISION.md)
-calls for. Review history now sits inside it; human decisions,
-publishing-operation intent records, and commit lineage do not, so
+calls for. Review history and delivery authorization, intent, and outcomes now
+sit inside it; full commit lineage and transcript retention do not, so
 [ADR-0016](../../adr/0016-persist-authority-bearing-task-history-and-provenance.md)
 remains proposed.
 

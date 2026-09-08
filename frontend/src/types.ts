@@ -700,6 +700,10 @@ export interface ReviewIteration {
   outcome: "approved" | "comments" | "aborted" | "error" | "interrupted";
   comment_count: number | null;
   stderr: string | null;
+  /** The protected candidate this iteration graded. Null for an iteration
+   * recorded before reviews were content-bound; such an approval is history,
+   * not authorization for current work. */
+  candidate_id?: string | null;
   recorded_at: string;
 }
 
@@ -709,6 +713,8 @@ export interface ReviewState {
    * restored across a daemon restart, whose llmvet process is gone. */
   url: string | null;
   port: number | null;
+  /** The candidate the current (or last) round is bound to. */
+  candidate_id?: string | null;
   iterations: ReviewIteration[];
 }
 
@@ -716,6 +722,7 @@ export interface ReviewStartedPayload {
   task_id: number;
   url: string;
   port: number;
+  candidate_id?: string | null;
 }
 
 export interface ReviewIterationPayload {
@@ -728,50 +735,189 @@ export interface ReviewFinishedPayload {
   status: "approved" | "aborted" | "error";
 }
 
+/** Publication text. Inert: editable by hand, and it authorizes nothing.
+ * `state` distinguishes an agent turn in progress from one a daemon restart
+ * interrupted, which is retryable rather than silently restarted. */
 export interface ShipDraft {
   commit_message: string;
   pr_title: string;
   pr_body: string;
-  source: "agent" | "manual";
+  source: "agent" | "operator";
+  state: "drafting" | "ready" | "interrupted" | "failed";
+  error?: string | null;
 }
 
-export type ShipStatus = "drafting" | "drafted" | "committing" | "pushing" | "shipped" | "error";
+/** How far a delivery is authorized to go. Not a workflow result. */
+export type ShipEnding = "commit" | "push" | "pr";
 
-export type ShipStepName = "draft" | "fetch" | "commit" | "push" | "pr";
-export type ShipStepStatus = "started" | "ok" | "failed";
-export type ShipStepDetail = string | { sha: string; count: number };
+export type ShipActionKind = "commit" | "push" | "pr";
 
-export interface ShipStepState {
-  step: ShipStepName;
-  status: ShipStepStatus;
-  detail?: ShipStepDetail | null;
-}
+/** The write-ahead phase of one action attempt. `failed` means Ompire
+ * established that the effect did not happen; `needs_reconciliation` means it
+ * could not tell, which is neither success nor failure. */
+export type ShipActionPhase =
+  | "prepared"
+  | "executing"
+  | "succeeded"
+  | "failed"
+  | "needs_reconciliation";
 
-export interface ShipState {
-  status: ShipStatus;
-  mode?: "squash" | "retain";
-  draft: ShipDraft | null;
-  commit_sha: string | null;
-  pr_url: string | null;
-  error: string | null;
+export type ShipDisposition =
+  | "open"
+  | "authorized"
+  | "completed"
+  | "blocked"
+  | "unresolved"
+  | "abandoned";
+
+export interface ShipAction {
+  id: number;
+  kind: ShipActionKind;
+  attempt: number;
+  phase: ShipActionPhase;
+  expected?: Record<string, unknown> | null;
+  progress?: Record<string, unknown> | null;
+  identity?: Record<string, unknown> | null;
+  result?: Record<string, unknown> | null;
+  error?: string | null;
   updated_at: string;
-  /** Latest daemon-owned transient step, included in snapshots and deltas. */
-  last_step?: ShipStepState | null;
 }
 
-export interface ShipDraftPayload {
-  task_id: number;
-  draft: ShipDraft;
+export interface ShipDecision {
+  kind: "authorize" | "extend" | "recheck" | "adopt" | "retry" | "abandon" | "block";
+  action_id: number | null;
+  detail?: Record<string, unknown> | null;
+  note?: string | null;
+  decided_at: string;
 }
 
-export interface ShipStepPayload extends ShipStepState {
-  task_id: number;
+export interface ShipCommitResult {
+  signed_tip: string;
+  commit_count: number;
+  mode: "squash" | "retain";
+  installed: boolean;
+  note?: string | null;
+  [key: string]: unknown;
 }
 
-export interface ShipFinishedPayload {
+export interface ShipPushResult {
+  head: string;
+  ref: string;
+  branch: string;
+  adopted?: boolean;
+  [key: string]: unknown;
+}
+
+export interface ShipPrResult {
+  url: string;
+  number?: number;
+  state?: string;
+  adopted?: boolean;
+  [key: string]: unknown;
+}
+
+export interface ShipResults {
+  commit?: ShipCommitResult;
+  push?: ShipPushResult;
+  pr?: ShipPrResult;
+}
+
+export interface ShipHistoryEntry {
+  delivery_id: number;
+  ending: ShipEnding | null;
+  mode: "squash" | "retain" | null;
+  disposition: ShipDisposition;
+  candidate_id: string | null;
+  authorized_at: string | null;
+  authorized_by: string | null;
+  results: ShipResults;
+  updated_at: string;
+}
+
+/** The daemon's durable per-task delivery projection.
+ *
+ * Replaces the transient ship state entirely. `version` is per task and
+ * monotonic: an older or duplicated delivery is dropped rather than applied. */
+export interface ShipProjection {
   task_id: number;
-  status: "shipped" | "error";
-  pr_url?: string;
+  version: number;
+  delivery_id: number | null;
+  disposition: ShipDisposition | null;
+  ending: ShipEnding | null;
+  mode: "squash" | "retain" | null;
+  candidate_id: string | null;
+  review_candidate_id: string | null;
+  draft: ShipDraft | null;
+  blocked_reason: string | null;
+  workspace_owner: string | null;
+  completed_actions: ShipActionKind[];
+  remaining_actions: ShipActionKind[];
+  results: ShipResults;
+  pr_url: string | null;
+  /** A publication recorded before delivery had a journal behind it. */
+  legacy_publication: boolean;
+  actions: ShipAction[];
+  decisions: ShipDecision[];
+  history: ShipHistoryEntry[];
+}
+
+/** One reason a delivery is currently refused. Every reason is listed, not
+ * just the first, so an operator fixes one thing and sees what remains. */
+export interface ShipBlocker {
+  code: string;
+  message: string;
+}
+
+/** A read-only resolution of one requested ending. Authorizes nothing. */
+export interface ShipPreview {
+  task_id: number;
+  delivery_id: number;
+  version: number;
+  ending: ShipEnding;
+  mode: "squash" | "retain";
+  request_id: string;
+  candidate_id: string | null;
+  candidate: {
+    candidate_id: string;
+    base_branch: string;
+    base_commit: string;
+    original_head: string;
+    tree_id: string;
+    commit_count: number;
+    dirty: boolean;
+  } | null;
+  review: {
+    status: string | null;
+    approved_candidate_id: string | null;
+    current_candidate_id?: string | null;
+    content_bound: boolean;
+    stale?: boolean | null;
+    retained?: boolean;
+  };
+  completed_actions: ShipActionKind[];
+  remaining_actions: ShipActionKind[];
+  routing: {
+    remote_url: string;
+    branch: string;
+    ref: string;
+    head: string;
+    base_branch: string;
+    upstream_url: string;
+    slug?: string;
+  };
+  identity: {
+    signing?: { fingerprint: string; uid: string; source: string };
+    github?: { host: string; login: string | null; credential_source: string | null };
+    git?: { name: string | null; email: string | null };
+    git_transport?: { state: string; detail: string };
+  };
+  commit_message: string;
+  pr_title: string;
+  pr_body: string;
+  marker: string;
+  blockers: ShipBlocker[];
+  deliverable: boolean;
+  preview_token: string;
 }
 
 export type GpgState =
@@ -916,9 +1062,9 @@ export interface SnapshotPayload {
   /** Live/completed reviews, keyed by task id (JSON object keys arrive as
    * strings); absent from snapshots emitted before the review chunk. */
   reviews?: Record<string, ReviewState>;
-  /** Live/completed ship flows, keyed by task id (JSON object keys arrive as
-   * strings); absent from snapshots emitted before the ship chunk. */
-  ships?: Record<string, ShipState>;
+  /** Durable per-task delivery projections, keyed by task id (JSON object keys
+   * arrive as strings); absent from snapshots emitted before the ship chunk. */
+  ships?: Record<string, ShipProjection>;
   /** Current GPG signing-key cache state; absent from snapshots emitted before
    * the ship chunk. */
   gpg?: GpgStatus;

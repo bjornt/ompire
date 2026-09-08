@@ -19,6 +19,10 @@
 #                       regenerate $STATE/gitconfig from the forge tree
 #   reject-push <owner/repo>
 #                       arm a one-shot push rejection for that repo
+#   receives <owner/repo>
+#                       how many pushes this repo has received
+#   gate <owner/repo> <on|off>
+#                       hold the next receive open until the gate is lifted
 #   selfcheck           prove the whole git contract offline in a temp
 #                       root; never touches $STATE
 #
@@ -60,8 +64,16 @@ github_https_url() { printf 'https://github.com/%s.git' "$1"; }
 # --- hooks ------------------------------------------------------------------
 
 PRE_RECEIVE_HOOK='#!/bin/sh
-# installed by local-test/forge — rejects exactly one push when armed
+# installed by local-test/forge — one-shot push faults when armed
 d=$(cd "$(dirname "$0")/.." && pwd)
+# Every receive is counted, so a runbook can prove the daemon did not repeat a
+# push it had already made.
+echo "$(date -u +%s)" >>"$d/.receives"
+# An armed gate holds the receive open, which is how a runbook catches the
+# daemon inside the write window.
+if [ -f "$d/.gate" ]; then
+    while [ -f "$d/.gate" ]; do sleep 0.2; done
+fi
 if [ -f "$d/.reject-next" ]; then
     rm -f "$d/.reject-next"
     echo "forge: rejecting push (injected failure)" >&2
@@ -183,6 +195,28 @@ cmd_reject_push() {
 	log "reject-push: next push to $1 will be rejected (one-shot)"
 }
 
+# --- receives / gate -----------------------------------------------------------
+
+cmd_receives() {
+	[ $# -eq 1 ] || die "receives: expected <owner/repo>"
+	local repo
+	repo=$(forge_dir "$1")
+	[ -d "$repo" ] || die "receives: no such forge repo: $1"
+	if [ -f "$repo/.receives" ]; then wc -l <"$repo/.receives" | tr -d ' '; else printf '0\n'; fi
+}
+
+cmd_gate() {
+	[ $# -eq 2 ] || die "gate: expected <owner/repo> <on|off>"
+	local repo
+	repo=$(forge_dir "$1")
+	[ -d "$repo" ] || die "gate: no such forge repo: $1"
+	case "$2" in
+	on) touch "$repo/.gate"; log "gate: the next push to $1 will be held open" ;;
+	off) rm -f "$repo/.gate"; log "gate: released for $1" ;;
+	*) die "gate: expected on or off" ;;
+	esac
+}
+
 # --- selfcheck -----------------------------------------------------------------
 
 SELF_TMP=""
@@ -300,7 +334,24 @@ cmd_selfcheck() {
 		run git -C "$SELF_TMP/taskclone" push --quiet ship-target \
 			"HEAD:refs/heads/$branch" --force-with-lease
 
-	log "selfcheck: 6/6 identity + HTTPS form"
+	log "selfcheck: 6/7 the receive counter and the gate"
+	local receives_before receives_after
+	receives_before=$(LOCAL_TEST_STATE=$root "$0" receives "$slug")
+	echo "counted" >>"$SELF_TMP/taskclone/file.txt"
+	run git -C "$SELF_TMP/taskclone" add file.txt
+	run git -C "$SELF_TMP/taskclone" commit --quiet -m "counted push"
+	check "counted push succeeds" \
+		run git -C "$SELF_TMP/taskclone" push --quiet ship-target \
+			"HEAD:refs/heads/$branch" --force-with-lease
+	receives_after=$(LOCAL_TEST_STATE=$root "$0" receives "$slug")
+	check "the receive counter saw exactly one more push" \
+		test "$receives_after" -eq "$((receives_before + 1))"
+	LOCAL_TEST_STATE=$root "$0" gate "$slug" on >/dev/null
+	check "the gate marker is armed" test -e "$bare/.gate"
+	LOCAL_TEST_STATE=$root "$0" gate "$slug" off >/dev/null
+	check "the gate marker is released" test ! -e "$bare/.gate"
+
+	log "selfcheck: 7/7 identity + HTTPS form"
 	check "commit author comes from the gitconfig" \
 		test "$(git -C "$SELF_TMP/taskclone" log -1 --format=%an)" = "Self Check"
 	check "commit email comes from the gitconfig" \
@@ -320,6 +371,8 @@ case "$command" in
 init) shift; cmd_init "$@" ;;
 gitconfig) shift; cmd_gitconfig "$@" ;;
 reject-push) shift; cmd_reject_push "$@" ;;
+receives) shift; cmd_receives "$@" ;;
+gate) shift; cmd_gate "$@" ;;
 selfcheck) shift; cmd_selfcheck "$@" ;;
 help | --help | -h) usage ;;
 *) die "unknown command: $command (try 'help')" ;;

@@ -51,10 +51,10 @@ def test_outcome_comparison_preserves_behavioral_differences(tmp_path: Path) -> 
             "updated_at": "2026-08-22T01:02:03Z",
             "status": "shipped",
         },
-        "events": [{"type": "ship_finished", "status": "shipped"}],
+        "events": [{"type": "ship_updated", "disposition": "completed"}],
     }
     local = {
-        "events": [{"type": "ship_finished", "status": "shipped"}],
+        "events": [{"type": "ship_updated", "disposition": "completed"}],
         "task": {
             "status": "shipped",
             "updated_at": "2026-08-23T04:05:06Z",

@@ -292,12 +292,18 @@ workflow_step_records = Table(
 # is stamped before llmvet is launched and cleared when the process is
 # observed exiting, so startup can tell an interrupted reviewer from a review
 # left `open` because its comments went back to the agent.
+#
+# `candidate_id` binds the review to the protected candidate it is grading
+# (ADR-0032). NULL is the legacy shape: a review recorded before content
+# binding existed. Such a review stays readable as history and is never
+# backfilled from today's workspace, but it cannot authorize a new delivery.
 reviews = Table(
     "reviews",
     metadata,
     Column("task_id", Integer, ForeignKey("tasks.id"), primary_key=True),
     Column("status", String, nullable=False),
     Column("process_started_at", String, nullable=True),
+    Column("candidate_id", String, nullable=True),
     Column("created_at", String, nullable=False),
     Column("updated_at", String, nullable=False),
 )
@@ -305,6 +311,8 @@ reviews = Table(
 # Ordered review iterations; identity is (task_id, seq) because re-review
 # after comments appends to the same review's history, mirroring
 # `workflow_step_records`.
+# Each iteration also names the candidate it actually graded, so an approval
+# says *what* was approved rather than only that something was.
 review_iterations = Table(
     "review_iterations",
     metadata,
@@ -313,7 +321,140 @@ review_iterations = Table(
     Column("outcome", String, nullable=False),
     Column("comment_count", Integer, nullable=True),
     Column("stderr", Text, nullable=True),
+    Column("candidate_id", String, nullable=True),
     Column("recorded_at", String, nullable=False),
+)
+
+# The protected content a review graded and a delivery signs (ADR-0032). A
+# candidate is the *whole* publishable task delta resolved once: the pinned
+# base branch, the base commit the delta is measured from, the original HEAD it
+# was captured at, the full candidate tree, and — for retain — the ordered
+# source commits with their trees and messages.
+#
+# `candidate_id` is a hash of that normalized semantic data, not of rendered UI
+# text, timestamps, or the agent's draft: re-capturing an unchanged workspace
+# yields the same identity, and any change to what would be published yields a
+# different one. That is the whole approval binding.
+#
+# `storage_path` names the owner-private bare Git repository holding the
+# candidate's objects outside the task clone, so a task cannot mutate or
+# garbage-collect what is under review. It is temporary operation evidence
+# with its own lifecycle, not an artifact store.
+delivery_candidates = Table(
+    "delivery_candidates",
+    metadata,
+    Column("candidate_id", String, primary_key=True),
+    Column("task_id", Integer, ForeignKey("tasks.id"), nullable=False),
+    Column("base_branch", String, nullable=False),
+    Column("base_commit", String, nullable=False),
+    Column("original_head", String, nullable=False),
+    Column("tree_id", String, nullable=False),
+    Column("source_commits_json", Text, nullable=False),
+    Column("dirty", Integer, nullable=False, server_default="0"),
+    Column("storage_path", String, nullable=True),
+    Column("created_at", String, nullable=False),
+    Index("ix_delivery_candidates_task", "task_id"),
+)
+
+# One delivery: the operator's authorization to publish one candidate as far as
+# one selected ending (ADR-0032). Rows are history — a task accumulates them —
+# but at most one is non-terminal at a time, which is what makes "this task is
+# already delivering" a durable fact rather than an in-memory flag.
+#
+# `version` is a per-task monotonic counter across the task's deliveries. It is
+# what a client compares before confirming and what the projection reducer uses
+# to drop a stale or duplicated update.
+#
+# `draft_json` is the durable publication draft — inert text, editable by hand,
+# authorizing nothing. It lives here rather than in a separate table because a
+# draft is the beginning of a delivery, and an interrupted agent draft has to be
+# recoverable as *this* delivery's retryable interruption.
+#
+# `ending`, `mode`, and the final metadata are immutable once authorized: they
+# are what the confirmation named. Extending a completed prefix (a later push,
+# a later PR) appends a decision and new actions; it never rewrites them.
+deliveries = Table(
+    "deliveries",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("task_id", Integer, ForeignKey("tasks.id"), nullable=False),
+    Column("version", Integer, nullable=False),
+    Column("workflow_revision", String, nullable=True),
+    Column("candidate_id", String, nullable=True),
+    Column("review_candidate_id", String, nullable=True),
+    Column("mode", String, nullable=True),
+    Column("ending", String, nullable=True),
+    Column("commit_message", Text, nullable=True),
+    Column("pr_title", Text, nullable=True),
+    Column("pr_body", Text, nullable=True),
+    Column("routing_json", Text, nullable=True),
+    Column("identity_json", Text, nullable=True),
+    Column("authorized_at", String, nullable=True),
+    Column("authorized_by", String, nullable=True),
+    Column("request_key", String, nullable=True),
+    Column("input_fingerprint", String, nullable=True),
+    Column("draft_json", Text, nullable=True),
+    Column("disposition", String, nullable=False),
+    Column("blocked_reason", Text, nullable=True),
+    Column("created_at", String, nullable=False),
+    Column("updated_at", String, nullable=False),
+    Index("ix_deliveries_task", "task_id"),
+    Index(
+        "uq_deliveries_request_key",
+        "task_id",
+        "request_key",
+        unique=True,
+        sqlite_where=text("request_key IS NOT NULL"),
+    ),
+)
+
+# One row per attempt at one privileged action. `phase` is the write-ahead
+# marker: `prepared` is committed before anything runs, `executing` is
+# committed before the effect is launched, and only an established outcome
+# moves it to `succeeded`, `failed` (proven not to have happened, or verifiably
+# rolled back) or `needs_reconciliation` (unknown).
+#
+# `expected_json` is what the attempt is allowed to do — destination ref, source
+# object id, observed pre-write remote head, PR correlation marker — captured
+# before the effect so recovery can look for exactly that result rather than
+# guessing from today's state. `progress_json` records per-signature progress,
+# so an interrupted retain rewrite is not an opaque boolean.
+delivery_actions = Table(
+    "delivery_actions",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("delivery_id", Integer, ForeignKey("deliveries.id"), nullable=False),
+    Column("seq", Integer, nullable=False),
+    Column("kind", String, nullable=False),
+    Column("attempt", Integer, nullable=False),
+    Column("request_key", String, nullable=False),
+    Column("input_fingerprint", String, nullable=False),
+    Column("phase", String, nullable=False),
+    Column("expected_json", Text, nullable=True),
+    Column("progress_json", Text, nullable=True),
+    Column("identity_json", Text, nullable=True),
+    Column("result_json", Text, nullable=True),
+    Column("error", Text, nullable=True),
+    Column("created_at", String, nullable=False),
+    Column("updated_at", String, nullable=False),
+    Index("ix_delivery_actions_delivery", "delivery_id", "seq"),
+)
+
+# Ordered, immutable authorization and reconciliation decisions: who authorized
+# what, which observations a recheck made, what an adoption verified, and what
+# an abandonment left unresolved. Appended, never rewritten — extending a
+# delivery to a further ending adds a row rather than editing the first one.
+delivery_decisions = Table(
+    "delivery_decisions",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("delivery_id", Integer, ForeignKey("deliveries.id"), nullable=False),
+    Column("action_id", Integer, nullable=True),
+    Column("kind", String, nullable=False),
+    Column("detail_json", Text, nullable=True),
+    Column("note", Text, nullable=True),
+    Column("decided_at", String, nullable=False),
+    Index("ix_delivery_decisions_delivery", "delivery_id", "id"),
 )
 
 # ADR-0013: UI-editable overrides are persisted as JSON-encoded scalar

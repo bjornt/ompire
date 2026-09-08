@@ -29,6 +29,7 @@ from ompire_daemon.auth import load_or_create_token
 from ompire_daemon.config import DEFAULT_CONFIG_PATH, Config
 from ompire_daemon.datadir import carry_forward_snap_state
 from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
+from ompire_daemon.delivery import WorkspaceGuard
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import GpgProbe
@@ -127,10 +128,12 @@ async def _prepare_startup(
     events: EventHub,
     sessions: SessionTracker,
     project_setup: ProjectSetupManager,
+    ships: ShipManager,
+    guard: WorkspaceGuard,
 ) -> list[Any]:
     """Retain the packaged workflow definitions, finish the upgrade, resolve
-    interrupted project clones and reviews, restore any parked clone or
-    Workshop staging, then classify startup tasks.
+    interrupted project clones, reviews and deliveries, restore any parked
+    clone or Workshop staging, then classify startup tasks.
 
     Order matters here. The packaged definitions are retained *first*: a task
     accepted in this process will pin one of them, and recovery resolves every
@@ -165,29 +168,54 @@ async def _prepare_startup(
     # the first snapshot never carries an open review whose llmvet process
     # died with the daemon (review capability; ADR-0016).
     restore_reviews(engine)
+    # Interrupted deliveries are reconciled before anything else can write to
+    # their tasks (ADR-0032). This performs no privileged writes: it reads what
+    # each attempt intended, observes whether that specific result exists, and
+    # blocks the task when it cannot tell. It must run before the parked-clone
+    # restore below, so a completed signed result is never reset away before
+    # recovery has looked at it, and before task classification hands anything
+    # to session recovery.
+    for blocked_task_id in await ships.restore():
+        logger.warning(
+            "task %d has an unresolved delivery effect and is blocked until an "
+            "operator resolves it",
+            blocked_task_id,
+        )
+    # Clones parked by an older daemon's in-clone review or signing. A ref that
+    # survives because Ompire could not honour it is evidence, not noise: the
+    # affected task is blocked and says so, rather than being handed to
+    # recovery as though its workspace were sound (ADR-0032).
     for task in list_tasks(engine):
         if task.state == "archived":
             continue
-        try:
-            restored_review = await ReviewManager.restore_parked_clone(
-                task.clone_path, config.spawn_step_timeout
+        outcomes: dict[str, str] = {}
+        for label, restore in (
+            ("review", ReviewManager.restore_parked_clone),
+            ("delivery", ShipManager.restore_parked_clone),
+        ):
+            try:
+                outcomes[label] = await restore(
+                    task.clone_path, config.spawn_step_timeout
+                )
+            except Exception as exc:  # noqa: BLE001 — one clone must not break startup
+                logger.warning(
+                    "failed to check/restore the legacy %s ref for task %d: %s",
+                    label,
+                    task.id,
+                    exc,
+                )
+                outcomes[label] = "unsafe"
+        unsafe = [label for label, result in outcomes.items() if result == "unsafe"]
+        if unsafe:
+            reason = (
+                f"a legacy {' and '.join(unsafe)} recovery ref survives in this "
+                "task's clone because it could not be restored safely; its "
+                "workspace is not trustworthy until that is resolved by hand"
             )
-        except Exception as exc:  # noqa: BLE001 — a single clone must not break startup
-            logger.warning(
-                "failed to check/restore review ref for task %d: %s", task.id, exc
-            )
-            restored_review = False
-        try:
-            restored_ship = await ShipManager.restore_parked_clone(
-                task.clone_path, config.spawn_step_timeout
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "failed to check/restore ship ref for task %d: %s", task.id, exc
-            )
-            restored_ship = False
-        if restored_review or restored_ship:
-            logger.info("restored task %d clone from parked ref", task.id)
+            guard.block(task.id, reason)
+            logger.warning("task %d is blocked: %s", task.id, reason)
+        elif "restored" in outcomes.values():
+            logger.info("restored task %d clone from a legacy parked ref", task.id)
     return await classify_startup_tasks(engine, events, sessions)
 
 
@@ -249,8 +277,18 @@ def create_app(
         app.state.agents,
         app.state.sessions,
     )
+    # One task-scoped exclusion shared by review, drafting, delivery, agent
+    # turns, workflow steps and cleanup (ADR-0032). It is created before the
+    # managers that admit against it.
+    app.state.workspace_guard = WorkspaceGuard()
+    app.state.workflow_runner.set_guard(app.state.workspace_guard)
     app.state.reviews = ReviewManager(
-        config, app.state.engine, app.state.events, app.state.sessions, app.state.agents
+        config,
+        app.state.engine,
+        app.state.events,
+        app.state.sessions,
+        app.state.agents,
+        app.state.workspace_guard,
     )
     app.state.gpg = GpgProbe(config, app.state.events, app.state.settings_store)
     app.state.gh = GitHubProbe(config, app.state.events)
@@ -265,6 +303,7 @@ def create_app(
         app.state.agents,
         app.state.gpg,
         app.state.gh,
+        app.state.workspace_guard,
     )
     app.state.notifications = AttentionNotifier(
         app.state.events,
@@ -299,6 +338,8 @@ def create_app(
             app.state.events,
             app.state.sessions,
             app.state.project_setup,
+            app.state.ships,
+            app.state.workspace_guard,
         )
     )
 

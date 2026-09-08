@@ -2,13 +2,18 @@
 
 ## Overview
 
-After a task ships, Ompire tracks its pull request until it resolves, and uses
+After a task opens a pull request, Ompire tracks it until it resolves, and uses
 that state to decide when cleanup becomes available.
 
-The purpose is a grace period. A shipped task's clone and container stay on
-disk while the pull request is open, so the operator can still go back to the
-workspace if review turns up something. Cleanup unlocks only once the work has
-actually landed — or been closed.
+The purpose is a grace period. The clone and container stay on disk while the
+pull request is open, so the operator can still go back to the workspace if
+review turns up something. Cleanup unlocks only once the work has actually
+landed — or been closed.
+
+Polling is about pull requests, and only about pull requests. A delivery that
+ended at a local signed commit or a pushed branch has no pull request to track:
+it is never polled, waits for no merge, and is ready for cleanup as soon as it
+completes. See [Ship flow](ship-flow.md#endings).
 
 ## States and behavior
 
@@ -33,6 +38,8 @@ remains an explicit operator action through the cleanup endpoint.
 
 | Pull-request state | Cleanup surface |
 |---|---|
+| No pull request, delivery complete | Ready, behind explicit confirmation and a warning naming what the workspace still holds |
+| No pull request, delivery incomplete or unresolved | No action offered |
 | null or `open` | "awaiting merge · cleanup deferred", no action offered |
 | `merged` | Cleanup offered behind explicit confirmation |
 | `closed` | Same, labeled closed-unmerged so the operator knows the work did not land |

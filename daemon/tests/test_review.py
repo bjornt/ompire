@@ -14,7 +14,17 @@ from fastapi.testclient import TestClient
 from ompire_daemon.config import Config
 from ompire_daemon.execution_inputs import encode_execution_inputs
 from ompire_daemon.review import REVIEW_GIT_REF, ReviewManager
+from ompire_daemon.ship import ShipManager
 from tests.conftest import TEST_ROLES, make_execution_inputs, spawn_task
+
+
+def _add_change(clone: Path, name: str = "worked.txt", text: str = "work\n") -> None:
+    """Give a clone something to review.
+
+    Review captures a candidate now (ADR-0032) and refuses an empty delta, so a
+    test that reviews has to have produced something — which is also what a
+    real task has by the time it is reviewed."""
+    (clone / name).write_text(text, encoding="utf-8")
 
 
 def _create_demo_profile(client: TestClient) -> None:
@@ -111,16 +121,22 @@ def demo_project_and_task(review_client: TestClient, auth_headers: dict[str, str
     raise RuntimeError("task did not reach idle")
 
 
-class TestResetDance:
+class TestCandidateReviewView:
     @pytest.mark.asyncio
-    async def test_reset_dance_exposes_full_delta_and_restores_working_tree(
+    async def test_review_view_exposes_full_delta_and_leaves_the_clone_alone(
         self, review_app, tmp_path: Path
     ) -> None:
-        app = review_app
-        reviews = app.state.reviews
-        reviews.start()
+        """The reviewer reads the candidate, not the task's live tree.
 
-        # Build a local clone with checkpoint commits ahead of origin/main.
+        Same delta the reset dance used to expose — committed checkpoints and
+        pending edits together — but assembled in a separate checkout, so the
+        task clone's HEAD, index, and working tree are untouched throughout.
+        """
+        from ompire_daemon.delivery import capture_candidate, prepare_review_view
+        from ompire_daemon.registry.tasks import Task
+
+        app = review_app
+
         def git(*args: str, cwd: Path) -> None:
             subprocess.run(
                 ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
@@ -133,42 +149,139 @@ class TestResetDance:
         upstream.mkdir()
         git("init", "--bare", "--initial-branch=main", ".", cwd=upstream)
 
-        checkout = tmp_path / "proj" / "demo"
-        checkout.mkdir(parents=True)
-        git("init", "--initial-branch=main", ".", cwd=checkout)
-        (checkout / "file.txt").write_text("base\n")
-        git("add", "file.txt", cwd=checkout)
-        git("commit", "-m", "base", cwd=checkout)
-        git("remote", "add", "origin", str(upstream), cwd=checkout)
-        git("push", "origin", "main", cwd=checkout)
+        clone = tmp_path / "proj" / "demo"
+        clone.mkdir(parents=True)
+        git("init", "--initial-branch=main", ".", cwd=clone)
+        (clone / "file.txt").write_text("base\n")
+        git("add", "file.txt", cwd=clone)
+        git("commit", "-m", "base", cwd=clone)
+        git("remote", "add", "origin", str(upstream), cwd=clone)
+        git("push", "origin", "main", cwd=clone)
 
-        (checkout / "file.txt").write_text("base\nchange1\n")
-        git("commit", "-am", "cp1", cwd=checkout)
-        (checkout / "file.txt").write_text("base\nchange1\nchange2\n")
-        git("commit", "-am", "cp2", cwd=checkout)
+        (clone / "file.txt").write_text("base\nchange1\n")
+        git("commit", "-am", "cp1", cwd=clone)
+        (clone / "file.txt").write_text("base\nchange1\nchange2\n")
+        git("commit", "-am", "cp2", cwd=clone)
+        # Pending work an agent left uncommitted, plus a new untracked file.
+        (clone / "file.txt").write_text("base\nchange1\nchange2\npending\n")
+        (clone / "new.txt").write_text("brand new\n")
 
-        # Save current HEAD and run the dance manually.
-        orig = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=checkout, check=True, capture_output=True, text=True
-        ).stdout.strip()
-        await reviews._save_review_orig(str(checkout))
-        await reviews._reset_to_merge_base(str(checkout), "main")
+        def rev(*args: str) -> str:
+            return subprocess.run(
+                ["git", *args], cwd=clone, check=True, capture_output=True, text=True
+            ).stdout.strip()
 
+        before_head = rev("rev-parse", "HEAD")
+        before_status = rev("status", "--porcelain")
+
+        task = Task(
+            id=1,
+            project_name="demo",
+            slug="task1",
+            branch="main",
+            clone_path=str(clone),
+            state="created",
+            prompt="hello",
+            error=None,
+            workshop_id=None,
+            workflow_name="single-step",
+            workflow_status=None,
+            workflow_step=None,
+            workflow_result=None,
+            pr_url=None,
+            pr_state=None,
+            pr_merged_at=None,
+            spawn_completed_at=None,
+            created_at=_now_iso(),
+            updated_at=_now_iso(),
+            execution_inputs=None,
+        )
+        candidate = await capture_candidate(
+            app.state.config, app.state.engine, task, base_branch="main"
+        )
+        view = await prepare_review_view(app.state.config, task.id, candidate)
+
+        # The view shows every part of the delta as reviewable change.
         diff = subprocess.run(
-            ["git", "diff", "--stat"], cwd=checkout, capture_output=True, text=True, check=False
+            ["git", "diff", "--stat"], cwd=view, capture_output=True, text=True, check=False
         ).stdout
-        assert "2 insertions" in diff
+        assert "3 insertions" in diff
+        untracked = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=view,
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        assert "?? new.txt" in untracked
+        assert (view / "new.txt").read_text() == "brand new\n"
 
-        await reviews._restore(str(checkout))
-        restored = subprocess.run(
-            ["git", "rev-parse", "HEAD"], cwd=checkout, capture_output=True, text=True, check=False
-        ).stdout.strip()
-        assert restored == orig
-        status = subprocess.run(
-            ["git", "status", "--short"], cwd=checkout, capture_output=True, text=True, check=False
-        ).stdout.strip()
-        assert status == ""
+        # And the task clone is exactly as it was.
+        assert rev("rev-parse", "HEAD") == before_head
+        assert rev("status", "--porcelain") == before_status
 
+    @pytest.mark.asyncio
+    async def test_capture_refuses_a_clone_that_configures_content_filters(
+        self, review_app, tmp_path: Path
+    ) -> None:
+        """An agent-writable clone must not choose what gets captured."""
+        from ompire_daemon.delivery import UnsafeCloneConfigError, capture_candidate
+        from ompire_daemon.registry.tasks import Task
+
+        app = review_app
+
+        def git(*args: str, cwd: Path) -> None:
+            subprocess.run(
+                ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+                cwd=cwd,
+                check=True,
+                capture_output=True,
+            )
+
+        upstream = tmp_path / "filtered.git"
+        upstream.mkdir()
+        git("init", "--bare", "--initial-branch=main", ".", cwd=upstream)
+        clone = tmp_path / "filtered"
+        clone.mkdir()
+        git("init", "--initial-branch=main", ".", cwd=clone)
+        (clone / "a.txt").write_text("a\n")
+        git("add", "a.txt", cwd=clone)
+        git("commit", "-m", "base", cwd=clone)
+        git("remote", "add", "origin", str(upstream), cwd=clone)
+        git("push", "origin", "main", cwd=clone)
+        (clone / "b.txt").write_text("b\n")
+        git("config", "filter.evil.clean", "cat /etc/passwd", cwd=clone)
+
+        task = Task(
+            id=2,
+            project_name="demo",
+            slug="task2",
+            branch="main",
+            clone_path=str(clone),
+            state="created",
+            prompt="hello",
+            error=None,
+            workshop_id=None,
+            workflow_name="single-step",
+            workflow_status=None,
+            workflow_step=None,
+            workflow_result=None,
+            pr_url=None,
+            pr_state=None,
+            pr_merged_at=None,
+            spawn_completed_at=None,
+            created_at=_now_iso(),
+            updated_at=_now_iso(),
+            execution_inputs=None,
+        )
+        with pytest.raises(UnsafeCloneConfigError) as caught:
+            await capture_candidate(
+                app.state.config, app.state.engine, task, base_branch="main"
+            )
+        assert "filter.evil.clean" in str(caught.value)
+
+
+class TestLegacyParkedClone:
     @pytest.mark.asyncio
     async def test_startup_restore_of_parked_clone(
         self, review_app, tmp_path: Path
@@ -200,7 +313,7 @@ class TestResetDance:
         restored = await ReviewManager.restore_parked_clone(
             str(checkout), app.state.config.spawn_step_timeout
         )
-        assert restored is True
+        assert restored == "restored"
         current = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=checkout, capture_output=True, text=True, check=False
         ).stdout.strip()
@@ -213,6 +326,106 @@ class TestResetDance:
             check=False,
         )
         assert ref_exists.returncode != 0
+
+    @pytest.mark.asyncio
+    async def test_a_clone_with_no_legacy_ref_reports_absent(
+        self, review_app, tmp_path: Path
+    ) -> None:
+        """`absent` and `unsafe` must stay distinguishable: only the second is a
+        reason to stop working on a task."""
+        app = review_app
+        checkout = tmp_path / "clean"
+        checkout.mkdir()
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", "."],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        assert (
+            await ReviewManager.restore_parked_clone(
+                str(checkout), app.state.config.spawn_step_timeout
+            )
+            == "absent"
+        )
+        assert (
+            await ShipManager.restore_parked_clone(
+                str(checkout), app.state.config.spawn_step_timeout
+            )
+            == "absent"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unrestorable_legacy_ref_is_kept_and_reported_unsafe(
+        self, review_app, tmp_path: Path
+    ) -> None:
+        """A ref Ompire cannot honour is evidence. It stays, and the caller is
+        told, rather than being deleted or silently ignored."""
+        app = review_app
+        checkout = tmp_path / "broken"
+        checkout.mkdir()
+        subprocess.run(
+            ["git", "init", "--initial-branch=main", "."],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        for name in ("file.txt",):
+            (checkout / name).write_text("base\n")
+        subprocess.run(["git", "add", "."], cwd=checkout, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "base"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+        )
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        # A parked ref pointing at an object this clone does not have: the
+        # restore cannot succeed, so the marker must survive.
+        missing = "0" * 39 + "1"
+        (checkout / ".git" / "refs" / "ompire").mkdir(parents=True, exist_ok=True)
+        (checkout / ".git" / "refs" / "ompire" / "ship-orig").write_text(missing + "\n")
+        (checkout / ".git" / "refs" / "ompire" / "review-orig").write_text(missing + "\n")
+
+        assert (
+            await ShipManager.restore_parked_clone(
+                str(checkout), app.state.config.spawn_step_timeout
+            )
+            == "unsafe"
+        )
+        assert (
+            await ReviewManager.restore_parked_clone(
+                str(checkout), app.state.config.spawn_step_timeout
+            )
+            == "unsafe"
+        )
+        # Nothing was destroyed: the refs are still there and HEAD is unmoved.
+        for ref in ("refs/ompire/ship-orig", "refs/ompire/review-orig"):
+            assert (
+                subprocess.run(
+                    ["git", "rev-parse", "--verify", ref],
+                    cwd=checkout,
+                    capture_output=True,
+                    check=False,
+                ).returncode
+                == 0
+            ), f"{ref} was removed without a verified restore"
+        assert (
+            subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=checkout,
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            == head
+        )
 
 
 class TestReviewRestGuards:
@@ -245,6 +458,16 @@ class TestReviewRestGuards:
         # Task is created but not yet idle.
         r = client.post(f"/api/tasks/{task_id}/review", headers=auth_headers)
         assert r.status_code == 409
+
+    def test_review_refuses_an_empty_delta(
+        self, review_client: TestClient, auth_headers: dict[str, str], demo_project_and_task: int
+    ) -> None:
+        """Nothing to review is a refusal that says so, not a reviewer error."""
+        r = review_client.post(
+            f"/api/tasks/{demo_project_and_task}/review", headers=auth_headers
+        )
+        assert r.status_code == 409, r.text
+        assert "nothing to deliver" in r.json()["detail"]
 
     def test_review_409_no_live_agent(
         self, review_client: TestClient, auth_headers: dict[str, str], git_checkout: Path
@@ -287,6 +510,8 @@ class TestReviewRestGuards:
     ) -> None:
         client = review_client
         task_id = demo_project_and_task
+        task = client.get(f"/api/tasks/{task_id}", headers=auth_headers).json()
+        _add_change(Path(task["clone_path"]))
         with client.websocket_connect(f"/api/ws?token={client.app.state.auth_token}") as ws:
             ws.receive_json()  # snapshot
             r = client.post(f"/api/tasks/{task_id}/review", headers=auth_headers)
@@ -294,6 +519,9 @@ class TestReviewRestGuards:
             body = r.json()
             assert body["status"] == "open"
             assert body["url"].startswith("http://127.0.0.1:")
+            # The approval this review can produce will name the content it
+            # graded, not merely that something was approved (ADR-0032).
+            assert body["candidate_id"]
             # The session transition and review_started both fire; drain until
             # we see the review event.
             event = ws.receive_json()
@@ -362,6 +590,8 @@ class TestReviewManagerLifecycle:
         task = get_task(engine, task_id)
         app.state.sessions.recovering(task_id, 'main')
         app.state.sessions.session_recovered(task_id, 'main')
+
+        _add_change(git_checkout)
 
         state = await reviews.start_review(task)
         assert state.status == "open"
@@ -438,6 +668,8 @@ class TestReviewManagerLifecycle:
         app.state.sessions.recovering(task_id, 'main')
         app.state.sessions.session_recovered(task_id, 'main')
 
+        _add_change(git_checkout)
+
         await reviews.start_review(task)
         # Wait for fake llmvet (exit 130) to finish.
         deadline = asyncio.get_event_loop().time() + 5
@@ -511,6 +743,8 @@ class TestReviewManagerLifecycle:
         task = get_task(engine, task_id)
         app.state.sessions.recovering(task_id, 'main')
         app.state.sessions.session_recovered(task_id, 'main')
+
+        _add_change(git_checkout)
 
         await reviews.start_review(task)
         deadline = asyncio.get_event_loop().time() + 5
@@ -601,6 +835,7 @@ class TestReviewDurability:
 
         # The row exists as soon as the review opens, with the write-ahead
         # process marker stamped before llmvet was launched.
+        _add_change(git_checkout)
         await reviews.start_review(get_task(engine, task_id))
         opened = get_review(engine, task_id)
         assert opened is not None
@@ -645,6 +880,7 @@ class TestReviewDurability:
                 **{**app.state.config.__dict__, "llmvet_command": (str(script),)}
             )
             reviews._config = app.state.config
+            _add_change(git_checkout)
             await reviews.start_review(task)
             deadline = asyncio.get_event_loop().time() + 5
             while task_id in reviews._processes:
@@ -834,6 +1070,7 @@ class TestCleanupWithLiveReviewer:
         task_id = _seed_project_and_task(engine, git_checkout)
         app.state.sessions.recovering(task_id, "main")
         app.state.sessions.session_recovered(task_id, "main")
+        _add_change(git_checkout)
         await reviews.start_review(get_task(engine, task_id))
         deadline = asyncio.get_event_loop().time() + 5
         while task_id not in reviews._processes:

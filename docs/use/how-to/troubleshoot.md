@@ -170,10 +170,23 @@ as `starting` and settle into `idle` or `failed` once the resumed agent is
 ready or fails. Recovery fan-out is bounded — four concurrent resumes by
 default — because each one is a real container-side agent startup.
 
-A review or ship interrupted mid-sequence is restored from its durable Git ref
-at startup. If a task's clone looks wrong after a crash, check for
-`refs/ompire/review-orig` or `refs/ompire/ship-orig` in it; their presence
-means a restore has not completed.
+An interrupted review leaves the task clone untouched — the reviewer reads an
+isolated copy — so a crash mid-review is nothing to clean up.
+
+An interrupted delivery is reconciled at startup against what actually happened,
+and startup never signs, pushes, or creates a pull request on your behalf. If it
+cannot establish an effect's outcome, the task says so explicitly: Ship flow
+shows the action, its expected target, the observed evidence, and the recheck,
+adopt, retry, and abandon decisions. Nothing dependent runs and cleanup is
+refused until you resolve it. See
+[Ship flow](../reference/ship-flow.md#interrupted-effects).
+
+A clone parked by an older Ompire still carries `refs/ompire/review-orig` or
+`refs/ompire/ship-orig`. Startup restores those and removes the marker only when
+the restoration verifies. A ref that is still present after a restart means the
+clone could not be restored safely: the marker is kept as evidence, and that one
+task is blocked — review, drafting, delivery, and cleanup all refuse and name the
+surviving ref. Resolve the clone by hand, then restart.
 
 Session status itself does not survive a restart — it is in-memory state that
 is rebuilt, not replayed.

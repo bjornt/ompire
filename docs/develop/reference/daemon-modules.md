@@ -36,7 +36,8 @@ All paths are under `daemon/src/ompire_daemon/`.
 | `registry/workflows.py` | Workflow runs, step records, and the atomic waiting, retry, and gate-decision transitions |
 | `registry/workflow_definitions.py` | Retained revisions: append-only, verified on read, cached by content identity and never by name |
 | `registry/workflow_library.py` | The operator-owned library above those revisions: entries, inert drafts, current-revision selection, archive/restore, edit versions, and the single transactional prospective lookup. See [ADR-0031](../../adr/0031-let-operators-own-a-workflow-library-above-retained-revisions.md) |
-| `registry/reviews.py` | Review status and ordered iteration history |
+| `registry/reviews.py` | Review status and ordered iteration history, each bound to the candidate it graded |
+| `registry/ships.py` | Delivery candidates, operator authorizations, write-ahead action attempts, and reconciliation decisions |
 | `registry/settings.py` | Layered settings: override, then TOML, then default |
 | `registry/launch.py` | Inert upgrade evidence and the operator decisions that close out a reconciliation. Nothing here is read to execute anything. |
 
@@ -63,8 +64,9 @@ All paths are under `daemon/src/ompire_daemon/`.
 
 | Module | Responsibility |
 |---|---|
-| `review.py` | Host-side review: the reset dance, the llmvet subprocess, and startup interruption handling. The record lives in `registry/reviews.py`. |
-| `ship.py` | Draft, signed commit, push, PR. Owns `refs/ompire/ship-orig`. |
+| `delivery.py` | The protected candidate — capture, identity, its owner-private object store, and the isolated review view — plus the task-workspace ownership guard every daemon-managed writer is admitted through. |
+| `review.py` | Host-side review: candidate capture, the llmvet subprocess over an isolated view, and startup interruption handling. The record lives in `registry/reviews.py`. |
+| `ship.py` | Draft, plus three independently admitted trusted operations — signed commit, push, pull request — a coordinator that runs only the authorized prefix, and operation-specific reconciliation. The journal lives in `registry/ships.py`. |
 | `gpg.py` | Signing-key enumeration, selection (override → config → git → auto), and non-prompting agent classification: `ready`, `locked`, `ambiguous`, `no_key`, `missing`, `agent_unavailable`, `error`, `unknown`. |
 | `gh.py` | The only daemon-owned GitHub CLI boundary: configured executable discovery, non-interactive bounded execution, credential redaction, ambient identity probe, canonical upstream eligibility checks, and in-memory `gh_status` projection. |
 | `prwatch.py` | Polls pull requests to a terminal state. |
@@ -79,6 +81,6 @@ All paths are under `daemon/src/ompire_daemon/`.
 ## Reading order
 
 To follow one task end to end: `spawn.py` → `agent.py` → `rpc.py` →
-`sessions.py` → `workflows.py` → `review.py` → `ship.py`.
+`sessions.py` → `workflows.py` → `delivery.py` → `review.py` → `ship.py`.
 
 To understand how clients see any of it: `events.py` → `api/ws.py`.

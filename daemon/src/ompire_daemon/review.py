@@ -3,17 +3,24 @@
 Architecture: ADR-0011
 (docs/adr/0011-keep-review-and-publishing-authority-outside-agent-sandbox.md)
 
-`ReviewManager` owns the reset dance, the supervised llmvet subprocess, exit
+`ReviewManager` owns candidate capture, the supervised llmvet subprocess, exit
 interpretation, and the comment loopback to the live agent. It is the process
 supervisor, not the record: review status and the ordered iteration history
 are durable rows behind `registry/reviews.py` (ADR-0016's review slice), and
 every transition is written there before it is broadcast.
 
+Reviews are content-bound (ADR-0032). Starting one captures a protected
+candidate — the task's whole publishable delta against its accepted base — and
+llmvet reads an isolated checkout of *that*, not the task's live tree. The
+approval therefore says what was approved, and an agent that keeps working
+cannot change what is under review; it can only make its own approval unusable
+for delivery, which is a visible refusal rather than a silent substitution.
+
 Two things stay deliberately in memory, because they describe a process that
 cannot outlive the daemon: the reviewer's URL and port. A restored review
 therefore reports neither, and the UI offers no external link for it. The git
-ref `refs/ompire/review-orig` the reset dance writes remains the clone's own
-recovery artifact.
+ref `refs/ompire/review-orig` written by the superseded reset dance is still
+recognized and restored on startup, for clones parked by an older daemon.
 """
 
 from __future__ import annotations
@@ -30,6 +37,13 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import Engine
 
 from ompire_daemon.config import Config
+from ompire_daemon.delivery import (
+    DeliveryWorkspaceError,
+    WorkspaceGuard,
+    capture_candidate,
+    prepare_review_view,
+    remove_review_view,
+)
 from ompire_daemon.events import EventHub
 from ompire_daemon.registry.reviews import (
     ReviewIterationRecord,
@@ -40,6 +54,7 @@ from ompire_daemon.registry.reviews import (
     list_reviews,
     open_review,
 )
+from ompire_daemon.registry.ships import CandidateRecord
 from ompire_daemon.registry.tasks import Task, require_task_inputs
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.spawn import Step, _run_step
@@ -52,7 +67,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 REVIEW_GIT_REF = "refs/ompire/review-orig"
-_REVIEW_ORIGIN_NAME = "origin"
 
 
 def _now_iso() -> str:
@@ -86,6 +100,12 @@ class ReviewError(Exception):
     """Base for review-manager errors that should surface as review outcomes."""
 
 
+class ReviewContentError(ReviewError):
+    """There is nothing safe to review: an empty delta, an unreachable base, or
+    a clone configured in a way the daemon refuses to capture under. A refusal
+    about the workspace, not a reviewer failure."""
+
+
 class ReviewAlreadyOpenError(ReviewError):
     def __init__(self, task_id: int) -> None:
         super().__init__(f"task {task_id} already has an open review")
@@ -98,6 +118,7 @@ class ReviewIteration:
     outcome: str
     comment_count: int | None = None
     stderr: str | None = None
+    candidate_id: str | None = None
     recorded_at: str = field(default_factory=_now_iso)
 
 
@@ -110,6 +131,7 @@ class ReviewState:
     status: str  # open | approved | aborted | error
     url: str | None
     port: int | None
+    candidate_id: str | None = None
     iterations: list[ReviewIteration] = field(default_factory=list)
 
 
@@ -121,12 +143,16 @@ class ReviewManager:
         hub: EventHub,
         sessions: SessionTracker,
         agents: AgentSupervisor,
+        guard: WorkspaceGuard,
     ) -> None:
         self._config = config
         self._engine = engine
         self._hub = hub
         self._sessions = sessions
         self._agents = agents
+        self._guard = guard
+        # Runtime only: the isolated checkout each open review is reading.
+        self._views: dict[int, str] = {}
         # Runtime only: {task_id: (url, port)} for a live reviewer process.
         # Status and iterations live in the registry.
         self._runtime: dict[int, tuple[str, int]] = {}
@@ -166,11 +192,13 @@ class ReviewManager:
                 "status": record.status,
                 "url": url,
                 "port": port,
+                "candidate_id": record.candidate_id,
                 "iterations": [
                     {
                         "outcome": it.outcome,
                         "comment_count": it.comment_count,
                         "stderr": it.stderr,
+                        "candidate_id": it.candidate_id,
                         "recorded_at": it.recorded_at,
                     }
                     for it in record.iterations
@@ -187,11 +215,13 @@ class ReviewManager:
             status=record.status,
             url=url,
             port=port,
+            candidate_id=record.candidate_id,
             iterations=[
                 ReviewIteration(
                     outcome=it.outcome,
                     comment_count=it.comment_count,
                     stderr=it.stderr,
+                    candidate_id=it.candidate_id,
                     recorded_at=it.recorded_at,
                 )
                 for it in record.iterations
@@ -255,108 +285,65 @@ class ReviewManager:
         diff."""
         return require_task_inputs(task).workspace.base_branch
 
-    async def _fetch(self, clone_path: str, timeout: int) -> None:
-        await _run_step(
-            Step(
-                "review-fetch",
-                ["git", "-C", clone_path, "fetch", _REVIEW_ORIGIN_NAME],
-                timeout,
-            )
-        )
-
-    async def _save_review_orig(self, clone_path: str) -> str:
-        """Return the original HEAD rev and save it under the durable ref."""
-        orig = (
-            await _run_git_output(
-                ["git", "-C", clone_path, "rev-parse", "HEAD"],
-                clone_path,
-                self._config.spawn_step_timeout,
-                "review-save-orig",
-            )
-        ).strip()
-        if not orig:
-            raise ReviewError("could not capture current HEAD for review restore")
-        await _run_step(
-            Step(
-                "review-update-ref",
-                ["git", "-C", clone_path, "update-ref", REVIEW_GIT_REF, orig],
-                self._config.spawn_step_timeout,
-            )
-        )
-        return orig
-
-    async def _reset_to_merge_base(self, clone_path: str, base_branch: str) -> None:
-        base = (
-            await _run_git_output(
-                [
-                    "git",
-                    "-C",
-                    clone_path,
-                    "merge-base",
-                    f"{_REVIEW_ORIGIN_NAME}/{base_branch}",
-                    "HEAD",
-                ],
-                clone_path,
-                self._config.spawn_step_timeout,
-                "review-merge-base",
-            )
-        ).strip()
-        await _run_step(
-            Step(
-                "review-park-head",
-                ["git", "-C", clone_path, "reset", "--mixed", base],
-                self._config.spawn_step_timeout,
-            )
-        )
-
-    async def _restore(self, clone_path: str) -> None:
-        """Restore HEAD to the saved ref and delete the marker. Idempotent."""
-        await _run_step(
-            Step(
-                "review-restore",
-                ["git", "-C", clone_path, "reset", "--mixed", REVIEW_GIT_REF],
-                self._config.spawn_step_timeout,
-            )
-        )
-        await _run_step(
-            Step(
-                "review-delete-ref",
-                ["git", "-C", clone_path, "update-ref", "-d", REVIEW_GIT_REF],
-                self._config.spawn_step_timeout,
-            )
-        )
-
     # --- public lifecycle ---------------------------------------------------
 
     async def start_review(self, task: Task) -> ReviewState:
+        """Capture what this task would publish, then review exactly that.
+
+        The workspace guard is taken before the capture and held by the
+        reviewer process, so nothing daemon-managed can write to the task while
+        its candidate is being resolved. Ownership is explicit rather than
+        scoped to this coroutine because the reviewer outlives the call; the
+        watcher releases it.
+        """
         task_id = task.id
         if task_id in self._processes:
             raise ReviewAlreadyOpenError(task_id)
 
-        port = await self._allocate_port()
         base_branch = self._base_branch(task)
-        clone_path = task.clone_path
-        timeout = self._config.spawn_step_timeout
-
-        await self._fetch(clone_path, timeout)
-        await self._save_review_orig(clone_path)
-        await self._reset_to_merge_base(clone_path, base_branch)
+        self._guard.acquire(task_id, "review")
+        try:
+            candidate = await capture_candidate(
+                self._config, self._engine, task, base_branch=base_branch
+            )
+            view = await prepare_review_view(self._config, task_id, candidate)
+            port = await self._allocate_port()
+        except DeliveryWorkspaceError as exc:
+            # A capture refusal is a review refusal, and says which content
+            # problem stopped it rather than failing as an opaque 500.
+            self._guard.release(task_id, "review")
+            raise ReviewContentError(str(exc)) from exc
+        except Exception:
+            self._guard.release(task_id, "review")
+            raise
 
         url = f"http://127.0.0.1:{port}"
         # Durable first: `open_review` upserts the row (re-review after
-        # comments appends to the same history) and stamps the write-ahead
-        # process marker, so a crash between here and the first frame is
-        # recoverable as an interrupted review rather than a lost one.
-        open_review(self._engine, task_id)
+        # comments appends to the same history), binds it to the candidate it
+        # is grading, and stamps the write-ahead process marker, so a crash
+        # between here and the first frame is recoverable as an interrupted
+        # review rather than a lost one.
+        open_review(self._engine, task_id, candidate_id=candidate.candidate_id)
         self._runtime[task_id] = (url, port)
+        self._views[task_id] = str(view)
         state = self.get(task_id)
         assert state is not None
 
         primary = self._primary_session(task)
         self._sessions.review_opened(task_id, primary, f"llmvet review on {url}")
-        self._hub.publish("review_started", {"task_id": task_id, "url": url, "port": port})
+        self._hub.publish(
+            "review_started",
+            {
+                "task_id": task_id,
+                "url": url,
+                "port": port,
+                "candidate_id": candidate.candidate_id,
+            },
+        )
 
-        watcher = asyncio.create_task(self._watch_review(task_id, task, port))
+        watcher = asyncio.create_task(
+            self._watch_review(task_id, task, port, str(view), candidate)
+        )
         self._watchers[task_id] = watcher
         watcher.add_done_callback(lambda t: self._pop_watcher(task_id, t))
         return state
@@ -405,7 +392,11 @@ class ReviewManager:
             and record.process_started_at is not None
         ):
             iteration = append_iteration(
-                self._engine, task_id, outcome="aborted", status="aborted"
+                self._engine,
+                task_id,
+                outcome="aborted",
+                status="aborted",
+                candidate_id=record.candidate_id,
             )
             self._hub.publish(
                 "review_iteration",
@@ -419,22 +410,30 @@ class ReviewManager:
         clear_process_marker(self._engine, task_id)
 
     def drop_review(self, task_id: int) -> None:
-        """Drop the review's runtime state — watcher, process handle, and the
-        URL/port. Rows are untouched here: cleanup retains them and
-        `purge_task` deletes them. Does not restore the clone — cleanup
-        already deletes the directory."""
+        """Drop the review's runtime state — watcher, process handle, URL/port,
+        the isolated candidate view, and the workspace hold. Rows are untouched
+        here: cleanup retains them and `purge_task` deletes them. The task clone
+        needs no restoration — the reviewer never wrote to it."""
         watcher = self._watchers.pop(task_id, None)
         if watcher is not None:
             watcher.cancel()
         self._processes.pop(task_id, None)
         self._runtime.pop(task_id, None)
+        view = self._views.pop(task_id, None)
+        if view is not None:
+            remove_review_view(view)
+        self._guard.release(task_id, "review")
 
     # --- internals ----------------------------------------------------------
 
     async def _watch_review(
-        self, task_id: int, task: Task, port: int
+        self,
+        task_id: int,
+        task: Task,
+        port: int,
+        view_path: str,
+        candidate: CandidateRecord,
     ) -> None:
-        clone_path = task.clone_path
         process: asyncio.subprocess.Process | None = None
         try:
             argv = [
@@ -445,9 +444,11 @@ class ReviewManager:
                 "-port",
                 str(port),
             ]
+            # The reviewer runs in the isolated candidate view, never in the
+            # task clone: what it reads is the content the approval will name.
             process = await asyncio.create_subprocess_exec(
                 *argv,
-                cwd=clone_path,
+                cwd=view_path,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -460,6 +461,7 @@ class ReviewManager:
                 task_id,
                 task,
                 outcome="error",
+                candidate_id=candidate.candidate_id,
                 stderr=f"failed to launch llmvet: {exc}",
                 close_session=True,
             )
@@ -468,20 +470,33 @@ class ReviewManager:
             self._processes.pop(task_id, None)
             # The process was observed exiting: drop its URL/port and clear
             # the write-ahead marker, so a later startup does not read this
-            # review as interrupted.
+            # review as interrupted. The isolated view goes with it — the
+            # candidate's own protected store keeps the reviewed objects.
             self._runtime.pop(task_id, None)
+            self._views.pop(task_id, None)
             clear_process_marker(self._engine, task_id)
-            await self._restore(clone_path)
+            await asyncio.to_thread(remove_review_view, view_path)
 
         assert process is not None
         stdout = stdout_bytes.decode("utf-8", errors="replace")
         stderr = stderr_bytes.decode("utf-8", errors="replace")
         code = process.returncode
         assert code is not None
-        await self._interpret_exit(task_id, task, code, stdout, stderr)
+        try:
+            await self._interpret_exit(
+                task_id, task, code, stdout, stderr, candidate.candidate_id
+            )
+        finally:
+            self._guard.release(task_id, "review")
 
     async def _interpret_exit(
-        self, task_id: int, task: Task, code: int, stdout: str, stderr: str
+        self,
+        task_id: int,
+        task: Task,
+        code: int,
+        stdout: str,
+        stderr: str,
+        candidate_id: str | None = None,
     ) -> None:
         if get_review(self._engine, task_id) is None:
             return
@@ -493,6 +508,7 @@ class ReviewManager:
                     task,
                     outcome="approved",
                     comment_count=0,
+                    candidate_id=candidate_id,
                     close_session=True,
                 )
                 return
@@ -507,6 +523,7 @@ class ReviewManager:
                 task_id,
                 outcome="comments",
                 comment_count=comment_count if comment_count > 0 else None,
+                candidate_id=candidate_id,
             )
             self._hub.publish(
                 "review_iteration",
@@ -516,26 +533,35 @@ class ReviewManager:
             # on whatever model policy that session last applied (ADR-0027) —
             # taken inside the session boundary so a concurrent policy handoff
             # cannot hand back a child it is already retiring.
-            handle = await self._agents.acquire(task_id, self._primary_session(task))
-            if handle is None:
-                await self._finalize(
-                    task_id,
-                    task,
-                    outcome="error",
-                    stderr="no live agent to receive review comments",
-                    close_session=False,
+            # Ownership goes back before the agent is prompted. The reviewer
+            # is finished with the workspace, and the correction turn has to be
+            # admitted on its own — inheriting the reviewer's hold would let it
+            # write during a review, and holding it would deadlock the handoff.
+            with self._guard.released(task_id, "review"):
+                handle = await self._agents.acquire(
+                    task_id, self._primary_session(task)
                 )
-                return
-            try:
-                await handle.prompt(stdout)
-            except (AgentGoneError, RequestFailedError) as exc:
-                await self._finalize(
-                    task_id,
-                    task,
-                    outcome="error",
-                    stderr=f"failed to send review comments to agent: {exc}",
-                    close_session=False,
-                )
+                if handle is None:
+                    await self._finalize(
+                        task_id,
+                        task,
+                        outcome="error",
+                        candidate_id=candidate_id,
+                        stderr="no live agent to receive review comments",
+                        close_session=False,
+                    )
+                    return
+                try:
+                    await handle.prompt(stdout)
+                except (AgentGoneError, RequestFailedError) as exc:
+                    await self._finalize(
+                        task_id,
+                        task,
+                        outcome="error",
+                        candidate_id=candidate_id,
+                        stderr=f"failed to send review comments to agent: {exc}",
+                        close_session=False,
+                    )
             return
 
         if code == 130:
@@ -543,6 +569,7 @@ class ReviewManager:
                 task_id,
                 task,
                 outcome="aborted",
+                candidate_id=candidate_id,
                 close_session=True,
             )
             return
@@ -551,6 +578,7 @@ class ReviewManager:
             task_id,
             task,
             outcome="error",
+            candidate_id=candidate_id,
             stderr=stderr if stderr.strip() else f"llmvet exited with code {code}",
             close_session=True,
         )
@@ -563,12 +591,15 @@ class ReviewManager:
         outcome: str,
         comment_count: int | None = None,
         stderr: str | None = None,
+        candidate_id: str | None = None,
         close_session: bool,
     ) -> None:
         if get_review(self._engine, task_id) is None:
             return
         # One transaction for the terminal iteration and the status it
-        # produced, written before either is broadcast.
+        # produced, written before either is broadcast. The iteration names
+        # the candidate it graded, which is what makes an approval usable —
+        # or, once the workspace moves on, visibly stale.
         record = append_iteration(
             self._engine,
             task_id,
@@ -576,6 +607,7 @@ class ReviewManager:
             comment_count=comment_count,
             stderr=stderr,
             status=outcome,
+            candidate_id=candidate_id,
         )
         self._hub.publish(
             "review_iteration",
@@ -593,6 +625,7 @@ class ReviewManager:
             "outcome": iteration.outcome,
             "comment_count": iteration.comment_count,
             "stderr": iteration.stderr,
+            "candidate_id": iteration.candidate_id,
             "recorded_at": iteration.recorded_at,
         }
 
@@ -647,26 +680,59 @@ class ReviewManager:
     # --- startup crash-recovery helpers -------------------------------------
 
     @staticmethod
-    async def restore_parked_clone(clone_path: str, timeout: int) -> bool:
-        """If `refs/ompire/review-orig` exists in the clone, reset to it and
-        delete the ref. Returns True when a restore actually happened.
+    async def restore_parked_clone(clone_path: str, timeout: int) -> str:
+        """Restore a clone parked by the superseded in-clone review.
+
+        Returns `absent`, `restored`, or `unsafe`, for the same reason the
+        delivery equivalent does: a surviving ref Ompire could not honour is a
+        reason to stop working on that task, and a boolean cannot tell it apart
+        from having nothing to restore.
+
+        Reviews no longer park the task clone at all — the reviewer reads an
+        isolated checkout — so this only ever meets clones left by an older
+        daemon.
         """
         try:
-            await _run_git_output(
-                ["git", "-C", clone_path, "rev-parse", "--verify", REVIEW_GIT_REF],
-                clone_path,
-                timeout,
-                "review-ref-check",
-            )
+            parked = (
+                await _run_git_output(
+                    ["git", "-C", clone_path, "rev-parse", "--verify", REVIEW_GIT_REF],
+                    clone_path,
+                    timeout,
+                    "review-ref-check",
+                )
+            ).strip()
         except ReviewError:
-            return False
-        await _run_step(
-            Step(
-                "review-startup-restore",
-                ["git", "-C", clone_path, "reset", "--mixed", REVIEW_GIT_REF],
-                timeout,
+            return "absent"
+        try:
+            await _run_step(
+                Step(
+                    "review-startup-restore",
+                    ["git", "-C", clone_path, "reset", "--mixed", REVIEW_GIT_REF],
+                    timeout,
+                )
             )
-        )
+            head = (
+                await _run_git_output(
+                    ["git", "-C", clone_path, "rev-parse", "HEAD"],
+                    clone_path,
+                    timeout,
+                    "review-startup-verify",
+                )
+            ).strip()
+        except Exception:  # noqa: BLE001 — a bad clone must not stop startup
+            logger.warning(
+                "clone %s carries a legacy review-orig ref that could not be "
+                "restored; leaving it in place",
+                clone_path,
+            )
+            return "unsafe"
+        if head != parked:
+            logger.warning(
+                "clone %s did not restore to its parked head; leaving the "
+                "legacy review ref in place",
+                clone_path,
+            )
+            return "unsafe"
         await _run_step(
             Step(
                 "review-startup-delete-ref",
@@ -674,7 +740,7 @@ class ReviewManager:
                 timeout,
             )
         )
-        return True
+        return "restored"
 
 
 

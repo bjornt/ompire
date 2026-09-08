@@ -813,15 +813,55 @@ describe("applyEnvelope attention/advisory events", () => {
   });
 });
 
-describe("applyEnvelope ship/gpg events", () => {
+describe("applyEnvelope delivery/gpg events", () => {
   const draft = {
     commit_message: "fix the bug",
     pr_title: "Fix the bug",
     pr_body: "This fixes the bug.",
     source: "agent" as const,
+    state: "ready" as const,
   };
 
-  it("loads ships and gpg from the snapshot", () => {
+  const projection = (overrides: Record<string, unknown> = {}) => ({
+    task_id: 1,
+    version: 1,
+    delivery_id: 10,
+    disposition: "open",
+    ending: null,
+    mode: null,
+    candidate_id: null,
+    review_candidate_id: null,
+    draft: null,
+    blocked_reason: null,
+    workspace_owner: null,
+    completed_actions: [],
+    remaining_actions: [],
+    results: {},
+    pr_url: null,
+    legacy_publication: false,
+    actions: [],
+    decisions: [],
+    history: [],
+    ...overrides,
+  });
+
+  const gpgReady = {
+    state: "ready",
+    selected: {
+      fingerprint: "A".repeat(40),
+      key_id: "ABC",
+      uid: null,
+      keygrip: "abc",
+      source: "auto",
+      protection: "unprotected",
+    },
+    candidates: [],
+    cache_ttl: null,
+    detail: null,
+    checked_at: "t0",
+  };
+
+  it("loads delivery projections and gpg from the snapshot", () => {
     const state = applyEnvelope(initialDaemonState, {
       seq: 0,
       ts: "",
@@ -829,31 +869,15 @@ describe("applyEnvelope ship/gpg events", () => {
       payload: {
         projects: [],
         tasks: [task],
-        ships: {
-          "1": {
-            status: "drafted",
-            draft,
-            commit_sha: null,
-            pr_url: null,
-            error: null,
-            updated_at: "t0",
-          },
-        },
-        gpg: { state: "ready", selected: { fingerprint: "A".repeat(40), key_id: "ABC", uid: null, keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
+        ships: { "1": projection({ draft }) },
+        gpg: gpgReady,
       },
     });
-    expect(state.ships[1]).toEqual({
-      status: "drafted",
-      draft,
-      commit_sha: null,
-      pr_url: null,
-      error: null,
-      updated_at: "t0",
-    });
-    expect(state.gpg).toEqual({ state: "ready", selected: { fingerprint: "A".repeat(40), key_id: "ABC", uid: null, keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" });
+    expect(state.ships[1]).toEqual(projection({ draft }));
+    expect(state.gpg).toEqual(gpgReady);
   });
 
-  it("upserts a ship on ship_draft", () => {
+  it("replaces the whole projection on ship_updated", () => {
     const empty = applyEnvelope(initialDaemonState, {
       seq: 0,
       ts: "",
@@ -863,53 +887,29 @@ describe("applyEnvelope ship/gpg events", () => {
     const state = applyEnvelope(empty, {
       seq: 1,
       ts: "t1",
-      type: "ship_draft",
-      payload: { task_id: 1, draft },
+      type: "ship_updated",
+      payload: projection({
+        version: 2,
+        disposition: "completed",
+        ending: "commit",
+        completed_actions: ["commit"],
+        results: {
+          commit: {
+            signed_tip: "s".repeat(40),
+            commit_count: 1,
+            mode: "squash",
+            installed: true,
+          },
+        },
+      }),
     });
-    expect(state.ships[1]).toMatchObject({ status: "drafted", draft, updated_at: "t1" });
+    expect(state.ships[1].disposition).toBe("completed");
+    expect(state.ships[1].results.commit?.signed_tip).toBe("s".repeat(40));
   });
 
-  it("upserts draft lifecycle from ship_step and clears errors on success", () => {
-    let state = applyEnvelope(initialDaemonState, {
-      seq: 1,
-      ts: "t1",
-      type: "ship_step",
-      payload: { task_id: 1, step: "draft", status: "started" },
-    });
-    expect(state.ships[1]).toMatchObject({
-      status: "drafting",
-      draft: null,
-      error: null,
-      last_step: { step: "draft", status: "started" },
-    });
-
-    state = applyEnvelope(state, {
-      seq: 2,
-      ts: "t2",
-      type: "ship_step",
-      payload: { task_id: 1, step: "draft", status: "failed", detail: "bad markers" },
-    });
-    expect(state.ships[1]).toMatchObject({
-      status: "error",
-      error: "bad markers",
-      last_step: { step: "draft", status: "failed", detail: "bad markers" },
-    });
-
-    state = applyEnvelope(state, {
-      seq: 3,
-      ts: "t3",
-      type: "ship_draft",
-      payload: { task_id: 1, draft },
-    });
-    expect(state.ships[1]).toMatchObject({
-      status: "drafted",
-      draft,
-      error: null,
-      last_step: { step: "draft", status: "ok" },
-    });
-  });
-
-  it("tracks step progress and failure on ship_step", () => {
+  it("drops a projection older than the one already applied", () => {
+    // The daemon publishes the whole versioned projection after it commits, so
+    // an out-of-order or duplicated delivery must not move a client backwards.
     let state = applyEnvelope(initialDaemonState, {
       seq: 0,
       ts: "",
@@ -917,65 +917,53 @@ describe("applyEnvelope ship/gpg events", () => {
       payload: {
         projects: [],
         tasks: [task],
-        ships: {
-          "1": {
-            status: "committing",
-            draft: null,
-            commit_sha: null,
-            pr_url: null,
-            error: null,
-            updated_at: "t0",
-          },
-        },
+        ships: { "1": projection({ version: 7, disposition: "completed" }) },
       },
     });
     state = applyEnvelope(state, {
       seq: 1,
       ts: "t1",
-      type: "ship_step",
-      payload: { task_id: 1, step: "push", status: "ok" },
+      type: "ship_updated",
+      payload: projection({ version: 6, disposition: "open" }),
     });
-    expect(state.ships[1].status).toBe("pushing");
-    expect(state.ships[1].last_step).toEqual({ step: "push", status: "ok" });
+    expect(state.ships[1].version).toBe(7);
+    expect(state.ships[1].disposition).toBe("completed");
 
     state = applyEnvelope(state, {
       seq: 2,
       ts: "t2",
-      type: "ship_step",
-      payload: { task_id: 1, step: "pr", status: "failed", detail: "denied" },
+      type: "ship_updated",
+      payload: projection({ version: 7, disposition: "blocked" }),
     });
-    expect(state.ships[1].status).toBe("error");
-    expect(state.ships[1].error).toBe("denied");
+    // Equal versions still apply: a command response and its broadcast carry
+    // the same version and must converge rather than race.
+    expect(state.ships[1].disposition).toBe("blocked");
   });
 
-  it("sets shipped status and pr_url on ship_finished", () => {
+  it("carries an unresolved effect and its evidence", () => {
     const state = applyEnvelope(initialDaemonState, {
-      seq: 0,
-      ts: "",
-      type: "snapshot",
-      payload: {
-        projects: [],
-        tasks: [task],
-        ships: {
-          "1": {
-            status: "pushing",
-            draft: null,
-            commit_sha: "abc",
-            pr_url: null,
-            error: null,
-            updated_at: "t0",
-          },
-        },
-      },
-    });
-    const next = applyEnvelope(state, {
       seq: 1,
       ts: "t1",
-      type: "ship_finished",
-      payload: { task_id: 1, status: "shipped", pr_url: "https://github.com/o/p/pull/1" },
+      type: "ship_updated",
+      payload: projection({
+        version: 3,
+        disposition: "unresolved",
+        blocked_reason: "the destination could not be read",
+        actions: [
+          {
+            id: 4,
+            kind: "push",
+            attempt: 1,
+            phase: "needs_reconciliation",
+            expected: { ref: "refs/heads/x", signed_tip: "s".repeat(40) },
+            error: "the response was lost",
+            updated_at: "t1",
+          },
+        ],
+      }),
     });
-    expect(next.ships[1].status).toBe("shipped");
-    expect(next.ships[1].pr_url).toBe("https://github.com/o/p/pull/1");
+    expect(state.ships[1].disposition).toBe("unresolved");
+    expect(state.ships[1].actions[0].phase).toBe("needs_reconciliation");
   });
 
   it("updates gpg state on gpg_status", () => {
@@ -983,30 +971,19 @@ describe("applyEnvelope ship/gpg events", () => {
       seq: 1,
       ts: "",
       type: "gpg_status",
-      payload: { status: { state: "locked", key: "ABC", keygrip: "abc", detail: null, checked_at: "t0" } },
+      payload: {
+        status: { state: "locked", key: "ABC", keygrip: "abc", detail: null, checked_at: "t0" },
+      },
     });
     expect(state.gpg?.state).toBe("locked");
   });
 
-  it("drops ships on task_deleted", () => {
+  it("drops delivery projections on task_deleted", () => {
     let state = applyEnvelope(initialDaemonState, {
       seq: 0,
       ts: "",
       type: "snapshot",
-      payload: {
-        projects: [],
-        tasks: [task],
-        ships: {
-          "1": {
-            status: "drafted",
-            draft,
-            commit_sha: null,
-            pr_url: null,
-            error: null,
-            updated_at: "t0",
-          },
-        },
-      },
+      payload: { projects: [], tasks: [task], ships: { "1": projection({ draft }) } },
     });
     state = applyEnvelope(state, { seq: 1, ts: "", type: "task_deleted", payload: { id: 1 } });
     expect(state.ships).toEqual({});

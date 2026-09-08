@@ -2,14 +2,18 @@ import type { Task } from "../types";
 
 /** The shared destructive-cleanup confirmation (tasks capability: "Cleanup
  * requires confirmation in the UI"): names the clone path and, when
- * recorded, the workshop container. Used by both the task card and the Ship
- * Flow Cleanup step so there is exactly one wording. */
-export function confirmCleanup(task: Task): boolean {
+ * recorded, the workshop container, plus any delivery-specific data-loss
+ * warning. Used by both the task card and the Ship Flow Cleanup step so there
+ * is exactly one wording. */
+export function confirmCleanup(task: Task, warning?: string | null): boolean {
   const workshopLine = task.workshop_id
     ? `\n…and removes the workshop container:\n${task.workshop_id}`
     : "";
+  // A delivery that never pushed has its only Ompire-managed copy in this
+  // clone, so the confirmation has to say what is about to be lost (ADR-0032).
+  const warningLine = warning ? `\n\n${warning}` : "";
   return window.confirm(
-    `Clean up ${task.project_name}/${task.slug}?\n\nThis deletes the clone directory:\n${task.clone_path}${workshopLine}`,
+    `Clean up ${task.project_name}/${task.slug}?\n\nThis deletes the clone directory:\n${task.clone_path}${workshopLine}${warningLine}`,
   );
 }
 

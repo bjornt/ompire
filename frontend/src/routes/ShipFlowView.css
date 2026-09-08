@@ -352,3 +352,159 @@
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* --- Selectable endings, preview, and recovery (ADR-0032) --- */
+
+.endingChooser {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface2);
+}
+
+.endingChooser legend {
+  padding: 0 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+}
+
+.endingOption {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  align-items: baseline;
+  padding: 5px 0;
+  cursor: pointer;
+}
+
+.endingOption input {
+  grid-row: 1 / span 2;
+}
+
+.endingLabel {
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* The effects a confirmation permits are part of the choice, not a footnote:
+   the superseded flow named one effect and performed three. */
+.endingEffects,
+.endingDone {
+  grid-column: 2;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.endingDone {
+  color: var(--green);
+}
+
+.endingOption input:disabled ~ .endingLabel {
+  color: var(--faint);
+}
+
+.deliveryPreview {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface2));
+}
+
+.deliveryPreview h3 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--faint);
+}
+
+.deliveryPreview ul {
+  margin: 0 0 10px;
+  padding-left: 18px;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.previewFacts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin: 0 0 10px;
+  font-size: 11.5px;
+}
+
+.previewFacts dt {
+  color: var(--faint);
+}
+
+.previewFacts dd {
+  margin: 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.previewBody summary {
+  font-size: 11.5px;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.previewBody pre {
+  margin: 6px 0 10px;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Every reason at once: fixing one and rediscovering the next is worse than
+   seeing the whole list. */
+.previewBlockers {
+  margin: 0 0 10px;
+  padding: 8px 10px 8px 26px;
+  background: color-mix(in srgb, var(--red) 8%, var(--surface2));
+  border: 1px solid color-mix(in srgb, var(--red) 20%, var(--line));
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.recoveryNote {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+.recoveryNote input {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+@media (max-width: 640px) {
+  .endingOption {
+    grid-template-columns: auto 1fr;
+  }
+
+  .previewFacts {
+    grid-template-columns: 1fr;
+    gap: 0 0;
+  }
+
+  .previewFacts dd {
+    margin-bottom: 6px;
+  }
+}

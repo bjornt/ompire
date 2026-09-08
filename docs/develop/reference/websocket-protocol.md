@@ -68,8 +68,8 @@ full current registry state:
 | `settings` | The effective settings map |
 | `gpg` | Current signing status: `state`, `selected` key, `candidates`, `cache_ttl`, `detail`, `checked_at` — public identifiers only |
 | `gh` | Current in-memory GitHub CLI identity plus canonical target eligibility map; no credential value or token fragment |
-| `reviews` | Per task, durable review status and iterations, plus the live reviewer's URL and port when one is running (`null` otherwise) |
-| `ships` | Per task, in-memory ship status, mode, draft, commit sha, PR URL, error, and latest `last_step` projection |
+| `reviews` | Per task, durable review status and iterations, each naming the candidate it graded, plus the live reviewer's URL and port when one is running (`null` otherwise) |
+| `ships` | Per task, the durable delivery projection: `version`, disposition, selected ending and mode, candidate and review identity, draft, completed and remaining actions, concrete results, every action attempt and reconciliation decision, and the delivery history |
 | attention | Current attention entries |
 
 Every frame after the snapshot is a delta.
@@ -80,13 +80,14 @@ why the frontend can be stateless with respect to the daemon, and why
 restarting the browser cannot corrupt anything.
 
 The main socket subscribes to the event hub **before** it reads the snapshot,
-and releases the subscription on every exit path. The library is editable, so a
-mutation committing while the snapshot is being assembled would otherwise fall
-into the gap between the read and the subscription and never arrive.
+and releases the subscription on every exit path. The library is editable and a
+delivery can commit at any moment, so a mutation landing while the snapshot is
+being assembled would otherwise fall into the gap between the read and the
+subscription and never arrive.
 
 What queued up during that overlap is then filtered: only deltas carrying a
-version the client orders by — today `workflow_library_updated` alone — are
-forwarded. Re-delivering an entry the snapshot already holds is a no-op, so
+version the client orders by — `workflow_library_updated` and `ship_updated` —
+are forwarded. Re-delivering an entry the snapshot already holds is a no-op, so
 nothing is lost. Every other delta is unversioned, and one published *before*
 the snapshot read but delivered after it would move the client backwards; those
 are dropped, exactly as the pre-subscription gap dropped them, because the
@@ -158,8 +159,7 @@ Published on the dashboard channel:
 | `attention`, `attention_cleared` | A task's attention tier changes |
 | `stats`, `advisory` | Session telemetry and decorations |
 | `review_started`, `review_iteration`, `review_finished` | Review lifecycle |
-| `ship_draft` | A parsed agent draft is ready |
-| `ship_step`, `ship_finished` | A `draft`, `commit`, `push`, or `pr` step starts, completes, fails, or the publication reaches a terminal state |
+| `ship_updated` | A task's delivery projection changed; carries the whole versioned document |
 | `gpg_status` | The signing-key probe result changes |
 | `gh_status` | A completed GitHub identity or target probe replaced the full safe `gh` projection |
 | `settings_changed` | Effective settings change |
@@ -170,19 +170,26 @@ with git's stderr on failure. It is transient and never part of the snapshot:
 the durable outcome is the project's own `setup_state`/`setup_error`, which
 are broadcast as `project_updated` and are what a reconnecting client renders.
 
-`spawn_step` and `ship_step` payloads carry `status` — `started`, `ok`, or
-`failed` — and a failure carries the relevant detail. Ship-step `detail` is a
-string for a draft, push, or pull-request failure, a pull-request URL on a
-successful `pr`, and commit metadata on a successful `commit`.
+`spawn_step` payloads carry `status` — `started`, `ok`, or `failed` — and a
+failure carries the relevant detail.
 
-Draft lifecycle is explicit: `ship_step` with `step: "draft"` and
-`status: "started"` precedes the agent request; a parsed success publishes
-`ship_draft` followed by `draft`/`ok`; a timeout, transport failure, missing
-text, or marker parse failure publishes `draft`/`failed`. The daemon keeps the
-latest `last_step` in its in-memory `ships` snapshot, so a client that missed a
-delta can render the same Draft-stage retry state after reconnect. Ship state is
-not durable except for a task's pull-request URL; a restart replaces it with an
-empty ship projection rather than replaying an agent request.
+`ship_updated` is the delivery surface, and it is deliberately not a step event
+([ADR-0032](../../adr/0032-bind-trusted-delivery-to-retained-candidates.md)). It
+carries the same whole document the snapshot carries, published only *after* the
+daemon committed it, and every REST command response is that same document. A
+client renders what it last received rather than assembling a picture from
+fragments, which is what makes a lost or duplicated delta harmless.
+
+Each projection carries a per-task monotonic `version`. Clients apply a payload
+only when its version is at least the one they hold, so an out-of-order or
+duplicated delivery is dropped rather than moving the client backwards. Equal
+versions still apply: a command response and its broadcast carry the same
+version and must converge rather than race.
+
+Because delivery state is durable, a reconnect after a restart serves the real
+current state — including a delivery that stopped with an unresolved effect,
+with the action, its expected target, and the observed evidence attached. A
+restart never replays an agent draft request or repeats a privileged write.
 
 `gh` is environmental observation rather than durable publishing policy. Its
 identity states are `unknown`, `missing`, `unauthenticated`, `ready`, and

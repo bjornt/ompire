@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { ReviewState, ShipState, Task } from "../types";
-import { buildShipIndex, hasShipFlowHandoff, presentShipFlow } from "./shipPresentation";
+import type { ReviewState, ShipProjection, Task } from "../types";
+import {
+  approvalBindingFor,
+  buildShipIndex,
+  cleanupWarning,
+  hasShipFlowHandoff,
+  presentShipFlow,
+  unresolvedActions,
+} from "./shipPresentation";
 
 function task(overrides: Partial<Task> = {}): Task {
   return {
@@ -36,185 +43,276 @@ function task(overrides: Partial<Task> = {}): Task {
   };
 }
 
-function approvedReview(): ReviewState {
+function approvedReview(candidateId: string | null = "cand-1"): ReviewState {
   return {
     status: "approved",
     url: "http://127.0.0.1:7180",
     port: 7180,
-    iterations: [],
+    candidate_id: candidateId,
+    iterations: [
+      {
+        outcome: "approved",
+        comment_count: 0,
+        stderr: null,
+        candidate_id: candidateId,
+        recorded_at: "2026-08-20T00:00:00Z",
+      },
+    ],
   };
 }
 
-function ship(overrides: Partial<ShipState> = {}): ShipState {
+function ship(overrides: Partial<ShipProjection> = {}): ShipProjection {
   return {
-    status: "drafted",
-    draft: {
-      commit_message: "fix: ship it",
-      pr_title: "Ship it",
-      pr_body: "Body",
-      source: "agent",
-    },
-    commit_sha: null,
+    task_id: 1,
+    version: 1,
+    delivery_id: 10,
+    disposition: "open",
+    ending: null,
+    mode: null,
+    candidate_id: null,
+    review_candidate_id: null,
+    draft: null,
+    blocked_reason: null,
+    workspace_owner: null,
+    completed_actions: [],
+    remaining_actions: [],
+    results: {},
     pr_url: null,
-    error: null,
-    updated_at: "2026-08-20T00:02:00Z",
+    legacy_publication: false,
+    actions: [],
+    decisions: [],
+    history: [],
     ...overrides,
   };
 }
 
-describe("ship presentation", () => {
-  it("recognizes only observed review or publishing handoffs", () => {
-    const current = task();
+const signedCommit = {
+  signed_tip: "s".repeat(40),
+  commit_count: 1,
+  mode: "squash" as const,
+  installed: true,
+};
 
-    expect(hasShipFlowHandoff(current, undefined, undefined)).toBe(false);
-    expect(hasShipFlowHandoff(current, approvedReview(), undefined)).toBe(true);
-    // An approval restored across a daemon restart has no live reviewer URL,
-    // but still opens the ship flow.
-    expect(
-      hasShipFlowHandoff(current, { ...approvedReview(), url: null, port: null }, undefined),
-    ).toBe(true);
-    expect(hasShipFlowHandoff(current, undefined, ship())).toBe(true);
-    expect(hasShipFlowHandoff({ ...current, pr_url: "https://github.com/ompire/maas/pull/1" }, undefined, undefined)).toBe(
-      true,
-    );
+describe("presentShipFlow", () => {
+  it("waits for review before anything can be delivered", () => {
+    const presentation = presentShipFlow(task(), undefined, undefined);
+    expect(presentation.stage).toBe("review");
+    expect(presentation.activity).toBe("ready");
+    expect(presentation.detail).toContain("approved review of the current content");
   });
 
-  it.each([
-    ["review", task(), undefined, ship({ status: "error", draft: null, error: "draft failed" }), "review"],
-    ["draft", task(), approvedReview(), undefined, "draft"],
-    ["sign", task(), approvedReview(), ship(), "sign"],
-    ["push and PR", task(), approvedReview(), ship({ commit_sha: "abc123" }), "push-pr"],
-    [
-      "unpolled pull request",
-      task({ pr_url: "https://github.com/ompire/maas/pull/1" }),
-      approvedReview(),
-      ship({ commit_sha: "abc123", pr_url: "https://github.com/ompire/maas/pull/1" }),
-      "wait-merge",
-    ],
-    [
-      "open pull request",
-      task({ pr_url: "https://github.com/ompire/maas/pull/1", pr_state: "open" }),
-      approvedReview(),
-      ship({ commit_sha: "abc123" }),
-      "wait-merge",
-    ],
-    [
-      "merged pull request",
-      task({ pr_url: "https://github.com/ompire/maas/pull/1", pr_state: "merged" }),
-      approvedReview(),
-      ship({ commit_sha: "abc123" }),
-      "cleanup",
-    ],
-    [
-      "closed pull request",
-      task({ pr_url: "https://github.com/ompire/maas/pull/1", pr_state: "closed" }),
-      approvedReview(),
-      ship({ commit_sha: "abc123" }),
-      "cleanup",
-    ],
-    [
-      "cleaned-up pull request",
-      task({ state: "archived", pr_url: "https://github.com/ompire/maas/pull/1", pr_state: "merged" }),
-      approvedReview(),
-      ship({ commit_sha: "abc123" }),
-      "cleanup-complete",
-    ],
-  ])("chooses %s as the furthest observed stage", (_name, current, review, currentShip, stage) => {
-    expect(presentShipFlow(current, review, currentShip).stage).toBe(stage);
-  });
-
-  it.each([
-    ["drafting", ship({ status: "drafting", draft: null }), "draft", "in-progress"],
-    ["committing", ship({ status: "committing" }), "sign", "in-progress"],
-    ["pushing", ship({ status: "pushing", commit_sha: "abc123" }), "push-pr", "in-progress"],
-  ])("marks %s as in progress", (_name, currentShip, stage, activity) => {
-    const presentation = presentShipFlow(task(), approvedReview(), currentShip);
-    expect(presentation.stage).toBe(stage);
-    expect(presentation.activity).toBe(activity);
-  });
-
-  it("keeps a failed attempt at its retry stage with its daemon error", () => {
+  it("treats a completed local ending as a success, not a missing pull request", () => {
     const presentation = presentShipFlow(
       task(),
       approvedReview(),
       ship({
-        status: "error",
-        commit_sha: "abc123",
-        error: "push/PR failed: forbidden",
-        last_step: { step: "pr", status: "failed", detail: "forbidden" },
+        disposition: "completed",
+        ending: "commit",
+        completed_actions: ["commit"],
+        results: { commit: signedCommit },
       }),
     );
-
-    expect(presentation).toMatchObject({
-      stage: "push-pr",
-      activity: "error",
-      error: "push/PR failed: forbidden",
-    });
-    expect(presentation.detail).toContain("Retry Push / PR");
+    expect(presentation.stage).toBe("delivered-commit");
+    expect(presentation.label).toBe("Signed locally");
+    expect(presentation.activity).toBe("complete");
+    expect(presentation.error).toBeNull();
   });
 
-  it("keeps a no-review draft failure at the Draft retry stage", () => {
+  it("treats a push-only ending as complete without waiting for a merge", () => {
     const presentation = presentShipFlow(
       task(),
-      undefined,
+      approvedReview(),
       ship({
-        status: "error",
-        draft: null,
-        error: "could not parse draft markers",
-        last_step: {
-          step: "draft",
-          status: "failed",
-          detail: "could not parse draft markers",
+        disposition: "completed",
+        ending: "push",
+        completed_actions: ["commit", "push"],
+        results: {
+          commit: signedCommit,
+          push: { head: "s".repeat(40), ref: "refs/heads/x", branch: "x" },
         },
       }),
     );
+    expect(presentation.stage).toBe("delivered-push");
+    expect(presentation.detail).toContain("No pull request was opened");
+  });
 
-    expect(presentation).toMatchObject({
-      stage: "draft",
-      activity: "error",
-      error: "could not parse draft markers",
+  it("ranks an unresolved effect above every other stage", () => {
+    const projection = ship({
+      disposition: "unresolved",
+      ending: "pr",
+      blocked_reason: "the forge could not be searched completely",
+      completed_actions: ["commit", "push"],
+      results: {
+        commit: signedCommit,
+        push: { head: "s".repeat(40), ref: "refs/heads/x", branch: "x" },
+      },
+      actions: [
+        {
+          id: 3,
+          kind: "pr",
+          attempt: 1,
+          phase: "needs_reconciliation",
+          error: "the response was lost",
+          updated_at: "2026-08-20T00:02:00Z",
+        },
+      ],
     });
+    const presentation = presentShipFlow(task(), approvedReview(), projection);
+    expect(presentation.stage).toBe("unresolved");
+    expect(presentation.activity).toBe("unresolved");
+    expect(presentation.error).toContain("could not be searched");
+    expect(unresolvedActions(projection)).toHaveLength(1);
   });
 
-  it("uses a pull request over lower ship milestones", () => {
-    const presentation = presentShipFlow(
-      task({ pr_url: "https://github.com/ompire/maas/pull/1", pr_state: "open" }),
+  it("keeps PR state ahead of delivery progress once a pull request exists", () => {
+    const merged = presentShipFlow(
+      task({ pr_url: "https://github.com/o/p/pull/1", pr_state: "merged" }),
       approvedReview(),
-      ship({ status: "error", commit_sha: "abc123", error: "old push failure" }),
+      ship({ disposition: "completed", results: { commit: signedCommit } }),
     );
-
-    expect(presentation.stage).toBe("wait-merge");
-    expect(presentation.activity).toBe("ready");
+    expect(merged.stage).toBe("cleanup");
   });
 
-  it("groups each qualifying task once and sorts by task update time", () => {
-    const index = buildShipIndex(
+  it("reports a blocked delivery with the daemon's own reason", () => {
+    const presentation = presentShipFlow(
+      task(),
+      approvedReview(),
+      ship({ disposition: "blocked", blocked_reason: "the signing key is locked" }),
+    );
+    expect(presentation.stage).toBe("deliver");
+    expect(presentation.activity).toBe("error");
+    expect(presentation.error).toBe("the signing key is locked");
+  });
+});
+
+describe("approvalBindingFor", () => {
+  it("accepts an approval bound to the delivery's candidate", () => {
+    expect(
+      approvalBindingFor(approvedReview("cand-1"), ship({ candidate_id: "cand-1" })),
+    ).toBe("usable");
+  });
+
+  it("calls an approval stale once the delivery names different content", () => {
+    expect(
+      approvalBindingFor(approvedReview("cand-old"), ship({ candidate_id: "cand-new" })),
+    ).toBe("stale");
+  });
+
+  it("calls an approval that never named its content unbound", () => {
+    expect(approvalBindingFor(approvedReview(null), undefined)).toBe("unbound");
+  });
+});
+
+describe("cleanupWarning", () => {
+  it("warns that a local-only result has no other managed copy", () => {
+    const warning = cleanupWarning(
+      task(),
+      ship({ disposition: "completed", results: { commit: signedCommit } }),
+    );
+    expect(warning).toContain("only Ompire-managed Git copy");
+    expect(warning).toContain("not a backup");
+  });
+
+  it("names the remote branch and the absent pull request for a push-only result", () => {
+    const warning = cleanupWarning(
+      task(),
+      ship({
+        disposition: "completed",
+        results: {
+          commit: signedCommit,
+          push: { head: "s".repeat(40), ref: "refs/heads/x", branch: "ompire/fix-bug" },
+        },
+      }),
+    );
+    expect(warning).toContain("ompire/fix-bug");
+    expect(warning).toContain("no pull request");
+    expect(warning).toContain("remote branch is left alone");
+  });
+
+  it("refuses cleanup outright while an effect is unresolved", () => {
+    const warning = cleanupWarning(
+      task(),
+      ship({
+        disposition: "unresolved",
+        actions: [
+          {
+            id: 1,
+            kind: "push",
+            attempt: 1,
+            phase: "needs_reconciliation",
+            error: "lost",
+            updated_at: "t",
+          },
+        ],
+      }),
+    );
+    expect(warning).toContain("refused");
+  });
+
+  it("says nothing once a pull request exists", () => {
+    expect(
+      cleanupWarning(task({ pr_url: "https://github.com/o/p/pull/1" }), undefined),
+    ).toBeNull();
+  });
+});
+
+describe("hasShipFlowHandoff", () => {
+  it("is true for an approved review, a delivery record, or a pull request", () => {
+    expect(hasShipFlowHandoff(task(), approvedReview(), undefined)).toBe(true);
+    expect(hasShipFlowHandoff(task(), undefined, ship())).toBe(true);
+    expect(
+      hasShipFlowHandoff(task({ pr_url: "https://github.com/o/p/pull/1" }), undefined, undefined),
+    ).toBe(true);
+  });
+
+  it("is false for a task nothing has been decided about", () => {
+    expect(hasShipFlowHandoff(task(), undefined, undefined)).toBe(false);
+  });
+
+  it("is true for a legacy publication with no journal behind it", () => {
+    expect(
+      hasShipFlowHandoff(task(), undefined, ship({ delivery_id: null, legacy_publication: true })),
+    ).toBe(true);
+  });
+});
+
+describe("buildShipIndex", () => {
+  it("splits live handoffs from archived history, newest first", () => {
+    const { active, recent } = buildShipIndex(
       [
         task({ id: 1, updated_at: "2026-08-20T00:01:00Z" }),
-        task({
-          id: 2,
-          updated_at: "2026-08-20T00:04:00Z",
-          pr_url: "https://github.com/ompire/maas/pull/2",
-          pr_state: "merged",
-        }),
+        task({ id: 2, updated_at: "2026-08-20T00:03:00Z" }),
         task({
           id: 3,
           state: "archived",
-          updated_at: "2026-08-20T00:05:00Z",
-          pr_url: "https://github.com/ompire/maas/pull/3",
+          updated_at: "2026-08-20T00:04:00Z",
+          pr_url: "https://github.com/o/p/pull/3",
           pr_state: "merged",
         }),
-        task({ id: 4, updated_at: "2026-08-20T00:06:00Z" }),
-        task({ id: 5, updated_at: "2026-08-20T00:03:00Z" }),
+        task({ id: 4, updated_at: "2026-08-20T00:05:00Z" }),
       ],
-      { 1: approvedReview() },
-      { 5: ship({ status: "pushing", commit_sha: "abc123" }) },
+      { 1: approvedReview(), 2: approvedReview() },
+      {},
     );
+    expect(active.map((entry) => entry.task.id)).toEqual([2, 1]);
+    expect(recent.map((entry) => entry.task.id)).toEqual([3]);
+  });
 
-    expect(index.active.map((entry) => entry.task.id)).toEqual([2, 5, 1]);
-    expect(index.active.map((entry) => entry.stage)).toEqual(["cleanup", "push-pr", "draft"]);
-    expect(index.recent.map((entry) => entry.task.id)).toEqual([3]);
-    expect(index.recent[0]).toMatchObject({ stage: "cleanup-complete", activity: "complete" });
-    expect([...index.active, ...index.recent].map((entry) => entry.task.id)).toEqual([2, 5, 1, 3]);
+  it("lists a local-only delivery as active work, not as a failure", () => {
+    const { active } = buildShipIndex(
+      [task({ id: 1 })],
+      {},
+      {
+        1: ship({
+          disposition: "completed",
+          ending: "commit",
+          completed_actions: ["commit"],
+          results: { commit: signedCommit },
+        }),
+      },
+    );
+    expect(active).toHaveLength(1);
+    expect(active[0].stage).toBe("delivered-commit");
+    expect(active[0].error).toBeNull();
   });
 });

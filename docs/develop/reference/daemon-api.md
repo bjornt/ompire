@@ -21,7 +21,7 @@ reference](../../use/reference/api.md); the generated OpenAPI schema at
 profile contract, including its identifier grammar and status codes, is in
 [Model profiles](../../use/reference/model-profiles.md).
 
-Four mutation boundaries are worth knowing before adding routes near them.
+Five mutation boundaries are worth knowing before adding routes near them.
 
 Profile input schemas forbid unknown fields at every nesting level, so a
 misspelled role or binding key is a `422` rather than silently ignored
@@ -100,6 +100,33 @@ whose format reads results differently from the ones already on record cannot
 explain that history, so it is reported incompatible with the reasons named
 rather than offered and silently reinterpreting them. There is no automatic
 format upgrade.
+
+Trusted delivery is the fifth, and it is the one where the boundary is
+deliberately *not* in this layer at all
+([ADR-0032](../../adr/0032-bind-trusted-delivery-to-retained-candidates.md)).
+`/api/tasks/{id}/ship/*` parses and authenticates; every review, target, mode,
+credential, exclusivity, and replay check happens inside the delivery service,
+which re-loads its own contract from the durable record rather than trusting a
+caller-supplied snapshot. A direct service call is admitted exactly as a REST
+request is, and there is no no-review path and no tokenless path.
+
+The shape is the same preview-then-confirm boundary as task creation, with two
+differences. `ship/preview` resolves a *requested ending* — `commit`, `push` or
+`pr` — and returns the actions still to run alongside every reason the delivery
+is refused, so an operator fixes them together rather than one attempt at a
+time. And its token covers only the inputs that ending will actually use: a
+commit message means nothing once the commit is done, and pull-request text
+means nothing for an ending that opens none, so including them would invalidate
+a continuation over a field it cannot act on.
+
+`ship/push` and `ship/pr` continue an existing verified result and never start
+an implicit earlier action. `ship/reconcile` records one decision about an
+unresolved effect and writes nothing privileged: `retry` only makes a
+proven-not-executed action eligible for a fresh preview and confirmation.
+
+Every one of these responds with the task's whole versioned delivery
+projection, the same document the WebSocket publishes — so a response and its
+broadcast converge through one reducer instead of racing.
 
 `POST /api/tasks/{id}/workflow/resume` carries the same shape of guard for a
 *human* decision. The request names the waiting attempt, the daemon decides

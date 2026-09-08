@@ -103,7 +103,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 # Event types the client orders by a version carried in the payload, so an
 # out-of-order or duplicate delivery is dropped rather than applied. Only these
 # are safe to forward from the window the snapshot was being read in.
-VERSION_ORDERED_TYPES = frozenset({"workflow_library_updated"})
+VERSION_ORDERED_TYPES = frozenset({"workflow_library_updated", "ship_updated"})
 
 
 async def _drain_snapshot_overlap(
@@ -112,9 +112,10 @@ async def _drain_snapshot_overlap(
     """Forward what queued up while the snapshot was being assembled — but only
     the deltas the client can order for itself.
 
-    Subscribing before the read is what keeps a concurrent library save from
-    falling into the gap, and an entry's edit version makes re-delivering one
-    the snapshot already carries a no-op. Every other delta is unversioned: one
+    Subscribing before the read is what keeps a concurrent library save — or a
+    delivery committing mid-assembly — from falling into the gap, and the
+    entry or delivery version makes re-delivering one the snapshot already
+    carries a no-op. Every other delta is unversioned: one
     published *before* the snapshot read and delivered after it would move the
     client backwards, which is worse than the missed update it replaces. Those
     are dropped here, exactly as the gap dropped them before — the snapshot is
@@ -181,7 +182,9 @@ async def _deliver_snapshot(
         str(task_id): info
         for task_id, info in websocket.app.state.reviews.snapshot().items()
     }
-    # Live ship progress and the shared GPG lock condition.
+    # Durable delivery projections (ADR-0032): authorization, action results,
+    # unresolved effects and history, versioned per task so a later delta can
+    # be ordered against this snapshot. Plus the shared GPG lock condition.
     ships_payload = {
         str(task_id): info
         for task_id, info in websocket.app.state.ships.snapshot().items()

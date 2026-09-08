@@ -146,3 +146,4 @@ nav:
           - 0029 Declared outcomes and evidence: adr/0029-declare-domain-outcomes-and-evidence-handoffs.md
           - 0030 Committed human decisions: adr/0030-commit-human-decisions-before-advancing.md
           - 0031 Operator-owned workflow library: adr/0031-let-operators-own-a-workflow-library-above-retained-revisions.md
+          - 0032 Content-bound trusted delivery: adr/0032-bind-trusted-delivery-to-retained-candidates.md

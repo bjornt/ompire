@@ -376,6 +376,7 @@ this package never contained.
 | `task_id` | integer | FK to `tasks.id`, primary key |
 | `status` | string | `open`, `approved`, `aborted`, `error` |
 | `process_started_at` | string, nullable | Write-ahead marker; ISO-8601 |
+| `candidate_id` | string, nullable | The protected candidate this round is grading |
 | `created_at`, `updated_at` | string | ISO-8601 |
 
 One row per task, upserted on every start: re-review after comments reopens
@@ -385,11 +386,17 @@ the same review so the loop stays one ordered history.
 process is observed exiting. It is not a display field — it is what lets
 startup tell an interrupted reviewer from a review that is `open` only because
 its comments went back to the agent. See
-[Crash recovery](crash-recovery.md#review-and-ship-recovery).
+[Crash recovery](crash-recovery.md#review-recovery).
 
 The reviewer's URL and port are deliberately **not** columns. They describe a
 process that cannot outlive the daemon, and a restored review must not offer a
 dead link.
+
+`candidate_id` binds the review to the content it is grading
+([ADR-0032](../../adr/0032-bind-trusted-delivery-to-retained-candidates.md)).
+It is nullable because that is the whole upgrade story: a review recorded before
+content binding keeps a `NULL` and stays readable, and nothing infers which tree
+it graded. Such an approval is history, not authorization.
 
 ## `review_iterations`
 
@@ -400,11 +407,124 @@ dead link.
 | `outcome` | string | `approved`, `comments`, `aborted`, `error`, `interrupted` |
 | `comment_count` | integer, nullable | Cosmetic; the comment text is authoritative |
 | `stderr` | text, nullable | Captured reviewer stderr |
+| `candidate_id` | string, nullable | The candidate this iteration graded |
 | `recorded_at` | string | ISO-8601 |
 
 Ordered `(task_id, seq)` like `workflow_steps`, because re-review revisits the
 same review. `interrupted` is iteration-only and always accompanies an
 `aborted` review.
+
+The terminal `approved` iteration's `candidate_id` is what delivery reads: it
+says what an approval covers, so "is this still the reviewed content?" is a
+comparison rather than an assumption.
+
+## `delivery_candidates`
+
+| Column | Type | Notes |
+|---|---|---|
+| `candidate_id` | string | Primary key: SHA-256 over the normalized content below |
+| `task_id` | integer | FK to `tasks.id`, indexed |
+| `base_branch` | string | The base the task was accepted with |
+| `base_commit` | string | Merge-base the delta is measured from |
+| `original_head` | string | The HEAD the capture was taken at |
+| `tree_id` | string | The full publishable candidate tree |
+| `source_commits_json` | text | Ordered `{commit_id, tree_id, message, parent_ids}` for retain |
+| `dirty` | integer | Whether the workspace had uncommitted publishable changes |
+| `storage_path` | string, nullable | The owner-private bare repository holding its objects |
+| `created_at` | string | ISO-8601 |
+
+The identity is a hash of exactly the fields above — not the rendered preview,
+not the agent's draft, not a timestamp. An unchanged workspace captures to the
+same identity, and any change to what would be published captures to a different
+one.
+
+`storage_path` names a bare repository under the daemon's data directory, not
+the workshop mount, holding only the base, the original head, and a commit that
+makes the candidate tree reachable. It is temporary operation evidence with its
+own lifecycle: it is removed once no active or unresolved delivery still needs
+it, and `storage_path` becomes `NULL`. The manifest row stays as the record of
+what was reviewed and signed.
+
+## `deliveries`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | integer | Primary key |
+| `task_id` | integer | FK to `tasks.id`, indexed |
+| `version` | integer | Per-task monotonic projection version |
+| `workflow_revision` | string, nullable | The pinned procedure this task was accepted under (ADR-0028); attribution, never policy |
+| `candidate_id`, `review_candidate_id` | string, nullable | What is delivered, and what the approval named |
+| `mode` | string, nullable | `squash` or `retain` |
+| `ending` | string, nullable | `commit`, `push`, or `pr` |
+| `commit_message`, `pr_title`, `pr_body` | text, nullable | The immutable final metadata |
+| `routing_json` | text, nullable | The accepted destination |
+| `identity_json` | text, nullable | Safe identity observations only |
+| `authorized_at`, `authorized_by` | string, nullable | `operator` for the authenticated single-operator command |
+| `request_key`, `input_fingerprint` | string, nullable | Replay identity; unique per task where set |
+| `draft_json` | text, nullable | Durable publication draft and its state |
+| `disposition` | string | `open`, `authorized`, `completed`, `blocked`, `unresolved`, `abandoned` |
+| `blocked_reason` | text, nullable | Why it stopped |
+| `created_at`, `updated_at` | string | ISO-8601 |
+
+A task accumulates deliveries, but at most one is non-terminal at a time —
+reserved transactionally, so "this task is already delivering" is a durable fact
+rather than an in-memory flag.
+
+`version` advances on every committed change and is what a client compares: the
+projection is published whole, and an older or duplicated version is dropped
+rather than applied.
+
+`identity_json` records only safe facts — the Git author and committer, the
+selected signer, and the observed GitHub host, login and credential-source
+label. Never a credential value. The ambient Git transport principal is recorded
+as explicitly unattributed rather than invented.
+
+## `delivery_actions`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | integer | Primary key |
+| `delivery_id` | integer | FK to `deliveries.id`, indexed with `seq` |
+| `seq`, `kind`, `attempt` | integer/string | Ordering, `commit`/`push`/`pr`, and attempt number |
+| `request_key`, `input_fingerprint` | string | Replay identity for this attempt |
+| `phase` | string | `prepared`, `executing`, `succeeded`, `failed`, `needs_reconciliation` |
+| `expected_json` | text, nullable | What the attempt intends to write, recorded first |
+| `progress_json` | text, nullable | Per-signature progress and reconciliation evidence |
+| `identity_json` | text, nullable | Safe identity facts for this attempt |
+| `result_json` | text, nullable | The verified outcome |
+| `error` | text, nullable | Sanitized failure detail |
+| `created_at`, `updated_at` | string | ISO-8601 |
+
+`phase` is the write-ahead marker. `prepared` commits before anything runs;
+`executing` commits *before* the effect is launched; `succeeded` and the
+eligibility it grants commit together. `failed` is reachable only when
+non-execution or a verified rollback was established — everything less certain
+becomes `needs_reconciliation`, which is neither success nor failure.
+
+`expected_json` is what makes a lost response answerable: the destination ref and
+source object id, the observed pre-push head, the protected ref a signature will
+be written under, the correlation marker that will appear in a pull-request body.
+Recovery looks for exactly that, instead of guessing from today's state.
+
+`progress_json` records per-signature progress, so an interrupted retain rewrite
+is inspectable rather than an opaque boolean.
+
+## `delivery_decisions`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | integer | Primary key |
+| `delivery_id` | integer | FK to `deliveries.id`, indexed with `id` |
+| `action_id` | integer, nullable | The attempt a reconciliation decided about |
+| `kind` | string | `authorize`, `extend`, `recheck`, `adopt`, `retry`, `abandon`, `block` |
+| `detail_json` | text, nullable | The decision's evidence |
+| `note` | text, nullable | The operator's own words |
+| `decided_at` | string | ISO-8601 |
+
+Append-only. Extending a delivery to a further ending adds a row; it never
+rewrites the authorization that came before it. A delivery whose first action was
+refused has no terminal prefix to protect, so a corrected confirmation may
+replace it — and that, too, is appended as its own decision.
 
 ## `settings`
 
@@ -430,16 +550,35 @@ default-only. The daemon never rewrites your TOML.
 
 An unknown key or a wrong value type is rejected with `422` naming the key.
 
+## Reference safety across the delivery tables
+
+The delivery tables declare named, non-cascading foreign keys for the same
+reason `projects.default_model_profile` does, and with the same caveat: the
+runtime connection enables WAL and **not** `PRAGMA foreign_keys`.
+
+The guarantees are the same `BEGIN IMMEDIATE` write reservation used elsewhere —
+reserving the single non-terminal delivery per task, admitting an action attempt,
+and landing a result with the eligibility it grants — plus explicit child
+deletion in purge, because a cascade cannot be assumed.
+
 ## What is not durable
 
-Session status, attention state, the live reviewer process (its URL and port),
-and most ship progress are in-memory. Review status and iteration history are
-durable, realizing the review slice of
+Session status, attention state, and the live reviewer process (its URL and
+port) are in-memory. Review status and iteration history are durable, as are
+delivery authorizations, action attempts, and reconciliation decisions —
+realizing the review and delivery slices of
 [ADR-0016](../../adr/0016-persist-authority-bearing-task-history-and-provenance.md).
 
 The durable boundary is still narrower than [`VISION.md`](../../VISION.md)
-calls for: human decisions, publishing-operation intent records, and commit
-lineage remain transient, so ADR-0016 stays proposed.
+calls for: full commit lineage and transcript retention remain incomplete, so
+ADR-0016 stays proposed.
+
+### Retention
+
+Delivery rows survive task archival: a cleaned-up task keeps the record of what
+it published and under whose authorization. Only purge deletes them, and purge
+returns the candidate storage paths that are now unreferenced so the caller can
+remove them from disk — nothing else knows those paths once the rows are gone.
 
 ## Migrations
 

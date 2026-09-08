@@ -48,6 +48,11 @@ PAUSE_CONDITION_UNRESOLVED = "condition_unresolved"
 # open and recorded, and it stops here rather than prompting an agent with
 # a handoff its author said it must have.
 PAUSE_MISSING_EVIDENCE = "missing_evidence"
+# The task's workspace is owned by another daemon-managed writer — a review, a
+# delivery — or an unresolved privileged effect makes writing to it unsafe
+# (ADR-0032). The step is not started, its attempt keeps its own evidence, and
+# an operator retry re-enters it once the workspace is free.
+PAUSE_WORKSPACE_UNAVAILABLE = "workspace_unavailable"
 PAUSE_VERSION = 1
 
 # Appended to a paused attempt's error when an operator authorizes a retry.

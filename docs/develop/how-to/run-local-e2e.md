@@ -61,16 +61,18 @@ the daemon, and `cleanup` runs last.
 
 | Scenario | Covers |
 |---|---|
-| `happy-path` | Spawn through review, GitHub preflight, signed ship, and pull request |
+| `happy-path` | Spawn through review, GitHub preflight, a previewed and confirmed pull-request delivery |
 | `file-mentions` | Prompt `@file` search, the submit refusals, and literal delivery |
 | `ask-approval` | Agent questions and approval gates |
 | `workflow-decisions` | Declared results, evidence handoffs, and answering a workflow gate |
 | `review-comments` | Feeding review comments back into the session |
 | `ship-retain` | `retain` mode commit rewriting and signature verification |
-| `ship-failures` | GitHub authentication/target refusal, redaction, no-mutation proof, GPG, push, PR, and retain recovery |
+| `ship-endings` | Stopping at a local signed commit, pushing it later, opening its pull request later, and cleaning up a local-only result |
+| `ship-failures` | Every refusal named before any effect — missing and stale review, GitHub authentication and target denial, redaction, signing, retain preconditions — and recovery from each |
+| `ship-interrupted` | Lost replies: an already-landed push adopted rather than repeated, a pull request found by its correlation marker, and an unsearchable forge left explicitly unresolved with cleanup refused |
 | `merge-poll` | Pull-request state polling to a terminal state |
 | `advisories-stalls` | Stall detection and context advisories |
-| `crash-recovery` | Killing the daemon mid-work and recovering |
+| `crash-recovery` | Killing the daemon mid-work and recovering, including inside a delivery's push window |
 | `cleanup` | Workshop removal, clone deletion, archival |
 
 `ws-watch` also exists but is **not** in the `--all` matrix. Run it explicitly

@@ -19,7 +19,7 @@ DRAFT_FILE=$(mktemp /tmp/ompire-retain-draft-XXXXXX.json)
 _retain_cleanup() { rm -f "$DRAFT_FILE"; }
 register_cleanup _retain_cleanup
 
-ws_start ship_finished
+ws_start ship_updated
 _agent_idle_after() { # _agent_idle_after TASK PREVIOUS_IDLE_EVENTS
 	[ "$(ws_count '.type == "status_changed" and .payload.task_id == '"$1"' and .payload.session == "main" and .payload.to == "idle"')" -gt "$2" ]
 }
@@ -43,18 +43,27 @@ ok "$AGENT_COMMITS agent commits authored"
 
 # --- retain ship ---------------------------------------------------------------
 
+approve_review "$tid"
 api_json POST "/api/tasks/$tid/ship/draft" >"$DRAFT_FILE"
 [ "$API_CODE" = 200 ] || die "draft failed: $(cat "$DRAFT_FILE")"
 message=$(jq -r '.draft.commit_message' "$DRAFT_FILE")
 pr_title=$(jq -r '.draft.pr_title' "$DRAFT_FILE")
 pr_body=$(jq -r '.draft.pr_body // ""' "$DRAFT_FILE")
 $GPGCTL warm
-api_json POST "/api/tasks/$tid/ship/commit" \
-	"$(jq -n --arg m "$message" --arg t "$pr_title" --arg b "$pr_body" \
-		'{message: $m, pr_title: $t, pr_body: $b, mode: "retain"}')" >/dev/null
-[ "$API_CODE" = 200 ] || die "retain commit rejected ($API_CODE)"
-wait_for "retain ship finished shipped" 120 \
-	_ws_seen '.type == "ship_finished" and .payload.status == "shipped"' "$tid"
+
+# The preview reports the range it would retain before anything is signed.
+ship_preview "$tid" pr retain "retain-$tid" "$message" "$pr_title" "$pr_body"
+[ "$API_CODE" = 200 ] || die "retain preview rejected ($API_CODE): $(cat /tmp/ship-preview-$tid.json)"
+jq -e --argjson n "$AGENT_COMMITS" '.deliverable and .candidate.commit_count == $n' \
+	/tmp/ship-preview-$tid.json >/dev/null &&
+	ok "preview names the $AGENT_COMMITS commits retain would publish" ||
+	fail "retain preview range" "$(jq -c '{deliverable, candidate, blockers}' /tmp/ship-preview-$tid.json)"
+
+ship_deliver "$tid" pr retain "$message" "$pr_title" "$pr_body"
+wait_for "retain delivery finishes" 120 ship_done "$tid" pr
+[ "$(ship_field "$tid" '.results.commit.commit_count')" = "$AGENT_COMMITS" ] &&
+	ok "the recorded result keeps the retained commit count" ||
+	fail "recorded retain count" "$(ship_field "$tid" '.results.commit')"
 
 # --- assertions -----------------------------------------------------------------
 

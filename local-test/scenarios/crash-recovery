@@ -7,20 +7,20 @@
 #     daemon, restart — recovery relaunches the fake omp with --resume for
 #     the recorded session, serves the recovery nudge, and the task
 #     reaches completion again.
-#   leg 2 (parked clone): hold ship's squash commit inside a gated
-#     `pre-commit` hook in the task clone (plain git — the hook waits for
-#     a gate file), kill -9 while `refs/ompire/ship-orig` exists, restart
-#     — startup restores the parked clone (ref consumed, HEAD back to the
-#     captured pre-ship commit), and the task ships afterwards.
+#   leg 2 (interrupted push): hold the delivery inside the forge's receive
+#     window with a gated pre-receive hook, kill -9 the daemon while the
+#     push action is journaled `executing`, release the gate, restart —
+#     startup performs no new push, reconciles the attempt against what the
+#     destination actually holds, and the task stays drivable.
 #
-# Clone surgery note: leg 2 installs a pre-commit hook in the throwaway
-# task clone and removes it in every exit path (EXIT trap).
+# Forge surgery note: leg 2 arms and releases the forge's own gate through
+# `local-test/forge`, in every exit path (EXIT trap).
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 PARKED_GATE=""
-PARKED_HOOK=""
 PARKED_DRAFT=$(mktemp /tmp/ompire-parked-draft-XXXXXX.json)
+BARE_SANDBOX=$STATE_ROOT/forge/github.com/local-test/sandbox.git
 _agent_live() { # _agent_live CLONE
 	$OMPCTL sessions | awk -v clone="$1" '$0 ~ clone {print $1}' | grep -q .
 }
@@ -30,13 +30,21 @@ _launch_count() { # _launch_count SESSION WANT
 	[ "$count" -ge "$2" ] && printf '%s' "$count" || { printf 'launches=%s' "$count"; return 1; }
 }
 _parked_cleanup() {
-	if [ -n "$PARKED_GATE" ]; then
-		touch "$PARKED_GATE"
-		sleep 0.3
-		rm -f "$PARKED_GATE"
-	fi
-	[ -z "$PARKED_HOOK" ] || rm -f "$PARKED_HOOK"
+	[ -z "$PARKED_GATE" ] || "$FORGE" gate local-test/sandbox off >/dev/null 2>&1 || true
 	rm -f "$PARKED_DRAFT"
+}
+
+# Reconciled: startup either adopted a completed push or established that it
+# never happened. Either is a resolution; silence is not.
+_push_reconciled() { # _push_reconciled TASK
+	local phase
+	phase=$(ship_field "$1" '[.actions[] | select(.kind == "push")][-1].phase // empty' || true)
+	case "$phase" in
+	succeeded | failed) printf '%s' "$phase"; return 0 ;;
+	needs_reconciliation) printf 'unresolved (an explicit decision is required)'; return 0 ;;
+	esac
+	printf 'phase=%s' "${phase:-none}"
+	return 1
 }
 register_cleanup _parked_cleanup
 
@@ -76,59 +84,64 @@ $OMPCTL transcript "$session_id" | jq -e \
 	fail "recovery nudge" "no resume-nudge prompt served"
 assert "task never failed after recovery" task_not_failed "$tid"
 
-# --- leg 2: parked ship clone restored ------------------------------------------
+# --- leg 2: an interrupted push is reconciled, never repeated -------------------
 
-tid2=$(spawn_task "$(unique_slug parked)" "[[scenario:commit]]\nParked-clone E2E: do the work and commit it.")
-wait_for "work step completes (parked leg)" 180 workflow_complete "$tid2"
+tid2=$(spawn_task "$(unique_slug parked)" "[[scenario:commit]]\nInterrupted-push E2E: do the work and commit it.")
+wait_for "work step completes (interrupted-push leg)" 180 workflow_complete "$tid2"
 approve_review "$tid2"
 api_json POST "/api/tasks/$tid2/ship/draft" >"$PARKED_DRAFT"
 $GPGCTL warm
 
-clone2=$(task_field "$tid2" clone_path)
-PARKED_GATE=$STATE_ROOT/parked-gate.$$
-PARKED_HOOK=$clone2/.git/hooks/pre-commit
-rm -f "$PARKED_GATE"
-cat >"$PARKED_HOOK" <<HOOK
-#!/bin/sh
-# installed by local-test/scenarios/crash-recovery — blocks the ship squash
-# commit until the gate file appears, holding the daemon in the ship-orig
-# window; self-destructs on first pass.
-rm -f "\$0"
-while [ ! -e "$PARKED_GATE" ]; do sleep 0.2; done
-HOOK
-chmod +x "$PARKED_HOOK"
+branch2=$(task_field "$tid2" branch)
+PARKED_GATE=gate
+$FORGE gate local-test/sandbox on
 
-head_before=$(git -C "$clone2" rev-parse HEAD)
-api POST "/api/tasks/$tid2/ship/commit" \
-	"$(jq -n --arg m "$(jq -r .draft.commit_message "$PARKED_DRAFT")" \
-		'{message: $m, pr_title: "Parked", pr_body: "b", mode: "squash"}')" >/dev/null
-[ "$API_CODE" = 200 ] || die "parked ship commit rejected ($API_CODE)"
+_push_executing() { # _push_executing TASK
+	local payload
+	payload=$(ship_projection "$1")
+	[ -n "$payload" ] || { printf 'no projection yet'; return 1; }
+	jq -e '[.actions[] | select(.kind == "push" and .phase == "executing")] | length >= 1' \
+		<<<"$payload" >/dev/null || { printf 'no executing push'; return 1; }
+	printf 'push executing'
+}
 
-wait_for "refs/ompire/ship-orig written (commit held by hook)" 60 \
-	bash -c "git -C '$clone2' rev-parse --verify -q refs/ompire/ship-orig"
+ship_deliver "$tid2" push squash \
+	"$(jq -r .draft.commit_message "$PARKED_DRAFT")" "Interrupted" "b"
+wait_for "push intent journaled as executing" 120 _push_executing "$tid2"
+signed_tip=$(ship_field "$tid2" '.results.commit.signed_tip')
+[ -n "$signed_tip" ] && ok "the signed result was recorded before the push began" ||
+	fail "signed result recorded" "$(ship_projection "$tid2")"
+
 daemon_kill9
 ws_stop
-ok "daemon SIGKILLed inside the ship-orig window"
+ok "daemon SIGKILLed inside the push window"
 
-touch "$PARKED_GATE"
-sleep 0.5
-rm -f "$PARKED_GATE" "$PARKED_HOOK"
+$FORGE gate local-test/sandbox off
+PARKED_GATE=""
+sleep 1
+landed=$(git -C "$BARE_SANDBOX" rev-parse --verify -q "refs/heads/$branch2" 2>/dev/null || printf none)
+receives_after_kill=$($FORGE receives local-test/sandbox)
+ok "forge received $receives_after_kill pushes before the restart (destination: ${landed:0:12})"
 
 daemon_start
 ws_start
-wait_for "parked ship ref consumed on startup" 60 \
-	bash -c "! git -C '$clone2' rev-parse --verify -q refs/ompire/ship-orig"
-head_after=$(git -C "$clone2" rev-parse HEAD)
-[ "$head_after" = "$head_before" ] &&
-	ok "clone restored to pre-ship HEAD" ||
-	fail "parked clone restore" "$head_after != $head_before"
+wait_for "the interrupted delivery is reconciled" 90 _push_reconciled "$tid2"
 
-# task drivable again: ship completes on the recovered clone
-api POST "/api/tasks/$tid2/ship/commit" \
-	"$(jq -n --arg m "$(jq -r .draft.commit_message "$PARKED_DRAFT")" \
-		'{message: $m, pr_title: "Parked", pr_body: "b", mode: "squash"}')" >/dev/null
-[ "$API_CODE" = 200 ] || die "post-recovery ship rejected ($API_CODE)"
-wait_for "post-recovery ship finishes" 120 \
-	_ws_seen '.type == "ship_finished" and .payload.status == "shipped"' "$tid2"
-assert "parked task never failed" task_not_failed "$tid2"
+# Whatever the destination actually holds, startup agreed with it — and it
+# never wrote to the forge to find out.
+[ "$($FORGE receives local-test/sandbox)" = "$receives_after_kill" ] &&
+	ok "startup performed no new push (receives unchanged at $receives_after_kill)" ||
+	fail "no push on startup" "receives moved from $receives_after_kill to $($FORGE receives local-test/sandbox)"
 
+phase=$(ship_field "$tid2" '[.actions[] | select(.kind == "push")][-1].phase')
+if [ "$landed" = "$signed_tip" ]; then
+	[ "$phase" = succeeded ] &&
+		ok "the completed push was adopted rather than repeated" ||
+		fail "adopted completed push" "destination holds the signed tip but the attempt is $phase"
+else
+	[ "$phase" = failed ] || [ "$phase" = needs_reconciliation ] &&
+		ok "the unlanded push was not treated as done (phase $phase)" ||
+		fail "unlanded push classification" "phase $phase with destination at $landed"
+fi
+
+assert "interrupted-push task never failed" task_not_failed "$tid2"

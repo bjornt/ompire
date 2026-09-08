@@ -278,9 +278,15 @@ All paths are under `/api/tasks/{id}/sessions/{session}/agent`.
 |---|---|---|
 | `POST` | `/api/tasks/{id}/workflow/resume` | Advance a waiting run: answer a gate with one of its declared choices, resume a gate that offers none, or retry a paused step |
 | `POST` | `/api/tasks/{id}/review` | Open a review |
-| `POST` | `/api/tasks/{id}/review/cancel` | Cancel and restore the clone |
-| `POST` | `/api/tasks/{id}/ship/draft` | Ensure one initial agent draft, or explicitly replace it with `{"replace": true}`. A new/replacement request requires a live, `idle` primary agent; an ordinary repeated request returns observed ship state without a second agent turn. |
-| `POST` | `/api/tasks/{id}/ship/commit` | Sign, commit, push, open the PR |
+| `POST` | `/api/tasks/{id}/review/cancel` | Cancel an open review |
+| `GET` | `/api/tasks/{id}/ship` | The task's current delivery projection — the same document the snapshot and every command response carry |
+| `POST` | `/api/tasks/{id}/ship/draft` | Ensure one agent draft, or explicitly replace it with `{"replace": true}`. A new or replacement request requires a live, `idle` primary agent; an ordinary repeated request returns the observed delivery projection without a second agent turn. |
+| `PUT` | `/api/tasks/{id}/ship/draft` | Store operator-written publication text |
+| `POST` | `/api/tasks/{id}/ship/preview` | Resolve one requested ending read-only. Authorizes nothing |
+| `POST` | `/api/tasks/{id}/ship/commit` | Authorize a delivery and run its authorized action prefix |
+| `POST` | `/api/tasks/{id}/ship/push` | Push an existing verified signed result |
+| `POST` | `/api/tasks/{id}/ship/pr` | Open a pull request for an existing verified pushed result |
+| `POST` | `/api/tasks/{id}/ship/reconcile` | Record one decision about an unresolved delivery effect |
 
 `workflow/resume` takes a required `expected_seq` — the waiting attempt's
 sequence number — plus an optional `choice_id` and `note`. **The daemon decides
@@ -307,15 +313,46 @@ returns, so an accepted answer is durable and a repeated or stale one advances
 nothing. Answering a gate never starts review, signs, pushes, or opens a pull
 request.
 
+### Delivering
+
+Delivery is preview-then-confirm, and every response is the task's whole
+versioned delivery projection.
+
+`ship/preview` takes `ending` (`commit`, `push`, or `pr`), `mode`, the
+publication fields, a client-stable `request_id`, and an optional
+`delivery_id`. It resolves that ending read-only and returns the candidate and
+review identity, the completed and remaining actions, the safe destination and
+identities, the exact pull-request body Ompire would write, every `blockers`
+entry, and a `preview_token`. It captures nothing and authorizes nothing.
+
+`ship/commit` requires `ending`, the final fields, `request_id`,
+`preview_token`, and — when continuing an existing delivery — `delivery_id` and
+`expected_version`. There is no omitted-ending shape and no tokenless path.
+`ship/push` and `ship/pr` continue an existing verified result and never start
+an implicit earlier action.
+
+`ship/reconcile` takes `delivery_id`, `action_id`, `expected_version`, a
+`decision` of `recheck`, `adopt`, `retry`, or `abandon`, and an optional `note`.
+None of them writes anything privileged.
+
+| Code | When |
+|---|---|
+| `404` | Unknown task |
+| `422` | Unsupported ending or mode on a preview; an unknown reconciliation decision |
+| `409` | The preview token no longer matches, the delivery moved on, a request identifier was reused with different inputs, an action is refused, or an adoption or retry cannot be justified by what Ompire can observe |
+
+A refused confirmation returns `{"detail":{"message":...}}`, and a blocked one
+adds `blockers` — every reason at once, so they are fixed together rather than
+one attempt at a time. Neither creates a delivery record or touches Git.
+
 `ship/draft` returns `404` for an unknown task and `409` for an unavailable or
-non-idle primary agent, an archived or already-published task, or an explicit
-replacement while a ship attempt is active. See [Ship flow](ship-flow.md) for
-draft lifecycle and field behavior. `ship/commit` returns `409` when GitHub
-CLI identity or target eligibility cannot be established, the GPG key is not
-`ready`, a ship is already in flight, the mode is not `squash` or `retain`, or
-`retain` preconditions are unmet. GitHub refusal uses
-`{"detail":{"message":...,"gh":...}}`; it is safe to show but creates no
-ship job or local Git mutation.
+non-idle primary agent, an archived task, a draft already in flight, or a
+delivery that is already authorized. See [Ship flow](ship-flow.md) for the
+delivery contract, the blocker vocabulary, and recovery.
+
+The same admission runs for the UI, the authenticated API, and a direct service
+call: this layer parses and authenticates, and every review, target, mode,
+credential, exclusivity, and replay check happens inside the delivery service.
 
 ## Daemon
 

@@ -43,7 +43,7 @@ import math
 import os
 import signal
 import traceback
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, replace
 from importlib import resources
 from pathlib import Path
@@ -53,6 +53,11 @@ from sqlalchemy import Engine as SAEngine
 
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
+from ompire_daemon.delivery import (
+    WorkspaceBlockedError,
+    WorkspaceBusyError,
+    WorkspaceGuard,
+)
 from ompire_daemon.events import EventHub
 from ompire_daemon.execution_inputs import (
     ConsumerBinding,
@@ -82,6 +87,7 @@ from ompire_daemon.registry.workflows import (
     PAUSE_MISSING_OUTCOME,
     PAUSE_PROMPT_UNRENDERABLE,
     PAUSE_UNRESOLVED_DECISION,
+    PAUSE_WORKSPACE_UNAVAILABLE,
     RETRY_NOTE,
     StepRecord,
     WorkflowGateChoiceError,
@@ -549,6 +555,28 @@ class WorkflowRunner:
         self._runs: dict[int, asyncio.Task] = {}
         # task_id → future completed with the operator's note on gate resume.
         self._gate_waits: dict[int, asyncio.Future[str | None]] = {}
+        # Set by app wiring; steps that touch the workspace are admitted
+        # through it so a run and a delivery cannot write at once (ADR-0032).
+        self._guard: WorkspaceGuard | None = None
+
+    def set_guard(self, guard: WorkspaceGuard) -> None:
+        self._guard = guard
+
+    @contextlib.asynccontextmanager
+    async def _admitted(self, task_id: int) -> AsyncIterator[None]:
+        """Own the task workspace for one step attempt.
+
+        A step is the task's ordinary writer, so it holds the guard only while
+        it actually runs: a run parked at a gate must not keep review or
+        delivery waiting on a decision nobody has made yet.
+        """
+        if self._guard is None:
+            yield
+            return
+        async with self._guard.hold(
+            task_id, "workflow-step", kind=WorkspaceGuard.AGENT
+        ):
+            yield
 
     # --- public surface -------------------------------------------------------
 
@@ -906,7 +934,28 @@ class WorkflowRunner:
             self._publish_task_updated(updated)
             self._publish_step(task_id, step, "started", seq=current.record.seq)
             try:
-                result = await self._run_step(current, ctx, task, inputs)
+                async with self._admitted(task_id):
+                    result = await self._run_step(current, ctx, task, inputs)
+            except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
+                # Not started at all. The attempt keeps its own evidence and
+                # says why, and an operator retry re-enters this step once the
+                # workspace is free — the daemon never interrupts the writer
+                # that already has it.
+                self._pause(
+                    task_id,
+                    step,
+                    current.record.seq,
+                    _Pause(
+                        reason=PAUSE_WORKSPACE_UNAVAILABLE,
+                        message=(
+                            f"The step {step.name!r} was not started because "
+                            f"{exc}. Retry it once that work is finished or "
+                            "resolved."
+                        ),
+                        error=str(exc),
+                    ),
+                )
+                return
             except _StepInfraFailure as exc:
                 self._fail_step(task_id, step, current.record.seq, str(exc))
                 return

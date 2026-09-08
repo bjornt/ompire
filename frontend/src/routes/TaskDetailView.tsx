@@ -15,8 +15,8 @@ import {
   taskSessionNames,
   workflowActive,
 } from "../lib/daemonReducer";
-import { projectReview } from "../lib/reviewPresentation";
-import { hasShipFlowHandoff } from "../lib/shipPresentation";
+import { type ApprovalBinding, projectReview } from "../lib/reviewPresentation";
+import { approvalBindingFor, hasShipFlowHandoff } from "../lib/shipPresentation";
 import { useDaemonState } from "../lib/useDaemonState";
 import type {
   GateChoice,
@@ -345,14 +345,16 @@ function ReviewPanel({
   taskId,
   review,
   primarySession,
+  approvalBinding,
   showShipFlow,
 }: {
   taskId: number;
   review: ReviewState | undefined;
   primarySession: SessionInfo | undefined;
+  approvalBinding: ApprovalBinding;
   showShipFlow: boolean;
 }) {
-  const presentation = projectReview(review, primarySession);
+  const presentation = projectReview(review, primarySession, approvalBinding);
   const [pending, setPending] = useState<"starting" | "cancelling" | null>(null);
   const [error, setError] = useState<{ action: "start" | "cancel"; message: string } | null>(null);
   const commandLocked = useRef(false);
@@ -399,7 +401,11 @@ function ReviewPanel({
   return (
     <section className="panel reviewPanel" data-testid="task-detail-review">
       <h2 className="panelTitle">Review</h2>
-      <ReviewSummary review={review} primarySession={primarySession} />
+      <ReviewSummary
+        review={review}
+        primarySession={primarySession}
+        approvalBinding={approvalBinding}
+      />
       {pending && (
         <p className="reviewCommandState" data-testid="review-command-state">
           {pending === "starting"
@@ -441,7 +447,9 @@ function ReviewPanel({
         )}
         {showShipFlow && (
           <Link className="reviewAction ship" to={`/ship/${taskId}`} data-testid="task-detail-ship-link">
-            {presentation.state === "approved" ? "Continue to Ship flow" : "Open Ship flow"}
+            {presentation.state === "approved" && approvalBinding === "usable"
+              ? "Continue to Ship flow"
+              : "Open Ship flow"}
           </Link>
         )}
       </div>
@@ -715,6 +723,7 @@ export function TaskDetailView() {
         taskId={taskId}
         review={review}
         primarySession={primarySession}
+        approvalBinding={approvalBindingFor(review, ship)}
         showShipFlow={showShipFlow}
       />
 

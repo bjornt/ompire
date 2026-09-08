@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/ship-endings — the operator chooses how far a delivery
+# goes, and can go further later (ADR-0032).
+#
+#   leg 1  stop at a local signed commit: nothing is pushed, no PR exists, and
+#          the delivery is complete rather than half-finished
+#   leg 2  authorize a push of that existing signed result — without signing
+#          again and without opening a pull request
+#   leg 3  authorize a pull request for that existing pushed result
+#   leg 4  cleanup of a local-only delivery warns about the copy it removes
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+ws_start
+
+BARE=$STATE_ROOT/forge/github.com/local-test/sandbox.git
+
+_forge_has_branch() { # _forge_has_branch BRANCH
+	git -C "$BARE" rev-parse --verify -q "refs/heads/$1" >/dev/null 2>&1
+}
+
+tid=$(spawn_task "$(unique_slug endings)" "[[scenario:commit]]\nSelectable-endings E2E: do the work and commit it.")
+wait_for "work step completes" 180 workflow_complete "$tid"
+clone=$(task_field "$tid" clone_path)
+branch=$(task_field "$tid" branch)
+approve_review "$tid"
+$GPGCTL warm
+
+# --- leg 1: a local signed commit is a complete delivery ----------------------
+
+receives_before=$($FORGE receives local-test/sandbox)
+ship_deliver "$tid" commit squash "ship: local only" "" ""
+wait_for "the local ending completes" 120 ship_done "$tid" commit
+
+signed_tip=$(ship_field "$tid" '.results.commit.signed_tip')
+[ "$signed_tip" = "$(git -C "$clone" rev-parse HEAD)" ] &&
+	ok "the signed commit is installed at the task's HEAD" ||
+	fail "signed result installed" "recorded $signed_tip, clone $(git -C "$clone" rev-parse HEAD)"
+assert "the signed commit verifies in the clone" \
+	forge_git -C "$clone" verify-commit HEAD
+[ "$(git -C "$clone" status --porcelain)" = "" ] &&
+	ok "the clone is clean against its own signed commit" ||
+	fail "clone clean after signing" "$(git -C "$clone" status --porcelain)"
+_forge_has_branch "$branch" &&
+	fail "local ending pushed nothing" "the forge has $branch" ||
+	ok "nothing reached the forge"
+[ "$($FORGE receives local-test/sandbox)" = "$receives_before" ] &&
+	ok "the forge received no push (still $receives_before)" ||
+	fail "no push for a local ending" "receives moved"
+[ -z "$(task_field "$tid" pr_url)" ] &&
+	ok "no pull request was opened" ||
+	fail "local ending opened a PR" "$(task_field "$tid" pr_url)"
+[ "$(ship_field "$tid" '.results.pr')" = null ] &&
+	ok "the delivery reports a completed local ending, not a failed PR" ||
+	fail "local ending result" "$(ship_field "$tid" '.results')"
+
+# --- leg 2: push that existing signed result, later, on its own authorization -
+
+ship_deliver "$tid" push squash "" "" ""
+wait_for "the later push completes" 120 ship_done "$tid" push
+[ "$(ship_field "$tid" '.results.push.head')" = "$signed_tip" ] &&
+	ok "the push published exactly the already-signed result" ||
+	fail "pushed head" "$(ship_field "$tid" '.results.push')"
+[ "$(ship_field "$tid" '.results.commit.signed_tip')" = "$signed_tip" ] &&
+	ok "the signed result was reused, not produced again" ||
+	fail "signature reuse" "$(ship_field "$tid" '.results.commit')"
+[ "$(git -C "$BARE" rev-parse "refs/heads/$branch")" = "$signed_tip" ] &&
+	ok "the forge branch holds the signed tip" ||
+	fail "forge branch tip" "$(git -C "$BARE" rev-parse "refs/heads/$branch")"
+[ -z "$(task_field "$tid" pr_url)" ] &&
+	ok "a pushed branch is still not a pull request" ||
+	fail "push ending opened a PR" "$(task_field "$tid" pr_url)"
+
+# --- leg 3: open the pull request for that pushed result ----------------------
+
+ship_deliver "$tid" pr squash "" "Selectable endings" "opened last"
+wait_for "the later pull request completes" 120 ship_done "$tid" pr
+pr_url=$(task_field "$tid" pr_url)
+[ -n "$pr_url" ] && ok "pull request opened: $pr_url" || fail "pr url" "empty"
+# One authorization per ending, appended — the first is never rewritten.
+[ "$(ship_field "$tid" '[.decisions[] | select(.kind == "authorize")] | length')" = 1 ] &&
+	[ "$(ship_field "$tid" '[.decisions[] | select(.kind == "extend")] | length')" = 2 ] &&
+	ok "each further ending appended its own authorization" ||
+	fail "authorization history" "$(ship_field "$tid" '[.decisions[].kind]')"
+[ "$(ship_field "$tid" '[.actions[] | select(.kind == "commit")] | length')" = 1 ] &&
+	ok "the commit action ran exactly once across all three endings" ||
+	fail "commit attempts" "$(ship_field "$tid" '[.actions[] | {kind, attempt, phase}]')"
+
+# --- leg 4: cleanup of a local-only delivery names what it removes ------------
+
+tid2=$(spawn_task "$(unique_slug localonly)" "[[scenario:commit]]\nLocal-only E2E: do the work and commit it.")
+wait_for "work step completes (local-only leg)" 180 workflow_complete "$tid2"
+approve_review "$tid2"
+$GPGCTL warm
+ship_deliver "$tid2" commit squash "ship: local only, cleaned up" "" ""
+wait_for "the local-only delivery completes" 120 ship_done "$tid2" commit
+
+api_json POST "/api/tasks/$tid2/cleanup" >/dev/null
+[ "$API_CODE" = 200 ] || die "cleanup of a local-only delivery rejected ($API_CODE)"
+[ "$(task_field "$tid2" state)" = archived ] &&
+	ok "a local-only delivery can be cleaned up" ||
+	fail "cleanup archived the task" "$(task_field "$tid2" state)"
+# The journal outlives the workspace: what was published, and under whose
+# authorization, is still answerable after the clone is gone.
+[ -n "$(ship_field "$tid2" '.results.commit.signed_tip')" ] &&
+	ok "the delivery record survives cleanup" ||
+	fail "retained delivery record" "$(ship_projection "$tid2")"
+
+assert "task $tid never failed" task_not_failed "$tid"
+assert "task $tid2 never failed" task_not_failed "$tid2"

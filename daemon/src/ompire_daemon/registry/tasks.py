@@ -314,8 +314,12 @@ def list_tasks(engine: Engine) -> list[Task]:
 
 
 def list_pr_pollable_tasks(engine: Engine) -> list[Task]:
-    """Tasks the PR watcher polls (merge-poll capability, design D-2): shipped
-    (have a `pr_url`), not archived, and not yet in a terminal PR state."""
+    """Tasks the PR watcher polls (merge-poll capability, design D-2): they
+    have a `pr_url`, are not archived, and are not yet in a terminal PR state.
+
+    A delivery that ended at a local signed commit or a pushed branch has no
+    `pr_url` and is therefore never polled — there is no pull request to watch
+    and no merge it is waiting for (ADR-0032)."""
     with engine.connect() as conn:
         rows = conn.execute(
             tasks.select()
@@ -451,19 +455,32 @@ def mark_archived(engine: Engine, task_id: int) -> Task:
     return _update(engine, task_id, state="archived")
 
 
-def purge_task(engine: Engine, task_id: int) -> None:
+def purge_task(engine: Engine, task_id: int) -> list[str]:
+    """Delete a task and every durable child row it owns.
+
+    Returns the candidate staging repositories that are now unreferenced, so
+    the caller can remove them from disk — foreign-key cascades cannot be
+    assumed on this connection, and nothing else knows those paths once the
+    rows are gone.
+
+    Purge is the only operation that deletes durable history; cleanup
+    deliberately retains the review and the delivery journal (ADR-0016).
+    """
+    from ompire_daemon.registry.ships import delete_task_deliveries
+
     task = get_task(engine, task_id)
     if task.state != "archived":
         raise TaskNotArchivedError(task_id, task.state)
+    storage_paths = delete_task_deliveries(engine, task_id)
     # Child rows go first: session rows, step records, and review history are
-    # all keyed by task id. Purge is the only operation that deletes durable
-    # history — cleanup deliberately retains the review (ADR-0016).
+    # all keyed by task id.
     with engine.begin() as conn:
         conn.execute(workflow_step_records.delete().where(workflow_step_records.c.task_id == task_id))
         conn.execute(task_sessions.delete().where(task_sessions.c.task_id == task_id))
         conn.execute(review_iterations.delete().where(review_iterations.c.task_id == task_id))
         conn.execute(reviews.delete().where(reviews.c.task_id == task_id))
         conn.execute(tasks.delete().where(tasks.c.id == task_id))
+    return storage_paths
 
 
 def reconcile_startup(engine: Engine) -> tuple[list[Task], list[Task]]:

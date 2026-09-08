@@ -23,10 +23,7 @@ import type {
   ReviewState,
   SessionInfo,
   SettingsChangedPayload,
-  ShipDraftPayload,
-  ShipFinishedPayload,
-  ShipState,
-  ShipStepPayload,
+  ShipProjection,
   SessionModelPayload,
   SnapshotPayload,
   SpawnStepPayload,
@@ -103,9 +100,11 @@ export interface DaemonState {
    * snapshot, upserted by review events, dropped by review_finished and by
    * task deletion/cleanup. */
   reviews: Record<number, ReviewState>;
-  /** Live/completed ship flows per task id (ship capability): loaded from the
-   * snapshot, upserted by ship events, dropped by task deletion/cleanup. */
-  ships: Record<number, ShipState>;
+  /** Durable delivery projections per task id (ADR-0032): loaded from the
+   * snapshot, replaced wholesale by each committed `ship_updated`, dropped by
+   * task deletion. Cleanup keeps the projection — the record of what a task
+   * published outlives its workspace. */
+  ships: Record<number, ShipProjection>;
   /** Current GPG signing-key cache state (ship capability): loaded from the
    * snapshot, upserted by gpg_status events. */
   gpg: GpgStatus | null;
@@ -253,7 +252,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       for (const [taskId, review] of Object.entries(payload.reviews ?? {})) {
         reviews[Number(taskId)] = review;
       }
-      const ships: Record<number, ShipState> = {};
+      const ships: Record<number, ShipProjection> = {};
       for (const [taskId, ship] of Object.entries(payload.ships ?? {})) {
         ships[Number(taskId)] = ship;
       }
@@ -551,97 +550,20 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         },
       };
     }
-    case "ship_draft": {
-      const { task_id, draft } = envelope.payload as ShipDraftPayload;
-      const existing: ShipState = state.ships[task_id] ?? {
-        status: "drafted",
-        mode: "squash",
-        draft: null,
-        commit_sha: null,
-        pr_url: null,
-        error: null,
-        updated_at: envelope.ts,
-        last_step: null,
-      };
-      return {
-        ...state,
-        ships: {
-          ...state.ships,
-          [task_id]: {
-            ...existing,
-            status: "drafted",
-            draft,
-            error: null,
-            last_step: { step: "draft", status: "ok" },
-            updated_at: envelope.ts,
-          },
-        },
-      };
-    }
-    case "ship_step": {
-      const { task_id, step, status, detail } = envelope.payload as ShipStepPayload;
-      const existing: ShipState = state.ships[task_id] ?? {
-        status: "drafting",
-        mode: "squash",
-        draft: null,
-        commit_sha: null,
-        pr_url: null,
-        error: null,
-        updated_at: envelope.ts,
-        last_step: null,
-      };
-      let nextStatus = existing.status;
-      if (status === "failed" && existing.status !== "shipped") {
-        nextStatus = "error";
-      } else if (step === "draft") {
-        if (status === "started") nextStatus = "drafting";
-        else if (existing.draft !== null) nextStatus = "drafted";
-      } else if (step === "commit") {
-        nextStatus = "committing";
-      } else if (step === "push" || step === "pr") {
-        nextStatus = "pushing";
+    case "ship_updated": {
+      // The whole versioned delivery projection, published only after the
+      // daemon committed it. Command responses go through this same reducer,
+      // so a response and its broadcast converge instead of racing; an older
+      // or duplicated version is dropped rather than moving the client
+      // backwards (ADR-0032).
+      const projection = envelope.payload as ShipProjection;
+      const existing = state.ships[projection.task_id];
+      if (existing !== undefined && existing.version > projection.version) {
+        return state;
       }
-      const lastStep = {
-        step,
-        status,
-        ...(detail === undefined ? {} : { detail }),
-      };
       return {
         ...state,
-        ships: {
-          ...state.ships,
-          [task_id]: {
-            ...existing,
-            status: nextStatus,
-            error:
-              status === "failed"
-                ? typeof detail === "string"
-                  ? detail
-                  : "Ship step failed"
-                : status === "started"
-                  ? null
-                  : existing.error,
-            last_step: lastStep,
-            updated_at: envelope.ts,
-          },
-        },
-      };
-    }
-    case "ship_finished": {
-      const { task_id, status, pr_url } = envelope.payload as ShipFinishedPayload;
-      const existing = state.ships[task_id];
-      if (!existing) return state;
-      return {
-        ...state,
-        ships: {
-          ...state.ships,
-          [task_id]: {
-            ...existing,
-            status,
-            pr_url: pr_url ?? existing.pr_url,
-            updated_at: envelope.ts,
-          },
-        },
+        ships: { ...state.ships, [projection.task_id]: projection },
       };
     }
     case "workflow_step": {

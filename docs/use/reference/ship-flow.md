@@ -2,253 +2,275 @@
 
 ## Overview
 
-Shipping turns a task's work into a signed commit, a pushed branch, and a pull
-request. The primary agent can draft the publication text; the daemon does
+Delivering a task turns its reviewed work into one of three endings — a local
+signed commit, a pushed branch, or a pull request — and the operator chooses
+which. The primary agent can draft the publication text; the daemon does
 everything else with host-side credentials the agent never sees.
 
-The flow has four steps — Review, Commit, Push + PR, Cleanup — surfaced as a
+The flow has four steps — Review, Deliver, Delivered, Cleanup — surfaced as a
 stepper in the Ship Flow view. Opening a task-specific Ship flow prepares an
-eligible agent draft automatically; it never signs, pushes, or creates a pull
-request without the operator's explicit action.
+eligible agent draft; opening the page, generating a draft, or finishing agent
+work grants no publication authority.
 
-Before a task can sign, the daemon performs a fresh, read-only GitHub
-eligibility preflight for the task's registered upstream. The browser's status
-is advisory; the server repeats this check before it creates ship state,
-background work, or local Git changes.
+Every delivery is content-bound (ADR-0032). Review captures a *candidate* — the
+task's whole publishable delta against its accepted base — and an approval names
+the candidate it graded. What gets signed is that candidate, taken from a
+protected copy, not whatever the workspace happens to hold when signing starts.
+
+## Endings
+
+| Ending | What the confirmation permits |
+|---|---|
+| Local signed commit | Sign locally and stop. Nothing is pushed and no pull request is opened. |
+| Pushed branch | Sign, then push to the task's accepted destination. No pull request is opened. |
+| Pull request | Sign, push, and open a pull request. |
+
+A local or push-only ending is a **successful delivery**, not a failed pull
+request. A completed ending can be extended later: an operator can authorize
+pushing an existing signed result, or opening a pull request for an existing
+pushed result, without repeating what already completed. Each further ending is
+previewed and confirmed on its own and appends its authorization; the earlier
+one is never rewritten.
+
+Changing the content requires a fresh review and a new delivery authorization.
+
+## Preview and confirmation
+
+Nothing privileged happens without two steps.
+
+`POST /api/tasks/{id}/ship/preview` resolves one requested ending read-only. It
+captures nothing, writes no Git state, and authorizes nothing. It returns:
+
+- the candidate being delivered — its identity, base branch, base commit, tree,
+  and commit count — and whether the approval covers it;
+- the actions still to run and the ones already completed;
+- the accepted destination, the signing identity, and the GitHub account, where
+  each applies to the requested ending;
+- the exact pull-request body Ompire will write, including the recovery
+  correlation marker;
+- **every** reason the delivery is currently refused, not just the first;
+- a `preview_token` fingerprint over those exact inputs.
+
+The confirmation carries that token back. Changing the ending, the mode, the
+metadata, the content, or the destination invalidates it, and a replayed or
+conflicting submission cannot start a second delivery.
+
+### Why a delivery is refused
+
+| Blocker | Meaning |
+|---|---|
+| `review-missing` | The task has no approved review. |
+| `review-unbound` | The approval predates content-bound review, so it does not identify what was approved. It stays on record; delivering needs a fresh review. |
+| `review-stale` | The content changed after the approval. Review the current content before delivering it. |
+| `empty-candidate` | There is nothing to deliver. Ompire refuses rather than manufacturing a commit. |
+| `candidate-unavailable` | The workspace could not be resolved into publishable content. |
+| `signing-unavailable` | The signing key is not ready; the message names the specific state. |
+| `github-unavailable` | GitHub identity or repository eligibility blocks a pushing ending. A local ending is unaffected. |
+| `retain-dirty` / `retain-empty` / `retain-merges` | Retain publishes existing commits; this range cannot be retained as it stands. |
+| `workspace-busy` | A review, draft, or delivery already owns the task workspace. |
+| `unresolved-effect` | A previous privileged action's outcome is unknown; nothing dependent may run. |
+| `already-delivered` | This ending's actions have all completed. |
+| `archived` | The task is archived. |
+
+### Credentials by ending
+
+A local signed commit needs signing readiness and nothing else — no GitHub
+availability at all. Any ending that pushes keeps the trusted-target and GitHub
+eligibility preflight, and pull-request creation repeats the GitHub
+identity/target check immediately before its write.
+
+That check demonstrates GitHub **API** identity and repository eligibility only.
+It is not proof of the SSH key or HTTPS credential used for Git transport, and
+the preview says so: the Git transport identity is recorded as unattributed
+rather than invented.
+
+A later push or pull request of an already-verified signed result does not
+require re-signing or an unlocked signing key.
 
 ## Ship flow index
 
 The global **Ship flow** navigation item opens `/ship`, a chooser for the
-existing task-specific publishing workflows. It sends no command and does not
-relax review, signing, Git, forge, or cleanup preconditions.
+existing task-specific publishing workflows. It sends no command and relaxes no
+precondition.
 
 The chooser waits for the current daemon snapshot before deciding what is
-available. Until then it shows loading rather than an empty or missing-task
-state. Once the snapshot arrives, it shows non-archived tasks with an approved
-review, recorded ship state, or pull request in **Ready or in progress**, then
-the remaining pull-request records — including archived records — in **Recently
-shipped**. A task appears once in its most relevant group; each group is
-ordered by the task's `updated_at` value, newest first.
-
-Each row links to `/ship/<task-id>` and names the next stage from daemon state:
+available. Once it arrives, non-archived tasks with an approved review, a
+delivery record, or a pull request appear in **Ready or in progress**, and
+archived ones in **Recently shipped**, each ordered by `updated_at`, newest
+first.
 
 | Label | Meaning |
 |---|---|
-| Review | The recorded handoff has not reached approved review. |
-| Draft | Review is approved but publication text is not ready. |
-| Sign | A draft is ready, or the signed commit is in progress. |
-| Push / PR | A signed commit exists or publication is in progress. |
+| Needs a decision | An effect's outcome is unknown and an operator decision is required. |
+| Review | The recorded handoff has not reached an approved review of the current content. |
+| Draft | Review is approved; publication text and an ending are still to be chosen. |
+| Deliver | A delivery is authorized or stopped and can be confirmed. |
+| Signed locally | A local ending completed. Nothing was pushed. |
+| Pushed | A push ending completed. No pull request was opened. |
 | Wait for merge | A pull request exists but has not resolved. |
-| Cleanup | A merged or closed pull request can have its workspace removed. |
-| Cleanup complete | An archived task remains as shipped history. |
-
-A failed ship state remains visible at its retry stage with the daemon's
-captured error. The chooser updates from snapshot deltas without reloading. If
-it has no qualifying task after a snapshot, it links back to Tasks.
+| Cleanup | Delivery is finished and the workspace can be removed. |
+| Cleanup complete | An archived task remains as delivery history. |
 
 ## Using ship flow
 
-### 1. Draft
+### 1. Review
 
-After its initial daemon snapshot, `/ship/<task-id>` automatically starts one
-draft when the task has no ship state, is neither archived nor already attached
-to a pull request, its primary session is both live and `idle`, and review is
-either approved or absent. Review approval is the normal handoff. The
-no-review case preserves the explicit Ship flow path for legacy tasks.
+Delivery needs an approved review of the content being delivered. See
+[Review](review.md) for how an approval is bound to a candidate and when it
+stops being usable.
 
-The Commit step shows **Drafting…** immediately. Its commit-message,
-pull-request-title, and pull-request-body fields remain editable while the
-agent works. A value the operator changes while that request is running is not
-replaced by the arriving draft; untouched fields are seeded independently.
-Signing and another draft request remain unavailable until the request is
-terminal.
+### 2. Draft
 
-When the primary session is working, reviewing, starting, retrying, or waiting,
-the step says that drafting is waiting for it to become idle. When no live
-primary agent is available, the step says so and keeps all three fields usable
-for manual text. A review record that is present but not approved prevents only
-the automatic trigger; it does not erase the manual fields or change the
-ordinary command guards.
+`POST /api/tasks/{id}/ship/draft` is an idempotent **ensure draft** command. It
+asks the task's primary session for a commit message and pull-request title and
+body only when no ready draft exists; repeated bodyless requests return the
+existing draft without another agent turn. Send `{"replace": true}` to
+regenerate, and `PUT /api/tasks/{id}/ship/draft` to store text written by hand.
 
-`POST /api/tasks/{id}/ship/draft` is an idempotent **ensure draft** command.
-It asks the task's primary session for a commit message and pull-request title
-and body only when no ship attempt exists; repeated bodyless requests return
-the existing draft or current attempt without another agent turn. Send
-`{"replace": true}` to explicitly regenerate an existing draft or retry a
-terminal draft error. Replacement is refused while any draft, commit, or push
-is in flight.
-
-The daemon broadcasts a parsed successful draft as `ship_draft`, prefilling
-editable fields. It also publishes draft lifecycle through `ship_step`; see
-[Interfaces](#interfaces). The draft turn drives the primary session
-`idle → working → idle` through normal frame handling, with no bespoke
-transition.
+The draft is inert. It is editable at any time, it selects nothing, and it
+authorizes nothing.
 
 Drafting is best-effort. A transport error, timeout, missing agent text, or
-invalid markers leaves the fields intact, records a retryable Draft-stage
-error, and does not retry automatically. Correct the fields manually or use
-the explicit retry action once the session is again eligible.
+invalid markers leaves the fields intact and records a retryable draft error. A
+daemon restart during a draft turn records it as **interrupted**: nothing is
+sent again on the operator's behalf, and the retry is explicit.
 
-### GitHub preflight
+While the primary session is working, reviewing, starting, retrying, or
+waiting, the step says drafting is waiting for it. With no live primary agent,
+every field stays usable for manual text.
 
-The task-specific banner requests `gh api --hostname github.com user`, then
-repository and pull-request reads for the canonical upstream target. A result
-is usable only for the exact `host/owner/repository`, login, and credential
-source that produced it. Missing CLI, missing or rejected authentication,
-repository denial, malformed output, and timeouts block shipping.
+### 3. Deliver
 
-The check demonstrates GitHub API identity and repository eligibility only. It
-does not verify the SSH key or HTTPS credential used for Git transport, branch
-state, organization rules, or every later pull-request condition.
+Choose an ending, choose squash or retain, review the resolved preview, then
+confirm. The confirmation names every effect it permits.
 
-### 2. Commit
+**Squash** delivers exactly the reviewed candidate tree as one signed commit on
+the candidate's base.
 
-`POST /api/tasks/{id}/ship/commit` accepts `mode` of `squash` or `retain`,
-plus the final message and pull-request fields. Both modes produce host-side,
-GPG-signed commits using the operator's own signing configuration, never the
-task clone's; GitHub CLI identity is
-shown and gated separately rather than selected or persisted by this flow.
+**Retain** replays the reviewed range commit by commit, preserving each message
+and tree and rewriting only the identity and signature. It refuses a dirty tree,
+an empty range, and merge commits.
 
-**Squash** fetches origin, computes the merge-base of `origin/<base>` and
-`HEAD`, runs `git reset --soft` to that merge-base so every agent checkpoint
-and uncommitted edit is staged as one set, and commits with `-S` using the
-supplied message.
+Both modes sign against the protected candidate — never a freshly staged live
+workspace — using the operator's own signing configuration, never the task
+clone's. Trees, commit count, parents, and the signing key are all verified
+before the result leaves its protected store.
 
-**Retain** instead rewrites the existing range with amend-and-sign, so every
-commit keeps its message and tree but gains operator authorship and a good
-signature. The rewritten tip sha is recorded.
+The signed result is then installed into the task clone under a compare-and-swap
+against the HEAD the candidate was captured at, and the index is synchronized to
+the signed tree only after re-checking what the workspace holds. A workspace
+that moved on keeps its files, and the delivery stops for a decision rather than
+resetting over new work.
 
-In the UI, selecting Retain disables the commit-message field with a hint that
-per-commit messages are retained. Pull-request fields stay editable in both
-modes.
+### 4. Delivered
 
-### 3. Push and open the pull request
+Completed actions show their concrete results: the signed tip and commit count,
+the pushed branch and head, or the pull-request link. A delivery that ended
+before a pull request says so plainly, and offers the further endings.
 
-After the signed commit the daemon pushes with host credentials, then performs
-a second GitHub identity/target preflight immediately before `gh pr create`:
+### 5. Cleanup
 
-- Push goes to the project's `fork_url` when one is set, otherwise to the
-  registered upstream URL.
-- Push uses `--force-with-lease`, so a re-ship after review comments can
-  rewrite the squashed commit safely.
-- `gh pr create` runs against the registered upstream repository with the
-  operator's title and body and the correct head reference — fork
-  owner-qualified when a fork is configured.
+Cleanup removes the workspace. It is refused while any writer owns the task and
+while a privileged effect's outcome is unknown, and it warns about what it is
+about to remove:
 
-On success the pull-request URL is persisted on the task row.
+- A **local-only** result lives in the clone alone. Removing it removes the only
+  Ompire-managed Git copy of that commit. The delivery record is retained, and a
+  record is not a backup.
+- A **push-only** result names the remote branch it left behind and the absence
+  of a pull request. No remote branch or pull request is ever deleted.
 
-### 4. Cleanup
-
-Cleanup is deferred until the pull request resolves. See
+A pull-request delivery stays deferred until the pull request resolves; see
 [merge polling](merge-poll.md).
 
-## States and behavior
+## Interrupted effects
 
-### Preconditions
+Every action attempt records what it is about to do — the destination ref and
+object id, the observed pre-push head, the correlation marker that will be in
+the pull-request body — and commits that *before* anything runs. An attempt is
+only recorded as failed when its non-execution or a verified rollback was
+established. Anything less certain becomes an **unresolved** effect, which is
+neither success nor failure.
 
-Ship commit is refused, before any Git operation runs, when:
+While an effect is unresolved, no dependent action runs, cleanup is refused, and
+the task shows the action, its expected target, what was observed, and why
+Ompire cannot safely continue. Four decisions are available, and none of them
+writes anything privileged:
 
-| Condition | Response |
+| Decision | Effect |
 |---|---|
-| Unknown task | `404` |
-| GPG signing key not `ready` | `409` naming the actual state and its recovery (locked, unselected, absent, agent down, tools missing) |
-| GitHub CLI missing, unauthenticated, target-denied, unchecked, or error | Safe `409` with current `gh` status before local ship mutation |
-| Mode other than `squash` or `retain` | `409` |
-| A ship is already in flight | `409` |
-| Retain with a dirty working tree | `409` naming the dirty tree |
-| Retain over a range containing a merge commit | `409`; merges are unsupported |
+| Recheck | Observe again. A now-verifiable result is adopted. |
+| Adopt | Adopt a result Ompire can verify. An unverifiable one is refused. |
+| Retry | Only once non-execution is proven; it makes the action eligible for a fresh preview and confirmation, not an unconditional write. |
+| Abandon | Record that no further authority was granted. An unknown effect stays unknown, and cleanup stays refused. |
 
-Draft is refused with `404` for an unknown task. A new or explicit replacement
-draft receives `409` when the task is archived, has a pull request, has already
-shipped, has a draft/ship operation in flight, has no live primary agent, or
-that session is not `idle`. A bodyless request that observes an existing draft,
-draft error, or in-flight attempt returns it unchanged; `{"replace": true}` is
-the explicit retry or regeneration path.
+How each action is observed:
 
-### Failure restores exactly
+- **Commit** — the attempt writes its signed result under its own protected ref
+  before it can return, so the absence of that ref proves no signature landed. A
+  result that exists is verified against the reviewed tree, range, and signer.
+- **Push** — the exact destination ref is compared with the authorized head and
+  the recorded pre-push value. The lease is that recorded value, never a
+  tracking ref refreshed behind the operator. An unexpected head is a conflict,
+  not permission to force over it.
+- **Pull request** — a deterministic correlation marker in the authorized body
+  is looked for across every pull-request state, including closed and merged,
+  with a bounded search that reports its own incompleteness. Exactly one
+  verified match is adoptable; ambiguous, incomplete, or unavailable stays
+  unresolved. `gh pr create` is never replayed just because a listing found
+  nothing.
 
-Ship rewrites Git history, so every failure path restores.
+A daemon restart performs no signing, no push, and no forge write. It restores
+safe state, reconciles what it can observe, and requires an explicit
+continuation for remaining work.
 
-- A squash commit that fails after the soft reset restores `HEAD` to its
-  pre-ship commit and records the ship state `error` with git's stderr.
-- A retain rewrite that fails mid-range, or fails post-rewrite verification,
-  aborts any in-progress rebase and restores `HEAD` and the working tree to
-  the pre-ship state.
+## Upgrading from an earlier Ompire
 
-Push failure records a Push-stage `error`; an SSH-form failure containing the
-public-key authentication signature is labelled SSH authentication. A failed
-GitHub recheck or `gh pr create` records a Pull-request-stage `error`. In all
-three cases the signed local commit remains a legitimate local result; it is
-not rolled back after publication starts.
+Existing review iterations and pull-request records are preserved and never
+rewritten. Reviews recorded before content binding carry no candidate: they stay
+visible as history and require a fresh review before a new delivery. A task that
+shipped before the delivery journal existed shows its pull request as a known
+fact with no recorded authorization behind it, which is exactly what is true.
 
-### Ship Flow view
-
-The stepper renders live:
-
-**Review** shows the review status, a `reopen 127.0.0.1:<port>` link while a
-review is open, and the per-iteration history.
-
-**Commit** starts an eligible initial draft automatically after the snapshot.
-It shows **Drafting…** while that request is active, then shows commit-mode
-radios with Squash as default, editable message and pull-request fields, a
-**Re-draft via agent** control, and **Sign & commit**. Fields remain editable
-while drafting; an arriving draft only fills fields the operator has not edited
-since the request began. Re-drafting asks for confirmation only if it would
-replace edited values, and preserves changes made after confirmation while the
-replacement is running. A failed draft shows its captured reason and an
-explicit retry alongside usable manual fields. Whenever the shared GPG state is
-not `ready`, it renders a blocked banner naming that specific condition, its
-recovery action, the terminal helper when one applies, and a **Re-check key**
-control. When it is `ready`, the step names the key that will sign. Alongside it, the GitHub banner
-checks the registered upstream, names the safe selected account and target,
-offers **Re-check GitHub**, explains the Git-transport boundary, and disables
-**Sign & commit** until the current target is allowed.
-
-**Push + PR** reflects progress from `ship_step` events and shows the
-resulting pull-request link.
-
-**Cleanup** shows the deferred, ready, or cleaned-up state per the task's
-pull-request state.
-
-All four update without a page reload.
-
-Direct `/ship/<task-id>` navigation also waits for the current snapshot. An
-unknown or non-numeric id after that snapshot shows **Task not found** with
-links to both Ship flow and Tasks, rather than a transient false 404.
+Clones parked by an older daemon's signing dance are still recognized on
+startup, and are restored only when the restoration verifies; one that cannot be
+restored safely keeps its marker rather than losing the evidence.
 
 ## Configuration
 
 | Key | Effect |
 |---|---|
 | `gpg_signing_key` | The signing key. Selectable in Settings, which takes precedence over this file; auto-detected when the host holds exactly one. |
-| `gh_command` | Non-empty GitHub CLI prefix used for bounded, non-interactive version, API, PR-create, and PR-watch calls. |
+| `gh_command` | Non-empty GitHub CLI prefix used for bounded, non-interactive version, API, PR-create, PR-list, and PR-watch calls. |
 
 ## Interfaces
 
 | Method | Path |
 |---|---|
-| `POST` | `/api/tasks/{id}/ship/draft` — body omitted or `{"replace": false}` ensures one initial draft; `{"replace": true}` explicitly regenerates or retries |
-| `POST` | `/api/tasks/{id}/ship/commit` |
+| `GET` | `/api/tasks/{id}/ship` — the current delivery projection, read-only |
+| `POST` | `/api/tasks/{id}/ship/draft` — body omitted or `{"replace": false}` ensures one draft; `{"replace": true}` regenerates |
+| `PUT` | `/api/tasks/{id}/ship/draft` — store operator-written publication text |
+| `POST` | `/api/tasks/{id}/ship/preview` — resolve one ending read-only |
+| `POST` | `/api/tasks/{id}/ship/commit` — authorize a delivery and run its action prefix |
+| `POST` | `/api/tasks/{id}/ship/push` — push an existing verified signed result |
+| `POST` | `/api/tasks/{id}/ship/pr` — open a pull request for an existing verified pushed result |
+| `POST` | `/api/tasks/{id}/ship/reconcile` — record one decision about an unresolved effect |
 | `GET` | `/api/gh` — latest safe in-memory identity and target status |
 | `POST` | `/api/gh/recheck` — body omitted for global identity, or `{"task_id": id}` for the task's registered upstream |
 
 | Event | Payload |
 |---|---|
-| `ship_step` | `{task_id, step, status, detail?}`; `step` is `draft`, `commit`, `push`, or `pr`, and `status` is `started`, `ok`, or `failed` |
-| `ship_draft` | `{task_id, draft}` after a parsed successful draft |
-| `ship_finished` | `{task_id, status, pr_url}` — `shipped` or `error` |
+| `ship_updated` | The whole versioned per-task delivery projection, published after the daemon commits it |
 | `gh_status` | `{gh: {identity, targets}}` after every completed GitHub probe |
 
-A draft begins with `ship_step` `draft`/`started`. Success publishes
-`ship_draft`, then `draft`/`ok`; failure publishes `draft`/`failed` with its
-reason. The snapshot carries a `ships` map from task id to the current status,
-mode, draft, commit sha, pull-request URL, error, and latest transient
-`last_step`, plus a current in-memory `gh` identity/target status. REST
-responses and deltas can arrive in either order; clients render daemon state
-rather than treating a response as the source of form values.
+The snapshot carries a `ships` map from task id to that same projection, so a
+reconnecting client sees the current state without replaying anything. Every
+projection carries a per-task monotonic `version`; command responses go through
+the same reducer as the deltas, and an older or duplicated version is dropped
+rather than applied.
 
-Ship state other than the persisted `pr_url` is held in memory and is lost on a
-daemon restart as well as when the task is cleaned up or purged. A durable
-approved review can make a newly opened Ship flow request a fresh draft after a
-restart; no commit, push, or pull request is repeated automatically.
-
+Unlike earlier releases, delivery state is durable. The authorization, the
+candidate it names, every action attempt with the exact refs it intended to
+write, and every reconciliation decision survive a daemon restart, and they
+survive cleanup — a cleaned-up task keeps the record of what it published and
+under whose authorization. Only purge deletes them.

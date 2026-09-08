@@ -89,10 +89,17 @@ an open review, comments returned to the agent, approval, abort, review error,
 and a reviewer interrupted by a daemon restart. When comments are returned, it says the primary agent is addressing
 them; after that session returns to idle, **Start another review** becomes
 available. It exposes the task's Ship flow link when review is approved, the
-daemon has recorded ship progress, or the task has a pull request. When the
-review display is approved the link reads **Continue to Ship flow**; otherwise
-a recorded ship or pull-request handoff reads **Open Ship flow**. Both open
+daemon has recorded a delivery, or the task has a pull request. The link reads
+**Continue to Ship flow** only when the approval still covers the content that
+would be published; a superseded approval reads **Open Ship flow**, because the
+next step there is another review rather than a handoff. Both open
 `/ship/<task-id>`.
+
+An approval names the content it graded. When the task has moved on since, the
+panel labels it **Approved (superseded)** and says that delivering the current
+content needs a fresh review. An approval recorded before content-bound review
+says instead that it does not identify what it approved. Neither is deleted:
+both remain visible as history. See [Review](review.md).
 
 Every iteration is ordered from oldest to newest and records its outcome,
 recorded time, optional comment count, and any captured reviewer stderr. Error

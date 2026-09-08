@@ -25,6 +25,11 @@ from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.datadir import audit_log_path_for
+from ompire_daemon.delivery import (
+    WorkspaceBlockedError,
+    WorkspaceBusyError,
+    WorkspaceGuard,
+)
 from ompire_daemon.events import EventHub
 from ompire_daemon.execution_inputs import (
     WORKSPACE_FIELDS,
@@ -32,9 +37,7 @@ from ompire_daemon.execution_inputs import (
 from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import (
     FINGERPRINT_RE,
-    STATE_READY,
     GpgProbe,
-    gpg_signing_refusal,
 )
 from ompire_daemon.launch import (
     ConsumerOverride,
@@ -113,6 +116,10 @@ from ompire_daemon.registry.settings import (
     SettingsValidationError,
     effective_checkout_root,
 )
+from ompire_daemon.registry.ships import (
+    DeliveryConflictError,
+    get_active_delivery,
+)
 from ompire_daemon.registry.tasks import (
     ClonePathOutsideRootError,
     DuplicateTaskError,
@@ -164,10 +171,21 @@ from ompire_daemon.registry.workflows import (
     latest_step_record,
     list_step_records,
 )
-from ompire_daemon.review import ReviewAlreadyOpenError, ReviewError, ReviewManager
+from ompire_daemon.review import (
+    ReviewAlreadyOpenError,
+    ReviewContentError,
+    ReviewError,
+    ReviewManager,
+)
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.sessions import SessionTracker
-from ompire_daemon.ship import GitHubPreflightError, ShipError, ShipManager
+from ompire_daemon.ship import (
+    DeliveryBlockedError,
+    PreviewMismatchError,
+    ShipError,
+    ShipManager,
+    UnresolvedEffectError,
+)
 from ompire_daemon.spawn import run_spawn_pipeline
 from ompire_daemon.taskdefinition import (
     TaskDefinitionUnavailableError,
@@ -344,6 +362,10 @@ def _reviews(request: Request) -> ReviewManager:
 
 def _ships(request: Request) -> ShipManager:
     return request.app.state.ships
+
+
+def _guard(request: Request) -> WorkspaceGuard:
+    return request.app.state.workspace_guard
 
 
 def _gpg(request: Request) -> GpgProbe:
@@ -2220,12 +2242,29 @@ async def cleanup_task_route(
     advisories: AdvisorySampler = Depends(_advisories),
     reviews: ReviewManager = Depends(_reviews),
     ships: ShipManager = Depends(_ships),
+    guard: WorkspaceGuard = Depends(_guard),
     notifications: AttentionNotifier = Depends(_notifications),
 ) -> dict[str, Any]:
     try:
         task = get_task(engine, task_id)
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+    # Cleanup deletes the clone, so it is refused while anything owns the
+    # workspace and while a privileged effect's outcome is unknown (ADR-0032).
+    # Abandoning remaining work does not make an unresolved effect safe to
+    # destroy the evidence for; it has to be reconciled first.
+    try:
+        guard.assert_host_free(task_id)
+    except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    active = get_active_delivery(engine, task_id)
+    if active is not None and active.disposition in ("authorized", "unresolved"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"task {task_id} has a delivery that is still {active.disposition}; "
+            "finish or reconcile it before cleaning up",
+        )
 
     clone_path = Path(task.clone_path).resolve()
     task_root = config.task_dir_root.expanduser().resolve()
@@ -2251,6 +2290,12 @@ async def cleanup_task_route(
 
     await reviews.cancel_and_drop(task_id)
     await ships.cancel_and_drop(task_id)
+    # The delivery journal is deliberately retained across cleanup: a
+    # cleaned-up task keeps the record of what it published and under whose
+    # authorization. Only the candidate staging repositories go, and only the
+    # ones no unresolved work still needs as evidence.
+    ships.release_candidate_storage(task_id)
+    guard.discard(task_id)
     archived = mark_archived(engine, task_id)
     sessions.discard(task_id)
     advisories.clear_task(task_id)
@@ -2354,7 +2399,10 @@ class AgentMessage(BaseModel):
 
 
 async def _require_live_agent(
-    supervisor: AgentSupervisor, task_id: int, session: str
+    supervisor: AgentSupervisor,
+    task_id: int,
+    session: str,
+    guard: WorkspaceGuard | None = None,
 ) -> AgentHandle:
     """The session's live agent, taken inside its own boundary (ADR-0027).
 
@@ -2362,7 +2410,17 @@ async def _require_live_agent(
     that a concurrent policy handoff has already started retiring. It runs on
     whatever policy that session last applied — never a reset to the task
     default.
+
+    It is also a workspace writer, so it is admitted through the same guard a
+    review, a delivery, or a workflow step takes (ADR-0032): the daemon refuses
+    the new turn rather than interrupting whoever holds the workspace, and
+    refuses it outright while an unresolved privileged effect is outstanding.
     """
+    if guard is not None:
+        try:
+            guard.assert_host_free(task_id)
+        except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
+            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     handle = await supervisor.acquire(task_id, session)
     if handle is None:
         raise HTTPException(
@@ -2396,10 +2454,11 @@ async def steer_agent_route(
     body: AgentMessage,
     engine: Engine = Depends(_engine),
     supervisor: AgentSupervisor = Depends(_supervisor),
+    guard: WorkspaceGuard = Depends(_guard),
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     _require_declared_session(engine, task, session)
-    handle = await _require_live_agent(supervisor, task_id, session)
+    handle = await _require_live_agent(supervisor, task_id, session, guard)
     return await _agent_request(handle, "steer", message=body.message)
 
 
@@ -2410,10 +2469,11 @@ async def follow_up_agent_route(
     body: AgentMessage,
     engine: Engine = Depends(_engine),
     supervisor: AgentSupervisor = Depends(_supervisor),
+    guard: WorkspaceGuard = Depends(_guard),
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     _require_declared_session(engine, task, session)
-    handle = await _require_live_agent(supervisor, task_id, session)
+    handle = await _require_live_agent(supervisor, task_id, session, guard)
     return await _agent_request(handle, "follow_up", message=body.message)
 
 
@@ -2425,10 +2485,11 @@ async def interrupt_agent_route(
     engine: Engine = Depends(_engine),
     supervisor: AgentSupervisor = Depends(_supervisor),
     sessions: SessionTracker = Depends(_sessions),
+    guard: WorkspaceGuard = Depends(_guard),
 ) -> dict[str, object]:
     task = _require_task(engine, task_id)
     _require_declared_session(engine, task, session)
-    handle = await _require_live_agent(supervisor, task_id, session)
+    handle = await _require_live_agent(supervisor, task_id, session, guard)
     # Any pending question is moot once the turn is aborted (design D-6); the
     # abort's own agent_start/agent_end then drives state normally.
     sessions.clear_pending(task_id, session)
@@ -2661,7 +2722,9 @@ async def start_review_route(
 
     try:
         state = await reviews.start_review(task)
-    except ReviewAlreadyOpenError as exc:
+    except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except (ReviewAlreadyOpenError, ReviewContentError) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except ReviewError as exc:
         raise HTTPException(
@@ -2673,11 +2736,13 @@ async def start_review_route(
         "status": state.status,
         "url": state.url,
         "port": state.port,
+        "candidate_id": state.candidate_id,
         "iterations": [
             {
                 "outcome": it.outcome,
                 "comment_count": it.comment_count,
                 "stderr": it.stderr,
+                "candidate_id": it.candidate_id,
                 "recorded_at": it.recorded_at,
             }
             for it in state.iterations
@@ -2705,11 +2770,13 @@ async def cancel_review_route(
         "status": state.status,
         "url": state.url,
         "port": state.port,
+        "candidate_id": state.candidate_id,
         "iterations": [
             {
                 "outcome": it.outcome,
                 "comment_count": it.comment_count,
                 "stderr": it.stderr,
+                "candidate_id": it.candidate_id,
                 "recorded_at": it.recorded_at,
             }
             for it in state.iterations
@@ -2721,14 +2788,84 @@ class ShipDraftBody(BaseModel):
     replace: bool = False
 
 
-class ShipCommitBody(BaseModel):
-    message: str
-    pr_title: str
-    pr_body: str
+class ShipDraftSaveBody(BaseModel):
+    """Operator-entered publication text. Inert: it authorizes nothing."""
+
+    commit_message: str = ""
+    pr_title: str = ""
+    pr_body: str = ""
+
+
+class ShipPreviewBody(BaseModel):
+    """A requested ending and its inputs, resolved read-only."""
+
+    ending: str
     mode: str = "squash"
+    message: str = ""
+    pr_title: str = ""
+    pr_body: str = ""
+    request_id: str
+    delivery_id: int | None = None
 
 
-_IN_FLIGHT_SHIP_STATUSES = {"drafting", "committing", "pushing"}
+class ShipCommitBody(BaseModel):
+    """One authorization. Every field the preview fingerprinted is required —
+    there is no omitted-ending legacy shape and no tokenless path."""
+
+    ending: str
+    mode: str = "squash"
+    message: str = ""
+    pr_title: str = ""
+    pr_body: str = ""
+    request_id: str
+    preview_token: str
+    delivery_id: int | None = None
+    expected_version: int | None = None
+
+
+class ShipContinueBody(BaseModel):
+    """Authorize a further ending for an existing verified result."""
+
+    ending: str
+    pr_title: str = ""
+    pr_body: str = ""
+    request_id: str
+    preview_token: str
+    delivery_id: int
+    expected_version: int
+
+
+class ShipReconcileBody(BaseModel):
+    delivery_id: int
+    action_id: int
+    expected_version: int
+    decision: str
+    note: str | None = None
+    adopt_reference: str | None = None
+
+
+def _delivery_conflict(exc: Exception) -> HTTPException:
+    """Conflicts return the safe current state and the reason, never a bare
+    string the operator has to guess at."""
+    detail: dict[str, Any] = {"message": str(exc)}
+    if isinstance(exc, DeliveryBlockedError):
+        detail["blockers"] = [asdict(blocker) for blocker in exc.blockers]
+    return HTTPException(status.HTTP_409_CONFLICT, detail)
+
+
+@router.get("/tasks/{task_id}/ship")
+def get_ship_route(
+    task_id: int,
+    engine: Engine = Depends(_engine),
+    ships: ShipManager = Depends(_ships),
+) -> dict[str, Any]:
+    """The task's current delivery projection.
+
+    The same document the snapshot and every command response carry, for a
+    caller that wants to read it without holding a WebSocket. Read-only.
+    """
+    task = _require_task(engine, task_id)
+    return ships.projection(task) or ships.empty_projection(task_id)
 
 
 @router.post("/tasks/{task_id}/ship/draft")
@@ -2738,18 +2875,62 @@ async def draft_ship_route(
     engine: Engine = Depends(_engine),
     ships: ShipManager = Depends(_ships),
 ) -> dict[str, Any]:
+    task = _require_task(engine, task_id)
     try:
-        task = get_task(engine, task_id)
-    except TaskNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-
-    try:
-        state = await ships.draft(
+        return await ships.draft(
             task, replace=body.replace if body is not None else False
         )
+    except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except ShipError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    return asdict(state)
+
+
+@router.put("/tasks/{task_id}/ship/draft")
+def save_ship_draft_route(
+    task_id: int,
+    body: ShipDraftSaveBody,
+    engine: Engine = Depends(_engine),
+    ships: ShipManager = Depends(_ships),
+) -> dict[str, Any]:
+    task = _require_task(engine, task_id)
+    try:
+        return ships.save_manual_draft(task, body.model_dump())
+    except ShipError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+
+@router.post("/tasks/{task_id}/ship/preview")
+async def preview_ship_route(
+    task_id: int,
+    body: ShipPreviewBody,
+    engine: Engine = Depends(_engine),
+    ships: ShipManager = Depends(_ships),
+) -> dict[str, Any]:
+    """Resolve one requested ending. Read-only, and authorizes nothing.
+
+    Everything a confirmation needs is here: the candidate and the review that
+    covers it, the remaining actions, the safe targets and identities, every
+    reason the delivery is currently refused, and the fingerprint the
+    confirmation must carry.
+    """
+    task = _require_task(engine, task_id)
+    try:
+        resolved = await ships.preview(
+            task,
+            ending=body.ending,
+            mode=body.mode,
+            commit_message=body.message,
+            pr_title=body.pr_title,
+            pr_body=body.pr_body,
+            request_id=body.request_id,
+            delivery_id=body.delivery_id,
+        )
+    except PreviewMismatchError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except TaskConfigurationRequiredError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    return resolved.payload()
 
 
 @router.post("/tasks/{task_id}/ship/commit")
@@ -2758,68 +2939,172 @@ async def commit_ship_route(
     body: ShipCommitBody,
     request: Request,
     engine: Engine = Depends(_engine),
-    gpg: GpgProbe = Depends(_gpg),
     ships: ShipManager = Depends(_ships),
 ) -> dict[str, Any]:
+    """Accept one authorization and start its authorized action prefix.
+
+    This route parses and authenticates. Every safety check — review binding,
+    accepted target, mode, credentials, exclusivity, replay — happens inside
+    the delivery service, so a direct service or API caller gets exactly the
+    same admission the UI does.
+    """
+    task = _require_task(engine, task_id)
     try:
-        task = get_task(engine, task_id)
-    except TaskNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-
-    if body.mode not in ("squash", "retain"):
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"ship mode {body.mode!r} is not supported; only 'squash' or 'retain' are available",
-        )
-
-    existing = ships.get(task_id)
-    if existing is not None and existing.status in _IN_FLIGHT_SHIP_STATUSES:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"task {task_id} already has a ship in flight",
-        )
-    try:
-        await ships.preflight(task)
-    except GitHubPreflightError as exc:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={"message": str(exc), "gh": asdict(exc.status)},
-        ) from exc
-
-    gpg_status = await gpg.probe()
-    if gpg_status.state != STATE_READY:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={
-                "message": gpg_signing_refusal(gpg_status),
-                "gpg": asdict(gpg_status),
-            },
-        )
-
-    if body.mode == "retain":
-        try:
-            await ships.check_retain_preconditions(task)
-        except ShipError as exc:
-            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-
-    ships.seed_commit(task.id, mode=body.mode)
-
-    job = asyncio.create_task(
-        ships.commit_and_ship(
+        resolved = await ships.preview(
             task,
-            body.message,
-            body.pr_title,
-            body.pr_body,
+            ending=body.ending,
             mode=body.mode,
+            commit_message=body.message,
+            pr_title=body.pr_title,
+            pr_body=body.pr_body,
+            request_id=body.request_id,
+            delivery_id=body.delivery_id,
         )
-    )
-    jobs: set[asyncio.Task] = request.app.state.spawn_jobs
-    jobs.add(job)
-    job.add_done_callback(jobs.discard)
+        if resolved.fingerprint != body.preview_token:
+            raise PreviewMismatchError(
+                "the delivery changed since it was previewed; review the new "
+                "preview before confirming"
+            )
+        if resolved.blockers:
+            raise DeliveryBlockedError(resolved.blockers)
+        delivery_id, projection = await ships.authorize(
+            task, resolved, expected_version=body.expected_version
+        )
+    except PreviewMismatchError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+    except DeliveryBlockedError as exc:
+        raise _delivery_conflict(exc) from exc
+    except DeliveryConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+    except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+    except ShipError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
 
-    state = ships.get(task_id)
-    assert state is not None
-    return asdict(state)
+    ships.start_delivery(
+        task, delivery_id, body.request_id, request.app.state.spawn_jobs
+    )
+    return projection
+
+
+async def _continue_delivery(
+    task_id: int,
+    body: ShipContinueBody,
+    request: Request,
+    engine: Engine,
+    ships: ShipManager,
+    required: str,
+) -> dict[str, Any]:
+    """Shared body for the push and pull-request continuation routes.
+
+    Neither starts an implicit earlier action: the requested ending must be one
+    this delivery has a verified result for up to, and the service refuses
+    anything else.
+    """
+    task = _require_task(engine, task_id)
+    try:
+        resolved = await ships.preview(
+            task,
+            ending=body.ending,
+            mode="squash",
+            commit_message="",
+            pr_title=body.pr_title,
+            pr_body=body.pr_body,
+            request_id=body.request_id,
+            delivery_id=body.delivery_id,
+        )
+        if required not in resolved.remaining_actions:
+            raise PreviewMismatchError(
+                f"this delivery has no remaining {required} action to authorize"
+            )
+        if resolved.fingerprint != body.preview_token:
+            raise PreviewMismatchError(
+                "the delivery changed since it was previewed; review the new "
+                "preview before confirming"
+            )
+        if resolved.blockers:
+            raise DeliveryBlockedError(resolved.blockers)
+        delivery_id, projection = await ships.authorize(
+            task, resolved, expected_version=body.expected_version
+        )
+    except PreviewMismatchError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+    except DeliveryBlockedError as exc:
+        raise _delivery_conflict(exc) from exc
+    except DeliveryConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+    except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+    except ShipError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+
+    ships.start_delivery(
+        task, delivery_id, body.request_id, request.app.state.spawn_jobs
+    )
+    return projection
+
+
+@router.post("/tasks/{task_id}/ship/push")
+async def push_ship_route(
+    task_id: int,
+    body: ShipContinueBody,
+    request: Request,
+    engine: Engine = Depends(_engine),
+    ships: ShipManager = Depends(_ships),
+) -> dict[str, Any]:
+    """Push an existing verified signed result, and optionally go on to a PR."""
+    return await _continue_delivery(task_id, body, request, engine, ships, "push")
+
+
+@router.post("/tasks/{task_id}/ship/pr")
+async def pr_ship_route(
+    task_id: int,
+    body: ShipContinueBody,
+    request: Request,
+    engine: Engine = Depends(_engine),
+    ships: ShipManager = Depends(_ships),
+) -> dict[str, Any]:
+    """Open a pull request for an existing verified pushed result."""
+    return await _continue_delivery(task_id, body, request, engine, ships, "pr")
+
+
+@router.post("/tasks/{task_id}/ship/reconcile")
+async def reconcile_ship_route(
+    task_id: int,
+    body: ShipReconcileBody,
+    engine: Engine = Depends(_engine),
+    ships: ShipManager = Depends(_ships),
+) -> dict[str, Any]:
+    """Record one operator decision about an unresolved delivery effect.
+
+    None of the decisions write anything privileged. `retry` only makes a
+    proven-not-executed action eligible for a fresh preview and confirmation;
+    it is not an unconditional write button.
+    """
+    task = _require_task(engine, task_id)
+    if body.decision not in ("recheck", "adopt", "retry", "abandon"):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {"field": "decision", "detail": f"unknown decision {body.decision!r}"},
+        )
+    try:
+        return await ships.reconcile(
+            task,
+            delivery_id=body.delivery_id,
+            action_id=body.action_id,
+            expected_version=body.expected_version,
+            decision=body.decision,
+            note=body.note,
+            adopt_reference=body.adopt_reference,
+        )
+    except PreviewMismatchError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+    except UnresolvedEffectError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+    except DeliveryConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+    except ShipError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
 
 
 @router.get("/gpg")
@@ -2868,16 +3153,19 @@ def purge_task_route(
     advisories: AdvisorySampler = Depends(_advisories),
     reviews: ReviewManager = Depends(_reviews),
     ships: ShipManager = Depends(_ships),
+    guard: WorkspaceGuard = Depends(_guard),
     notifications: AttentionNotifier = Depends(_notifications),
 ) -> dict[str, int]:
     try:
-        purge_task(engine, task_id)
+        storage_paths = purge_task(engine, task_id)
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except TaskNotArchivedError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     reviews.drop_review(task_id)
     ships.drop_ship(task_id)
+    ships.purge_candidate_storage(storage_paths)
+    guard.discard(task_id)
     sessions.discard(task_id)
     advisories.clear_task(task_id)
     notifications.clear_task(task_id)

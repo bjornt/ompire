@@ -19,6 +19,11 @@
 #   reopen <n> [--repo <slug>]    CLOSED -> OPEN
 #   fail-next [create|view] [--message <text>]
 #                                 arm a one-shot failure for the matching call
+#   lose-next [create|list] [--message <text>]
+#                                 arm a one-shot *lost reply*: `create` writes
+#                                 the pull request and then reports failure;
+#                                 `list` makes the correlated lookup fail, so
+#                                 the outcome stays unknown
 #   selfcheck                     prove control and fake contracts offline
 #   help                          this message
 
@@ -32,6 +37,10 @@ GH=$REPO_ROOT/local-test/fakes/gh
 # gh-style defaults (captured reference table, fake-gh design.md).
 DEFAULT_FAIL_CREATE='GraphQL: injected create failure (fake)'
 DEFAULT_FAIL_VIEW='GraphQL: injected view failure (fake)'
+# A lost reply is not a failure to act: the pull request exists, and the
+# caller is told nothing about it.
+DEFAULT_LOSE_CREATE='error connecting to api.github.com: connection reset (fake, after the write)'
+DEFAULT_LOSE_LIST='error connecting to api.github.com: connection reset (fake)'
 
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
@@ -307,6 +316,34 @@ cmd_fail_next() {
 	printf 'armed: next %s fails once with:\n  %s\n' "$site" "$msg"
 }
 
+# --- lose-next ---------------------------------------------------------------------
+
+cmd_lose_next() {
+	local site="" message=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		create | list) [ -z "$site" ] || die "one site per invocation"; site=$1; shift ;;
+		--message) message=$2; shift 2 ;;
+		*) die "unknown argument: $1 (usage: lose-next [create|list] [--message <text>])" ;;
+		esac
+	done
+	[ -f "$PRS_JSON" ] ||
+		die "no gh state at $PRS_JSON — run a local-test environment first (env up)"
+
+	if [ -z "$site" ]; then # inspection only
+		local c l
+		c=$(jq -r '.inject.lose_next.create // "none"' "$PRS_JSON")
+		l=$(jq -r '.inject.lose_next.list // "none"' "$PRS_JSON")
+		printf 'create: %s\nlist:   %s\n' "$c" "$l"
+		return 0
+	fi
+
+	local msg=${message:-$([ "$site" = create ] && printf '%s' "$DEFAULT_LOSE_CREATE" || printf '%s' "$DEFAULT_LOSE_LIST")}
+	mutate --arg site "$site" --arg msg "$msg" \
+		'.inject.lose_next[$site] = $msg'
+	printf 'armed: next %s loses its reply once with:\n  %s\n' "$site" "$msg"
+}
+
 # --- selfcheck -----------------------------------------------------------------------
 
 SELF_TMP=""
@@ -475,6 +512,7 @@ merge) shift; cmd_merge "$@" ;;
 close) shift; cmd_close "$@" ;;
 reopen) shift; cmd_reopen "$@" ;;
 fail-next) shift; cmd_fail_next "$@" ;;
+lose-next) shift; cmd_lose_next "$@" ;;
 selfcheck) shift; cmd_selfcheck "$@" ;;
 help | --help | -h) usage ;;
 *)

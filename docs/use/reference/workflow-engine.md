@@ -503,7 +503,7 @@ among declared answers, in format 2. A **pause** is the engine refusing to
 guess; the action retries the step that could not be decided, and it never
 continues past it.
 
-Five things pause a run:
+Six things pause a run:
 
 | Reason | What happened |
 |---|---|
@@ -512,9 +512,18 @@ Five things pause a run:
 | `prompt_unrenderable` | A prompt or gate message referenced a value that is missing and has no declared fallback, or a format-2 step that owes a result rendered an empty prompt |
 | `condition_unresolved` | A step's own condition could not be decided |
 | `missing_evidence` | A format-2 step declared a required evidence selector that matched nothing |
+| `workspace_unavailable` | Another daemon-managed writer owned the task's workspace, or an unresolved privileged effect made writing to it unsafe |
 
 None of these is a *negative result*. A `"failed"` outcome, a nonzero command
 exit, and a declared no-match all follow the definition's routes normally.
+
+`workspace_unavailable` is the only one that is not about evidence. A review or
+a delivery owns the task's workspace while it runs
+([ADR-0032](../../adr/0032-bind-trusted-delivery-to-retained-candidates.md)), and
+an effect whose outcome is unknown makes writing unsafe until an operator
+resolves it. The step is **not started** — Ompire refuses the new writer rather
+than interrupting the one that already holds the workspace — so retrying it once
+that work finishes re-enters the step with nothing lost.
 
 The paused attempt keeps everything it had: its own kind, its absent outcome,
 and the parse or evaluation error. Nothing is written that could later read as

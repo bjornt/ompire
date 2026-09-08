@@ -1,4 +1,3 @@
-import { StrictMode } from "react";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -2057,6 +2056,66 @@ describe("TaskDetailView", () => {
     expect(review.querySelector('time[datetime="2026-08-26T10:00:00Z"]')).toBeInTheDocument();
   });
 
+  it("says a superseded approval is history rather than a handoff", async () => {
+    const task = makeTask();
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", {
+      projects: [project],
+      tasks: [task],
+      sessions: { "1": { main: { status: "idle", reason: "review approved", since: "t0" } } },
+      reviews: {
+        "1": {
+          status: "approved",
+          url: null,
+          port: null,
+          candidate_id: "cand-old",
+          iterations: [
+            {
+              outcome: "approved",
+              comment_count: 0,
+              stderr: null,
+              candidate_id: "cand-old",
+              recorded_at: "2026-08-26T11:00:00Z",
+            },
+          ],
+        },
+      },
+      ships: {
+        "1": {
+          task_id: 1,
+          version: 1,
+          delivery_id: 10,
+          disposition: "open",
+          ending: null,
+          mode: null,
+          candidate_id: "cand-new",
+          review_candidate_id: null,
+          draft: null,
+          blocked_reason: null,
+          workspace_owner: null,
+          completed_actions: [],
+          remaining_actions: [],
+          results: {},
+          pr_url: null,
+          legacy_publication: false,
+          actions: [],
+          decisions: [],
+          history: [],
+        },
+      },
+    });
+
+    const review = await screen.findByTestId("task-detail-review");
+    expect(within(review).getByTestId("review-summary-hint")).toHaveTextContent(
+      "content changed after this approval",
+    );
+    // The handoff link stays — the operator still needs to get there to start
+    // another review — but it no longer claims the approval carries them on.
+    expect(within(review).getByTestId("task-detail-ship-link")).toHaveTextContent(
+      "Open Ship flow",
+    );
+  });
+
   it("shows a failed start, permits retry, and accepts observation before the retry response", async () => {
     const task = makeTask();
     const { promise: retryResponse, resolve: resolveRetry } =
@@ -2457,14 +2516,32 @@ describe("Review capability (TasksView)", () => {
     act(() => {
       socket().emit("review_started", { task_id: 1, url: "http://127.0.0.1:7180", port: 7180 });
       socket().emit("review_finished", { task_id: 1, status: "approved" });
-      socket().emit("ship_draft", {
+      socket().emit("ship_updated", {
         task_id: 2,
+        version: 1,
+        delivery_id: 10,
+        disposition: "open",
+        ending: null,
+        mode: null,
+        candidate_id: null,
+        review_candidate_id: null,
         draft: {
           commit_message: "draft commit",
           pr_title: "draft title",
           pr_body: "draft body",
           source: "agent",
+          state: "ready",
         },
+        blocked_reason: null,
+        workspace_owner: null,
+        completed_actions: [],
+        remaining_actions: [],
+        results: {},
+        pr_url: null,
+        legacy_publication: false,
+        actions: [],
+        decisions: [],
+        history: [],
       });
       socket().emit(
         "task_updated",
@@ -2484,6 +2561,97 @@ describe("Review capability (TasksView)", () => {
 });
 
 describe("ShipFlowView", () => {
+  const projection = (overrides: Record<string, unknown> = {}) => ({
+    task_id: 1,
+    version: 1,
+    delivery_id: 10,
+    disposition: "open",
+    ending: null,
+    mode: null,
+    candidate_id: null,
+    review_candidate_id: null,
+    draft: null,
+    blocked_reason: null,
+    workspace_owner: null,
+    completed_actions: [],
+    remaining_actions: [],
+    results: {},
+    pr_url: null,
+    legacy_publication: false,
+    actions: [],
+    decisions: [],
+    history: [],
+    ...overrides,
+  });
+
+  const approvedReview = (candidateId = "cand-1") => ({
+    status: "approved",
+    url: null,
+    port: null,
+    candidate_id: candidateId,
+    iterations: [
+      {
+        outcome: "approved",
+        comment_count: 0,
+        stderr: null,
+        candidate_id: candidateId,
+        recorded_at: "2026-08-20T00:00:00Z",
+      },
+    ],
+  });
+
+  const previewBody = (overrides: Record<string, unknown> = {}) => ({
+    task_id: 1,
+    delivery_id: 10,
+    version: 1,
+    ending: "commit",
+    mode: "squash",
+    request_id: "req-x",
+    candidate_id: "cand-1",
+    candidate: {
+      candidate_id: "cand-1",
+      base_branch: "main",
+      base_commit: "b".repeat(40),
+      original_head: "h".repeat(40),
+      tree_id: "t".repeat(40),
+      commit_count: 2,
+      dirty: false,
+    },
+    review: {
+      status: "approved",
+      approved_candidate_id: "cand-1",
+      current_candidate_id: "cand-1",
+      content_bound: true,
+      stale: false,
+    },
+    completed_actions: [],
+    remaining_actions: ["commit"],
+    routing: {
+      remote_url: "https://github.com/ompire/maas",
+      branch: "ompire/fix-bug",
+      ref: "refs/heads/ompire/fix-bug",
+      head: "ompire/fix-bug",
+      base_branch: "main",
+      upstream_url: "https://github.com/ompire/maas",
+      slug: "ompire/maas",
+    },
+    identity: {
+      signing: { fingerprint: "F".repeat(40), uid: "Op <op@example.com>", source: "auto" },
+      git_transport: {
+        state: "unattributed",
+        detail: "Ompire uses ambient Git credentials for the push.",
+      },
+    },
+    commit_message: "ship: it",
+    pr_title: "",
+    pr_body: "",
+    marker: "m".repeat(32),
+    blockers: [],
+    deliverable: true,
+    preview_token: "token-1",
+    ...overrides,
+  });
+
   it("renders the bare Ship flow chooser from the snapshot and updates it live", async () => {
     await renderAt("/ship", { projects: [project], tasks: [makeTask()] });
 
@@ -2491,21 +2659,23 @@ describe("ShipFlowView", () => {
     expect(screen.getByRole("link", { name: "Ship flow" }).className).toContain("navLinkActive");
 
     act(() => {
-      socket().emit("ship_draft", {
-        task_id: 1,
-        draft: {
-          commit_message: "draft commit",
-          pr_title: "draft title",
-          pr_body: "draft body",
-          source: "agent",
-        },
-      });
+      socket().emit(
+        "ship_updated",
+        projection({
+          draft: {
+            commit_message: "draft commit",
+            pr_title: "draft title",
+            pr_body: "draft body",
+            source: "agent",
+            state: "ready",
+          },
+        }),
+      );
     });
 
     const row = await screen.findByTestId("ship-index-row-1");
     expect(row).toHaveAttribute("href", "/ship/1");
-    expect(row).toHaveTextContent("Next: Sign");
-    expect(row).toHaveTextContent("Create the signed publication commit.");
+    expect(row).toHaveTextContent("Next: Draft");
   });
 
   it("waits for the daemon snapshot before rendering the bare Ship flow index", () => {
@@ -2520,65 +2690,63 @@ describe("ShipFlowView", () => {
     expect(screen.getByTestId("ship-index-empty")).toBeInTheDocument();
   });
 
-  it("lists active handoffs before retained shipped history without duplicates", async () => {
+  it("names a local-only delivery a success rather than a missing pull request", async () => {
     await renderAt("/ship", {
       projects: [project],
-      tasks: [
-        makeTask({
-          id: 1,
-          slug: "approved",
-          updated_at: "2026-08-20T00:01:00Z",
-        }),
-        makeTask({
-          id: 2,
-          slug: "cleanup",
-          updated_at: "2026-08-20T00:03:00Z",
-          pr_url: "https://github.com/ompire/maas/pull/2",
-          pr_state: "merged",
-        }),
-        makeTask({
-          id: 3,
-          slug: "failed-push",
-          updated_at: "2026-08-20T00:02:00Z",
-        }),
-        makeTask({
-          id: 4,
-          slug: "archived",
-          state: "archived",
-          updated_at: "2026-08-20T00:04:00Z",
-          pr_url: "https://github.com/ompire/maas/pull/4",
-          pr_state: "merged",
-        }),
-      ],
-      reviews: {
-        "1": { status: "approved", url: "http://127.0.0.1:7180", port: 7180, iterations: [] },
-      },
+      tasks: [makeTask({ id: 1, slug: "local-only" })],
       ships: {
-        "3": {
-          status: "error",
-          draft: null,
-          commit_sha: "abc123",
-          pr_url: null,
-          error: "push/PR failed: forbidden",
-          updated_at: "2026-08-20T00:02:00Z",
-          last_step: { step: "pr", status: "failed", detail: "forbidden" },
-        },
+        "1": projection({
+          disposition: "completed",
+          ending: "commit",
+          mode: "squash",
+          completed_actions: ["commit"],
+          results: {
+            commit: {
+              signed_tip: "s".repeat(40),
+              commit_count: 1,
+              mode: "squash",
+              installed: true,
+            },
+          },
+        }),
       },
     });
 
-    const active = screen.getByTestId("ship-index-active");
-    expect(within(active).getAllByRole("link").map((link) => link.getAttribute("href"))).toEqual([
-      "/ship/2",
-      "/ship/3",
-      "/ship/1",
-    ]);
-    expect(within(active).getByTestId("ship-index-row-2")).toHaveTextContent("Next: Cleanup");
-    expect(within(active).getByTestId("ship-index-row-3")).toHaveTextContent("Next: Push / PR");
-    expect(within(active).getByTestId("ship-index-error-3")).toHaveTextContent("push/PR failed: forbidden");
+    const row = screen.getByTestId("ship-index-row-1");
+    expect(row).toHaveTextContent("Next: Signed locally");
+    expect(row).toHaveTextContent("Nothing was pushed");
+    expect(screen.queryByTestId("ship-index-error-1")).not.toBeInTheDocument();
+  });
 
-    const recent = screen.getByTestId("ship-index-recent");
-    expect(within(recent).getByTestId("ship-index-row-4")).toHaveTextContent("Next: Cleanup complete");
-    expect(screen.getAllByTestId(/ship-index-row-/)).toHaveLength(4);
+  it("surfaces an unresolved effect ahead of everything else", async () => {
+    await renderAt("/ship", {
+      projects: [project],
+      tasks: [makeTask({ id: 1 })],
+      ships: {
+        "1": projection({
+          disposition: "unresolved",
+          ending: "push",
+          blocked_reason: "the destination could not be read",
+          actions: [
+            {
+              id: 5,
+              kind: "push",
+              attempt: 1,
+              phase: "needs_reconciliation",
+              expected: { ref: "refs/heads/ompire/fix-bug", signed_tip: "s".repeat(40) },
+              error: "the response was lost",
+              updated_at: "2026-08-20T00:00:00Z",
+            },
+          ],
+        }),
+      },
+    });
+
+    const row = screen.getByTestId("ship-index-row-1");
+    expect(row).toHaveTextContent("Next: Needs a decision");
+    expect(screen.getByTestId("ship-index-error-1")).toHaveTextContent(
+      "the destination could not be read",
+    );
   });
 
   it("waits for the current snapshot before resolving a direct ship route", async () => {
@@ -2591,7 +2759,6 @@ describe("ShipFlowView", () => {
     act(() => {
       socket().emitSnapshot({ projects: [project], tasks: [makeTask()] });
     });
-
     expect(await screen.findByTestId("ship-flow")).toBeInTheDocument();
   });
 
@@ -2603,936 +2770,443 @@ describe("ShipFlowView", () => {
     expect(within(unknown).getByRole("link", { name: "Tasks" })).toHaveAttribute("href", "/tasks");
   });
 
-  it("shows task recovery after the snapshot for a non-numeric task route", async () => {
-    await renderAt("/ship/not-a-task", { projects: [project], tasks: [makeTask()] });
-    expect(screen.getByTestId("ship-flow-not-found")).toBeInTheDocument();
-  });
-
-  it("moves a loaded ship route to its recovery state when the task is purged", async () => {
-    await renderAt("/ship/1", { projects: [project], tasks: [makeTask()] });
-    expect(screen.getByTestId("ship-flow")).toBeInTheDocument();
-
-    act(() => {
-      socket().emit("task_deleted", { id: 1 });
+  it("offers three endings, each naming every effect it permits", async () => {
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      reviews: { "1": approvedReview() },
     });
 
-    expect(await screen.findByTestId("ship-flow-not-found")).toBeInTheDocument();
+    const chooser = screen.getByTestId("ending-chooser");
+    expect(chooser).toHaveTextContent("Local signed commit");
+    expect(chooser).toHaveTextContent("Sign locally and stop. Nothing is pushed");
+    expect(chooser).toHaveTextContent("Pushed branch");
+    expect(chooser).toHaveTextContent("No pull request is opened");
+    expect(chooser).toHaveTextContent("Pull request");
+    expect(chooser).toHaveTextContent("Sign, push, and open a pull request");
   });
 
-  it("auto-drafts once under StrictMode and preserves fields edited in flight", async () => {
+  it("previews a delivery read-only and only then offers a confirmation", async () => {
     const user = userEvent.setup();
-    const deferred = nativePromiseWithResolvers.withResolvers<{
-      ok: boolean;
-      json: () => Promise<unknown>;
-    }>();
-    const fetchMock = vi.fn().mockReturnValue(deferred.promise);
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url === "/api/tasks/1/ship/preview") {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(previewBody()) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(projection()) });
+    });
     vi.stubGlobal("fetch", fetchMock);
 
-    window.history.pushState({}, "", "/ship/1");
-    render(
-      <StrictMode>
-        <App />
-      </StrictMode>,
-    );
-    const strictSocket = MockWebSocket.instances[MockWebSocket.instances.length - 1];
-    act(() => {
-      strictSocket.emitSnapshot({
-        projects: [project],
-        tasks: [makeTask()],
-        sessions: {
-          "1": { main: { status: "idle", reason: "turn ended", since: "t0" } },
-        },
-        reviews: {
-          "1": { status: "approved", url: null, port: null, iterations: [] },
-        },
-      });
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      reviews: { "1": approvedReview() },
+      gpg: { state: "ready", selected: null, candidates: [], detail: null, checked_at: "t" },
     });
 
+    await user.click(screen.getByTestId("ending-commit"));
+    expect(screen.queryByTestId("confirm-delivery-button")).not.toBeInTheDocument();
+
+    await user.click(screen.getByTestId("preview-delivery-button"));
+
+    const preview = await screen.findByTestId("delivery-preview");
+    expect(within(preview).getByTestId("preview-action-commit")).toHaveTextContent("Sign one commit");
+    expect(within(preview).queryByTestId("preview-action-push")).not.toBeInTheDocument();
+    expect(within(preview).getByTestId("preview-candidate")).toHaveTextContent("cand-1");
+    expect(within(preview).getByTestId("preview-signing")).toHaveTextContent("Op <op@example.com>");
+
+    // Preview alone authorized nothing.
+    expect(
+      fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/commit"),
+    ).toHaveLength(0);
+
+    // The button names the effects this confirmation permits, not the ending
+    // in the abstract.
+    expect(screen.getByTestId("confirm-delivery-button")).toHaveTextContent(
+      "Confirm: sign",
+    );
+
+    await user.click(screen.getByTestId("confirm-delivery-button"));
     await waitFor(() =>
       expect(
-        fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft"),
+        fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/commit"),
       ).toHaveLength(1),
     );
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/tasks/1/ship/draft",
-      expect.objectContaining({ method: "POST", body: undefined }),
+    const body = JSON.parse(
+      fetchMock.mock.calls.find(([url]) => url === "/api/tasks/1/ship/commit")?.[1].body as string,
     );
-    expect(screen.getByTestId("draft-status")).toHaveTextContent("Drafting");
-    expect(screen.getByTestId("commit-message")).not.toBeDisabled();
-    expect(screen.getByTestId("pr-title")).not.toBeDisabled();
-
-    await user.type(screen.getByTestId("commit-message"), "Operator message");
-    act(() => {
-      strictSocket.emit("ship_step", {
-        task_id: 1,
-        step: "draft",
-        status: "started",
-      });
-      strictSocket.emit("ship_draft", {
-        task_id: 1,
-        draft: {
-          commit_message: "Agent message",
-          pr_title: "Agent title",
-          pr_body: "Agent body",
-          source: "agent",
-        },
-      });
-      strictSocket.emit("status_changed", {
-        task_id: 1,
-        session: "main",
-        from: "idle",
-        to: "idle",
-        reason: "duplicate update",
-      });
-    });
-
-    await waitFor(() => {
-      expect(screen.getByTestId("commit-message")).toHaveValue("Operator message");
-      expect(screen.getByTestId("pr-title")).toHaveValue("Agent title");
-      expect(screen.getByTestId("pr-body")).toHaveValue("Agent body");
-    });
-    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(1);
-
-    await act(async () => {
-      deferred.resolve({
-        ok: true,
-        json: async () => ({
-          status: "drafted",
-          draft: null,
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t1",
-        }),
-      });
-      await deferred.promise;
+    expect(body).toMatchObject({
+      ending: "commit",
+      mode: "squash",
+      preview_token: "token-1",
+      request_id: "req-x",
+      expected_version: 1,
     });
   });
 
-  it("waits for a no-review primary session to become idle", async () => {
-    const deferred = nativePromiseWithResolvers.withResolvers<{
-      ok: boolean;
-      json: () => Promise<unknown>;
-    }>();
-    const fetchMock = vi.fn().mockReturnValue(deferred.promise);
-    vi.stubGlobal("fetch", fetchMock);
-
-    await renderAt("/ship/1", {
-      projects: [project],
-      tasks: [makeTask()],
-      sessions: {
-        "1": { main: { status: "working", reason: "agent turn", since: "t0" } },
-      },
-    });
-
-    expect(screen.getByTestId("draft-status")).toHaveTextContent("waiting");
-    expect(screen.getByTestId("draft-status")).toHaveTextContent("working");
-    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(0);
-
-    act(() => {
-      socket().emit("status_changed", {
-        task_id: 1,
-        session: "main",
-        from: "working",
-        to: "idle",
-        reason: "turn ended",
-      });
-    });
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(1),
-    );
-
-    await act(async () => {
-      deferred.resolve({
-        ok: true,
-        json: async () => ({
-          status: "drafting",
-          draft: null,
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t1",
-        }),
-      });
-      await deferred.promise;
-    });
-  });
-
-  it("waits for an existing review to be approved before auto-drafting", async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        status: "drafting",
-        draft: null,
-        commit_sha: null,
-        pr_url: null,
-        error: null,
-        updated_at: "t1",
-      }),
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    await renderAt("/ship/1", {
-      projects: [project],
-      tasks: [makeTask()],
-      sessions: {
-        "1": { main: { status: "idle", reason: "turn ended", since: "t0" } },
-      },
-      reviews: {
-        "1": { status: "open", url: null, port: null, iterations: [] },
-      },
-    });
-
-    expect(screen.getByTestId("draft-status")).toHaveTextContent("approved review");
-    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(0);
-
-    act(() => {
-      socket().emit("review_finished", { task_id: 1, status: "approved" });
-    });
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(1),
-    );
-  });
-
-  it("leaves manual fields usable when no primary agent is live", async () => {
+  it("invalidates a resolved preview as soon as the inputs change", async () => {
     const user = userEvent.setup();
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => readyGitHub,
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    await renderAt("/ship/1", {
-      projects: [githubProject],
-      tasks: [makeTask()],
-      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
-      gh: readyGitHub,
-    });
-
-    expect(screen.getByTestId("draft-status")).toHaveTextContent("No live primary agent");
-    expect(screen.getByTestId("redraft-button")).toBeDisabled();
-    expect(screen.getByTestId("commit-message")).not.toBeDisabled();
-    await user.type(screen.getByTestId("commit-message"), "Manual message");
-    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
-    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(0);
-  });
-
-  it("confirms edited regeneration and protects newer in-flight edits", async () => {
-    const user = userEvent.setup();
-    const deferred = nativePromiseWithResolvers.withResolvers<{
-      ok: boolean;
-      json: () => Promise<unknown>;
-    }>();
-    const fetchMock = vi.fn((url: string, _init?: RequestInit) =>
-      url === "/api/gh/recheck"
-        ? Promise.resolve({ ok: true, json: async () => readyGitHub })
-        : deferred.promise,
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    const confirmSpy = vi
-      .spyOn(window, "confirm")
-      .mockReturnValueOnce(false)
-      .mockReturnValueOnce(true);
-
-    await renderAt("/ship/1", {
-      projects: [githubProject],
-      gh: readyGitHub,
-      tasks: [makeTask()],
-      sessions: {
-        "1": { main: { status: "idle", reason: "turn ended", since: "t0" } },
-      },
-      reviews: {
-        "1": { status: "approved", url: null, port: null, iterations: [] },
-      },
-      ships: {
-        "1": {
-          status: "drafted",
-          draft: {
-            commit_message: "First message",
-            pr_title: "First title",
-            pr_body: "First body",
-            source: "agent",
-          },
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t0",
-          last_step: { step: "draft", status: "ok" },
-        },
-      },
-    });
-
-    await screen.findByDisplayValue("First title");
-    await user.clear(screen.getByTestId("pr-title"));
-    await user.type(screen.getByTestId("pr-title"), "Operator title");
-    await user.click(screen.getByTestId("redraft-button"));
-    expect(confirmSpy).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(0);
-
-    await user.click(screen.getByTestId("redraft-button"));
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(1),
-    );
-    const redraft = fetchMock.mock.calls.find(([url]) => url === "/api/tasks/1/ship/draft");
-    expect(redraft).toBeDefined();
-    expect(JSON.parse(redraft![1]?.body as string)).toEqual({
-      replace: true,
-    });
-    expect(screen.getByTestId("redraft-button")).toHaveTextContent("Re-drafting");
-    expect(screen.getByTestId("pr-body")).not.toBeDisabled();
-
-    await user.clear(screen.getByTestId("pr-body"));
-    await user.type(screen.getByTestId("pr-body"), "Newer operator body");
-    act(() => {
-      socket().emit("ship_draft", {
-        task_id: 1,
-        draft: {
-          commit_message: "Second message",
-          pr_title: "Second title",
-          pr_body: "Second agent body",
-          source: "agent",
-        },
-      });
-    });
-
-    await waitFor(() => {
-      expect(screen.getByTestId("commit-message")).toHaveValue("Second message");
-      expect(screen.getByTestId("pr-title")).toHaveValue("Second title");
-      expect(screen.getByTestId("pr-body")).toHaveValue("Newer operator body");
-    });
-
-    await act(async () => {
-      deferred.resolve({
-        ok: true,
-        json: async () => ({
-          status: "drafted",
-          draft: null,
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t1",
-        }),
-      });
-      await deferred.promise;
-    });
-  });
-
-  it("shows a transport error without auto-looping and retries explicitly", async () => {
-    const user = userEvent.setup();
-    const retry = nativePromiseWithResolvers.withResolvers<{
-      ok: boolean;
-      json: () => Promise<unknown>;
-    }>();
-    let draftAttempts = 0;
-    const fetchMock = vi.fn((url: string, _init?: RequestInit) => {
-      if (url === "/api/gh/recheck") {
-        return Promise.resolve({ ok: true, json: async () => readyGitHub });
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url === "/api/tasks/1/ship/preview") {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(previewBody()) });
       }
-      draftAttempts += 1;
-      return draftAttempts === 1 ? Promise.reject(new Error("daemon connection lost")) : retry.promise;
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(projection()) });
     });
     vi.stubGlobal("fetch", fetchMock);
 
     await renderAt("/ship/1", {
       projects: [project],
       tasks: [makeTask()],
-      sessions: {
-        "1": { main: { status: "idle", reason: "turn ended", since: "t0" } },
-      },
-      reviews: {
-        "1": { status: "approved", url: null, port: null, iterations: [] },
-      },
+      reviews: { "1": approvedReview() },
     });
 
-    expect(await screen.findByTestId("draft-command-error")).toHaveTextContent(
-      "daemon connection lost",
-    );
-    expect(screen.getByTestId("redraft-button")).toHaveTextContent("Retry drafting");
-    act(() => {
-      socket().emit("review_finished", { task_id: 1, status: "approved" });
-    });
-    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(1);
+    await user.click(screen.getByTestId("preview-delivery-button"));
+    expect(await screen.findByTestId("delivery-preview")).toBeInTheDocument();
 
-    await user.click(screen.getByTestId("redraft-button"));
+    await user.type(screen.getByTestId("commit-message"), "x");
     await waitFor(() =>
-      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")).toHaveLength(2),
+      expect(screen.queryByTestId("delivery-preview")).not.toBeInTheDocument(),
     );
-    const retriedDraft = fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/draft")[1];
-    expect(retriedDraft).toBeDefined();
-    expect(JSON.parse(retriedDraft![1]?.body as string)).toEqual({
-      replace: true,
-    });
-
-    await act(async () => {
-      retry.resolve({
-        ok: true,
-        json: async () => ({
-          status: "drafting",
-          draft: null,
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t1",
-        }),
-      });
-      await retry.promise;
-    });
   });
 
-  it("resets draft fields when navigating between task ship routes", async () => {
+  it("lists every reason a delivery is refused and keeps the confirmation disabled", async () => {
     const user = userEvent.setup();
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => readyGitHub }));
-    const second = makeTask({
-      id: 2,
-      slug: "second-task",
-      branch: "bjornt/second-task",
-      clone_path: "/home/op/tasks/maas/second-task",
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url === "/api/tasks/1/ship/preview") {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve(
+              previewBody({
+                deliverable: false,
+                blockers: [
+                  { code: "review-stale", message: "the task content changed after approval" },
+                  { code: "signing-unavailable", message: "the signing key is locked" },
+                ],
+              }),
+            ),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(projection()) });
     });
+    vi.stubGlobal("fetch", fetchMock);
+
     await renderAt("/ship/1", {
       projects: [project],
-      tasks: [makeTask(), second],
-      ships: {
-        "1": {
-          status: "drafted",
-          draft: {
-            commit_message: "First task",
-            pr_title: "First title",
-            pr_body: "First body",
-            source: "agent",
-          },
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t0",
-        },
-        "2": {
-          status: "drafted",
-          draft: {
-            commit_message: "Second task",
-            pr_title: "Second title",
-            pr_body: "Second body",
-            source: "agent",
-          },
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t0",
-        },
-      },
-    });
-
-    await screen.findByDisplayValue("First task");
-    await user.clear(screen.getByTestId("commit-message"));
-    await user.type(screen.getByTestId("commit-message"), "Edited first task");
-
-    act(() => {
-      window.history.pushState({}, "", "/ship/2");
-      window.dispatchEvent(new PopStateEvent("popstate"));
-    });
-
-    expect(await screen.findByDisplayValue("Second task")).toBeInTheDocument();
-    expect(screen.getByTestId("commit-message")).not.toHaveValue("Edited first task");
-  });
-  it("renders the live review step and live commit/push steps", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => readyGitHub }));
-    await renderAt("/ship/1", {
-      projects: [githubProject],
       tasks: [makeTask()],
-      sessions: {
-        "1": { main: { status: "reviewing", reason: "llmvet review", since: "t0" } },
-      },
-      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
-      gh: readyGitHub,
+      reviews: { "1": approvedReview() },
+    });
+
+    await user.click(screen.getByTestId("preview-delivery-button"));
+    const blockers = await screen.findByTestId("preview-blockers");
+    expect(within(blockers).getByTestId("preview-blocker-review-stale")).toBeInTheDocument();
+    expect(
+      within(blockers).getByTestId("preview-blocker-signing-unavailable"),
+    ).toBeInTheDocument();
+    expect(screen.getByTestId("confirm-delivery-button")).toBeDisabled();
+  });
+
+  it("explains a stale approval instead of offering it as authorization", async () => {
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      reviews: { "1": approvedReview("cand-old") },
+      ships: { "1": projection({ candidate_id: "cand-new" }) },
+    });
+
+    expect(screen.getByTestId("stale-approval-notice")).toHaveTextContent(
+      "content the task has since changed",
+    );
+    expect(screen.getByTestId("review-summary-hint")).toHaveTextContent(
+      "delivering the current content needs a fresh review",
+    );
+  });
+
+  it("explains a historical approval that never named its content", async () => {
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
       reviews: {
         "1": {
           status: "approved",
-          url: "http://127.0.0.1:7180",
-          port: 7180,
-          iterations: [{ outcome: "approved", comment_count: null, stderr: null, recorded_at: "t2" }],
-        },
-      },
-      ships: {
-        "1": {
-          status: "drafted",
-          mode: "squash",
-          draft: {
-            commit_message: " agent commit",
-            pr_title: " agent pr title",
-            pr_body: " agent pr body",
-            source: "agent",
-          },
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t0",
+          url: null,
+          port: null,
+          iterations: [
+            {
+              outcome: "approved",
+              comment_count: 0,
+              stderr: null,
+              recorded_at: "2026-08-20T00:00:00Z",
+            },
+          ],
         },
       },
     });
 
-    expect(screen.getByTestId("ship-flow")).toBeInTheDocument();
-    expect(screen.getByTestId("ship-step-review")).toHaveTextContent("approved");
-    expect(screen.getByTestId("ship-step-commit")).toHaveTextContent("Squash");
-    expect(screen.getByTestId("ship-step-commit")).toHaveTextContent("Retain");
-    expect((screen.getByTestId("commit-message") as HTMLTextAreaElement).value).toBe(" agent commit");
-    expect((screen.getByTestId("pr-title") as HTMLInputElement).value).toBe(" agent pr title");
-    expect((screen.getByTestId("pr-body") as HTMLTextAreaElement).value).toBe(" agent pr body");
-    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
-    expect(screen.getByTestId("push-pr-progress")).toHaveTextContent("Waiting for a signed commit.");
-    expect(screen.getByTestId("ship-step-cleanup")).toBeInTheDocument();
-  });
-
-  const signingSelection = {
-    fingerprint: "ABC1230000000000000000000000000000000000",
-    key_id: "ABC123",
-    uid: "Test Key <t@example.com>",
-    keygrip: "abc",
-    source: "auto" as const,
-    protection: "protected" as const,
-  };
-
-  it("blocks Sign & commit and shows the GPG locked banner with unlock command", async () => {
-    await renderAt("/ship/1", {
-      projects: [project],
-      tasks: [makeTask()],
-      gpg: {
-        state: "locked",
-        selected: signingSelection,
-        candidates: [],
-        cache_ttl: null,
-        detail: null,
-        checked_at: "t0",
-      },
-    });
-
-    expect(screen.getByTestId("sign-commit-button")).toBeDisabled();
-    expect(screen.getByTestId("gpg-blocked-banner")).toBeInTheDocument();
-    expect(screen.getByTestId("gpg-unlock-command")).toHaveTextContent(
-      "echo | gpg --clearsign -u ABC1230000000000000000000000000000000000 >/dev/null",
+    expect(screen.getByTestId("stale-approval-notice")).toHaveTextContent(
+      "does not identify the content it graded",
     );
   });
 
-  it.each([
-    ["ambiguous", "Several usable GPG signing keys", "Choose which key signs"],
-    ["no_key", "No signing-capable GPG key", "Generate or import a signing key"],
-    ["missing", "GPG command-line tools are unavailable", "Install GnuPG"],
-    ["agent_unavailable", "gpg-agent is unreachable", "Start the agent"],
-    ["unknown", "has not been checked yet", ""],
-  ])(
-    "blocks Sign & commit for %s and names the condition",
-    async (state, reason, recovery) => {
-      await renderAt("/ship/1", {
-        projects: [project],
-        tasks: [makeTask()],
-        gpg: {
-          state,
-          selected: state === "ambiguous" ? null : signingSelection,
-          candidates: [],
-          cache_ttl: null,
-          detail: null,
-          checked_at: "t0",
-        },
-      });
-
-      expect(screen.getByTestId("sign-commit-button")).toBeDisabled();
-      expect(screen.getByTestId("gpg-blocked-reason")).toHaveTextContent(reason);
-      if (recovery) {
-        expect(screen.getByTestId("gpg-blocked-banner")).toHaveTextContent(recovery);
+  it("shows the concrete signed result and offers a later push", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url === "/api/tasks/1/ship/preview") {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve(
+              previewBody({
+                ending: "push",
+                completed_actions: ["commit"],
+                remaining_actions: ["push"],
+              }),
+            ),
+        });
       }
-    },
-  );
+      return Promise.resolve({ ok: true, json: () => Promise.resolve(projection()) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
-  it("names the signing key when the gate is open", async () => {
     await renderAt("/ship/1", {
       projects: [project],
       tasks: [makeTask()],
-      gpg: {
-        state: "ready",
-        selected: signingSelection,
-        candidates: [],
-        cache_ttl: null,
-        detail: null,
-        checked_at: "t0",
-      },
-    });
-
-    expect(screen.queryByTestId("gpg-blocked-banner")).not.toBeInTheDocument();
-    expect(screen.getByTestId("gpg-signer")).toHaveTextContent(
-      "Signing as Test Key <t@example.com>",
-    );
-  });
-
-  it("posts ship commit with edited fields and squash mode", async () => {
-    const user = userEvent.setup();
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: () =>
-        Promise.resolve({
-          status: "committing",
-          draft: null,
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t1",
-        }),
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    await renderAt("/ship/1", {
-      projects: [githubProject],
-      tasks: [makeTask()],
-      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
-      gh: readyGitHub,
+      reviews: { "1": approvedReview() },
       ships: {
-        "1": {
-          status: "drafted",
+        "1": projection({
+          disposition: "completed",
+          ending: "commit",
           mode: "squash",
-          draft: {
-            commit_message: "draft commit",
-            pr_title: "draft title",
-            pr_body: "draft body",
-            source: "agent",
+          completed_actions: ["commit"],
+          results: {
+            commit: {
+              signed_tip: "s".repeat(40),
+              commit_count: 1,
+              mode: "squash",
+              installed: true,
+            },
           },
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t0",
-        },
+        }),
       },
     });
-    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
 
-    await user.clear(screen.getByTestId("commit-message"));
-    await user.type(screen.getByTestId("commit-message"), "Final commit");
-    await user.clear(screen.getByTestId("pr-title"));
-    await user.type(screen.getByTestId("pr-title"), "Final PR title");
-    await user.click(screen.getByTestId("sign-commit-button"));
+    expect(screen.getByTestId("result-commit")).toHaveTextContent("Signed commit at ssssssssssss");
+    expect(screen.getByTestId("no-pr-notice")).toHaveTextContent("No pull request was opened");
+    // The commit ending is done, so it cannot be chosen again.
+    expect(screen.getByTestId("ending-commit")).toBeDisabled();
 
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/tasks/1/ship/commit",
-      expect.objectContaining({
-        method: "POST",
-        body: expect.stringContaining("Final commit"),
-      }),
+    await user.click(screen.getByTestId("ending-push"));
+    await user.click(screen.getByTestId("preview-delivery-button"));
+    await screen.findByTestId("delivery-preview");
+    // A continuation must not claim it will sign: that already happened.
+    expect(screen.getByTestId("confirm-delivery-button")).toHaveTextContent(
+      "Confirm: push",
+    );
+    expect(screen.getByTestId("confirm-delivery-button")).not.toHaveTextContent("sign");
+    await user.click(screen.getByTestId("confirm-delivery-button"));
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/push")).toHaveLength(
+        1,
+      ),
     );
     const body = JSON.parse(
-      fetchMock.mock.calls.find(([url]) => url === "/api/tasks/1/ship/commit")?.[1].body as string,
+      fetchMock.mock.calls.find(([url]) => url === "/api/tasks/1/ship/push")?.[1].body as string,
     );
-    expect(body).toEqual({
-      message: "Final commit",
-      pr_title: "Final PR title",
-      pr_body: "draft body",
-      mode: "squash",
-    });
+    expect(body).toMatchObject({ ending: "push", delivery_id: 10, expected_version: 1 });
+    // Continuation never re-enters the commit action.
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/commit")).toHaveLength(
+      0,
+    );
   });
 
-  it("shows the PR link once a ship finishes with a pr_url", async () => {
-    const task = makeTask();
+  it("offers explicit decisions for an effect whose outcome is unknown", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: true, json: () => Promise.resolve(projection()) });
+    vi.stubGlobal("fetch", fetchMock);
+
     await renderAt("/ship/1", {
       projects: [project],
-      tasks: [task],
-      ships: {
-        "1": {
-          status: "shipped",
-          mode: "squash",
-          draft: null,
-          commit_sha: "abc123",
-          pr_url: "https://github.com/ompire/maas/pull/42",
-          error: null,
-          updated_at: "t1",
-        },
-      },
-    });
-
-    const link = screen.getByTestId("pr-link") as HTMLAnchorElement;
-    expect(link.href).toBe("https://github.com/ompire/maas/pull/42");
-  });
-
-  it("shows a not-found message for an unknown task id", async () => {
-    await renderAt("/ship/999", { projects: [project], tasks: [makeTask()] });
-    expect(screen.getByTestId("ship-flow-not-found")).toHaveTextContent("Task not found");
-  });
-
-  it("selects retain mode and disables the commit message field", async () => {
-    const user = userEvent.setup();
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => readyGitHub }));
-    await renderAt("/ship/1", {
-      projects: [githubProject],
       tasks: [makeTask()],
-      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
-      gh: readyGitHub,
       ships: {
-        "1": {
-          status: "drafted",
-          mode: "squash",
-          draft: {
-            commit_message: "draft commit",
-            pr_title: "draft title",
-            pr_body: "draft body",
-            source: "agent",
-          },
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t0",
-        },
-      },
-    });
-
-    const retainRadio = screen.getByRole("radio", { name: /Retain/i });
-    expect(retainRadio).not.toBeDisabled();
-
-    await user.click(retainRadio);
-    expect(screen.getByTestId("commit-message")).toBeDisabled();
-    expect(screen.getByTestId("retain-message-hint")).toHaveTextContent(
-      "Per-commit messages are retained",
-    );
-    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
-  });
-
-  it("posts ship commit with retain mode", async () => {
-    const user = userEvent.setup();
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: () =>
-        Promise.resolve({
-          status: "committing",
-          draft: null,
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t1",
+        "1": projection({
+          disposition: "unresolved",
+          ending: "pr",
+          blocked_reason: "the forge could not be searched completely",
+          actions: [
+            {
+              id: 7,
+              kind: "pr",
+              attempt: 1,
+              phase: "needs_reconciliation",
+              expected: { marker: "m".repeat(32) },
+              progress: {
+                evidence: {
+                  state: "unknown",
+                  detail: "the correlated search could not be completed",
+                },
+              },
+              error: "the forge could not be searched completely",
+              updated_at: "2026-08-20T00:00:00Z",
+            },
+          ],
         }),
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    await renderAt("/ship/1", {
-      projects: [githubProject],
-      tasks: [makeTask()],
-      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
-      gh: readyGitHub,
-      ships: {
-        "1": {
-          status: "drafted",
-          mode: "squash",
-          draft: {
-            commit_message: "draft commit",
-            pr_title: "draft title",
-            pr_body: "draft body",
-            source: "agent",
-          },
-          commit_sha: null,
-          pr_url: null,
-          error: null,
-          updated_at: "t0",
-        },
       },
     });
-    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
 
-    await user.click(screen.getByRole("radio", { name: /Retain/i }));
-    await user.click(screen.getByTestId("sign-commit-button"));
+    const panel = screen.getByTestId("ship-recovery-pr");
+    expect(within(panel).getByTestId("recovery-reason")).toHaveTextContent(
+      "could not be searched completely",
+    );
+    expect(within(panel).getByTestId("recovery-expected")).toHaveTextContent("marker");
+    // What Ompire saw, in the operator's terms — not the attempt's own intent
+    // dumped back at them.
+    expect(within(panel).getByTestId("recovery-observed")).toHaveTextContent(
+      "the correlated search could not be completed",
+    );
 
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/tasks/1/ship/commit",
-      expect.objectContaining({
-        method: "POST",
-        body: expect.stringContaining("retain"),
-      }),
+    await user.click(within(panel).getByTestId("recovery-recheck"));
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/1/ship/reconcile"),
+      ).toHaveLength(1),
     );
     const body = JSON.parse(
-      fetchMock.mock.calls.find(([url]) => url === "/api/tasks/1/ship/commit")?.[1].body as string,
+      fetchMock.mock.calls.find(([url]) => url === "/api/tasks/1/ship/reconcile")?.[1]
+        .body as string,
     );
-    expect(body).toEqual({
-      message: "draft commit",
-      pr_title: "draft title",
-      pr_body: "draft body",
-      mode: "retain",
+    expect(body).toMatchObject({
+      delivery_id: 10,
+      action_id: 7,
+      expected_version: 1,
+      decision: "recheck",
     });
   });
-  it("requests one task-scoped GitHub recheck under StrictMode", async () => {
-    const deferred = nativePromiseWithResolvers.withResolvers<{
-      ok: boolean;
-      json: () => Promise<unknown>;
-    }>();
-    const fetchMock = vi.fn((url: string) => {
-      if (url === "/api/gh/recheck") return deferred.promise;
-      throw new Error(`unexpected request ${url}`);
+
+  it("says an interrupted draft was not restarted on the operator's behalf", async () => {
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      ships: {
+        "1": projection({
+          draft: {
+            commit_message: "half a message",
+            pr_title: "",
+            pr_body: "",
+            source: "agent",
+            state: "interrupted",
+            error: "the daemon restarted while the agent was drafting",
+          },
+        }),
+      },
+    });
+
+    expect(screen.getByTestId("draft-status")).toHaveTextContent("Nothing was sent again");
+    expect(screen.getByTestId("commit-message")).toHaveValue("half a message");
+  });
+
+  it("blocks a pushing ending on GitHub eligibility and offers a re-check", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockImplementation((url: string) => {
+      if (url === "/api/tasks/1/ship/preview") {
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve(
+              previewBody({
+                ending: "pr",
+                remaining_actions: ["commit", "push", "pr"],
+                deliverable: false,
+                blockers: [
+                  {
+                    code: "github-unavailable",
+                    message: "GitHub preflight blocked shipping: GitHub CLI is unauthenticated",
+                  },
+                ],
+              }),
+            ),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    window.history.pushState({}, "", "/ship/1");
-    render(
-      <StrictMode>
-        <App />
-      </StrictMode>,
-    );
-    const strictSocket = MockWebSocket.instances[MockWebSocket.instances.length - 1];
-    act(() => {
-      strictSocket.emitSnapshot({ projects: [githubProject], tasks: [makeTask()], gh: readyGitHub });
+    await renderAt("/ship/1", {
+      projects: [githubProject],
+      tasks: [makeTask()],
+      reviews: { "1": approvedReview() },
+      gh: readyGitHub,
     });
 
+    await user.click(screen.getByTestId("preview-delivery-button"));
+    const banner = await screen.findByTestId("github-preflight-banner");
+    expect(banner).toHaveTextContent("GitHub access is required for this ending");
+    // The GitHub API check is not a claim about the Git transport identity.
+    expect(banner).toHaveTextContent("does not verify SSH or HTTPS authentication");
+    expect(screen.getByTestId("confirm-delivery-button")).toBeDisabled();
+
+    await user.click(screen.getByTestId("recheck-github-target-button"));
     await waitFor(() =>
       expect(fetchMock.mock.calls.filter(([url]) => url === "/api/gh/recheck")).toHaveLength(1),
     );
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/gh/recheck",
-      expect.objectContaining({ method: "POST", body: JSON.stringify({ task_id: 1 }) }),
-    );
-    await act(async () => {
-      deferred.resolve({ ok: true, json: async () => readyGitHub });
-      await deferred.promise;
-    });
   });
 
-  it.each([
-    [
-      {
-        ...readyGitHub,
-        identity: { ...readyGitHub.identity, state: "missing", login: null },
-        targets: {},
+  it("says a pull request that predates the journal has no authorization behind it", async () => {
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask({ pr_url: "https://github.com/ompire/maas/pull/3" })],
+      ships: {
+        "1": projection({
+          delivery_id: null,
+          disposition: null,
+          legacy_publication: true,
+          pr_url: "https://github.com/ompire/maas/pull/3",
+        }),
       },
-      "GitHub CLI is unavailable",
-      "Install or correct the configured GitHub CLI",
-    ],
-    [
-      {
-        ...readyGitHub,
-        identity: { ...readyGitHub.identity, state: "unauthenticated", login: null, credential_source: "GH_TOKEN" },
-        targets: {},
-      },
-      "GitHub authentication is required",
-      "GH_TOKEN takes precedence",
-    ],
-    [
-      {
-        ...readyGitHub,
-        targets: {
-          "github.com/ompire/maas": {
-            ...readyGitHub.targets["github.com/ompire/maas"],
-            state: "denied",
-            detail: "account lacks pull permission",
+    });
+
+    expect(screen.getByTestId("legacy-publication-notice")).toHaveTextContent(
+      "no recorded authorization",
+    );
+    expect(screen.getByTestId("pr-link")).toHaveAttribute(
+      "href",
+      "https://github.com/ompire/maas/pull/3",
+    );
+  });
+
+  it("drops a delivery projection older than the one already applied", async () => {
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      ships: {
+        "1": projection({
+          version: 5,
+          disposition: "completed",
+          completed_actions: ["commit"],
+          results: {
+            commit: {
+              signed_tip: "s".repeat(40),
+              commit_count: 1,
+              mode: "squash",
+              installed: true,
+            },
           },
-        },
+        }),
       },
-      "Repository access is denied",
-      "@octo cannot create a pull request for github.com/ompire/maas",
-    ],
-  ])("renders actionable blocked GitHub state", async (gh, heading, detail) => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => gh }));
-    await renderAt("/ship/1", {
-      projects: [githubProject],
-      tasks: [makeTask()],
-      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
-      gh,
     });
-
-    const banner = await screen.findByTestId("github-preflight-banner");
-    expect(banner).toHaveTextContent(heading);
-    expect(banner).toHaveTextContent(detail);
-    expect(banner).toHaveTextContent("does not verify SSH or HTTPS authentication");
-    expect(screen.getByTestId("sign-commit-button")).toBeDisabled();
-  });
-
-  it("recovers from a transient target check and enables the matching account", async () => {
-    const user = userEvent.setup();
-    let attempts = 0;
-    const fetchMock = vi.fn((url: string) => {
-      if (url !== "/api/gh/recheck") throw new Error(`unexpected request ${url}`);
-      attempts += 1;
-      if (attempts === 1) return Promise.reject(new Error("temporary network failure"));
-      return Promise.resolve({ ok: true, json: async () => readyGitHub });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    await renderAt("/ship/1", {
-      projects: [githubProject],
-      tasks: [makeTask()],
-      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
-      gh: { ...readyGitHub, identity: { ...readyGitHub.identity, state: "unknown", login: null }, targets: {} },
-    });
-
-    expect(await screen.findByTestId("github-preflight-banner")).toHaveTextContent(
-      "GitHub check could not complete",
-    );
-    await user.click(screen.getByTestId("recheck-github-target-button"));
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.filter(([url]) => url === "/api/gh/recheck")).toHaveLength(2),
-    );
-    act(() => {
-      socket().emit("gh_status", { gh: readyGitHub });
-    });
-    await user.type(screen.getByTestId("commit-message"), "manual commit");
-    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
-    expect(screen.getByTestId("github-preflight-banner")).toHaveTextContent("GitHub preflight ready");
-  });
-
-  it("does not reuse a target result for another upstream or identity", async () => {
-    const otherTarget = {
-      ...readyGitHub,
-      targets: {
-        "github.com/other/repository": {
-          ...readyGitHub.targets["github.com/ompire/maas"],
-          target: { host: "github.com", owner: "other", repository: "repository" },
-        },
-      },
-    };
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => otherTarget }));
-    await renderAt("/ship/1", {
-      projects: [githubProject],
-      tasks: [makeTask()],
-      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
-      gh: otherTarget,
-    });
-
-    await screen.findByTestId("github-preflight-banner");
-    expect(screen.getByTestId("github-preflight-banner")).toHaveTextContent("needs a current check");
-    expect(screen.getByTestId("sign-commit-button")).toBeDisabled();
+    expect(screen.getByTestId("result-commit")).toBeInTheDocument();
 
     act(() => {
-      socket().emit("gh_status", {
-        gh: {
-          ...readyGitHub,
-          identity: { ...readyGitHub.identity, login: "changed-account" },
-          targets: readyGitHub.targets,
-        },
-      });
+      socket().emit("ship_updated", projection({ version: 4, disposition: "open" }));
     });
-    await waitFor(() =>
-      expect(screen.getByTestId("github-preflight-banner")).toHaveTextContent("needs a current check"),
-    );
-    expect(screen.getByTestId("sign-commit-button")).toBeDisabled();
+    expect(screen.getByTestId("result-commit")).toBeInTheDocument();
+
+    act(() => {
+      socket().emit("ship_updated", projection({ version: 6, disposition: "open" }));
+    });
+    expect(screen.queryByTestId("result-commit")).not.toBeInTheDocument();
   });
-
-  it("renders a safe structured commit refusal", async () => {
-    const user = userEvent.setup();
-    const leaked = "github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    const fetchMock = vi.fn((url: string) => {
-      if (url === "/api/gh/recheck") return Promise.resolve({ ok: true, json: async () => readyGitHub });
-      if (url === "/api/tasks/1/ship/commit") {
-        return Promise.resolve({
-          ok: false,
-          status: 409,
-          json: async () => ({ detail: { message: `GitHub preflight blocked: Authorization: Bearer ${leaked}` } }),
-        });
-      }
-      throw new Error(`unexpected request ${url}`);
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    await renderAt("/ship/1", {
-      projects: [githubProject],
-      tasks: [makeTask()],
-      gpg: { state: "ready", selected: { fingerprint: "ABC1230000000000000000000000000000000000", key_id: "ABC123", uid: "Test Key <t@example.com>", keygrip: "abc", source: "auto", protection: "unprotected" }, candidates: [], cache_ttl: null, detail: null, checked_at: "t0" },
-      gh: readyGitHub,
-    });
-
-    await user.type(screen.getByTestId("commit-message"), "manual commit");
-    await waitFor(() => expect(screen.getByTestId("sign-commit-button")).not.toBeDisabled());
-    await user.click(screen.getByTestId("sign-commit-button"));
-    expect(await screen.findByTestId("commit-command-error")).toHaveTextContent(
-      "GitHub preflight blocked: Authorization: [redacted]",
-    );
-    expect(document.body.textContent).not.toContain(leaked);
-  });
-
 });
 
 describe("Chrome GPG chip", () => {
@@ -3888,10 +3562,105 @@ describe("ShipFlowView Cleanup step (merge-poll capability)", () => {
   const prTask = (overrides: Partial<Task> = {}) =>
     makeTask({ pr_url: "https://github.com/ompire/maas/pull/7", ...overrides });
 
-  it("stays inert before the task has shipped a PR", async () => {
+  it("stays inert before the task has delivered anything", async () => {
     await renderAt("/ship/1", { projects: [project], tasks: [makeTask()] });
 
-    expect(screen.getByTestId("cleanup-hint")).toHaveTextContent("unlocks once this task has shipped");
+    expect(screen.getByTestId("cleanup-hint")).toHaveTextContent(
+      "unlocks once this task has delivered",
+    );
+    expect(screen.queryByTestId("cleanup-ship-button")).not.toBeInTheDocument();
+  });
+
+  it("warns that cleanup removes the only managed copy of a local-only result", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({}) });
+    vi.stubGlobal("fetch", fetchMock);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      ships: {
+        "1": {
+          task_id: 1,
+          version: 3,
+          delivery_id: 10,
+          disposition: "completed",
+          ending: "commit",
+          mode: "squash",
+          candidate_id: "cand-1",
+          review_candidate_id: "cand-1",
+          draft: null,
+          blocked_reason: null,
+          workspace_owner: null,
+          completed_actions: ["commit"],
+          remaining_actions: [],
+          results: {
+            commit: {
+              signed_tip: "s".repeat(40),
+              commit_count: 1,
+              mode: "squash",
+              installed: true,
+            },
+          },
+          pr_url: null,
+          legacy_publication: false,
+          actions: [],
+          decisions: [],
+          history: [],
+        },
+      },
+    });
+
+    expect(screen.getByTestId("cleanup-warning")).toHaveTextContent(
+      "only Ompire-managed Git copy",
+    );
+    await user.click(screen.getByTestId("cleanup-ship-button"));
+    expect(confirmSpy).toHaveBeenCalledWith(
+      expect.stringContaining("only Ompire-managed Git copy"),
+    );
+  });
+
+  it("refuses cleanup while a delivery effect's outcome is unknown", async () => {
+    await renderAt("/ship/1", {
+      projects: [project],
+      tasks: [makeTask()],
+      ships: {
+        "1": {
+          task_id: 1,
+          version: 2,
+          delivery_id: 10,
+          disposition: "unresolved",
+          ending: "push",
+          mode: "squash",
+          candidate_id: "cand-1",
+          review_candidate_id: "cand-1",
+          draft: null,
+          blocked_reason: "the destination could not be read",
+          workspace_owner: null,
+          completed_actions: ["commit"],
+          remaining_actions: ["push"],
+          results: {},
+          pr_url: null,
+          legacy_publication: false,
+          actions: [
+            {
+              id: 4,
+              kind: "push",
+              attempt: 1,
+              phase: "needs_reconciliation",
+              expected: {},
+              error: "the response was lost",
+              updated_at: "2026-08-20T00:00:00Z",
+            },
+          ],
+          decisions: [],
+          history: [],
+        },
+      },
+    });
+
+    expect(screen.getByTestId("cleanup-hint")).toHaveTextContent("outcome is unknown");
     expect(screen.queryByTestId("cleanup-ship-button")).not.toBeInTheDocument();
   });
 

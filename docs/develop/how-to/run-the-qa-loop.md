@@ -257,19 +257,22 @@ the publishing path is broken no matter how green everything else looked.
 Only on the disposable bot-owned sandbox, verify the failure and recovery path
 before a normal ship:
 
-1. Spawn or select a sandbox task and record its clone `HEAD`, worktree state,
-   and absence of `refs/ompire/ship-orig`.
+1. Spawn or select a sandbox task and record its clone `HEAD` and worktree
+   state.
 2. Start the daemon once with a deliberately invalid `GH_TOKEN` in its launch
    environment. In the browser, confirm the chrome and Settings show `gh auth`
-   without token material and Ship flow disables **Sign & commit**.
-3. Send the ordinary ship-commit request. It must return safe `409` GitHub
-   status before a ship job, commit event, `HEAD` change, worktree change, or
-   `refs/ompire/ship-orig` change.
-4. Stop that daemon and restart the normal QA wrapper, which sources
+   without token material, and that resolving a pull-request ending in Ship flow
+   reports the GitHub blocker and leaves the confirmation disabled.
+3. Confirm that a **local signed commit** ending is still offered: it needs no
+   forge availability at all.
+4. Send the ordinary delivery preview. It must report the GitHub blocker with a
+   safe status and produce no delivery record, no commit, no `HEAD` change, and
+   no worktree change.
+5. Stop that daemon and restart the normal QA wrapper, which sources
    `.qa-agent/env.sh`. Re-check GitHub in Settings and the task Ship flow;
    both must report `gh @ompire-test` and the canonical sandbox target ready.
-5. Complete the normal signed ship and confirm the pull request exists on the
-   sandbox repository. Keep the GitHub API eligibility result distinct from
+6. Complete the normal signed delivery and confirm the pull request exists on
+   the sandbox repository. Keep the GitHub API eligibility result distinct from
    SSH or HTTPS push authentication.
 
 Capture only safe UI/API/event evidence. Never copy the invalid token, bot

@@ -103,9 +103,12 @@ interval until it is dealt with.
 | `error` | Any other indeterminate result; carries a reason | Refused |
 | `unknown` | No probe has completed yet | Refused |
 
-Only `ready` allows a commit; every other state fails closed and carries its
-own recovery action. An unprotected key is `ready` rather than `locked`: it has
-nothing to cache. See [GPG signing](gpg-signing.md).
+Only `ready` allows a signed commit; every other state fails closed and carries
+its own recovery action. An unprotected key is `ready` rather than `locked`: it
+has nothing to cache. See [GPG signing](gpg-signing.md).
+
+Signing readiness is required for the commit action alone. Pushing an existing
+verified signed result, or opening a pull request for one, needs no signing key.
 
 ## GitHub states
 
@@ -128,18 +131,46 @@ previous ready result rather than leaving stale authorization visible.
 Each canonical `host/owner/repository` result is bound to the host, login, and
 credential-source tuple that produced it.
 
-| State | Meaning | Shipping |
+| State | Meaning | Endings that push |
 |---|---|---|
 | `unchecked` | The target has not been checked under a ready identity. | Refused |
-| `allowed` | Read-only repository, pull-request policy, and effective-access checks passed. | Allowed with a `ready` GPG gate |
+| `allowed` | Read-only repository, pull-request policy, and effective-access checks passed. | Allowed |
 | `denied` | The known account cannot use the registered upstream target. | Refused |
 | `error` | Target response or eligibility evidence was incomplete or indeterminate. | Refused |
 
+GitHub availability gates only the endings that reach the forge. A local signed
+commit is unaffected by every state in this table.
+
+This check is GitHub **API** identity and repository eligibility. It is not
+proof of the SSH key or HTTPS credential `git push` uses, and Ompire records
+that transport identity as explicitly unattributed rather than inventing one.
+
+## Delivery states
+
+A delivery is the operator's authorization to publish one reviewed candidate as
+far as one selected ending. Its disposition is durable
+([ADR-0032](../../adr/0032-bind-trusted-delivery-to-retained-candidates.md)):
+
+| Disposition | Meaning |
+|---|---|
+| `open` | A draft exists. Nothing is authorized. |
+| `authorized` | A confirmation stands and actions remain. |
+| `completed` | The selected ending was reached. A further ending can still be authorized. |
+| `blocked` | A safe stop: nothing is in an unknown state, and a fresh preview and confirmation may continue. |
+| `unresolved` | An effect's outcome could not be established. Nothing dependent runs and cleanup is refused. |
+| `abandoned` | The operator granted no further authority. |
+
+Each action attempt has its own phase: `prepared`, `executing`, `succeeded`,
+`failed`, or `needs_reconciliation`. `failed` means Ompire established that the
+effect did not happen; `needs_reconciliation` means it could not tell, which is
+neither success nor failure.
+
 ## Pull-request states
 
-A shipped task records its pull-request URL, state, and merge time. Ompire
-polls until the pull request reaches a terminal state. Tasks are considered
-active while their pull-request state is unset or `open`.
+A task that opened a pull request records its URL, state, and merge time.
+Ompire polls until the pull request reaches a terminal state. Tasks are
+considered active while their pull-request state is unset or `open`. A delivery
+that ended earlier has no pull request and is not polled.
 
 ## Advisories
 

@@ -45,6 +45,9 @@ class ReviewIterationRecord:
     comment_count: int | None
     stderr: str | None
     recorded_at: str
+    # The protected candidate this iteration actually graded (ADR-0032), or
+    # None for an iteration recorded before content binding existed.
+    candidate_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,24 @@ class ReviewRecord:
     created_at: str
     updated_at: str
     iterations: list[ReviewIterationRecord]
+    # The candidate the current (or last) round is bound to.
+    candidate_id: str | None = None
+
+    @property
+    def approved_candidate_id(self) -> str | None:
+        """What this review's approval is usable for, if anything.
+
+        An approval names a candidate only when the terminal `approved`
+        iteration recorded one. A legacy approval — recorded before reviews
+        were content-bound — returns None: it stays visible as historical
+        evidence and is never treated as authorization for current work.
+        """
+        if self.status != "approved":
+            return None
+        for iteration in reversed(self.iterations):
+            if iteration.outcome == "approved":
+                return iteration.candidate_id
+        return None
 
 
 def _now_iso() -> str:
@@ -69,6 +90,7 @@ def _row_to_iteration(row) -> ReviewIterationRecord:
         comment_count=row.comment_count,
         stderr=row.stderr,
         recorded_at=row.recorded_at,
+        candidate_id=row.candidate_id,
     )
 
 
@@ -80,12 +102,18 @@ def _row_to_review(row, iterations: list[ReviewIterationRecord]) -> ReviewRecord
         created_at=row.created_at,
         updated_at=row.updated_at,
         iterations=iterations,
+        candidate_id=row.candidate_id,
     )
 
 
-def open_review(engine: Engine, task_id: int) -> ReviewRecord:
-    """Mark the task's review `open` and stamp the write-ahead process
-    marker. Upsert: a re-review keeps the existing row and its iterations."""
+def open_review(
+    engine: Engine, task_id: int, *, candidate_id: str | None = None
+) -> ReviewRecord:
+    """Mark the task's review `open`, bind it to the candidate being graded,
+    and stamp the write-ahead process marker. Upsert: a re-review keeps the
+    existing row and its iterations, and rebinds to the new candidate — a
+    second round grades the corrected content, not the content that produced
+    the comments."""
     now = _now_iso()
     with engine.begin() as conn:
         existing = conn.execute(
@@ -97,6 +125,7 @@ def open_review(engine: Engine, task_id: int) -> ReviewRecord:
                     task_id=task_id,
                     status="open",
                     process_started_at=now,
+                    candidate_id=candidate_id,
                     created_at=now,
                     updated_at=now,
                 )
@@ -105,7 +134,12 @@ def open_review(engine: Engine, task_id: int) -> ReviewRecord:
             conn.execute(
                 reviews.update()
                 .where(reviews.c.task_id == task_id)
-                .values(status="open", process_started_at=now, updated_at=now)
+                .values(
+                    status="open",
+                    process_started_at=now,
+                    candidate_id=candidate_id,
+                    updated_at=now,
+                )
             )
     record = get_review(engine, task_id)
     assert record is not None
@@ -142,6 +176,7 @@ def append_iteration(
     comment_count: int | None = None,
     stderr: str | None = None,
     status: str | None = None,
+    candidate_id: str | None = None,
 ) -> ReviewIterationRecord:
     """Append the next iteration (seq = max+1), optionally landing the
     review's status in the same transaction so a crash can never separate a
@@ -162,6 +197,7 @@ def append_iteration(
                 outcome=outcome,
                 comment_count=comment_count,
                 stderr=stderr,
+                candidate_id=candidate_id,
                 recorded_at=now,
             )
         )
@@ -177,6 +213,7 @@ def append_iteration(
         outcome=outcome,
         comment_count=comment_count,
         stderr=stderr,
+        candidate_id=candidate_id,
         recorded_at=now,
     )
 

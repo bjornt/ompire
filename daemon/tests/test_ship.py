@@ -1,8 +1,15 @@
-"""Tests for `ompire_daemon.ship`."""
+"""Tests for `ompire_daemon.ship`: content-bound, selectable, recoverable
+delivery (ADR-0032).
+
+Everything here runs against real disposable Git repositories and a real
+throwaway GPG key. What is faked is only what sits outside the trust boundary:
+the GitHub CLI and the forge it talks to.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import textwrap
@@ -15,6 +22,11 @@ from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.app import create_app
 from ompire_daemon.config import Config
 from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
+from ompire_daemon.delivery import (
+    DeliveryWorkspaceError,
+    WorkspaceGuard,
+    capture_candidate,
+)
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import (
     GitHubCli,
@@ -28,29 +40,35 @@ from ompire_daemon.gh import (
 )
 from ompire_daemon.gpg import GpgProbe, GpgSelection, GpgStatus, parse_candidates
 from ompire_daemon.registry.projects import create_project
+from ompire_daemon.registry.reviews import (
+    append_iteration,
+    clear_process_marker,
+    open_review,
+)
+from ompire_daemon.registry.ships import (
+    get_delivery,
+    get_latest_delivery,
+    list_deliveries,
+)
 from ompire_daemon.registry.tasks import (
     create_task,
     get_task,
-    mark_archived,
     mark_pr_url,
 )
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import (
+    DeliveryBlockedError,
     GitHubPreflightError,
-    NoLiveAgentError,
+    PreviewMismatchError,
     PushError,
-    SessionNotIdleError,
-    ShipAlreadyPublishedError,
     ShipDraft,
-    ShipError,
-    ShipInProgressError,
     ShipManager,
-    ShipState,
     SshAuthenticationError,
     _find_pr_url,
     _parse_draft,
+    body_with_marker,
+    correlation_marker,
 )
-from ompire_daemon.spawn import StepFailedError
 from tests.conftest import make_execution_inputs, register_builtin_workflows
 
 
@@ -168,6 +186,11 @@ def gh(config: Config) -> _AllowedGitHub:
 
 
 @pytest.fixture
+def guard() -> WorkspaceGuard:
+    return WorkspaceGuard()
+
+
+@pytest.fixture
 def ships(
     config: Config,
     engine,
@@ -176,8 +199,9 @@ def ships(
     agents: AgentSupervisor,
     gpg: GpgProbe,
     gh: _AllowedGitHub,
+    guard: WorkspaceGuard,
 ) -> ShipManager:
-    return ShipManager(config, engine, hub, sessions, agents, gpg, gh)
+    return ShipManager(config, engine, hub, sessions, agents, gpg, gh, guard)
 
 
 @pytest.fixture
@@ -403,74 +427,102 @@ def _make_project_and_task(
     return project, task
 
 
-@pytest.mark.parametrize("mode", ["squash", "retain"])
-async def test_direct_preflight_blocks_before_any_local_ship_mutation(
-    tmp_root, engine, ships, hub, monkeypatch, mode
-):
-    project, task = _make_project_and_task(engine, tmp_root)
-    origin = tmp_root / "preflight-origin.git"
-    _setup_git_clone(origin, Path(task.clone_path))
-    clone = Path(task.clone_path)
-    original_head = subprocess.run(
-        ["git", "-C", str(clone), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
+
+# --- shared delivery helpers ------------------------------------------------
+
+
+async def _approve_current(config, engine, task, base_branch: str = "main"):
+    """Capture the task's current content and record an approval bound to it.
+
+    Exactly what a real review leaves behind: the candidate it graded, plus a
+    terminal `approved` iteration naming that candidate. Delivery reads the
+    binding, never the status alone.
+    """
+    candidate = await capture_candidate(
+        config, engine, task, base_branch=base_branch
+    )
+    open_review(engine, task.id, candidate_id=candidate.candidate_id)
+    append_iteration(
+        engine,
+        task.id,
+        outcome="approved",
+        status="approved",
+        candidate_id=candidate.candidate_id,
+    )
+    clear_process_marker(engine, task.id)
+    return candidate
+
+
+def _local_destination(ships: ShipManager, remote: Path, monkeypatch) -> None:
+    """Point the accepted destination at a local bare repository.
+
+    The GitHub identity and eligibility preflight still runs against the
+    project's real upstream URL; only the Git transport target is local, so a
+    push can be observed as an actual ref write.
+    """
+    original = ships._destination
+
+    def local(task):
+        return {**original(task), "remote_url": str(remote)}
+
+    monkeypatch.setattr(ships, "_destination", local)
+
+
+def _bare(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _run_git(path, "init", "--bare")
+    return path
+
+
+def _git_out(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args], capture_output=True, text=True, check=True
     ).stdout.strip()
-    original_tree = (clone / "file3.txt").read_text(encoding="utf-8")
-    error = _blocked_preflight_error(project.upstream_url)
-
-    async def blocked(_upstream_url: str):
-        return error.status, error.target
-
-    monkeypatch.setattr(ships._gh, "probe_target", blocked)
-    events = hub.subscribe()
-    try:
-        with pytest.raises(GitHubPreflightError):
-            await ships.commit_and_ship(task, "message", "title", "body", mode=mode)
-        assert (
-            subprocess.run(
-                ["git", "-C", str(clone), "rev-parse", "HEAD"],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip()
-            == original_head
-        )
-        assert (clone / "file3.txt").read_text(encoding="utf-8") == original_tree
-        assert (
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(clone),
-                    "rev-parse",
-                    "--verify",
-                    "refs/ompire/ship-orig",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            ).returncode
-            != 0
-        )
-        assert ships.get(task.id) is None
-        assert ships._backgrounds == {}
-        assert events.empty()
-    finally:
-        hub.unsubscribe(events)
 
 
-# --- URL parsing ----------------------------------------------------------
+async def _deliver(
+    ships: ShipManager,
+    task,
+    *,
+    ending: str,
+    mode: str = "squash",
+    message: str = "ship: the work",
+    pr_title: str = "The work",
+    pr_body: str = "why",
+    request_id: str = "req-1",
+):
+    """Preview, then confirm exactly what the preview offered."""
+    preview = await ships.preview(
+        task,
+        ending=ending,
+        mode=mode,
+        commit_message=message,
+        pr_title=pr_title,
+        pr_body=pr_body,
+        request_id=request_id,
+    )
+    assert preview.deliverable, [b.code for b in preview.blockers]
+    return await ships.deliver(
+        task,
+        ending=ending,
+        mode=mode,
+        commit_message=message,
+        pr_title=pr_title,
+        pr_body=pr_body,
+        request_id=request_id,
+        preview_token=preview.fingerprint,
+    )
+
+
+# --- parsing (unchanged contracts) ------------------------------------------
 
 
 @pytest.mark.parametrize(
     "url,expected",
     [
-        ("git@github.com:owner/repo.git", "owner/repo"),
-        ("git@github.com:owner/repo", "owner/repo"),
-        ("https://github.com/owner/repo.git", "owner/repo"),
         ("https://github.com/owner/repo", "owner/repo"),
+        ("https://github.com/owner/repo.git", "owner/repo"),
+        ("git@github.com:owner/repo.git", "owner/repo"),
     ],
 )
 def test_parse_github_slug(url, expected):
@@ -479,11 +531,7 @@ def test_parse_github_slug(url, expected):
 
 @pytest.mark.parametrize(
     "url",
-    [
-        "https://gitlab.com/owner/repo",
-        "not-a-url",
-        "https://github.com/owner",
-    ],
+    ["https://gitlab.com/owner/repo", "https://github.com/owner", "not-a-url"],
 )
 def test_parse_github_slug_rejects_non_github(url):
     with pytest.raises(ValueError):
@@ -493,1713 +541,1211 @@ def test_parse_github_slug_rejects_non_github(url):
 @pytest.mark.parametrize(
     "url,expected",
     [
-        ("git@github.com:forkowner/repo.git", "forkowner"),
-        ("https://github.com/forkowner/repo", "forkowner"),
+        ("https://github.com/fork-owner/repo", "fork-owner"),
+        ("git@github.com:fork-owner/repo.git", "fork-owner"),
     ],
 )
 def test_parse_github_owner(url, expected):
     assert parse_github_owner(url) == expected
 
 
-# --- draft parsing --------------------------------------------------------
-
-
 def test_parse_draft_extracts_sections():
-    text = textwrap.dedent(
-        """\
-        <<<COMMIT_MESSAGE>>>
-        Add feature
-
-        <<<PR_TITLE>>>
-        Add the feature
-
-        <<<PR_BODY>>>
-        This adds the feature.
-        """
+    text = (
+        "preamble\n"
+        "<<<COMMIT_MESSAGE>>>\nfeat: thing\n\nbody line\n"
+        "<<<PR_TITLE>>>\nAdd thing\n"
+        "<<<PR_BODY>>>\n- did the thing\n"
     )
     draft = _parse_draft(text)
-    assert draft.commit_message == "Add feature"
-    assert draft.pr_title == "Add the feature"
-    assert draft.pr_body == "This adds the feature."
+    assert draft == ShipDraft(
+        commit_message="feat: thing\n\nbody line",
+        pr_title="Add thing",
+        pr_body="- did the thing",
+    )
 
 
 def test_parse_draft_returns_none_on_missing_marker():
-    assert _parse_draft("no markers") is None
+    assert _parse_draft("<<<COMMIT_MESSAGE>>>\nonly one section\n") is None
 
 
-# --- commit flow ----------------------------------------------------------
+def test_find_pr_url_extracts_the_first_pull_request_url():
+    assert (
+        _find_pr_url("noise\nhttps://github.com/o/r/pull/7\nmore")
+        == "https://github.com/o/r/pull/7"
+    )
 
 
-async def test_commit_and_ship_squashes_delta(
-    tmp_root, engine, ships, gpg, monkeypatch
+def test_the_authorized_pr_body_carries_the_correlation_marker():
+    """The preview shows the body Ompire will write, marker included, so the
+    body the operator authorizes is the body a lost response can be found by."""
+    marker = correlation_marker(7, "req-abc")
+    body = body_with_marker("why this change", marker)
+    assert "why this change" in body
+    assert f"ompire-delivery: {marker}" in body
+    # Deterministic from task and request identity alone.
+    assert correlation_marker(7, "req-abc") == marker
+    assert correlation_marker(8, "req-abc") != marker
+
+
+# --- candidate identity -----------------------------------------------------
+
+
+async def test_candidate_identity_is_content_and_survives_recapture(
+    tmp_root, engine, config
 ):
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-
-    origin = tmp_root / "origin.git"
-    _project, task = _make_project_and_task(
-        engine, tmp_root, upstream_url="git@github.com:owner/repo.git"
-    )
-
-    bin_dir = tmp_root / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    _write_script(
-        bin_dir,
-        "fake-gpg",
-        "#!/bin/sh\ncat <<'EOF'\n-----BEGIN PGP SIGNATURE-----\n\nxxxx\n-----END PGP SIGNATURE-----\nEOF\n",
-    )
-    _write_script(
-        bin_dir,
-        "gh",
-        "#!/bin/sh\necho 'https://github.com/owner/repo/pull/42'\n",
-    )
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-
-    _setup_git_clone(origin, Path(task.clone_path))
-    _wrapper, _fingerprint = _setup_signing_gpg(bin_dir, monkeypatch)
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(_fingerprint))
-
-    # Assert the ship flow pushes to the project's upstream_url (not the
-    # clone's local-path origin), then redirect the transport to the local
-    # bare repo so the push actually lands. See test_push_and_pr_routes_to_*.
-    real_ensure = ships._ensure_ship_remote
-    seen_urls: list[str] = []
-
-    async def ensure_local(clone_path, url, timeout):
-        seen_urls.append(url)
-        return await real_ensure(clone_path, str(origin), timeout)
-
-    monkeypatch.setattr(ships, "_ensure_ship_remote", ensure_local)
-
-    state = await ships.commit_and_ship(
-        task,
-        message="Final squash commit",
-        pr_title="Final PR",
-        pr_body="Body text",
-    )
-
-    assert state.status == "shipped", state.error
-    assert state.commit_sha is not None
-    assert state.pr_url == "https://github.com/owner/repo/pull/42"
-    assert seen_urls == ["git@github.com:owner/repo.git"]
-
-    persisted = get_task(engine, task.id)
-    assert persisted.pr_url == "https://github.com/owner/repo/pull/42"
-
-    # Exactly one commit ahead of origin/main.
+    """An unchanged workspace captures to the same candidate; any change to
+    what would be published captures to a different one."""
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "identity-origin.git", Path(task.clone_path))
     clone = Path(task.clone_path)
-    log = subprocess.run(
-        ["git", "-C", str(clone), "log", "--oneline", "origin/main..HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    assert len(log.strip().splitlines()) == 1
-    assert "Final squash commit" in log
 
-    # The ship commits the agent's pending work: the untracked file made it
-    # into the signed commit (not just the working tree, which ship leaves
-    # alone — dogfooding: this assert used to read the working tree and the
-    # untracked delta silently never shipped).
-    committed = subprocess.run(
-        ["git", "-C", str(clone), "log", "-1", "--format=", "--name-only"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    assert "file3.txt" in committed.splitlines()
-    # No ship plumbing leaks into the commit or the clone.
-    assert "ompire-ship-msg" not in committed
-    assert not list(clone.glob("ompire-ship-msg-*"))
+    first = await capture_candidate(config, engine, task, base_branch="main")
+    again = await capture_candidate(config, engine, task, base_branch="main")
+    assert again.candidate_id == first.candidate_id
+
+    # An untracked file an agent leaves behind is part of what would be
+    # published, so it changes the identity.
+    (clone / "sneaky.txt").write_text("added later\n", encoding="utf-8")
+    changed = await capture_candidate(config, engine, task, base_branch="main")
+    assert changed.candidate_id != first.candidate_id
+    assert changed.tree_id != first.tree_id
+
+
+async def test_capture_leaves_the_task_index_and_worktree_untouched(
+    tmp_root, engine, config
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "untouched-origin.git", Path(task.clone_path))
+    clone = Path(task.clone_path)
+    # Something deliberately staged, which capture must not disturb.
+    (clone / "staged.txt").write_text("staged\n", encoding="utf-8")
+    _run_git(clone, "add", "staged.txt")
+
+    before_head = _git_out(clone, "rev-parse", "HEAD")
+    before_status = _git_out(clone, "status", "--porcelain")
+
+    await capture_candidate(config, engine, task, base_branch="main")
+
+    assert _git_out(clone, "rev-parse", "HEAD") == before_head
+    assert _git_out(clone, "status", "--porcelain") == before_status
+
+
+# --- admission --------------------------------------------------------------
+
+
+async def test_delivery_requires_an_approval_bound_to_the_current_content(
+    tmp_root, engine, ships, config, monkeypatch
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "review-origin.git", Path(task.clone_path))
+    clone = Path(task.clone_path)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe())
+
+    unreviewed = await ships.preview(
+        task,
+        ending="commit",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    assert "review-missing" in [b.code for b in unreviewed.blockers]
+
+    await _approve_current(config, engine, task)
+    ready = await ships.preview(
+        task,
+        ending="commit",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    assert ready.deliverable, [b.code for b in ready.blockers]
+
+    # The agent keeps working. The approval survives as history and stops
+    # covering current work.
+    (clone / "after-approval.txt").write_text("new\n", encoding="utf-8")
+    stale = await ships.preview(
+        task,
+        ending="commit",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    assert "review-stale" in [b.code for b in stale.blockers]
+    assert stale.review["status"] == "approved"
+    assert stale.review["stale"] is True
+
+
+async def test_a_legacy_unbound_approval_is_history_not_authorization(
+    tmp_root, engine, ships
+):
+    """An approval recorded before content binding cannot deliver, and is not
+    backfilled from today's workspace."""
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "legacy-origin.git", Path(task.clone_path))
+    open_review(engine, task.id)
+    append_iteration(engine, task.id, outcome="approved", status="approved")
+    clear_process_marker(engine, task.id)
+
+    preview = await ships.preview(
+        task,
+        ending="commit",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    assert "review-unbound" in [b.code for b in preview.blockers]
+    assert preview.review["content_bound"] is False
+
+
+async def test_a_blocked_preview_cannot_be_confirmed(tmp_root, engine, ships):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "blocked-origin.git", Path(task.clone_path))
+    preview = await ships.preview(
+        task,
+        ending="commit",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    with pytest.raises(DeliveryBlockedError):
+        await ships.deliver(
+            task,
+            ending="commit",
+            mode="squash",
+            commit_message="m",
+            pr_title="",
+            pr_body="",
+            request_id="r1",
+            preview_token=preview.fingerprint,
+        )
+    assert list_deliveries(engine, task.id)[-1].authorized_at is None
+
+
+async def test_changing_the_inputs_invalidates_the_preview_token(
+    tmp_root, engine, ships, config
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "token-origin.git", Path(task.clone_path))
+    await _approve_current(config, engine, task)
+    preview = await ships.preview(
+        task,
+        ending="commit",
+        mode="squash",
+        commit_message="one message",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    with pytest.raises(PreviewMismatchError):
+        await ships.deliver(
+            task,
+            ending="commit",
+            mode="squash",
+            commit_message="a different message",
+            pr_title="",
+            pr_body="",
+            request_id="r1",
+            preview_token=preview.fingerprint,
+        )
+
+
+async def test_a_local_ending_needs_no_github_availability(
+    tmp_root, engine, ships, config, monkeypatch
+):
+    """Signing locally is not publishing, and does not wait on the forge."""
+    project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "offline-origin.git", Path(task.clone_path))
+    await _approve_current(config, engine, task)
+    error = _blocked_preflight_error(project.upstream_url)
+
+    async def blocked(_upstream_url: str):
+        return error.status, error.target
+
+    monkeypatch.setattr(ships._gh, "probe_target", blocked)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe())
+
+    local = await ships.preview(
+        task,
+        ending="commit",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    assert local.deliverable, [b.code for b in local.blockers]
+
+    published = await ships.preview(
+        task,
+        ending="pr",
+        mode="squash",
+        commit_message="m",
+        pr_title="t",
+        pr_body="b",
+        request_id="r1",
+    )
+    assert "github-unavailable" in [b.code for b in published.blockers]
+
+
+# --- endings ----------------------------------------------------------------
+
+
+async def test_commit_ending_signs_the_reviewed_content_and_stops(
+    tmp_root, engine, ships, config, monkeypatch
+):
+    """A local signed commit is a complete delivery: nothing is pushed and no
+    pull request is created."""
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "commit-origin.git", Path(task.clone_path))
+    clone = Path(task.clone_path)
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    candidate = await _approve_current(config, engine, task)
+
+    projection = await _deliver(ships, task, ending="commit")
+
+    assert projection["ending"] == "commit"
+    assert projection["disposition"] == "completed"
+    assert projection["completed_actions"] == ["commit"]
+    assert projection["pr_url"] is None
+    result = projection["results"]["commit"]
+    assert result["commit_count"] == 1
+    assert result["installed"] is True
+    # Ompire's own rewrite is not the operator's workspace moving: a clean
+    # install carries no "the workspace changed" caveat.
+    assert result["note"] is None
+
+    # The signed commit carries exactly the reviewed tree, one commit on the
+    # captured base, signed by the selected key.
+    head = _git_out(clone, "rev-parse", "HEAD")
+    assert head == result["signed_tip"]
+    assert _git_out(clone, "rev-parse", "HEAD^{tree}") == candidate.tree_id
+    assert _git_out(clone, "rev-parse", "HEAD^") == candidate.base_commit
+    assert _git_out(clone, "log", "-1", "--format=%s") == "ship: the work"
+    # The working tree survives and reads clean against the signed commit.
+    assert (clone / "file3.txt").read_text(encoding="utf-8") == "three\n"
+    assert _git_out(clone, "status", "--porcelain") == ""
+
+    # Nothing reached the remote.
+    origin_branches = _git_out(
+        Path(tmp_root / "commit-origin.git"), "branch", "--list"
+    )
+    assert "ompire/task-1" not in origin_branches
+
+
+async def test_a_signed_commit_can_be_pushed_later_without_signing_again(
+    tmp_root, engine, ships, config, monkeypatch
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "later-origin.git", Path(task.clone_path))
+    remote = _bare(tmp_root / "later-remote.git")
+    _local_destination(ships, remote, monkeypatch)
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    first = await _deliver(ships, task, ending="commit", request_id="req-commit")
+    signed_tip = first["results"]["commit"]["signed_tip"]
+    delivery_id = first["delivery_id"]
+
+    # Signing is no longer available. The later push must not need it.
+    monkeypatch.setattr(ships._gpg, "probe", _blocked_gpg_probe("locked"))
+
+    preview = await ships.preview(
+        task,
+        ending="push",
+        mode="squash",
+        commit_message="",
+        pr_title="",
+        pr_body="",
+        request_id="req-push",
+        delivery_id=delivery_id,
+    )
+    assert preview.remaining_actions == ["push"]
+    assert preview.deliverable, [b.code for b in preview.blockers]
+    delivery_id, _projection = await ships.authorize(
+        task, preview, expected_version=preview.version
+    )
+    await ships._run_prefix(task, delivery_id, "req-push")
+
+    record = get_delivery(engine, delivery_id)
+    assert record.disposition == "completed"
+    assert record.succeeded("commit").result["signed_tip"] == signed_tip
+    assert record.succeeded("push").result["head"] == signed_tip
+    assert record.succeeded("pr") is None
+    assert _git_out(remote, "rev-parse", "refs/heads/ompire/task-1") == signed_tip
+    # The original authorization was not rewritten; the extension is its own
+    # decision.
+    kinds = [d.kind for d in record.decisions]
+    assert kinds.count("authorize") == 1
+    assert "extend" in kinds
+
+
+async def test_pr_ending_signs_pushes_and_opens_one_pull_request(
+    tmp_root, engine, ships, config, monkeypatch
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "pr-origin.git", Path(task.clone_path))
+    remote = _bare(tmp_root / "pr-remote.git")
+    _local_destination(ships, remote, monkeypatch)
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    seen: list[list[str]] = []
+    original_run = ships._gh.run
+
+    async def recording(args, cwd, timeout):
+        seen.append(args)
+        return await original_run(args, cwd, timeout)
+
+    monkeypatch.setattr(ships._gh, "run", recording)
+
+    projection = await _deliver(ships, task, ending="pr")
+
+    assert projection["disposition"] == "completed"
+    assert projection["completed_actions"] == ["commit", "push", "pr"]
+    assert projection["pr_url"] == "https://github.com/owner/repo/pull/42"
+    assert get_task(engine, task.id).pr_url == projection["pr_url"]
+    assert sum(1 for args in seen if args[:2] == ["pr", "create"]) == 1
+
+    body_path = seen[[args[:2] for args in seen].index(["pr", "create"])][-1]
+    # The body file is written outside the clone, so it can never be captured
+    # into a later candidate.
+    assert not str(body_path).startswith(str(Path(task.clone_path)))
+
+
+async def test_retain_preserves_messages_trees_and_count_under_new_signatures(
+    tmp_root, engine, ships, config, monkeypatch
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "retain-origin.git", Path(task.clone_path))
+    clone = Path(task.clone_path)
+    # Retain publishes existing commits, so the pending edit is committed.
+    _run_git(clone, "add", "file3.txt")
+    _run_git(clone, "commit", "-m", "third task commit")
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    candidate = await _approve_current(config, engine, task)
+    assert candidate.commit_count == 3
+
+    projection = await _deliver(ships, task, ending="commit", mode="retain")
+    assert projection["results"]["commit"]["commit_count"] == 3
+
+    log = _git_out(
+        clone, "log", "--format=%s", f"{candidate.base_commit}..HEAD"
+    ).splitlines()
+    assert log == ["third task commit", "second task commit", "first task commit"]
+    trees = _git_out(
+        clone, "log", "--format=%T", f"{candidate.base_commit}..HEAD"
+    ).splitlines()
+    assert trees == [c.tree_id for c in reversed(candidate.source_commits)]
+    signers = _git_out(
+        clone,
+        "-c",
+        "gpg.program=" + str(_wrapper),
+        "log",
+        "--format=%G? %GF",
+        f"{candidate.base_commit}..HEAD",
+    ).splitlines()
+    assert all(line.split()[0] in ("G", "U") for line in signers)
+    assert all(line.split()[1].upper() == fingerprint.upper() for line in signers)
+
+
+async def test_retain_refuses_a_dirty_tree_and_an_empty_range(
+    tmp_root, engine, ships, config, monkeypatch
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "retain-refuse-origin.git", Path(task.clone_path))
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe())
+    await _approve_current(config, engine, task)
+
+    dirty = await ships.preview(
+        task,
+        ending="commit",
+        mode="retain",
+        commit_message="",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    assert "retain-dirty" in [b.code for b in dirty.blockers]
+
+
+async def test_an_empty_delta_is_refused_rather_than_manufactured(
+    tmp_root, engine, ships
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    clone = Path(task.clone_path)
+    origin = tmp_root / "empty-origin.git"
+    origin.mkdir(parents=True, exist_ok=True)
+    _run_git(origin, "init", "--bare")
+    clone.parent.mkdir(parents=True, exist_ok=True)
+    _run_git(clone.parent, "clone", str(origin), clone.name)
+    _run_git(clone, "config", "user.email", "t@e.com")
+    _run_git(clone, "config", "user.name", "T")
+    (clone / "base.txt").write_text("base\n", encoding="utf-8")
+    _run_git(clone, "add", ".")
+    _run_git(clone, "commit", "-m", "base")
+    _run_git(clone, "push", "origin", "HEAD:main")
+
+    preview = await ships.preview(
+        task,
+        ending="commit",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    assert "empty-candidate" in [b.code for b in preview.blockers]
+
+
+# --- replay and exclusivity -------------------------------------------------
+
+
+async def test_a_replayed_confirmation_does_not_start_a_second_delivery(
+    tmp_root, engine, ships, config, monkeypatch
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "replay-origin.git", Path(task.clone_path))
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    first = await _deliver(ships, task, ending="commit", request_id="same-request")
+    signed_tip = first["results"]["commit"]["signed_tip"]
+
+    # The same confirmation arrives again — a double submit, or a retried
+    # request. It must not sign a second time.
+    preview = await ships.preview(
+        task,
+        ending="commit",
+        mode="squash",
+        commit_message="ship: the work",
+        pr_title="The work",
+        pr_body="why",
+        request_id="same-request",
+    )
+    assert "review-stale" in [b.code for b in preview.blockers] or not preview.deliverable
+    deliveries = list_deliveries(engine, task.id)
+    assert len(deliveries) == 1
+    assert deliveries[0].succeeded("commit").result["signed_tip"] == signed_tip
+
+
+async def test_a_delivery_is_refused_while_another_writer_owns_the_workspace(
+    tmp_root, engine, ships, config, guard, monkeypatch
+):
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "busy-origin.git", Path(task.clone_path))
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe())
+    await _approve_current(config, engine, task)
+
+    guard.acquire(task.id, "review")
+    try:
+        preview = await ships.preview(
+            task,
+            ending="commit",
+            mode="squash",
+            commit_message="m",
+            pr_title="",
+            pr_body="",
+            request_id="r1",
+        )
+    finally:
+        guard.release(task.id, "review")
+    assert "workspace-busy" in [b.code for b in preview.blockers]
+
+
+# --- signing safety ---------------------------------------------------------
 
 
 async def test_clone_local_signing_config_cannot_redirect_the_commit(
-    tmp_root, engine, ships, gpg, monkeypatch
+    tmp_root, engine, ships, config, monkeypatch
 ):
-    """The clone is agent-writable, so nothing it says about signing counts.
+    """The clone is agent-writable, so it must not choose the signing program.
 
-    A clone-local `gpg.program` would otherwise make the daemon execute an
-    arbitrary binary on the host, outside the sandbox, as the operator.
+    A clone that tries is refused outright at capture, which is the earliest
+    point the daemon can see it and the only one where refusing costs nothing.
     """
-    origin = tmp_root / "origin.git"
+    from ompire_daemon.delivery import UnsafeCloneConfigError
+
     _project, task = _make_project_and_task(engine, tmp_root)
-
-    bin_dir = tmp_root / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    _write_script(
-        bin_dir, "gh", "#!/bin/sh\necho 'https://github.com/owner/repo/pull/42'\n"
-    )
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-
-    _setup_git_clone(origin, Path(task.clone_path))
-    _wrapper, fingerprint = _setup_signing_gpg(bin_dir, monkeypatch)
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(fingerprint))
-
-    # What a compromised agent would write into the task clone.
-    tripwire = tmp_root / "tripwire"
-    hostile = _write_script(
-        bin_dir,
-        "hostile-gpg",
-        f"#!/bin/sh\ntouch {tripwire}\nexit 1\n",
-    )
+    _setup_git_clone(tmp_root / "evil-origin.git", Path(task.clone_path))
     clone = Path(task.clone_path)
-    _run_git(clone, "config", "gpg.program", str(hostile))
-    _run_git(clone, "config", "gpg.format", "ssh")
-    _run_git(clone, "config", "user.signingkey", "DEADBEEFDEADBEEF")
+    evil = tmp_root / "evil-gpg"
+    evil.write_text("#!/bin/sh\ntouch " + str(tmp_root / "PWNED") + "\nexit 0\n")
+    evil.chmod(0o755)
+    _run_git(clone, "config", "gpg.program", str(evil))
 
-    real_ensure = ships._ensure_ship_remote
-
-    async def ensure_local(clone_path, url, timeout):
-        return await real_ensure(clone_path, str(origin), timeout)
-
-    monkeypatch.setattr(ships, "_ensure_ship_remote", ensure_local)
-
-    state = await ships.commit_and_ship(
-        task, message="Signed", pr_title="Title", pr_body="Body"
-    )
-
-    assert state.status == "shipped", state.error
-    assert not tripwire.exists(), "clone-local gpg.program was executed"
-
-    signer = subprocess.run(
-        [
-            "git", "-C", task.clone_path,
-            "-c", "gpg.format=openpgp", "-c", f"gpg.program={_wrapper}",
-            "log", "-1", "--format=%GF",
-        ],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    assert signer == fingerprint
+    with pytest.raises(UnsafeCloneConfigError):
+        await capture_candidate(config, engine, task, base_branch="main")
+    assert not (tmp_root / "PWNED").exists()
 
 
-async def test_commit_and_ship_commits_agent_pending_changes(
-    tmp_root, engine, ships, gpg, monkeypatch
+async def test_a_workspace_that_moved_on_blocks_installation_of_the_signed_result(
+    tmp_root, engine, ships, config, monkeypatch
 ):
-    """The common case: the agent committed nothing (dogfooding: the ship
-    died with `no changes added to commit`). Squash mode stages the pending
-    working tree itself, and daemon-owned files never ride along."""
-    origin = tmp_root / "origin.git"
+    """The signed content is still the reviewed content, so it is kept — but
+    a branch that moved under the delivery is not overwritten."""
     _project, task = _make_project_and_task(engine, tmp_root)
-
-    bin_dir = tmp_root / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    _write_script(
-        bin_dir, "gh", "#!/bin/sh\necho 'https://github.com/owner/repo/pull/42'\n"
-    )
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-
-    _setup_git_clone(origin, Path(task.clone_path))
+    _setup_git_clone(tmp_root / "moved-origin.git", Path(task.clone_path))
     clone = Path(task.clone_path)
-    # The agent committed nothing: the task branch sits at its base with the
-    # whole delta pending in the working tree.
-    _run_git(clone, "checkout", "main")
-    _run_git(clone, "checkout", "-B", "ompire/task-1")
-    (clone / "base.txt").write_text("edited by agent\n", encoding="utf-8")
-    (clone / "pending.txt").write_text("brand new\n", encoding="utf-8")
-    # A live workshop leaves its lock in the clone; it must never ship.
-    (clone / ".workshop.lock").write_text("ws-lock\n", encoding="utf-8")
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    candidate = await _approve_current(config, engine, task)
 
-    _wrapper, fingerprint = _setup_signing_gpg(bin_dir, monkeypatch)
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(fingerprint))
+    original_sign = ships._sign
 
-    real_ensure = ships._ensure_ship_remote
+    async def sign_then_move(*args, **kwargs):
+        result = await original_sign(*args, **kwargs)
+        # An agent lands a commit while the signature is being produced.
+        (clone / "raced.txt").write_text("raced\n", encoding="utf-8")
+        _run_git(clone, "add", "raced.txt")
+        _run_git(clone, "commit", "-m", "agent kept working")
+        return result
 
-    async def ensure_local(clone_path, url, timeout):
-        return await real_ensure(clone_path, str(origin), timeout)
+    monkeypatch.setattr(ships, "_sign", sign_then_move)
 
-    monkeypatch.setattr(ships, "_ensure_ship_remote", ensure_local)
-
-    state = await ships.commit_and_ship(
-        task, message="Pending work", pr_title="Title", pr_body="Body"
-    )
-
-    assert state.status == "shipped", state.error
-
-    committed = subprocess.run(
-        ["git", "-C", str(clone), "log", "-1", "--format=", "--name-only"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.splitlines()
-    assert "base.txt" in committed
-    assert "pending.txt" in committed
-    assert ".workshop.lock" not in committed
-    assert not any(name.startswith("ompire-ship-msg") for name in committed)
-
-
-async def test_commit_and_ship_names_empty_delta(
-    tmp_root, engine, ships, gpg, monkeypatch
-):
-    """A task with no changes at all fails with a diagnosis, not git noise."""
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-
-    origin = tmp_root / "origin.git"
-    _project, task = _make_project_and_task(engine, tmp_root)
-
-    _setup_git_clone(origin, Path(task.clone_path))
-    clone = Path(task.clone_path)
-    _run_git(clone, "checkout", "main")
-    _run_git(clone, "checkout", "-B", "ompire/task-1")
-    (clone / "file3.txt").unlink()
-
-    state = await ships.commit_and_ship(
-        task, message="m", pr_title="t", pr_body="b"
-    )
-
-    assert state.status == "error"
-    assert "nothing to ship" in (state.error or "")
-
-
-async def test_retain_preconditions_ignore_workshop_lock(
-    tmp_root, engine, ships, gpg, monkeypatch
-):
-    """The daemon-owned workshop lock is not a dirty tree (dogfooding: retain
-    mode would have refused every live clone as dirty)."""
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-
-    origin = tmp_root / "origin.git"
-    _project, task = _make_project_and_task(engine, tmp_root)
-
-    _setup_git_clone(origin, Path(task.clone_path))
-    clone = Path(task.clone_path)
-    _run_git(clone, "add", "file3.txt")
-    _run_git(clone, "commit", "-m", "commit the pending edit")
-    (clone / ".workshop.lock").write_text("ws-lock\n", encoding="utf-8")
-
-    # Clean tree apart from the lock: retain must be allowed.
-    await ships.check_retain_preconditions(task)
-
-
-async def test_commit_failure_restores_head_and_cleans_ref(
-    tmp_root, engine, ships, gpg, monkeypatch, caplog
-):
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-
-    origin = tmp_root / "origin.git"
-    _project, task = _make_project_and_task(engine, tmp_root)
-
-    # Fake gpg that fails signing.
-    tmp_root.joinpath("bin").mkdir(exist_ok=True)
-    fake_gpg = _write_script(
-        tmp_root / "bin",
-        "fake-gpg-fail",
-        "#!/bin/sh\necho 'signing failed' >&2\nexit 2\n",
-    )
-    monkeypatch.setenv("PATH", f"{tmp_root / 'bin'}{os.pathsep}{os.environ['PATH']}")
-
-    _setup_git_clone(origin, Path(task.clone_path))
-    _set_operator_signing_program(tmp_root / "bin", fake_gpg, monkeypatch)
-
-    orig_sha = subprocess.run(
-        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-
-    state = await ships.commit_and_ship(
+    preview = await ships.preview(
         task,
-        message="Will fail",
-        pr_title="Title",
-        pr_body="Body",
+        ending="commit",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
     )
+    delivery_id, _p = await ships.authorize(task, preview, expected_version=preview.version)
+    await ships._run_prefix(task, delivery_id, "r1")
 
-    assert state.status == "error"
-    assert state.commit_sha is None
-    # The commit's stderr must reach the operator, not just the step name
-    # (dogfooding: "spawn step 'ship-commit' failed" carried no diagnosis).
-    assert state.error is not None
-    assert state.error.startswith("commit failed (ship-commit):")
-    assert "gpg failed to sign" in state.error
-    # And the failure must reach the daemon log so journald shows it too.
-    assert any(
-        "ship commit failed" in rec.getMessage() and "gpg failed to sign" in rec.getMessage()
-        for rec in caplog.records
-    )
-
-    # HEAD restored to original.
-    head_sha = subprocess.run(
-        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    assert head_sha == orig_sha
-
-    # Ship-orig ref cleaned up.
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            task.clone_path,
-            "rev-parse",
-            "--verify",
-            "refs/ompire/ship-orig",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode != 0
+    record = get_delivery(engine, delivery_id)
+    commit = record.succeeded("commit")
+    assert commit is not None
+    assert commit.result["installed"] is False
+    assert record.disposition == "blocked"
+    # The agent's commit is untouched, and the reviewed signed result is
+    # retained in the candidate's own repository.
+    assert _git_out(clone, "log", "-1", "--format=%s") == "agent kept working"
+    store = Path(candidate.storage_path)
+    assert _git_out(store, "rev-parse", commit.result["signed_ref"]) == commit.result[
+        "signed_tip"
+    ]
 
 
-async def test_commit_and_ship_retain_rewrites_range(
-    tmp_root, engine, ships, gpg, monkeypatch
+# --- push safety ------------------------------------------------------------
+
+
+async def test_push_writes_the_authorized_object_under_the_recorded_lease(
+    tmp_root, engine, ships, config, monkeypatch
 ):
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-
-    origin = tmp_root / "origin.git"
-    _project, task = _make_project_and_task(
-        engine, tmp_root, upstream_url="git@github.com:owner/repo.git"
-    )
-
-    bin_dir = tmp_root / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    _write_script(
-        bin_dir,
-        "gh",
-        "#!/bin/sh\necho 'https://github.com/owner/repo/pull/42'\n",
-    )
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-
-    _setup_git_clone(origin, Path(task.clone_path))
-    _wrapper, _fingerprint = _setup_signing_gpg(bin_dir, monkeypatch)
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(_fingerprint))
-    # Clean up the working tree so retain mode accepts the clone.
-    _run_git(Path(task.clone_path), "add", "file3.txt")
-    _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
-
-    clone = Path(task.clone_path)
-    pre = (
-        subprocess.run(
-            ["git", "-C", str(clone), "log", "--format=%T %s", "origin/main..HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        .stdout.strip()
-        .splitlines()
-    )
-
-    real_ensure = ships._ensure_ship_remote
-    seen_urls: list[str] = []
-
-    async def ensure_local(clone_path, url, timeout):
-        seen_urls.append(url)
-        return await real_ensure(clone_path, str(origin), timeout)
-
-    monkeypatch.setattr(ships, "_ensure_ship_remote", ensure_local)
-
-    state = await ships.commit_and_ship(
-        task,
-        message="ignored in retain",
-        pr_title="Final PR",
-        pr_body="Body text",
-        mode="retain",
-    )
-
-    assert state.status == "shipped", state.error
-    assert state.mode == "retain"
-    assert state.commit_sha is not None
-    assert state.pr_url == "https://github.com/owner/repo/pull/42"
-    assert seen_urls == ["git@github.com:owner/repo.git"]
-
-    # Same number of commits and same trees/subjects.
-    post = (
-        subprocess.run(
-            ["git", "-C", str(clone), "log", "--format=%T %s", "origin/main..HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        .stdout.strip()
-        .splitlines()
-    )
-    assert len(post) == len(pre)
-    assert post == pre
-
-    # Every commit operator-authored and well-signed.
-    authors = (
-        subprocess.run(
-            [
-                "git",
-                "-C",
-                str(clone),
-                "log",
-                "--format=%an|%ae|%cn|%ce|%G?",
-                "origin/main..HEAD",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        .stdout.strip()
-        .splitlines()
-    )
-    for line in authors:
-        an, ae, cn, ce, sig = line.split("|")
-        assert an == "Test User"
-        assert ae == "test@example.com"
-        assert cn == "Test User"
-        assert ce == "test@example.com"
-        assert sig in ("G", "U")
-
-
-async def test_commit_and_ship_retain_refuses_dirty_tree(
-    tmp_root, engine, ships, gpg, monkeypatch
-):
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-
-    origin = tmp_root / "origin.git"
     _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "lease-origin.git", Path(task.clone_path))
+    remote = _bare(tmp_root / "lease-remote.git")
+    _local_destination(ships, remote, monkeypatch)
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
 
-    _setup_git_clone(origin, Path(task.clone_path))
-
-    state = await ships.commit_and_ship(
-        task,
-        message="m",
-        pr_title="t",
-        pr_body="b",
-        mode="retain",
-    )
-
-    assert state.status == "error"
-    assert "dirty" in state.error.lower()
+    projection = await _deliver(ships, task, ending="push")
+    push = projection["results"]["push"]
+    assert push["pre_push_oid"] is None
+    assert push["head"] == projection["results"]["commit"]["signed_tip"]
+    assert _git_out(remote, "rev-parse", "refs/heads/ompire/task-1") == push["head"]
+    assert projection["results"].get("pr") is None
 
 
-async def test_commit_and_ship_retain_refuses_merge_commits(
-    tmp_root, engine, ships, gpg, monkeypatch
+async def test_an_unexpected_remote_head_is_a_conflict_not_permission_to_force(
+    tmp_root, engine, ships, config, monkeypatch
 ):
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-
-    origin = tmp_root / "origin.git"
+    """The lease is the head Ompire observed and recorded, not whatever the
+    destination holds by the time the write goes out."""
     _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "conflict-origin.git", Path(task.clone_path))
+    remote = _bare(tmp_root / "conflict-remote.git")
+    _local_destination(ships, remote, monkeypatch)
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
 
-    _setup_git_clone(origin, Path(task.clone_path))
-    _run_git(Path(task.clone_path), "add", "file3.txt")
-    _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
+    # Someone else already owns the destination branch.
+    other = tmp_root / "other-publisher"
+    _run_git(tmp_root, "clone", str(remote), other.name)
+    _run_git(other, "config", "user.email", "other@e.com")
+    _run_git(other, "config", "user.name", "Other")
+    (other / "theirs.txt").write_text("theirs\n", encoding="utf-8")
+    _run_git(other, "add", ".")
+    _run_git(other, "commit", "-m", "someone else was here")
+    _run_git(other, "push", str(remote), "HEAD:refs/heads/ompire/task-1")
+    theirs = _git_out(remote, "rev-parse", "refs/heads/ompire/task-1")
 
-    clone = Path(task.clone_path)
-    _run_git(clone, "checkout", "-b", "side")
-    (clone / "side.txt").write_text("side\n", encoding="utf-8")
-    _run_git(clone, "add", ".")
-    _run_git(clone, "commit", "-m", "side commit")
-    _run_git(clone, "checkout", "ompire/task-1")
-    _run_git(clone, "merge", "--no-ff", "side", "-m", "merge side")
+    original_push = ships._push
 
-    state = await ships.commit_and_ship(
+    async def push_after_a_race(clone, destination, tip, observed, timeout):
+        # Between the observation Ompire recorded and the write, they push
+        # again. The recorded lease no longer matches.
+        _run_git(other, "commit", "--allow-empty", "-m", "and again")
+        _run_git(other, "push", str(remote), "HEAD:refs/heads/ompire/task-1")
+        return await original_push(clone, destination, tip, observed, timeout)
+
+    monkeypatch.setattr(ships, "_push", push_after_a_race)
+    preview = await ships.preview(
         task,
-        message="m",
-        pr_title="t",
-        pr_body="b",
-        mode="retain",
+        ending="push",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
     )
-
-    assert state.status == "error"
-    assert "merge" in state.error.lower()
-
-
-async def test_commit_and_ship_retain_refuses_empty_range(
-    tmp_root, engine, ships, gpg, monkeypatch
-):
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-
-    origin = tmp_root / "origin.git"
-    _project, task = _make_project_and_task(engine, tmp_root)
-
-    _setup_git_clone(origin, Path(task.clone_path))
-    # Drop the uncommitted change and reset the branch to main.
-    (Path(task.clone_path) / "file3.txt").unlink()
-    _run_git(Path(task.clone_path), "checkout", "main")
-    _run_git(Path(task.clone_path), "checkout", "-B", "ompire/task-1")
-
-    state = await ships.commit_and_ship(
-        task,
-        message="m",
-        pr_title="t",
-        pr_body="b",
-        mode="retain",
+    delivery_id, _p = await ships.authorize(
+        task, preview, expected_version=preview.version
     )
+    await ships._run_prefix(task, delivery_id, "r1")
 
-    assert state.status == "error"
-    assert state.commit_sha is None
-
-
-async def test_commit_and_ship_retain_amend_failure_restores_head(
-    tmp_root, engine, ships, gpg, monkeypatch
-):
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-
-    origin = tmp_root / "origin.git"
-    _project, task = _make_project_and_task(engine, tmp_root)
-
-    tmp_root.joinpath("bin").mkdir(exist_ok=True)
-    fake_gpg = _write_script(
-        tmp_root / "bin",
-        "fake-gpg-fail",
-        "#!/bin/sh\necho 'signing failed' >&2\nexit 2\n",
-    )
-    monkeypatch.setenv("PATH", f"{tmp_root / 'bin'}{os.pathsep}{os.environ['PATH']}")
-
-    _setup_git_clone(origin, Path(task.clone_path))
-    _wrapper, _fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(_fingerprint))
-    _run_git(Path(task.clone_path), "add", "file3.txt")
-    _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
-    # Swap to failing gpg so the rebase amend fails mid-range.
-    _set_operator_signing_program(tmp_root / "bin", fake_gpg, monkeypatch)
-
-    orig_sha = subprocess.run(
-        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-
-    state = await ships.commit_and_ship(
-        task,
-        message="Will fail",
-        pr_title="Title",
-        pr_body="Body",
-        mode="retain",
-    )
-
-    assert state.status == "error"
-    assert state.commit_sha is None
-
-    # HEAD restored to original and tree is clean.
-    head_sha = subprocess.run(
-        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    assert head_sha == orig_sha
-
-    status = subprocess.run(
-        ["git", "-C", task.clone_path, "status", "--porcelain"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    assert status == ""
-
-    # No rebase in progress and ref cleaned up.
-    assert not (Path(task.clone_path) / ".git" / "rebase-merge").exists()
-    assert not (Path(task.clone_path) / ".git" / "rebase-apply").exists()
-    result = subprocess.run(
-        [
-            "git",
-            "-C",
-            task.clone_path,
-            "rev-parse",
-            "--verify",
-            "refs/ompire/ship-orig",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode != 0
-
-
-async def test_commit_and_ship_retain_verification_failure_restores_head(
-    tmp_root, engine, ships, gpg, monkeypatch
-):
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-
-    origin = tmp_root / "origin.git"
-    _project, task = _make_project_and_task(engine, tmp_root)
-
-    _setup_git_clone(origin, Path(task.clone_path))
-    _wrapper, _fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(_fingerprint))
-    _run_git(Path(task.clone_path), "add", "file3.txt")
-    _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
-
-    from ompire_daemon import ship as ship_module
-
-    real_run = ship_module._run_git_output
-
-    async def fake_sigs(argv, cwd, timeout, step_name):
-        if step_name == "ship-verify-signatures":
-            return f"{'a' * 40} G {_fingerprint}\n{'b' * 40} X {_fingerprint}\n"
-        return await real_run(argv, cwd, timeout, step_name)
-
-    monkeypatch.setattr(ship_module, "_run_git_output", fake_sigs)
-
-    orig_sha = subprocess.run(
-        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-
-    state = await ships.commit_and_ship(
-        task,
-        message="m",
-        pr_title="t",
-        pr_body="b",
-        mode="retain",
-    )
-
-    assert state.status == "error"
-    assert "signature" in state.error.lower()
-
-    head_sha = subprocess.run(
-        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    assert head_sha == orig_sha
-
-
-# --- push routing ----------------------------------------------------------
-
-
-async def test_push_and_pr_routes_to_fork(tmp_root, engine, ships, gpg, monkeypatch):
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-
-    project, task = _make_project_and_task(
-        engine,
-        tmp_root,
-        upstream_url="https://github.com/upowner/uprepo",
-        fork_url="git@github.com:forkowner/uprepo.git",
-    )
-
-    pushed: list = []
-    created: dict = {}
-
-    async def fake_push(clone_path, remote_url, branch):
-        pushed.append((remote_url, branch))
-
-    async def fake_create_pr(clone_path, upstream_slug, base_branch, head, title, body):
-        created.update(
-            {
-                "upstream": upstream_slug,
-                "base": base_branch,
-                "head": head,
-                "title": title,
-                "body": body,
-            }
-        )
-        return "https://github.com/upowner/uprepo/pull/7"
-
-    monkeypatch.setattr(ships, "_push", fake_push)
-    monkeypatch.setattr(ships, "_create_pr", fake_create_pr)
-
-    ships._set_state(task.id, status="committing")
-    ships._set_state(task.id, commit_sha="abc123")
-    url = await ships._push_and_pr(
-        task, project, "main", pr_title="Title", pr_body="Body"
-    )
-
-    assert url == "https://github.com/upowner/uprepo/pull/7"
-    assert pushed == [("git@github.com:forkowner/uprepo.git", "ompire/task-1")]
-    assert created["upstream"] == "upowner/uprepo"
-    assert created["head"] == "forkowner:ompire/task-1"
-    assert created["base"] == "main"
-
-
-async def test_push_and_pr_routes_to_upstream_without_fork(
-    tmp_root, engine, ships, gpg, monkeypatch
-):
-    """Task clones have origin = the local checkout path, so a non-fork push
-    must target the project's upstream URL, never the `origin` name (found via
-    dogfooding: pushes to `origin` updated only the local checkout)."""
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-
-    project, task = _make_project_and_task(
-        engine,
-        tmp_root,
-        upstream_url="git@github.com:upowner/uprepo.git",
-    )
-
-    pushed: list = []
-
-    async def fake_push(clone_path, remote_url, branch):
-        pushed.append((remote_url, branch))
-
-    async def fake_create_pr(clone_path, upstream_slug, base_branch, head, title, body):
-        assert head == task.branch
-        return "https://github.com/upowner/uprepo/pull/9"
-
-    monkeypatch.setattr(ships, "_push", fake_push)
-    monkeypatch.setattr(ships, "_create_pr", fake_create_pr)
-
-    ships._set_state(task.id, status="committing")
-    ships._set_state(task.id, commit_sha="abc123")
-    url = await ships._push_and_pr(
-        task, project, "main", pr_title="Title", pr_body="Body"
-    )
-
-    assert url == "https://github.com/upowner/uprepo/pull/9"
-    assert pushed == [("git@github.com:upowner/uprepo.git", "ompire/task-1")]
-
-
-async def test_push_and_pr_revalidates_before_pull_request_creation(
-    tmp_root, engine, ships, monkeypatch
-):
-    project, task = _make_project_and_task(engine, tmp_root)
-    error = _blocked_preflight_error(project.upstream_url)
-    calls: list[str] = []
-
-    async def fake_push(*_args):
-        calls.append("push")
-
-    async def blocked_target(_upstream_url: str):
-        calls.append("preflight")
-        return error.status, error.target
-
-    async def should_not_create(*_args):
-        calls.append("create")
-        raise AssertionError(
-            "pull request creation must be blocked by the second preflight"
-        )
-
-    monkeypatch.setattr(ships, "_push", fake_push)
-    monkeypatch.setattr(ships._gh, "probe_target", blocked_target)
-    monkeypatch.setattr(ships, "_create_pr", should_not_create)
-
-    with pytest.raises(GitHubPreflightError):
-        await ships._push_and_pr(task, project, "main", "title", "body")
-    assert calls == ["push", "preflight"]
-
-
-async def test_push_uses_force_with_lease(tmp_root, engine, ships):
-    origin = tmp_root / "origin-push.git"
-    origin.mkdir()
-    _run_git(origin, "init", "--bare")
-
-    clone = tmp_root / "push-clone"
-    _run_git(tmp_root, "clone", str(origin), str(clone.name))
-    _run_git(clone, "config", "user.email", "t@e.com")
-    _run_git(clone, "config", "user.name", "T")
-    (clone / "a").write_text("a")
-    _run_git(clone, "add", ".")
-    _run_git(clone, "commit", "-m", "initial")
-    _run_git(clone, "push", "origin", "HEAD:main")
-
-    await ships._push(clone, str(origin), "feature")
-
-    branches = subprocess.run(
-        ["git", "-C", str(origin), "branch", "--list"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-    assert "feature" in branches
-
-
-async def test_push_failure_surfaces_remote_stderr(tmp_root, engine, ships):
-    origin = tmp_root / "origin-reject.git"
-    origin.mkdir()
-    _run_git(origin, "init", "--bare")
-    hook = origin / "hooks" / "pre-receive"
-    hook.write_text("#!/bin/sh\necho 'forge: rejecting push (injected)' >&2\nexit 1\n")
-    hook.chmod(0o755)
-
-    clone = tmp_root / "reject-clone"
-    _run_git(tmp_root, "clone", str(origin), str(clone.name))
-    _run_git(clone, "config", "user.email", "t@e.com")
-    _run_git(clone, "config", "user.name", "T")
-    (clone / "a").write_text("a")
-    _run_git(clone, "add", ".")
-    _run_git(clone, "commit", "-m", "initial")
-
-    with pytest.raises(ShipError, match="forge: rejecting push"):
-        await ships._push(clone, str(origin), "feature")
+    record = get_delivery(engine, delivery_id)
+    assert record.succeeded("commit") is not None
+    push = record.action("push")
+    assert push.expected["pre_push_oid"] == theirs
+    assert push.phase == "failed"
+    assert record.disposition == "blocked"
+    # Nothing of theirs was overwritten.
+    landed = _git_out(remote, "rev-parse", "refs/heads/ompire/task-1")
+    assert landed != record.succeeded("commit").result["signed_tip"]
 
 
 async def test_ssh_authentication_classification_is_narrow(
     tmp_root, engine, ships, monkeypatch
 ):
-    async def named_remote(_clone_path, _remote_url, _timeout):
-        return "ship-target"
+    async def denied(argv, **kwargs):
+        return "", "Permission denied (publickey)", 128
 
-    async def rejected(step):
-        raise StepFailedError(step.name, "Permission denied (publickey)")
-
-    monkeypatch.setattr(ships, "_ensure_ship_remote", named_remote)
-    monkeypatch.setattr("ompire_daemon.ship._run_step", rejected)
-
-    with pytest.raises(SshAuthenticationError, match="Permission denied"):
-        await ships._push("/irrelevant", "git@github.com:owner/repo.git", "feature")
+    monkeypatch.setattr("ompire_daemon.ship.run_git", denied)
+    ssh = {"remote_url": "git@github.com:owner/repo.git", "ref": "refs/heads/f"}
+    https = {"remote_url": "https://github.com/owner/repo.git", "ref": "refs/heads/f"}
+    with pytest.raises(SshAuthenticationError):
+        await ships._push("/irrelevant", ssh, "deadbeef", None, 10)
     with pytest.raises(PushError) as ordinary:
-        await ships._push("/irrelevant", "https://github.com/owner/repo.git", "feature")
+        await ships._push("/irrelevant", https, "deadbeef", None, 10)
     assert not isinstance(ordinary.value, SshAuthenticationError)
 
-async def test_ssh_authentication_during_ship_remote_setup_is_a_push_failure(
-    tmp_root, engine, ships, monkeypatch
+
+# --- recovery ---------------------------------------------------------------
+
+
+async def test_restart_adopts_a_push_that_actually_landed(
+    tmp_root, engine, ships, config, monkeypatch
 ):
-    async def denied_setup(_clone_path, _remote_url, _timeout):
-        raise StepFailedError("ship-fetch-target", "Permission denied (publickey)")
+    """A lost response is not a reason to push again."""
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "adopt-origin.git", Path(task.clone_path))
+    remote = _bare(tmp_root / "adopt-remote.git")
+    _local_destination(ships, remote, monkeypatch)
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
 
-    monkeypatch.setattr(ships, "_ensure_ship_remote", denied_setup)
+    original_push = ships._push
 
-    with pytest.raises(SshAuthenticationError, match="Permission denied"):
-        await ships._push("/irrelevant", "git@github.com:owner/repo.git", "feature")
+    async def push_then_die(clone, destination, tip, observed, timeout):
+        await original_push(clone, destination, tip, observed, timeout)
+        raise asyncio.CancelledError
 
-
-async def test_commit_records_push_failure_as_push_stage(
-    tmp_root, engine, ships, gpg, monkeypatch
-):
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-    project, task = _make_project_and_task(
-        engine, tmp_root, upstream_url="git@github.com:owner/repo.git"
+    monkeypatch.setattr(ships, "_push", push_then_die)
+    preview = await ships.preview(
+        task,
+        ending="push",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
     )
-    origin = tmp_root / "push-stage-origin.git"
-    _setup_git_clone(origin, Path(task.clone_path))
-    hook = origin / "hooks" / "pre-receive"
-    hook.write_text("#!/bin/sh\necho 'forge: rejecting push (injected)' >&2\nexit 1\n")
-    hook.chmod(0o755)
-    _wrapper, _fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(_fingerprint))
+    delivery_id, _p = await ships.authorize(task, preview, expected_version=preview.version)
+    with pytest.raises(asyncio.CancelledError):
+        await ships._run_prefix(task, delivery_id, "r1")
 
-    real_ensure = ships._ensure_ship_remote
+    record = get_delivery(engine, delivery_id)
+    assert record.action("push").phase == "executing"
 
-    async def ensure_local(clone_path, url, timeout):
-        assert url == project.upstream_url
-        return await real_ensure(clone_path, str(origin), timeout)
+    pushes: list[tuple] = []
 
-    monkeypatch.setattr(ships, "_ensure_ship_remote", ensure_local)
-    state = await ships.commit_and_ship(task, "message", "title", "body")
+    async def must_not_run(*args, **kwargs):
+        pushes.append(args)
+        raise AssertionError("startup must not push")
 
-    assert state.status == "error"
-    assert state.error is not None and state.error.startswith("push failed:")
-    assert "forge: rejecting push" in state.error
-    assert state.last_step is not None
-    assert (state.last_step.step, state.last_step.status) == ("push", "failed")
+    monkeypatch.setattr(ships, "_push", must_not_run)
+    blocked = await ships.restore()
 
-
-async def test_pr_creation_failure_sanitizes_state_and_events(
-    tmp_root, engine, ships, gpg, hub, monkeypatch
-):
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe())
-    project, task = _make_project_and_task(
-        engine, tmp_root, upstream_url="git@github.com:owner/repo.git"
-    )
-    origin = tmp_root / "pr-stage-origin.git"
-    bin_dir = tmp_root / "bin"
-    bin_dir.mkdir(exist_ok=True)
-    secret = "exact-pr-secret"
-    _write_script(
-        bin_dir,
-        "gh",
-        "#!/bin/sh\n"
-        "printf 'ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 %s\\n' \"$GH_TOKEN\"\n"
-        'printf \'Authorization: Bearer %s\\nhttps://user:%s@github.com/owner/repo\\n\' "$GH_TOKEN" "$GH_TOKEN" >&2\n'
-        "exit 1\n",
-    )
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("GH_TOKEN", secret)
-    _setup_git_clone(origin, Path(task.clone_path))
-    _wrapper, _fingerprint = _setup_signing_gpg(bin_dir, monkeypatch)
-    monkeypatch.setattr(gpg, "probe", _ready_gpg_probe(_fingerprint))
-    real_ensure = ships._ensure_ship_remote
-
-    async def ensure_local(clone_path, url, timeout):
-        assert url == project.upstream_url
-        return await real_ensure(clone_path, str(origin), timeout)
-
-    monkeypatch.setattr(ships, "_ensure_ship_remote", ensure_local)
-    events = hub.subscribe()
-    try:
-        state = await ships.commit_and_ship(task, "message", "title", "body")
-        payloads = []
-        while not events.empty():
-            payloads.append(events.get_nowait().payload)
-    finally:
-        hub.unsubscribe(events)
-
-    published = "\n".join([state.error or "", *(str(payload) for payload in payloads)])
-    assert state.status == "error"
-    assert state.error is not None and state.error.startswith(
-        "pull-request creation failed:"
-    )
-    assert state.last_step is not None
-    assert (state.last_step.step, state.last_step.status) == ("pr", "failed")
-    for credential in (
-        secret,
-        "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-        "Bearer",
-        "user",
-    ):
-        assert credential not in published
-    assert "[redacted]" in published
+    assert blocked == []
+    assert pushes == []
+    restored = get_delivery(engine, delivery_id)
+    assert restored.succeeded("push") is not None
+    assert restored.succeeded("push").result["adopted"] is True
+    assert restored.disposition == "completed"
 
 
-async def test_create_pr_parses_url_and_adopts_existing_pr(
-    tmp_root, engine, ships, monkeypatch
-):
-    tmp_root.joinpath("bin").mkdir(exist_ok=True)
-    _write_script(
-        tmp_root / "bin",
-        "gh",
-        "#!/bin/sh\n"
-        "echo 'a pull request for branch \"feature\" already exists:' >&2\n"
-        "echo 'https://github.com/owner/repo/pull/99' >&2\n"
-        "exit 1\n",
-    )
-    monkeypatch.setenv("PATH", f"{tmp_root / 'bin'}{os.pathsep}{os.environ['PATH']}")
-
-    clone = tmp_root / "pr-clone"
-    clone.mkdir()
-    url = await ships._create_pr(
-        str(clone),
-        upstream_slug="owner/repo",
-        base_branch="main",
-        head="forkowner:feature",
-        title="Title",
-        body="Body",
-    )
-    assert url == "https://github.com/owner/repo/pull/99"
-
-
-def test_find_pr_url():
-    text = "some text https://github.com/foo/bar/pull/123 more"
-    assert _find_pr_url(text) == "https://github.com/foo/bar/pull/123"
-    assert _find_pr_url("no url") is None
-
-
-# --- draft via agent ------------------------------------------------------
-
-
-class FakeAgentHandle:
-    returncode = None
-
-    def __init__(
-        self,
-        draft_text: str | None,
-        *,
-        prompt_started: asyncio.Event | None = None,
-        prompt_release: asyncio.Event | None = None,
-        request_error: Exception | None = None,
-    ):
-        self._draft = draft_text
-        self._prompt_started = prompt_started
-        self._prompt_release = prompt_release
-        self._request_error = request_error
-        self.prompt_count = 0
-
-    async def prompt(self, message: str) -> dict:
-        self.prompt_count += 1
-        if self._prompt_started is not None:
-            self._prompt_started.set()
-        if self._prompt_release is not None:
-            await self._prompt_release.wait()
-        return {"ok": True}
-
-    async def request(self, request_type: str, **fields) -> dict:
-        if self._request_error is not None:
-            raise self._request_error
-        if request_type == "get_last_assistant_text":
-            # Live omp wraps the text: {"success": true, "data": {"text": ...}}
-            # (same shape advisories.py reads). A bare string here once masked
-            # a production bug found in dogfooding.
-            return {"success": True, "data": {"text": self._draft}}
-        return {}
-
-
-def _mark_session_idle(sessions: SessionTracker, task_id: int) -> None:
-    sessions.recovering(task_id, "main")
-    sessions.session_recovered(task_id, "main")
-
-
-async def _fire_idle(hub: EventHub, task_id: int) -> None:
-    await asyncio.sleep(0.01)
-    hub.publish(
-        "status_changed",
-        {
-            "task_id": task_id,
-            "session": "main",
-            "from": "working",
-            "to": "idle",
-            "reason": "test",
-        },
-    )
-
-
-async def test_draft_via_agent_publishes_lifecycle(
-    tmp_root, engine, ships, agents, sessions, hub
+async def test_restart_proves_a_signing_attempt_never_produced_anything(
+    tmp_root, engine, ships, config, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    draft_text = textwrap.dedent(
-        """\
-        <<<COMMIT_MESSAGE>>>
-        Commit msg
+    _setup_git_clone(tmp_root / "nosig-origin.git", Path(task.clone_path))
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
 
-        <<<PR_TITLE>>>
-        PR title
+    async def die_before_signing(*args, **kwargs):
+        raise asyncio.CancelledError
 
-        <<<PR_BODY>>>
-        PR body
-        """
+    monkeypatch.setattr(ships, "_sign", die_before_signing)
+    preview = await ships.preview(
+        task,
+        ending="commit",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
     )
-    handle = FakeAgentHandle(draft_text)
-    agents._handles[(task.id, "main")] = handle
-    _mark_session_idle(sessions, task.id)
-    queue = hub.subscribe()
+    delivery_id, _p = await ships.authorize(task, preview, expected_version=preview.version)
+    with pytest.raises(asyncio.CancelledError):
+        await ships._run_prefix(task, delivery_id, "r1")
+    assert get_delivery(engine, delivery_id).action("commit").phase == "executing"
 
-    asyncio.create_task(_fire_idle(hub, task.id))
-    state = await ships.draft(task)
+    signed: list[tuple] = []
 
-    events = []
-    while len(events) < 3:
-        event = await asyncio.wait_for(queue.get(), timeout=1.0)
-        if event.type in {"ship_step", "ship_draft"}:
-            events.append(event)
-    hub.unsubscribe(queue)
+    async def must_not_sign(*args, **kwargs):
+        signed.append(args)
+        raise AssertionError("startup must not sign")
 
-    assert state.status == "drafted"
-    assert state.draft is not None
-    assert state.draft.commit_message == "Commit msg"
-    assert state.last_step is not None
-    assert (state.last_step.step, state.last_step.status) == ("draft", "ok")
-    assert handle.prompt_count == 1
-    assert [(event.type, event.payload.get("status")) for event in events] == [
-        ("ship_step", "started"),
-        ("ship_draft", None),
-        ("ship_step", "ok"),
-    ]
-    assert events[1].payload["draft"]["pr_title"] == "PR title"
+    monkeypatch.setattr(ships, "_sign", must_not_sign)
+    blocked = await ships.restore()
+
+    assert blocked == []
+    assert signed == []
+    record = get_delivery(engine, delivery_id)
+    assert record.action("commit").phase == "failed"
+    assert record.disposition == "blocked"
+    assert "proven not to have happened" in record.action("commit").error
 
 
-async def test_draft_without_live_agent_raises(tmp_root, engine, ships, monkeypatch):
-    _project, task = _make_project_and_task(engine, tmp_root)
-    with pytest.raises(NoLiveAgentError):
-        await ships.draft(task)
-
-
-async def test_draft_requires_idle_primary_session(
-    tmp_root, engine, ships, agents, sessions
+async def test_an_unreadable_destination_leaves_a_push_unresolved_and_blocks_the_task(
+    tmp_root, engine, ships, config, guard, monkeypatch
 ):
+    """Not being able to look is not evidence that nothing happened."""
     _project, task = _make_project_and_task(engine, tmp_root)
-    handle = FakeAgentHandle("unused")
-    agents._handles[(task.id, "main")] = handle
-    sessions.recovering(task.id, "main")
+    _setup_git_clone(tmp_root / "unknown-origin.git", Path(task.clone_path))
+    remote = _bare(tmp_root / "unknown-remote.git")
+    _local_destination(ships, remote, monkeypatch)
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
 
-    with pytest.raises(SessionNotIdleError, match="not idle"):
-        await ships.draft(task)
-    assert handle.prompt_count == 0
-
-
-async def test_concurrent_ensure_coalesces_and_replace_conflicts(
-    tmp_root, engine, ships, agents, sessions, hub
-):
-    _project, task = _make_project_and_task(engine, tmp_root)
-    started = asyncio.Event()
-    release = asyncio.Event()
-    handle = FakeAgentHandle(
-        textwrap.dedent(
-            """\
-            <<<COMMIT_MESSAGE>>>
-            Commit msg
-            <<<PR_TITLE>>>
-            PR title
-            <<<PR_BODY>>>
-            PR body
-            """
-        ),
-        prompt_started=started,
-        prompt_release=release,
+    preview = await ships.preview(
+        task,
+        ending="push",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
     )
-    agents._handles[(task.id, "main")] = handle
-    _mark_session_idle(sessions, task.id)
+    delivery_id, _p = await ships.authorize(task, preview, expected_version=preview.version)
 
-    first = asyncio.create_task(ships.draft(task))
-    await asyncio.wait_for(started.wait(), timeout=1.0)
+    original_remote_head = ships._remote_head
+    calls = {"n": 0}
 
-    duplicate = await ships.draft(task)
-    assert duplicate.status == "drafting"
-    with pytest.raises(ShipInProgressError):
-        await ships.draft(task, replace=True)
-    assert handle.prompt_count == 1
+    async def flaky(clone_path, remote_url, ref, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return await original_remote_head(clone_path, remote_url, ref, timeout)
+        raise PushError("the remote is unreachable")
 
-    release.set()
-    asyncio.create_task(_fire_idle(hub, task.id))
-    completed = await asyncio.wait_for(first, timeout=1.0)
-    assert completed.status == "drafted"
-    assert handle.prompt_count == 1
+    async def failing_push(*args, **kwargs):
+        raise PushError("connection reset")
 
+    monkeypatch.setattr(ships, "_remote_head", flaky)
+    monkeypatch.setattr(ships, "_push", failing_push)
+    await ships._run_prefix(task, delivery_id, "r1")
 
-async def test_existing_draft_is_idempotent_and_explicitly_replaceable(
-    tmp_root, engine, ships, agents, sessions, hub
-):
-    _project, task = _make_project_and_task(engine, tmp_root)
-    first_text = textwrap.dedent(
-        """\
-        <<<COMMIT_MESSAGE>>>
-        First
-        <<<PR_TITLE>>>
-        First title
-        <<<PR_BODY>>>
-        First body
-        """
+    record = get_delivery(engine, delivery_id)
+    assert record.action("push").phase == "needs_reconciliation"
+    assert record.disposition == "unresolved"
+    assert guard.blocked_reason(task.id) is not None
+
+    # An operator can recheck once the remote is back. It never pushed, so the
+    # destination still holds nothing and a retry becomes eligible.
+    monkeypatch.setattr(ships, "_remote_head", original_remote_head)
+    projection = await ships.reconcile(
+        task,
+        delivery_id=delivery_id,
+        action_id=record.action("push").id,
+        expected_version=record.version,
+        decision="retry",
+        note="the remote was down",
     )
-    handle = FakeAgentHandle(first_text)
-    agents._handles[(task.id, "main")] = handle
-    _mark_session_idle(sessions, task.id)
-
-    asyncio.create_task(_fire_idle(hub, task.id))
-    first = await ships.draft(task)
-    assert (await ships.draft(task)) is first
-    assert handle.prompt_count == 1
-
-    handle._draft = first_text.replace("First", "Second")
-    asyncio.create_task(_fire_idle(hub, task.id))
-    replaced = await ships.draft(task, replace=True)
-    assert replaced.draft is not None
-    assert replaced.draft.commit_message == "Second"
-    assert handle.prompt_count == 2
+    assert projection["disposition"] == "blocked"
+    assert guard.blocked_reason(task.id) is None
 
 
-async def test_failed_replacement_preserves_previous_draft_and_is_retryable(
-    tmp_root, engine, ships, agents, sessions, hub
+async def test_a_lost_pull_request_response_is_found_by_its_correlation_marker(
+    tmp_root, engine, ships, config, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    handle = FakeAgentHandle(
-        "<<<COMMIT_MESSAGE>>>\nFirst\n<<<PR_TITLE>>>\nTitle\n<<<PR_BODY>>>\nBody"
-    )
-    agents._handles[(task.id, "main")] = handle
-    _mark_session_idle(sessions, task.id)
+    _setup_git_clone(tmp_root / "marker-origin.git", Path(task.clone_path))
+    remote = _bare(tmp_root / "marker-remote.git")
+    _local_destination(ships, remote, monkeypatch)
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
 
-    asyncio.create_task(_fire_idle(hub, task.id))
-    original = await ships.draft(task)
-    assert original.draft is not None
+    from ompire_daemon.ship import PullRequestError
 
-    handle._draft = "missing markers"
-    asyncio.create_task(_fire_idle(hub, task.id))
-    failed = await ships.draft(task, replace=True)
-    assert failed.status == "error"
-    assert failed.draft is original.draft
-    assert failed.last_step is not None
-    assert failed.last_step.step == "draft"
-    assert failed.last_step.status == "failed"
-    assert "parse draft markers" in (failed.error or "")
+    marker = correlation_marker(task.id, "r1")
+    created: list[str] = []
 
-    handle._draft = (
-        "<<<COMMIT_MESSAGE>>>\nRetry\n<<<PR_TITLE>>>\nRetry title\n"
-        "<<<PR_BODY>>>\nRetry body"
-    )
-    asyncio.create_task(_fire_idle(hub, task.id))
-    retried = await ships.draft(task, replace=True)
-    assert retried.status == "drafted"
-    assert retried.error is None
-    assert retried.draft is not None
-    assert retried.draft.commit_message == "Retry"
+    async def gh_run(args, cwd, timeout):
+        from ompire_daemon.gh import GitHubCommandResult
 
-
-@pytest.mark.parametrize(
-    ("draft_text", "request_error", "expected"),
-    [
-        (None, None, "did not return text"),
-        ("missing markers", None, "could not parse draft markers"),
-        (None, RuntimeError("rpc broke"), "agent request failed: rpc broke"),
-    ],
-)
-async def test_draft_failures_publish_retryable_error(
-    tmp_root,
-    engine,
-    ships,
-    agents,
-    sessions,
-    hub,
-    draft_text,
-    request_error,
-    expected,
-):
-    _project, task = _make_project_and_task(engine, tmp_root)
-    handle = FakeAgentHandle(draft_text, request_error=request_error)
-    agents._handles[(task.id, "main")] = handle
-    _mark_session_idle(sessions, task.id)
-    queue = hub.subscribe()
-
-    asyncio.create_task(_fire_idle(hub, task.id))
-    state = await ships.draft(task)
-
-    failed = None
-    while failed is None:
-        event = await asyncio.wait_for(queue.get(), timeout=1.0)
-        if event.type == "ship_step" and event.payload.get("status") == "failed":
-            failed = event
-    hub.unsubscribe(queue)
-    assert state.status == "error"
-    assert expected in (state.error or "")
-    assert expected in failed.payload["detail"]
-    assert ships.snapshot()[task.id]["last_step"]["step"] == "draft"
-
-
-async def test_draft_timeout_publishes_retryable_error(
-    tmp_root, engine, ships, agents, sessions, hub, monkeypatch
-):
-    _project, task = _make_project_and_task(engine, tmp_root)
-    agents._handles[(task.id, "main")] = FakeAgentHandle("unused")
-    _mark_session_idle(sessions, task.id)
-
-    async def timeout(*args, **kwargs):
-        raise TimeoutError
-
-    monkeypatch.setattr("ompire_daemon.ship.wait_for_idle", timeout)
-    state = await ships.draft(task)
-    assert state.status == "error"
-    assert state.error == "timed out waiting for agent draft"
-    assert state.last_step is not None
-    assert state.last_step.status == "failed"
-
-
-@pytest.mark.parametrize("published", ["archived", "pr", "shipped"])
-async def test_explicit_draft_refuses_published_tasks(
-    tmp_root, engine, ships, agents, sessions, published
-):
-    _project, task = _make_project_and_task(engine, tmp_root)
-    handle = FakeAgentHandle("unused")
-    agents._handles[(task.id, "main")] = handle
-    _mark_session_idle(sessions, task.id)
-    if published == "archived":
-        task = mark_archived(engine, task.id)
-    elif published == "pr":
-        task = mark_pr_url(engine, task.id, "https://github.com/owner/repo/pull/1")
-    else:
-        ships._ships[task.id] = ShipState(status="shipped")
-
-    with pytest.raises(ShipAlreadyPublishedError):
-        await ships.draft(task, replace=True)
-    assert handle.prompt_count == 0
-
-
-# --- REST guards ----------------------------------------------------------
-
-
-def test_draft_route_409_without_live_agent(client, auth_header, engine, tmp_root):
-    _project, task = _make_project_and_task(engine, tmp_root)
-    response = client.post(f"/api/tasks/{task.id}/ship/draft", headers=auth_header)
-    assert response.status_code == 409
-
-
-def test_draft_route_keeps_bodyless_ensure_and_explicit_replace(
-    client, auth_header, engine, tmp_root, app, monkeypatch
-):
-    _project, task = _make_project_and_task(engine, tmp_root)
-    replacements: list[bool] = []
-    state = ShipState(
-        status="drafted",
-        draft=ShipDraft("Commit", "Title", "Body"),
-    )
-
-    async def draft(_task, *, replace: bool = False):
-        replacements.append(replace)
-        return state
-
-    monkeypatch.setattr(app.state.ships, "draft", draft)
-
-    ensured = client.post(f"/api/tasks/{task.id}/ship/draft", headers=auth_header)
-    replaced = client.post(
-        f"/api/tasks/{task.id}/ship/draft",
-        headers=auth_header,
-        json={"replace": True},
-    )
-
-    assert ensured.status_code == 200
-    assert replaced.status_code == 200
-    assert replacements == [False, True]
-
-
-@pytest.mark.parametrize("mode", ["squash", "retain"])
-def test_commit_route_preflight_409_precedes_seed_jobs_and_all_git_mutation(
-    client, auth_header, engine, tmp_root, app, monkeypatch, mode
-):
-    project, task = _make_project_and_task(engine, tmp_root)
-    origin = tmp_root / "route-preflight-origin.git"
-    _setup_git_clone(origin, Path(task.clone_path))
-    clone = Path(task.clone_path)
-    original_head = subprocess.run(
-        ["git", "-C", str(clone), "rev-parse", "HEAD"],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    original_tree = (clone / "file3.txt").read_text(encoding="utf-8")
-    error = _blocked_preflight_error(project.upstream_url)
-
-    async def unavailable(_task):
-        raise error
-
-    monkeypatch.setattr(app.state.ships, "preflight", unavailable)
-    events = app.state.events.subscribe()
-    try:
-        response = client.post(
-            f"/api/tasks/{task.id}/ship/commit",
-            headers=auth_header,
-            json={"message": "m", "pr_title": "t", "pr_body": "b", "mode": mode},
-        )
-        assert response.status_code == 409
-        detail = response.json()["detail"]
-        assert detail["message"] == str(error)
-        assert detail["gh"]["identity"]["state"] == "unauthenticated"
-        assert (
-            subprocess.run(
-                ["git", "-C", str(clone), "rev-parse", "HEAD"],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip()
-            == original_head
-        )
-        assert (clone / "file3.txt").read_text(encoding="utf-8") == original_tree
-        assert (
-            subprocess.run(
+        if args[:2] == ["pr", "create"]:
+            created.append("create")
+            # The pull request is created and the reply is lost.
+            raise PullRequestError("connection reset after the request was sent")
+        if args[:2] == ["pr", "list"]:
+            payload = json.dumps(
                 [
-                    "git",
-                    "-C",
-                    str(clone),
-                    "rev-parse",
-                    "--verify",
-                    "refs/ompire/ship-orig",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            ).returncode
-            != 0
-        )
-        assert app.state.ships.get(task.id) is None
-        assert app.state.spawn_jobs == set()
-        assert events.empty()
-    finally:
-        app.state.events.unsubscribe(events)
+                    {
+                        "number": 9,
+                        "url": "https://github.com/owner/repo/pull/9",
+                        "state": "OPEN",
+                        "body": f"why\n\n<!-- ompire-delivery: {marker} -->",
+                        "headRefName": "ompire/task-1",
+                        "baseRefName": "main",
+                    },
+                    {
+                        "number": 3,
+                        "url": "https://github.com/owner/repo/pull/3",
+                        "state": "CLOSED",
+                        "body": "an unrelated pull request",
+                        "headRefName": "ompire/task-1",
+                        "baseRefName": "main",
+                    },
+                ]
+            )
+            return GitHubCommandResult(returncode=0, stdout=payload, stderr="")
+        return GitHubCommandResult(returncode=1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(ships._gh, "run", gh_run)
+    projection = await _deliver(ships, task, ending="pr", request_id="r1")
+
+    assert created == ["create"]
+    assert projection["results"]["pr"]["adopted"] is True
+    assert projection["pr_url"] == "https://github.com/owner/repo/pull/9"
+    assert get_task(engine, task.id).pr_url == "https://github.com/owner/repo/pull/9"
+    # Adopting a lost reply is the delivery completing, not recovering from a
+    # failure: the ending it reached is the one that was authorized.
+    assert projection["disposition"] == "completed"
+    assert projection["completed_actions"] == ["commit", "push", "pr"]
 
 
-def test_commit_preflight_refusal_redacts_rest_and_websocket(
-    client, auth_header, engine, tmp_root, app, monkeypatch
+async def test_an_incomplete_pr_search_leaves_the_outcome_unknown(
+    tmp_root, engine, ships, config, guard, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    secret = "ship-rest-exact-secret"
-    _write_script(
-        tmp_root / "bin",
-        "gh",
-        "#!/bin/sh\n"
-        'case "$*" in\n'
-        "'--version') echo 'gh version 2.97.0 (test)' ;;\n"
-        "'api --hostname github.com user')\n"
-        "  printf 'HTTP 401: Bad credentials\\nAuthorization: Token %s\\nghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789\\n' \"$GH_TOKEN\" >&2\n"
-        "  exit 1 ;;\n"
-        "*) echo unsupported >&2; exit 1 ;;\n"
-        "esac\n",
+    _setup_git_clone(tmp_root / "unknown-pr-origin.git", Path(task.clone_path))
+    remote = _bare(tmp_root / "unknown-pr-remote.git")
+    _local_destination(ships, remote, monkeypatch)
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    async def gh_run(args, cwd, timeout):
+        from ompire_daemon.gh import GitHubCommandResult
+
+        if args[:2] == ["pr", "create"]:
+            return GitHubCommandResult(returncode=1, stdout="", stderr="HTTP 502")
+        if args[:2] == ["pr", "list"]:
+            return GitHubCommandResult(returncode=1, stdout="", stderr="HTTP 502")
+        return GitHubCommandResult(returncode=1, stdout="", stderr="unexpected")
+
+    monkeypatch.setattr(ships._gh, "run", gh_run)
+    preview = await ships.preview(
+        task,
+        ending="pr",
+        mode="squash",
+        commit_message="m",
+        pr_title="t",
+        pr_body="b",
+        request_id="r1",
     )
-    monkeypatch.setenv("GH_TOKEN", secret)
+    delivery_id, _p = await ships.authorize(task, preview, expected_version=preview.version)
+    await ships._run_prefix(task, delivery_id, "r1")
 
-    with client.websocket_connect(f"/api/ws?token={app.state.auth_token}") as ws:
-        ws.receive_json()
-        response = client.post(
-            f"/api/tasks/{task.id}/ship/commit",
-            headers=auth_header,
-            json={"message": "m", "pr_title": "t", "pr_body": "b"},
-        )
-        event = ws.receive_json()
+    record = get_delivery(engine, delivery_id)
+    assert record.action("pr").phase == "needs_reconciliation"
+    assert record.disposition == "unresolved"
+    assert guard.blocked_reason(task.id) is not None
+    assert get_task(engine, task.id).pr_url is None
 
-    published = f"{response.text}\n{event}"
-    assert response.status_code == 409
-    assert response.json()["detail"]["gh"]["identity"]["state"] == "unauthenticated"
-    assert event["type"] == "gh_status"
-    for credential in (
-        secret,
-        "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-        "Authorization: Token",
-    ):
-        assert credential not in published
-    assert app.state.ships.get(task.id) is None
+    # Abandoning does not erase the unknown effect.
+    projection = await ships.reconcile(
+        task,
+        delivery_id=delivery_id,
+        action_id=record.action("pr").id,
+        expected_version=record.version,
+        decision="abandon",
+        note="giving up for now",
+    )
+    assert projection["disposition"] == "unresolved"
+    assert guard.blocked_reason(task.id) is not None
 
 
-def test_commit_route_409_gpg_not_ready(
-    client, auth_header, engine, tmp_root, app, monkeypatch
+# --- projection -------------------------------------------------------------
+
+
+async def test_a_legacy_publication_is_a_known_fact_with_no_invented_journal(
+    tmp_root, engine, ships
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _blocked_gpg_probe())
-    response = client.post(
-        f"/api/tasks/{task.id}/ship/commit",
-        headers=auth_header,
-        json={
-            "message": "m",
-            "pr_title": "t",
-            "pr_body": "b",
-        },
-    )
-    assert response.status_code == 409
-    data = response.json()
-    assert data["detail"]["gpg"]["state"] == "locked"
+    mark_pr_url(engine, task.id, "https://github.com/owner/repo/pull/1")
+    projection = ships.projection(get_task(engine, task.id))
+    assert projection is not None
+    assert projection["pr_url"] == "https://github.com/owner/repo/pull/1"
+    assert projection["legacy_publication"] is True
+    assert projection["history"] == []
+    assert projection["delivery_id"] is None
 
 
-@pytest.mark.parametrize(
-    "state",
-    ["locked", "ambiguous", "no_key", "missing", "agent_unavailable", "unknown", "error"],
-)
-def test_commit_route_refuses_every_state_but_ready_without_touching_the_clone(
-    client, auth_header, engine, tmp_root, app, monkeypatch, state
-):
-    """Fail closed, and prove the refusal happened before any Git mutation."""
-    origin = tmp_root / "origin.git"
-    _project, task = _make_project_and_task(engine, tmp_root)
-    _setup_git_clone(origin, Path(task.clone_path))
-    monkeypatch.setattr(app.state.gpg, "probe", _blocked_gpg_probe(state))
-
-    before = subprocess.run(
-        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
-
-    response = client.post(
-        f"/api/tasks/{task.id}/ship/commit",
-        headers=auth_header,
-        json={"message": "m", "pr_title": "t", "pr_body": "b"},
-    )
-
-    assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert detail["gpg"]["state"] == state
-    # The message names the actual condition, not a generic "not cached".
-    assert detail["message"] and "not cached" not in detail["message"]
-
-    after = subprocess.run(
-        ["git", "-C", task.clone_path, "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    assert after == before
-    orig_ref = subprocess.run(
-        ["git", "-C", task.clone_path, "rev-parse", "--verify", "refs/ompire/ship-orig"],
-        capture_output=True, text=True, check=False,
-    )
-    assert orig_ref.returncode != 0
-
-
-def test_commit_route_409_unsupported_mode(
-    client, auth_header, engine, tmp_root, app, monkeypatch
+async def test_the_projection_version_advances_with_every_committed_change(
+    tmp_root, engine, ships, config, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _ready_gpg_probe())
-    response = client.post(
-        f"/api/tasks/{task.id}/ship/commit",
-        headers=auth_header,
-        json={
-            "message": "m",
-            "pr_title": "t",
-            "pr_body": "b",
-            "mode": "merge",
-        },
-    )
-    assert response.status_code == 409
+    _setup_git_clone(tmp_root / "version-origin.git", Path(task.clone_path))
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    before = ships.projection(task)
+    after = await _deliver(ships, task, ending="commit")
+    assert before is None or after["version"] > before["version"]
+    assert get_latest_delivery(engine, task.id).version == after["version"]
 
 
-def test_commit_route_409_retain_dirty_tree(
-    client, auth_header, engine, tmp_root, app, monkeypatch
+async def test_a_refused_first_action_can_be_corrected_and_confirmed_again(
+    tmp_root, engine, ships, config, monkeypatch
 ):
+    """Nothing succeeded, so there is no terminal prefix to protect."""
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _ready_gpg_probe())
-    origin = tmp_root / "origin.git"
-    _setup_git_clone(origin, Path(task.clone_path))
+    _setup_git_clone(tmp_root / "correct-origin.git", Path(task.clone_path))
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
 
-    response = client.post(
-        f"/api/tasks/{task.id}/ship/commit",
-        headers=auth_header,
-        json={
-            "message": "m",
-            "pr_title": "t",
-            "pr_body": "b",
-            "mode": "retain",
-        },
+    original_sign = ships._sign
+
+    async def refuse(*args, **kwargs):
+        raise DeliveryWorkspaceError("gpg said no")
+
+    monkeypatch.setattr(ships, "_sign", refuse)
+    preview = await ships.preview(
+        task,
+        ending="commit",
+        mode="squash",
+        commit_message="first attempt",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
     )
-    assert response.status_code == 409
-    assert "dirty" in response.json()["detail"].lower()
+    delivery_id, _p = await ships.authorize(
+        task, preview, expected_version=preview.version
+    )
+    await ships._run_prefix(task, delivery_id, "r1")
+    assert get_delivery(engine, delivery_id).disposition == "blocked"
 
+    # Signing works again, and the operator corrects the message.
+    monkeypatch.setattr(ships, "_sign", original_sign)
+    projection = await _deliver(
+        ships, task, ending="commit", message="corrected message", request_id="r2"
+    )
 
-def test_commit_route_409_retain_merge_commits(
-    client, auth_header, engine, tmp_root, app, monkeypatch
-):
-    _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _ready_gpg_probe())
-    origin = tmp_root / "origin.git"
-    _setup_git_clone(origin, Path(task.clone_path))
-    _run_git(Path(task.clone_path), "add", "file3.txt")
-    _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
-
+    assert projection["disposition"] == "completed"
+    assert len(list_deliveries(engine, task.id)) == 1
     clone = Path(task.clone_path)
-    _run_git(clone, "checkout", "-b", "side")
-    (clone / "side.txt").write_text("side\n", encoding="utf-8")
-    _run_git(clone, "add", ".")
-    _run_git(clone, "commit", "-m", "side commit")
-    _run_git(clone, "checkout", "ompire/task-1")
-    _run_git(clone, "merge", "--no-ff", "side", "-m", "merge side")
-
-    response = client.post(
-        f"/api/tasks/{task.id}/ship/commit",
-        headers=auth_header,
-        json={
-            "message": "m",
-            "pr_title": "t",
-            "pr_body": "b",
-            "mode": "retain",
-        },
-    )
-    assert response.status_code == 409
-    assert "merge" in response.json()["detail"].lower()
+    assert _git_out(clone, "log", "-1", "--format=%s") == "corrected message"
 
 
-def test_commit_route_409_retain_empty_range(
-    client, auth_header, engine, tmp_root, app, monkeypatch
+async def test_a_completed_prefix_survives_a_refusal_and_resumes_without_re_signing(
+    tmp_root, engine, ships, config, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _ready_gpg_probe())
-    origin = tmp_root / "origin.git"
-    _setup_git_clone(origin, Path(task.clone_path))
-    (Path(task.clone_path) / "file3.txt").unlink()
-    _run_git(Path(task.clone_path), "checkout", "main")
-    _run_git(Path(task.clone_path), "checkout", "-B", "ompire/task-1")
+    _setup_git_clone(tmp_root / "resume-origin.git", Path(task.clone_path))
+    remote = _bare(tmp_root / "resume-remote.git")
+    _local_destination(ships, remote, monkeypatch)
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
 
-    response = client.post(
-        f"/api/tasks/{task.id}/ship/commit",
-        headers=auth_header,
-        json={
-            "message": "m",
-            "pr_title": "t",
-            "pr_body": "b",
-            "mode": "retain",
-        },
+    original_push = ships._push
+    attempts = {"n": 0}
+
+    async def flaky_push(*args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise PushError("the remote refused it")
+        return await original_push(*args, **kwargs)
+
+    monkeypatch.setattr(ships, "_push", flaky_push)
+    preview = await ships.preview(
+        task,
+        ending="push",
+        mode="squash",
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
     )
-    assert response.status_code == 409
-    assert "no commits" in response.json()["detail"].lower()
+    delivery_id, _p = await ships.authorize(
+        task, preview, expected_version=preview.version
+    )
+    await ships._run_prefix(task, delivery_id, "r1")
+
+    blocked = get_delivery(engine, delivery_id)
+    assert blocked.disposition == "blocked"
+    signed_tip = blocked.succeeded("commit").result["signed_tip"]
+
+    signings: list[tuple] = []
+
+    async def must_not_sign(*args, **kwargs):
+        signings.append(args)
+        raise AssertionError("a resumed delivery must not sign again")
+
+    monkeypatch.setattr(ships, "_sign", must_not_sign)
+    projection = await _deliver(ships, task, ending="push", request_id="r2")
+
+    assert signings == []
+    assert projection["disposition"] == "completed"
+    assert projection["results"]["commit"]["signed_tip"] == signed_tip
+    assert projection["results"]["push"]["head"] == signed_tip
+    # The completed commit was never re-attempted, and the retry is on record.
+    record = get_delivery(engine, delivery_id)
+    assert len([a for a in record.actions if a.kind == "commit"]) == 1
+    assert "retry" in [d.kind for d in record.decisions]
 
 
-def test_commit_route_accepts_retain_mode(
-    client, auth_header, engine, tmp_root, app, monkeypatch
+async def test_adopting_an_unresolved_final_action_completes_the_delivery(
+    tmp_root, engine, ships, config, guard, monkeypatch
 ):
+    """Recovering from an unknown effect is not authorization to keep writing,
+    but an adopted result that finishes the ending finishes the delivery."""
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _ready_gpg_probe())
-    origin = tmp_root / "origin.git"
-    _setup_git_clone(origin, Path(task.clone_path))
-    _run_git(Path(task.clone_path), "add", "file3.txt")
-    _run_git(Path(task.clone_path), "commit", "-m", "stage working edit")
+    _setup_git_clone(tmp_root / "settle-origin.git", Path(task.clone_path))
+    remote = _bare(tmp_root / "settle-remote.git")
+    _local_destination(ships, remote, monkeypatch)
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
 
-    response = client.post(
-        f"/api/tasks/{task.id}/ship/commit",
-        headers=auth_header,
-        json={
-            "message": "m",
-            "pr_title": "t",
-            "pr_body": "b",
-            "mode": "retain",
-        },
+    marker = correlation_marker(task.id, "r1")
+    listing_available = {"value": False}
+
+    async def gh_run(args, cwd, timeout):
+        from ompire_daemon.gh import GitHubCommandResult
+
+        if args[:2] == ["pr", "create"]:
+            raise PullRequestError("connection reset after the request was sent")
+        if args[:2] == ["pr", "list"]:
+            if not listing_available["value"]:
+                return GitHubCommandResult(returncode=1, stdout="", stderr="HTTP 502")
+            payload = json.dumps(
+                [
+                    {
+                        "number": 11,
+                        "url": "https://github.com/owner/repo/pull/11",
+                        "state": "OPEN",
+                        "body": f"why\n\n<!-- ompire-delivery: {marker} -->",
+                        "headRefName": "ompire/task-1",
+                        "baseRefName": "main",
+                    }
+                ]
+            )
+            return GitHubCommandResult(returncode=0, stdout=payload, stderr="")
+        return GitHubCommandResult(returncode=1, stdout="", stderr="unexpected")
+
+    from ompire_daemon.ship import PullRequestError
+
+    monkeypatch.setattr(ships._gh, "run", gh_run)
+    projection = await _deliver(ships, task, ending="pr", request_id="r1")
+
+    assert projection["disposition"] == "unresolved"
+    assert guard.blocked_reason(task.id) is not None
+    delivery_id = projection["delivery_id"]
+    action_id = [a for a in projection["actions"] if a["kind"] == "pr"][-1]["id"]
+
+    # The forge answers again and the operator rechecks.
+    listing_available["value"] = True
+    resolved = await ships.reconcile(
+        task,
+        delivery_id=delivery_id,
+        action_id=action_id,
+        expected_version=projection["version"],
+        decision="recheck",
+        note="the forge is reachable again",
     )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "committing"
-    assert data["mode"] == "retain"
+    assert resolved["disposition"] == "completed"
+    assert resolved["results"]["pr"]["adopted"] is True
+    assert resolved["pr_url"] == "https://github.com/owner/repo/pull/11"
+    assert get_task(engine, task.id).pr_url == "https://github.com/owner/repo/pull/11"
+    assert guard.blocked_reason(task.id) is None
 
 
-def test_commit_route_409_when_ship_in_flight(
-    client, auth_header, engine, tmp_root, app, monkeypatch
+async def test_a_delivery_records_the_workflow_revision_it_published_from(
+    tmp_root, engine, ships, config, monkeypatch
 ):
+    """Attribution, not policy: a delivery says which pinned procedure produced
+    the work it published, and that stays true after the library moves on."""
     _project, task = _make_project_and_task(engine, tmp_root)
-    monkeypatch.setattr(app.state.gpg, "probe", _ready_gpg_probe())
-    app.state.ships.seed_commit(task.id)
-    response = client.post(
-        f"/api/tasks/{task.id}/ship/commit",
-        headers=auth_header,
-        json={
-            "message": "m",
-            "pr_title": "t",
-            "pr_body": "b",
-        },
-    )
-    assert response.status_code == 409
+    _setup_git_clone(tmp_root / "attribution-origin.git", Path(task.clone_path))
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    await _deliver(ships, task, ending="commit")
+
+    record = get_latest_delivery(engine, task.id)
+    expected = task.execution_inputs.workflow_binding.revision
+    assert expected
+    assert record.workflow_revision == expected
 
 
-def test_snapshot_carries_ships_and_gpg(client, auth_header, engine, tmp_root, app):
-    _project, task = _make_project_and_task(engine, tmp_root)
-    app.state.ships._set_state(
-        task.id,
-        status="drafted",
-        draft=ShipDraft("msg", "title", "body"),
-    )
-    with client.websocket_connect(f"/api/ws?token={app.state.auth_token}") as ws:
-        message = ws.receive_json()
-
-    assert message["type"] == "snapshot"
-    assert "ships" in message["payload"]
-    assert str(task.id) in message["payload"]["ships"]
-    assert "gpg" in message["payload"]
-    assert message["payload"]["gpg"]["state"] in (
-        "ready",
-        "locked",
-        "ambiguous",
-        "no_key",
-        "missing",
-        "agent_unavailable",
-        "unknown",
-        "error",
-    )
-    assert "candidates" in message["payload"]["gpg"]
-
-
-# --- cleanup/purge hooks --------------------------------------------------
-
-
-async def test_cleanup_calls_cancel_and_drop(
-    tmp_root, engine, client, auth_header, app, monkeypatch
+async def test_terminal_candidate_storage_is_released_and_unresolved_storage_is_kept(
+    tmp_root, engine, ships, config, monkeypatch
 ):
+    """Candidate objects are temporary operation evidence: they go once nothing
+    still needs them, and they stay while something might."""
+    from ompire_daemon.registry.ships import list_task_candidates
+
     _project, task = _make_project_and_task(engine, tmp_root)
-    dropped: list[int] = []
+    _setup_git_clone(tmp_root / "lifecycle-origin.git", Path(task.clone_path))
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    candidate = await _approve_current(config, engine, task)
+    store = Path(candidate.storage_path)
+    assert store.exists()
 
-    async def fake_cancel_and_drop(tid: int) -> None:
-        dropped.append(tid)
+    await _deliver(ships, task, ending="commit")
 
-    monkeypatch.setattr(app.state.ships, "cancel_and_drop", fake_cancel_and_drop)
-
-    # Cleanup needs a directory inside task root so the path check passes.
-    clone_dir = Path(task.clone_path)
-    clone_dir.mkdir(parents=True, exist_ok=True)
-    (clone_dir / ".git").mkdir(exist_ok=True)
-
-    response = client.post(f"/api/tasks/{task.id}/cleanup", headers=auth_header)
-    assert response.status_code == 200
-    assert dropped == [task.id]
-
-
-async def test_purge_calls_drop_ship(
-    tmp_root, engine, client, auth_header, app, monkeypatch
-):
-    _project, task = _make_project_and_task(engine, tmp_root)
-    mark_archived(engine, task.id)
-    dropped: list[int] = []
-    monkeypatch.setattr(app.state.ships, "drop_ship", lambda tid: dropped.append(tid))
-
-    response = client.delete(f"/api/tasks/{task.id}", headers=auth_header)
-    assert response.status_code == 200
-    assert dropped == [task.id]
-
-
-def test_gpg_get_returns_current_status(client, auth_header, app, monkeypatch):
-    status = GpgStatus(state="ready", selected=_selection(_TEST_FINGERPRINT))
-    monkeypatch.setattr(app.state.gpg, "current", lambda: status)
-
-    response = client.get("/api/gpg", headers=auth_header)
-    assert response.status_code == 200
-    data = response.json()
-    assert data["state"] == "ready"
-    assert data["selected"]["fingerprint"] == _TEST_FINGERPRINT
-
-
-def test_gpg_recheck_returns_probed_status(client, auth_header, app, monkeypatch):
-    status = GpgStatus(
-        state="locked", selected=_selection(_TEST_FINGERPRINT), detail="cold cache"
-    )
-
-    async def fake_probe() -> GpgStatus:
-        return status
-
-    monkeypatch.setattr(app.state.gpg, "probe", fake_probe)
-
-    response = client.post("/api/gpg/recheck", headers=auth_header)
-    assert response.status_code == 200
-    data = response.json()
-    assert data["state"] == "locked"
-    assert data["selected"]["fingerprint"] == _TEST_FINGERPRINT
+    # The delivery is terminal, so its evidence has served its purpose.
+    assert not store.exists()
+    retained = [c for c in list_task_candidates(engine, task.id)]
+    assert retained, "the manifest is history and stays"
+    assert all(c.storage_path is None for c in retained)

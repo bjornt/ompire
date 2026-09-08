@@ -52,7 +52,7 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0017"
+    assert version == "0018"
     assert "projects" in tables
     assert "tasks" in tables
     # Templates are retired (ADR-0026): the live table is gone and only inert
@@ -201,7 +201,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0017"
+    assert version == "0018"
     assert row == "demo"
 
 
@@ -653,10 +653,15 @@ def test_0010_review_tables_roundtrip(tmp_path: Path) -> None:
         iteration_columns = {
             row[1] for row in conn.execute(text("PRAGMA table_info(review_iterations)"))
         }
+        # 0018 adds the nullable candidate binding to both (ADR-0032). It is
+        # nullable precisely so this backfill-free property survives: a review
+        # recorded before content binding keeps a NULL candidate rather than
+        # being attributed to a tree nobody reviewed.
         assert review_columns == {
             "task_id",
             "status",
             "process_started_at",
+            "candidate_id",
             "created_at",
             "updated_at",
         }
@@ -666,6 +671,7 @@ def test_0010_review_tables_roundtrip(tmp_path: Path) -> None:
             "outcome",
             "comment_count",
             "stderr",
+            "candidate_id",
             "recorded_at",
         }
         # No backfill for pre-existing tasks.
@@ -1725,3 +1731,89 @@ def test_0016_downgrade_drops_only_the_two_new_columns(tmp_path: Path) -> None:
     # Everything 0015 owns survives the round trip.
     assert "pause_json" in step_columns
     assert slug == "historic"
+
+
+def test_0018_adds_the_delivery_journal_without_inventing_history(tmp_path: Path) -> None:
+    """0018 creates the delivery tables empty and binds reviews to nothing.
+
+    A task that shipped before content binding keeps its `pr_url` and its review
+    iterations, and gains no delivery record: the projection then says "this was
+    published, and there is no journal behind it", which is exactly true. Making
+    one up would be fabricated provenance.
+    """
+    db_path = tmp_path / "ompire.db"
+    _land_at_0007_with_tasks(db_path)
+    engine = make_engine(db_path)
+
+    from alembic import command
+
+    command.upgrade(_alembic_cfg(db_path), "0017")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO reviews (task_id, status, process_started_at, "
+                "created_at, updated_at) VALUES (1, 'approved', NULL, 't', 't')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO review_iterations (task_id, seq, outcome, "
+                "comment_count, stderr, recorded_at) "
+                "VALUES (1, 1, 'approved', 0, NULL, 't')"
+            )
+        )
+        conn.execute(text("UPDATE tasks SET pr_url = 'https://x/pull/1' WHERE id = 1"))
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            )
+        }
+        assert {
+            "delivery_candidates",
+            "deliveries",
+            "delivery_actions",
+            "delivery_decisions",
+        } <= tables
+        for table in ("delivery_candidates", "deliveries", "delivery_actions"):
+            assert conn.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one() == 0
+        # Existing history is preserved and left unbound.
+        assert (
+            conn.execute(
+                text("SELECT candidate_id FROM reviews WHERE task_id = 1")
+            ).scalar_one()
+            is None
+        )
+        assert (
+            conn.execute(
+                text("SELECT candidate_id FROM review_iterations WHERE task_id = 1")
+            ).scalar_one()
+            is None
+        )
+        assert (
+            conn.execute(text("SELECT pr_url FROM tasks WHERE id = 1")).scalar_one()
+            == "https://x/pull/1"
+        )
+
+    command.downgrade(_alembic_cfg(db_path), "0017")
+    with engine.connect() as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            )
+        }
+        assert "deliveries" not in tables
+        # The publication fact and the review history outlive the journal.
+        assert (
+            conn.execute(text("SELECT pr_url FROM tasks WHERE id = 1")).scalar_one()
+            == "https://x/pull/1"
+        )
+        assert (
+            conn.execute(text("SELECT COUNT(*) FROM review_iterations")).scalar_one()
+            == 1
+        )

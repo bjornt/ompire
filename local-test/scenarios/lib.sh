@@ -416,21 +416,175 @@ _ws_seen() { # _ws_seen JQ-FILTER [TASK_ID]
 	[ "$(ws_count "$filter")" -ge 1 ]
 }
  
-# Ship outcome: succeeds on shipped and returns 2 on a terminal error so
-# wait_for stops immediately instead of turning a known failure into a timeout.
-ship_done() { # ship_done TASK_ID
-	local err
-	err=$(jq -c "select(.type == \"ship_step\" and .payload.status == \"failed\" and .payload.task_id == $1)" "$WS_OUT" 2>/dev/null) || true
-	if [ -n "$err" ]; then
-		printf 'ship failed: %s' "$err"
-		return 2
-	fi
-	if _ws_seen '.type == "ship_finished" and .payload.status == "shipped"' "$1"; then
-		printf 'shipped'
+# --- delivery (ADR-0032) ------------------------------------------------------
+#
+# Delivery is journaled and versioned now, so the harness reads the committed
+# `ship_updated` projection rather than transient step events.
+
+ship_projection() { # ship_projection TASK — the daemon's current projection
+	# Read it from the daemon rather than from the WebSocket recording. Both
+	# carry the same versioned document, but a recorder that reconnects — or a
+	# runbook that restarts the daemon — has gaps, and a stale read would make a
+	# passing delivery look stuck.
+	_api_run GET "/api/tasks/$1/ship"
+	[ "$API_CODE" = 200 ] || { printf ''; return 1; }
+	printf '%s' "$API_BODY"
+}
+
+ship_field() { # ship_field TASK JQ-PATH
+	local payload
+	payload=$(ship_projection "$1")
+	[ -n "$payload" ] || { printf ''; return 1; }
+	jq -r "$2" <<<"$payload"
+}
+
+# Delivery outcome for wait_for: 0 once the selected ending completed, 2 on a
+# terminal block or an unresolved effect so a known stop is not a timeout.
+ship_done() { # ship_done TASK [ENDING]
+	local payload disposition ending
+	payload=$(ship_projection "$1")
+	[ -n "$payload" ] || { printf 'no delivery projection yet'; return 1; }
+	disposition=$(jq -r '.disposition // "none"' <<<"$payload")
+	ending=$(jq -r '.ending // "none"' <<<"$payload")
+	local -A rank=([none]=0 [commit]=1 [push]=2 [pr]=3)
+	case "$disposition" in
+	completed)
+		if [ $# -gt 1 ] && [ "$ending" != "$2" ]; then
+			# A shorter completed ending is the previous delivery step, not a
+			# wrong answer: the projection for the further ending has not
+			# arrived yet. A longer one is a real disagreement.
+			if [ "${rank[$ending]:-0}" -lt "${rank[$2]:-0}" ]; then
+				printf 'completed %s, waiting for %s' "$ending" "$2"
+				return 1
+			fi
+			printf 'completed %s, wanted %s' "$ending" "$2"
+			return 2
+		fi
+		printf 'delivered (%s)' "$ending"
 		return 0
-	fi
-	printf 'committing/pushing'
+		;;
+	blocked)
+		printf 'delivery blocked: %s' "$(jq -r '.blocked_reason // "no reason"' <<<"$payload")"
+		return 2
+		;;
+	unresolved)
+		printf 'delivery unresolved: %s' "$(jq -r '.blocked_reason // "no reason"' <<<"$payload")"
+		return 2
+		;;
+	esac
+	printf 'delivering (%s)' "$disposition"
 	return 1
+}
+
+# Wait for a delivery to stop with an unresolved effect — the interrupted-effect
+# runbooks' success condition.
+ship_unresolved() { # ship_unresolved TASK [KIND]
+	local payload
+	payload=$(ship_projection "$1")
+	[ -n "$payload" ] || { printf 'no delivery projection yet'; return 1; }
+	[ "$(jq -r '.disposition // ""' <<<"$payload")" = unresolved ] || {
+		printf 'disposition=%s' "$(jq -r '.disposition // "none"' <<<"$payload")"; return 1; }
+	if [ $# -gt 1 ]; then
+		jq -e --arg k "$2" \
+			'[.actions[] | select(.kind == $k and .phase == "needs_reconciliation")] | length >= 1' \
+			<<<"$payload" >/dev/null || { printf 'no unresolved %s action' "$2"; return 1; }
+	fi
+	printf 'unresolved'
+}
+
+ship_blocked() { # ship_blocked TASK
+	local payload
+	payload=$(ship_projection "$1")
+	[ -n "$payload" ] || { printf 'no delivery projection yet'; return 1; }
+	[ "$(jq -r '.disposition // ""' <<<"$payload")" = blocked ] || {
+		printf 'disposition=%s' "$(jq -r '.disposition // "none"' <<<"$payload")"; return 1; }
+	printf 'blocked'
+}
+
+# Ask the daemon to draft publication text through the live agent.
+ship_draft() { # ship_draft TASK
+	api_json POST "/api/tasks/$1/ship/draft" >/tmp/ship-draft-$1.json
+	[ "$API_CODE" = 200 ] || die "ship draft failed ($API_CODE): $(cat /tmp/ship-draft-$1.json)"
+	jq -e '.draft.state == "ready" and .draft.commit_message and .draft.pr_title' \
+		/tmp/ship-draft-$1.json >/dev/null ||
+		fail "draft parsed for task $1" "$(cat /tmp/ship-draft-$1.json)"
+}
+
+# Resolve one requested ending read-only. Leaves the response in
+# /tmp/ship-preview-$TASK.json and never authorizes anything.
+ship_preview() { # ship_preview TASK ENDING MODE REQUEST MESSAGE TITLE BODY
+	local tid=$1 ending=$2 mode=$3 req=$4 message=$5 title=$6 body=$7 delivery
+	delivery=$(ship_field "$tid" '.delivery_id // empty' || true)
+	api_json POST "/api/tasks/$tid/ship/preview" \
+		"$(jq -n --arg e "$ending" --arg mode "$mode" --arg r "$req" \
+			--arg m "$message" --arg t "$title" --arg b "$body" \
+			--argjson d "${delivery:-null}" \
+			'{ending: $e, mode: $mode, request_id: $r, message: $m,
+			  pr_title: $t, pr_body: $b, delivery_id: $d}')" \
+		>/tmp/ship-preview-$tid.json
+}
+
+# Preview then confirm exactly what the preview offered, and wait for the
+# selected ending. `commit`/`push`/`pr` are endings, not workflow results.
+ship_deliver() { # ship_deliver TASK ENDING [MODE] [MESSAGE] [TITLE] [BODY]
+	local tid=$1 ending=$2 mode=${3:-squash}
+	local message=${4:-"ship: local-test delivery"} title=${5:-"Local test"} body=${6:-"why"}
+	local req="e2e-$tid-$ending-$$-$RANDOM" token version delivery route
+	ship_preview "$tid" "$ending" "$mode" "$req" "$message" "$title" "$body"
+	[ "$API_CODE" = 200 ] ||
+		die "ship preview rejected for task $tid ($API_CODE): $(cat /tmp/ship-preview-$tid.json)"
+	jq -e '.deliverable' /tmp/ship-preview-$tid.json >/dev/null ||
+		die "delivery refused for task $tid: $(jq -c '.blockers' /tmp/ship-preview-$tid.json)"
+	token=$(jq -r '.preview_token' /tmp/ship-preview-$tid.json)
+	version=$(jq -r '.version' /tmp/ship-preview-$tid.json)
+	delivery=$(jq -r '.delivery_id' /tmp/ship-preview-$tid.json)
+
+	# Continuation goes to the action's own endpoint; neither starts an
+	# implicit earlier action.
+	route=commit
+	if jq -e '.completed_actions | index("push")' /tmp/ship-preview-$tid.json >/dev/null; then
+		route=pr
+	elif jq -e '.completed_actions | index("commit")' /tmp/ship-preview-$tid.json >/dev/null; then
+		route=push
+	fi
+
+	if [ "$route" = commit ]; then
+		api_json POST "/api/tasks/$tid/ship/commit" \
+			"$(jq -n --arg e "$ending" --arg mode "$mode" --arg r "$req" --arg tok "$token" \
+				--arg m "$message" --arg t "$title" --arg b "$body" \
+				--argjson d "$delivery" --argjson v "$version" \
+				'{ending: $e, mode: $mode, request_id: $r, preview_token: $tok,
+				  message: $m, pr_title: $t, pr_body: $b,
+				  delivery_id: $d, expected_version: $v}')" >/dev/null
+	else
+		api_json POST "/api/tasks/$tid/ship/$route" \
+			"$(jq -n --arg e "$ending" --arg r "$req" --arg tok "$token" \
+				--arg t "$title" --arg b "$body" \
+				--argjson d "$delivery" --argjson v "$version" \
+				'{ending: $e, request_id: $r, preview_token: $tok,
+				  pr_title: $t, pr_body: $b,
+				  delivery_id: $d, expected_version: $v}')" >/dev/null
+	fi
+	[ "$API_CODE" = 200 ] || die "ship $route rejected for task $tid ($API_CODE): $API_BODY"
+}
+
+# Record one operator decision about an unresolved effect. Writes nothing
+# privileged; `retry` only unlocks a fresh confirmation.
+ship_reconcile() { # ship_reconcile TASK KIND DECISION [NOTE]
+	local tid=$1 kind=$2 decision=$3 note=${4:-} payload delivery action version
+	payload=$(ship_projection "$tid")
+	[ -n "$payload" ] || die "task $tid has no delivery projection"
+	delivery=$(jq -r '.delivery_id' <<<"$payload")
+	version=$(jq -r '.version' <<<"$payload")
+	action=$(jq -r --arg k "$kind" \
+		'[.actions[] | select(.kind == $k and (.phase == "needs_reconciliation" or .phase == "executing"))][-1].id // empty' \
+		<<<"$payload")
+	[ -n "$action" ] || die "task $tid has no unresolved $kind action"
+	api_json POST "/api/tasks/$tid/ship/reconcile" \
+		"$(jq -n --argjson d "$delivery" --argjson a "$action" --argjson v "$version" \
+			--arg dec "$decision" --arg n "$note" \
+			'{delivery_id: $d, action_id: $a, expected_version: $v,
+			  decision: $dec, note: (if $n == "" then null else $n end)}')" >/dev/null
 }
 
 # One agent-authored commit in the clone (the `commit` scenario), waited
@@ -463,28 +617,22 @@ approve_review() { # approve_review TASK_ID
 	[ -n "$url" ] && [ "$url" != null ] || die "review response carried no url: $review"
 	wait_for "llmvet answers on $url" 30 review_ready "$url"
 	$REVIEW approve --url "$url"
-	# llmvet exits asynchronously; the daemon's reset-dance restore must
-	# conclude before anything touches the clone again (draft/ship).
+	# llmvet exits asynchronously; the review has to conclude before anything
+	# else asks for the workspace, and its approval names the content it read.
 	wait_for "review concluded approved" 60 \
 		_ws_seen '.type == "review_finished" and .payload.status == "approved"' "$1"
 	ok "review approved via llmvet ($url)"
 }
 
-ship_squash() { # ship_squash TASK_ID
+ship_squash() { # ship_squash TASK_ID — the full pull-request ending
 	local tid=$1 message pr_title pr_body
-	api_json POST "/api/tasks/$tid/ship/draft" >/tmp/ship-draft-$tid.json
-	[ "$API_CODE" = 200 ] || die "ship draft failed ($API_CODE): $(cat /tmp/ship-draft-$tid.json)"
-	jq -e '.status == "drafted" and .draft.commit_message and .draft.pr_title' /tmp/ship-draft-$tid.json >/dev/null ||
-		fail "draft parsed for task $tid" "$(cat /tmp/ship-draft-$tid.json)"
+	ship_draft "$tid"
 	message=$(jq -r '.draft.commit_message' /tmp/ship-draft-$tid.json)
 	pr_title=$(jq -r '.draft.pr_title' /tmp/ship-draft-$tid.json)
 	pr_body=$(jq -r '.draft.pr_body // ""' /tmp/ship-draft-$tid.json)
 	$GPGCTL warm
-	api_json POST "/api/tasks/$tid/ship/commit" \
-		"$(jq -n --arg m "$message" --arg t "$pr_title" --arg b "$pr_body" \
-			'{message: $m, pr_title: $t, pr_body: $b, mode: "squash"}')" >/dev/null
-	[ "$API_CODE" = 200 ] || die "ship commit rejected for task $tid ($API_CODE)"
-	wait_for "task $tid ship finishes" 120 ship_done "$tid"
+	ship_deliver "$tid" pr squash "$message" "$pr_title" "$pr_body"
+	wait_for "task $tid delivery finishes" 120 ship_done "$tid" pr
 	ok "task $tid shipped (pr: $(task_field "$tid" pr_url))"
 }
 

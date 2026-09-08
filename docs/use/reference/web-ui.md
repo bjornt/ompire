@@ -55,18 +55,27 @@ A reconnect loses nothing, because the client never held anything the daemon
 did not also hold. The daemon chip reflects connection state so the operator
 can tell "nothing is happening" from "I am not being told what is happening".
 
-### Shipping preflight
+### Delivery preflight
 
-An actionable task's Ship flow requests a task-scoped GitHub recheck when its
-registered upstream changes. The banner compares the daemon result to that
-specific upstream and current identity; it never reuses an allowed result for
-another target or account. It shows checking, ready, missing/authentication,
-denied, and error recovery states, and **Sign & commit** requires both this
-ready target result and a `ready` GPG key.
+A task's Ship flow resolves the requested ending against the daemon rather than
+against browser state. The resolution lists **every** reason the delivery is
+currently refused, so the operator fixes them together instead of one attempt at
+a time, and the confirmation stays disabled until none remain.
+
+GitHub eligibility gates only the endings that reach the forge; a local signed
+commit is offered regardless. When it does apply, the banner compares the daemon
+result to that specific upstream and current identity and never reuses an
+allowed result for another target or account, offering a recheck for
+missing-credential, authentication, denied, and error states.
 
 The banner says explicitly that GitHub API eligibility does not prove SSH or
 HTTPS `git push` authentication. The daemon repeats every preflight; browser
 state only controls presentation.
+
+The confirmation names every effect it permits — signing, pushing, and opening a
+pull request are three different authorizations, not one button — and it carries
+back a token over the exact resolution the operator saw. Any change to the
+ending, mode, text, or content invalidates it.
 ### Model profiles and project defaults
 
 **Settings** carries a **Model profiles** section beside the daemon panels. It

@@ -21,7 +21,9 @@ import type {
   WorkflowStepDescriptor,
   WorkflowValidation,
   ReviewState,
-  ShipState,
+  ShipEnding,
+  ShipPreview,
+  ShipProjection,
   Task,
   TaskDetail,
   TaskExecutionInputs,
@@ -517,22 +519,108 @@ export function cancelReview(id: number): Promise<ReviewState> {
   return request<ReviewState>("POST", `/api/tasks/${id}/review/cancel`);
 }
 
-/** Ensure or explicitly replace commit/PR metadata through the live agent. */
-export function draftShip(id: number, options?: { replace: boolean }): Promise<ShipState> {
-  return request<ShipState>("POST", `/api/tasks/${id}/ship/draft`, options);
+/** Ensure or explicitly replace publication text through the live agent. */
+export function draftShip(
+  id: number,
+  options?: { replace: boolean },
+): Promise<ShipProjection> {
+  return request<ShipProjection>("POST", `/api/tasks/${id}/ship/draft`, options);
 }
 
-/** Run the signed squash commit → push → PR flow (ship capability). */
+/** Persist operator-entered publication text. Inert: authorizes nothing. */
+export function saveShipDraft(
+  id: number,
+  body: { commit_message: string; pr_title: string; pr_body: string },
+): Promise<ShipProjection> {
+  return request<ShipProjection>("PUT", `/api/tasks/${id}/ship/draft`, body);
+}
+
+/** Resolve one requested ending read-only.
+ *
+ * Returns the candidate and review identity, the remaining actions, the safe
+ * targets and identities, every reason the delivery is refused, and the token a
+ * confirmation must carry. It authorizes nothing. */
+export function previewShip(
+  id: number,
+  body: {
+    ending: ShipEnding;
+    mode?: "squash" | "retain";
+    message?: string;
+    pr_title?: string;
+    pr_body?: string;
+    request_id: string;
+    delivery_id?: number | null;
+  },
+): Promise<ShipPreview> {
+  return request<ShipPreview>("POST", `/api/tasks/${id}/ship/preview`, body);
+}
+
+/** Authorize one delivery and start its action prefix (ADR-0032). */
 export function shipCommit(
   id: number,
   body: {
-    message: string;
-    pr_title: string;
-    pr_body: string;
+    ending: ShipEnding;
     mode?: "squash" | "retain";
+    message?: string;
+    pr_title?: string;
+    pr_body?: string;
+    request_id: string;
+    preview_token: string;
+    delivery_id?: number | null;
+    expected_version?: number | null;
   },
-): Promise<ShipState> {
-  return request<ShipState>("POST", `/api/tasks/${id}/ship/commit`, body);
+): Promise<ShipProjection> {
+  return request<ShipProjection>("POST", `/api/tasks/${id}/ship/commit`, body);
+}
+
+/** Push an existing verified signed result, optionally continuing to a PR. */
+export function shipPush(
+  id: number,
+  body: {
+    ending: ShipEnding;
+    pr_title?: string;
+    pr_body?: string;
+    request_id: string;
+    preview_token: string;
+    delivery_id: number;
+    expected_version: number;
+  },
+): Promise<ShipProjection> {
+  return request<ShipProjection>("POST", `/api/tasks/${id}/ship/push`, body);
+}
+
+/** Open a pull request for an existing verified pushed result. */
+export function shipPr(
+  id: number,
+  body: {
+    ending: ShipEnding;
+    pr_title?: string;
+    pr_body?: string;
+    request_id: string;
+    preview_token: string;
+    delivery_id: number;
+    expected_version: number;
+  },
+): Promise<ShipProjection> {
+  return request<ShipProjection>("POST", `/api/tasks/${id}/ship/pr`, body);
+}
+
+/** Record one operator decision about an unresolved delivery effect.
+ *
+ * None of these write anything privileged: `retry` only makes a
+ * proven-not-executed action eligible for a fresh preview and confirmation. */
+export function shipReconcile(
+  id: number,
+  body: {
+    delivery_id: number;
+    action_id: number;
+    expected_version: number;
+    decision: "recheck" | "adopt" | "retry" | "abandon";
+    note?: string | null;
+    adopt_reference?: string | null;
+  },
+): Promise<ShipProjection> {
+  return request<ShipProjection>("POST", `/api/tasks/${id}/ship/reconcile`, body);
 }
 
 /** Force a fresh gpg-agent cache probe (ship capability). */

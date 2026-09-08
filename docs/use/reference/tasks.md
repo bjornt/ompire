@@ -192,13 +192,13 @@ review link and the `reviewing` pill instead.
 
 ### Ship flow action
 
-A non-archived task card exposes **Ship flow** when its review is approved,
-the daemon has recorded ship progress, or the task has a pull-request URL. It
-opens that task's existing `/ship/<task-id>` workflow so the operator can
-resume drafting, signing, publication, merge waiting, or cleanup. The card
+A non-archived task card exposes **Ship flow** when its review is approved, the
+daemon has recorded a delivery, or the task has a pull-request URL. It opens
+that task's existing `/ship/<task-id>` workflow so the operator can resume
+drafting, choosing an ending, publishing, merge waiting, or cleanup. The card
 never starts a review or privileged publication itself. The task-specific Ship
 flow may automatically request an agent draft after its snapshot confirms the
-task is eligible; see [Ship flow](ship-flow.md#1-draft).
+task is eligible; see [Ship flow](ship-flow.md#2-draft).
 
 ### The Shipped section
 

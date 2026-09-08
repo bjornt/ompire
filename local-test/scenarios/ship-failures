@@ -1,36 +1,25 @@
 #!/usr/bin/env bash
 #
-# local-test/scenarios/ship-failures — publishing failures recover safely.
+# local-test/scenarios/ship-failures — refusals happen before any effect, and
+# every one of them recovers.
 #
-# GitHub authentication and repository eligibility are checked before GPG or
-# any local Git mutation. The runbook captures the clone baseline, injects
-# credential-shaped fake CLI output, proves the safe 409/event surface, then
-# restores access and continues through existing GPG, PR, push, and retain
-# recovery legs.
+# Admission is resolved by a read-only preview now (ADR-0032): the operator is
+# told every reason a delivery is refused before anything is signed, pushed, or
+# created. This runbook proves each refusal names itself, leaves the workspace
+# untouched, and clears once its cause is fixed.
 
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
 ws_start
 
-_ship_error() { # _ship_error TASK SUBSTRING — a failed ship_step whose
-	# detail names SUBSTRING is recorded for TASK
-	local lines
-	lines=$(jq -c "select(.type == \"ship_step\" and .payload.status == \"failed\" and .payload.task_id == $1)" "$WS_OUT" 2>/dev/null) || true
-	[ -n "$lines" ] || { printf 'no failed ship_step recorded'; return 1; }
-	grep -F "$2" <<<"$lines" >/dev/null && printf 'ship error names %s' "$2" || {
-		printf 'ship error detail lacks %q\n%s' "$2" "$lines"; return 1; }
+BARE=$STATE_ROOT/forge/github.com/local-test/sandbox.git
+
+_blockers() { # _blockers TASK — the codes the last preview reported
+	jq -r '[.blockers[].code] | join(",")' "/tmp/ship-preview-$1.json"
 }
-_ship_shipped() { # _ship_shipped TASK WANT_COUNT
-	[ "$(ws_count '.type == "ship_finished" and .payload.status == "shipped" and .payload.task_id == '"$1"'')" -ge "$2" ]
-}
-_clone_commits() { # _clone_commits CLONE WANT
-	local n
-	n=$(git -C "$1" rev-list --count origin/main..HEAD 2>/dev/null) || { printf 'no origin/main'; return 1; }
-	[ "$n" = "$2" ] && printf '%s' "$n" || { printf 'commits=%s want=%s' "$n" "$2"; return 1; }
-}
-ship_body() { # ship_body MODE MESSAGE
-	jq -n --arg m "$2" --arg mode "$1" '{message: $m, pr_title: "Failure paths", pr_body: "b", mode: $mode}'
+_has_blocker() { # _has_blocker TASK CODE
+	jq -e --arg c "$2" '[.blockers[].code] | index($c)' "/tmp/ship-preview-$1.json" >/dev/null
 }
 _clone_unchanged() { # _clone_unchanged CLONE HEAD STATUS
 	local clone=$1 expected_head=$2 expected_status=$3
@@ -38,12 +27,12 @@ _clone_unchanged() { # _clone_unchanged CLONE HEAD STATUS
 		printf 'HEAD changed: %s' "$(git -C "$clone" rev-parse HEAD)"; return 1; }
 	[ "$(git -C "$clone" status --porcelain)" = "$expected_status" ] || {
 		printf 'worktree changed'; return 1; }
-	if git -C "$clone" rev-parse --verify refs/ompire/ship-orig >/dev/null 2>&1; then
-		printf 'ship restore ref was created'; return 1
-	fi
 }
-_no_commit_started() { # _no_commit_started TASK
-	[ "$(ws_count '.type == "ship_step" and .payload.task_id == '"$1"' and .payload.step == "commit"')" = 0 ]
+_no_action_started() { # _no_action_started TASK
+	local payload
+	payload=$(ship_projection "$1")
+	[ -z "$payload" ] && return 0
+	[ "$(jq -r '.actions | length' <<<"$payload")" = 0 ]
 }
 
 tid=$(spawn_task "$(unique_slug fail)" "[[scenario:commit]]\nShip-failures E2E: do the work and commit it.")
@@ -52,47 +41,58 @@ clone=$(task_field "$tid" clone_path)
 baseline_head=$(git -C "$clone" rev-parse HEAD)
 baseline_status=$(git -C "$clone" status --porcelain)
 
-# --- leg 1: invalid ambient auth is redacted and cannot touch Git ------------
+# --- leg 1: no approved review is a refusal that says so ----------------------
+
+ship_preview "$tid" pr squash "no-review-$tid" "m" "t" "b"
+[ "$API_CODE" = 200 ] || die "preview request failed ($API_CODE)"
+_has_blocker "$tid" review-missing &&
+	ok "an unreviewed task is refused by name (blockers: $(_blockers "$tid"))" ||
+	fail "unreviewed refusal" "$(_blockers "$tid")"
+assert "unreviewed preview started no action" _no_action_started "$tid"
+
+approve_review "$tid"
+
+# --- leg 2: invalid ambient auth blocks a pushing ending, not a local one -----
+
 $GHCTL auth unauthenticated >/dev/null
 $GHCTL token-echo stderr >/dev/null
-_api_run POST "/api/tasks/$tid/ship/commit" "$(ship_body squash gh-auth-blocked)"
-body=$API_BODY
 fake_token='github_pat_LOCAL_TEST_TOKEN_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-[ "$API_CODE" = 409 ] && jq -e '.detail.gh.identity.state == "unauthenticated"' <<<"$body" >/dev/null &&
-	ok "GitHub auth preflight refused with safe 409" ||
-	fail "GitHub auth preflight refusal" "code $API_CODE: $body"
+ship_preview "$tid" pr squash "gh-auth-$tid" "m" "t" "b"
+_has_blocker "$tid" github-unavailable &&
+	ok "a pushing ending is refused while GitHub is unauthenticated" ||
+	fail "GitHub auth refusal" "$(_blockers "$tid")"
+$GPGCTL warm
+ship_preview "$tid" commit squash "gh-auth-local-$tid" "m" "" ""
+jq -e '.deliverable' "/tmp/ship-preview-$tid.json" >/dev/null &&
+	ok "a local signed commit needs no GitHub availability at all" ||
+	fail "local ending independence" "$(_blockers "$tid")"
 assert "auth-blocked clone remains unchanged" _clone_unchanged "$clone" "$baseline_head" "$baseline_status"
-assert "auth-blocked ship emits no commit start" _no_commit_started "$tid"
 if grep -F "$fake_token" "$WS_OUT" >/dev/null 2>&1 || grep -Fi 'Authorization: Bearer' "$WS_OUT" >/dev/null 2>&1; then
-	fail "GitHub preflight redaction" "credential-shaped fake output reached WebSocket recording"
+	fail "GitHub preflight redaction" "credential-shaped fake output reached the WebSocket recording"
 else
-	ok "GitHub preflight status and WebSocket recording are redacted"
+	ok "GitHub preflight observations and the delivery projection are redacted"
 fi
 $GHCTL token-echo off >/dev/null
 $GHCTL auth login ompire-test >/dev/null
 
-# --- leg 2: repository denial is pre-mutation and recovers -------------------
+# --- leg 3: repository denial is named before any effect ----------------------
+
 $GHCTL repository deny >/dev/null
-_api_run POST "/api/tasks/$tid/ship/commit" "$(ship_body squash gh-repository-denied)"
-body=$API_BODY
-[ "$API_CODE" = 409 ] && jq -e '.detail.gh.targets["github.com/local-test/sandbox"].state == "denied"' <<<"$body" >/dev/null &&
-	ok "GitHub repository preflight refused with 409" ||
-	fail "GitHub repository preflight refusal" "code $API_CODE: $body"
+ship_preview "$tid" pr squash "gh-deny-$tid" "m" "t" "b"
+_has_blocker "$tid" github-unavailable &&
+	ok "a denied repository refuses the pull-request ending" ||
+	fail "repository denial refusal" "$(_blockers "$tid")"
 assert "denied-repository clone remains unchanged" _clone_unchanged "$clone" "$baseline_head" "$baseline_status"
-assert "denied-repository ship emits no commit start" _no_commit_started "$tid"
 $GHCTL repository allow >/dev/null
 
-# --- leg 3: locked GPG gate refuses with 409, warm recovers ------------------
+# --- leg 4: a locked signing key refuses, and warming clears it ---------------
+
 $GPGCTL lock
-_api_run POST "/api/tasks/$tid/ship/commit" "$(ship_body squash fail-1)"
-body=$API_BODY
-[ "$API_CODE" = 409 ] &&
-	[ "$(jq -r '.detail.gpg.state' <<<"$body")" = locked ] &&
-	jq -e '.detail.message | test("locked")' <<<"$body" >/dev/null &&
-	ok "locked gate refused with 409 naming the state" ||
-	fail "locked gate refusal" "code $API_CODE: $body"
-assert "locked-gate clone remains unchanged" _clone_unchanged \
-	"$clone" "$baseline_head" "$baseline_status"
+ship_preview "$tid" commit squash "gpg-locked-$tid" "m" "" ""
+_has_blocker "$tid" signing-unavailable &&
+	ok "a locked signing key refuses by name" ||
+	fail "locked key refusal" "$(_blockers "$tid")"
+assert "locked-key clone remains unchanged" _clone_unchanged "$clone" "$baseline_head" "$baseline_status"
 $GPGCTL warm
 api_json POST /api/gpg/recheck >/dev/null
 [ "$(jq -r .state <<<"$API_BODY")" = ready ] &&
@@ -104,51 +104,70 @@ api_json POST /api/gpg/recheck >/dev/null
 	[ -n "$(jq -r '.selected.fingerprint' <<<"$API_BODY")" ] &&
 	ok "recheck names the signing subkey of the configured primary" ||
 	fail "gpg selected fingerprint" "$API_BODY"
-# --- leg 4: injected gh create failure → ship error → retry ships --------------
 
-$GHCTL fail-next create >/dev/null
-api POST "/api/tasks/$tid/ship/commit" "$(ship_body squash fail-gh)" >/dev/null
-[ "$API_CODE" = 200 ] || die "ship commit (gh-fail leg) rejected ($API_CODE)"
-wait_for "gh failure lands as ship error" 120 _ship_error "$tid" "injected create failure"
-ok "injected gh failure surfaced in ship error"
-api POST "/api/tasks/$tid/ship/commit" "$(ship_body squash fail-gh-retry)" >/dev/null
-[ "$API_CODE" = 200 ] || die "ship retry rejected ($API_CODE)"
-wait_for "retry ships after gh failure" 120 _ship_shipped "$tid" 1
-ok "recovered: shipped after gh failure"
-
-# --- leg 5: forge rejects exactly one push -------------------------------------
+# --- leg 5: an injected forge push rejection blocks, and a retry delivers -----
 
 $FORGE reject-push local-test/sandbox >/dev/null
-api POST "/api/tasks/$tid/ship/commit" "$(ship_body squash pushfail)" >/dev/null
-[ "$API_CODE" = 200 ] || die "ship commit (push-fail leg) rejected ($API_CODE)"
-wait_for "push rejection lands as ship error" 120 _ship_error "$tid" "forge: rejecting push"
-ok "forge rejection surfaced in ship error"
-api POST "/api/tasks/$tid/ship/commit" "$(ship_body squash pushfail-retry)" >/dev/null
-[ "$API_CODE" = 200 ] || die "push retry rejected ($API_CODE)"
-wait_for "retry ships after push rejection" 120 _ship_shipped "$tid" 2
-ok "recovered: shipped after push rejection"
+ship_deliver "$tid" push squash "pushfail" "Push fail" "b"
+wait_for "the rejected push blocks the delivery" 120 ship_blocked "$tid"
+ok "forge rejection stopped the delivery: $(ship_field "$tid" '.blocked_reason')"
+[ -n "$(ship_field "$tid" '.results.commit.signed_tip')" ] &&
+	ok "the signed result survives the failed push" ||
+	fail "signed prefix retained" "$(ship_field "$tid" '.results')"
 
-# --- leg 6: retain mode refuses a dirty tree -----------------------------------
+signed_before=$(ship_field "$tid" '.results.commit.signed_tip')
+ship_deliver "$tid" push squash "pushfail-retry" "Push fail" "b"
+wait_for "the retry delivers" 120 ship_done "$tid" push
+[ "$(ship_field "$tid" '.results.commit.signed_tip')" = "$signed_before" ] &&
+	ok "the retry reused the signed result rather than signing again" ||
+	fail "retry reused the signature" "$(ship_field "$tid" '.results.commit')"
 
-follow_up "$tid" "[[scenario:commit]]
-One commit so retain has something to retain."
-clone=$(task_field "$tid" clone_path)
-wait_for "agent commit lands" 60 _clone_commits "$clone" 2
-echo "stray" >"$clone/uncommitted.txt"
-_api_run POST "/api/tasks/$tid/ship/commit" "$(ship_body retain dirty)"
-body=$API_BODY
-[ "$API_CODE" = 409 ] && grep -q "working tree is dirty" <<<"$body" &&
-	ok "retain refused dirty tree with 409" ||
-	fail "dirty-tree refusal" "code $API_CODE: $body"
-rm -f "$clone/uncommitted.txt"
+# --- leg 6: an injected gh create failure blocks, and a retry opens the PR ----
+
+$GHCTL fail-next create >/dev/null
+ship_deliver "$tid" pr squash "" "Fail then recover" "b"
+wait_for "the injected create failure blocks the delivery" 120 ship_blocked "$tid"
+grep -qi "injected create failure" <<<"$(ship_field "$tid" '.blocked_reason')" &&
+	ok "the create failure is reported verbatim" ||
+	fail "create failure detail" "$(ship_field "$tid" '.blocked_reason')"
+ship_deliver "$tid" pr squash "" "Fail then recover" "b"
+wait_for "the retry opens the pull request" 120 ship_done "$tid" pr
+ok "recovered: pull request $(task_field "$tid" pr_url)"
+
+# --- leg 7: retain refuses a dirty tree -------------------------------------
+
+tid2=$(spawn_task "$(unique_slug retainfail)" "[[scenario:commit]]\nRetain refusal E2E: commit the work.")
+wait_for "work step completes (retain leg)" 180 workflow_complete "$tid2"
+clone2=$(task_field "$tid2" clone_path)
+echo "stray" >"$clone2/uncommitted.txt"
+approve_review "$tid2"
 $GPGCTL warm
-api POST "/api/tasks/$tid/ship/commit" "$(ship_body retain dirty-recovered)" >/dev/null
-[ "$API_CODE" = 200 ] || die "retain retry rejected ($API_CODE)"
-wait_for "retain ships after cleanup" 120 _ship_shipped "$tid" 3
-ok "recovered: retain shipped after tree cleaned"
+ship_preview "$tid2" commit retain "retain-dirty-$tid2" "" "" ""
+_has_blocker "$tid2" retain-dirty &&
+	ok "retain refuses a dirty tree and says which mode to use" ||
+	fail "retain dirty refusal" "$(_blockers "$tid2")"
+rm -f "$clone2/uncommitted.txt"
 
-# --- final agreement ------------------------------------------------------------
+# --- leg 8: content that changed after approval cannot be delivered ----------
+
+tid3=$(spawn_task "$(unique_slug stale)" "[[scenario:commit]]\nStale approval E2E: commit the work.")
+wait_for "work step completes (stale leg)" 180 workflow_complete "$tid3"
+clone3=$(task_field "$tid3" clone_path)
+approve_review "$tid3"
+$GPGCTL warm
+ship_preview "$tid3" commit squash "fresh-$tid3" "m" "" ""
+jq -e '.deliverable' "/tmp/ship-preview-$tid3.json" >/dev/null &&
+	ok "the fresh approval covers the current content" ||
+	fail "fresh approval" "$(_blockers "$tid3")"
+echo "unreviewed change" >"$clone3/after-approval.txt"
+ship_preview "$tid3" commit squash "stale-$tid3" "m" "" ""
+_has_blocker "$tid3" review-stale &&
+	ok "content changed after approval is refused rather than signed" ||
+	fail "stale approval refusal" "$(_blockers "$tid3")"
+assert "the stale-approval task started no action" _no_action_started "$tid3"
 
 assert "task $tid never failed" task_not_failed "$tid"
+assert "task $tid2 never failed" task_not_failed "$tid2"
+assert "task $tid3 never failed" task_not_failed "$tid3"
 [ -n "$(task_field "$tid" pr_url)" ] && ok "task retains its PR URL" ||
 	fail "task PR URL" "missing after recovery phases"

@@ -2,6 +2,13 @@ import type { ReviewIteration, ReviewState, SessionInfo } from "../types";
 
 export type ReviewDisplayState = "no-review" | "open" | "comments" | "approved" | "aborted" | "error";
 
+/** Whether an approval can still authorize a delivery (ADR-0032).
+ *
+ * `unbound` is an approval recorded before reviews named the content they
+ * graded; `stale` is one whose content has since changed. Both remain visible
+ * as history — they simply are not authorization for what the task holds now. */
+export type ApprovalBinding = "usable" | "stale" | "unbound";
+
 export interface ReviewPresentation {
   state: ReviewDisplayState;
   label: string;
@@ -9,6 +16,8 @@ export interface ReviewPresentation {
   canStart: boolean;
   canCancel: boolean;
   url: string | null;
+  /** Set only when the review is approved. */
+  approvalBinding: ApprovalBinding | null;
   iterations: ReviewIteration[];
 }
 
@@ -22,6 +31,7 @@ export function latestReviewIteration(review: ReviewState | undefined): ReviewIt
 export function projectReview(
   review: ReviewState | undefined,
   primarySession: SessionInfo | undefined,
+  approvalBinding: ApprovalBinding = "usable",
 ): ReviewPresentation {
   const latest = latestReviewIteration(review);
   const canStart =
@@ -44,18 +54,26 @@ export function projectReview(
       canStart,
       canCancel: false,
       url: null,
+      approvalBinding: null,
       iterations: [],
     };
   }
 
   if (review.status === "approved") {
+    const hint =
+      approvalBinding === "stale"
+        ? "The task content changed after this approval. It stays on record; delivering the current content needs a fresh review."
+        : approvalBinding === "unbound"
+          ? "This approval predates content-bound review, so it does not identify what was approved. It stays on record; delivering needs a fresh review."
+          : "Independent review approved this task's current content.";
     return {
       state: "approved",
-      label: "Approved",
-      hint: "Independent review approved this task.",
+      label: approvalBinding === "usable" ? "Approved" : "Approved (superseded)",
+      hint,
       canStart,
       canCancel: false,
       url: review.url,
+      approvalBinding,
       iterations: review.iterations,
     };
   }
@@ -70,6 +88,7 @@ export function projectReview(
       canStart,
       canCancel: false,
       url: review.url,
+      approvalBinding: null,
       iterations: review.iterations,
     };
   }
@@ -81,6 +100,7 @@ export function projectReview(
       canStart,
       canCancel: false,
       url: review.url,
+      approvalBinding: null,
       iterations: review.iterations,
     };
   }
@@ -97,6 +117,7 @@ export function projectReview(
       canStart,
       canCancel: false,
       url: review.url,
+      approvalBinding: null,
       iterations: review.iterations,
     };
   }
@@ -108,6 +129,7 @@ export function projectReview(
     canStart: false,
     canCancel: true,
     url: review.url,
+    approvalBinding: null,
     iterations: review.iterations,
   };
 }

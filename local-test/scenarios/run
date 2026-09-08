@@ -30,7 +30,9 @@ MATRIX=(
 	workflow-decisions
 	review-comments
 	ship-retain
+	ship-endings
 	ship-failures
+	ship-interrupted
 	merge-poll
 	advisories-stalls
 	crash-recovery

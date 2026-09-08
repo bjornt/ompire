@@ -31,25 +31,42 @@ assert "task never failed" task_not_failed "$tid"
 
 approve_review "$tid"
 
-# --- ship: draft (agent-authored) then squash ---------------------------------
+# --- deliver: draft (agent-authored), preview, then the pull-request ending ----
 
-# The draft route awaits the agent's reply synchronously and returns the
-# drafted state (status drafted + parsed draft) — no separate wait needed.
+# The draft route awaits the agent's reply synchronously and returns the whole
+# committed delivery projection — no separate wait needed. The draft is inert:
+# it authorizes nothing (ADR-0032).
 api_json POST "/api/tasks/$tid/ship/draft" >"$DRAFT_FILE"
 [ "$API_CODE" = 200 ] || die "ship draft failed ($API_CODE): $(cat "$DRAFT_FILE")"
-jq -e '.status == "drafted" and .draft.commit_message and .draft.pr_title' "$DRAFT_FILE" >/dev/null &&
-	ok "draft drafted + parsed (title: $(jq -r .draft.pr_title "$DRAFT_FILE"))" ||
+jq -e '.draft.state == "ready" and .draft.commit_message and .draft.pr_title' "$DRAFT_FILE" >/dev/null &&
+	ok "draft ready + parsed (title: $(jq -r .draft.pr_title "$DRAFT_FILE"))" ||
 	fail "draft state" "$(cat "$DRAFT_FILE")"
+jq -e '.disposition == "open" and .completed_actions == []' "$DRAFT_FILE" >/dev/null &&
+	ok "drafting authorized nothing" ||
+	fail "draft authorized nothing" "$(cat "$DRAFT_FILE")"
 message=$(jq -r '.draft.commit_message' "$DRAFT_FILE")
 pr_title=$(jq -r '.draft.pr_title' "$DRAFT_FILE")
 pr_body=$(jq -r '.draft.pr_body // ""' "$DRAFT_FILE")
 
 $GPGCTL warm
-api_json POST "/api/tasks/$tid/ship/commit" \
-	"$(jq -n --arg m "$message" --arg t "$pr_title" --arg b "$pr_body" \
-		'{message: $m, pr_title: $t, pr_body: $b, mode: "squash"}')" >/dev/null
-[ "$API_CODE" = 200 ] || die "ship commit rejected ($API_CODE)"
-wait_for "ship finishes" 120 ship_done "$tid"
+ship_preview "$tid" pr squash "happy-$tid" "$message" "$pr_title" "$pr_body"
+[ "$API_CODE" = 200 ] || die "ship preview rejected ($API_CODE): $(cat /tmp/ship-preview-$tid.json)"
+jq -e '.deliverable and .remaining_actions == ["commit","push","pr"]' /tmp/ship-preview-$tid.json >/dev/null &&
+	ok "preview names every action the confirmation permits" ||
+	fail "preview remaining actions" "$(jq -c '{deliverable, remaining_actions, blockers}' /tmp/ship-preview-$tid.json)"
+# The approval identifies the content, and the preview shows the body Ompire
+# will actually write, marker included.
+jq -e '.review.content_bound and (.review.approved_candidate_id == .candidate_id)' \
+	/tmp/ship-preview-$tid.json >/dev/null &&
+	ok "the approval names the content being delivered" ||
+	fail "approval binding" "$(jq -c .review /tmp/ship-preview-$tid.json)"
+marker=$(jq -r .marker /tmp/ship-preview-$tid.json)
+jq -e --arg m "$marker" '.pr_body | test("ompire-delivery: " + $m)' /tmp/ship-preview-$tid.json >/dev/null &&
+	ok "the previewed PR body carries the recovery correlation marker" ||
+	fail "preview marker" "$(jq -r .pr_body /tmp/ship-preview-$tid.json)"
+
+ship_deliver "$tid" pr squash "$message" "$pr_title" "$pr_body"
+wait_for "delivery finishes" 120 ship_done "$tid" pr
 
 # --- assertions ---------------------------------------------------------------
 
@@ -75,7 +92,11 @@ grep -F "$branch -> main" <<<"$pr_info" >/dev/null &&
 # Daemon state agreement.
 assert "review_finished approved observed" \
 	_ws_seen '.type == "review_finished" and .payload.status == "approved"' "$tid"
-assert "ship_finished shipped observed" \
-	_ws_seen '.type == "ship_finished" and .payload.status == "shipped"' "$tid"
+assert "delivery projection reports the pull-request ending" \
+	_ws_seen '.type == "ship_updated" and .payload.disposition == "completed" and .payload.ending == "pr"' "$tid"
+signed_tip=$(ship_field "$tid" '.results.commit.signed_tip')
+[ -n "$signed_tip" ] && [ "$signed_tip" = "$(ship_field "$tid" '.results.push.head')" ] &&
+	ok "the pushed head is the signed result the delivery recorded" ||
+	fail "recorded signed/pushed heads agree" "$(ship_field "$tid" '.results')"
 assert "task never failed (final)" task_not_failed "$tid"
 ok "final task state: $(task_field "$tid" state) (pr_state: $(task_field "$tid" pr_state))"

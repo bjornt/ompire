@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/ship-interrupted — a lost reply is not permission to
+# repeat a privileged write (ADR-0032).
+#
+# Both faults here are real process boundaries. A previous attempt's push is
+# already on the destination when the daemon comes to write it, and the fake
+# GitHub CLI creates a pull request and then reports failure. In each case the
+# effect happened and the daemon was told nothing about it, so it has to go
+# looking for that specific result rather than assume either answer.
+#
+#   leg 1  a push already at the authorized head is adopted, not repeated
+#   leg 2  a pull request created under a lost reply is found by its
+#          correlation marker, across every PR state
+#   leg 3  when the forge cannot be searched, the outcome stays unknown: the
+#          task blocks, cleanup is refused, and an explicit recheck resolves it
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+ws_start
+
+BARE=$STATE_ROOT/forge/github.com/local-test/sandbox.git
+
+_prs_with_marker() { # _prs_with_marker MARKER — how many PRs carry it
+	$GHCTL pr --repo local-test/sandbox >/dev/null 2>&1 || true
+	jq --arg m "$1" '[.repos["local-test/sandbox"].prs[]? | select(.body | test($m))] | length' \
+		"$STATE_ROOT/gh/prs.json"
+}
+
+_ready() { # _ready TASK
+	local tid=$1
+	wait_for "work step completes ($tid)" 180 workflow_complete "$tid"
+	approve_review "$tid"
+	$GPGCTL warm
+}
+
+# --- leg 1: a push already at the authorized head is adopted -----------------
+
+tid=$(spawn_task "$(unique_slug lostpush)" "[[scenario:commit]]\nLost-push E2E: do the work and commit it.")
+_ready "$tid"
+branch=$(task_field "$tid" branch)
+clone=$(task_field "$tid" clone_path)
+
+# Sign locally first, so there is a signed result to talk about.
+ship_deliver "$tid" commit squash "ship: lost push reply" "" ""
+wait_for "the local ending completes" 120 ship_done "$tid" commit
+signed_tip=$(ship_field "$tid" '.results.commit.signed_tip')
+
+# A previous attempt's push landed and its reply was lost: the destination
+# already holds exactly the head this delivery is authorized to write.
+git -C "$clone" push --quiet "$BARE" "$signed_tip:refs/heads/$branch" ||
+	die "could not seed the destination with the signed head"
+receives_before=$($FORGE receives local-test/sandbox)
+
+ship_deliver "$tid" push squash "" "" ""
+wait_for "the delivery resolves the already-landed push" 120 ship_done "$tid" push
+
+[ "$(git -C "$BARE" rev-parse "refs/heads/$branch")" = "$signed_tip" ] &&
+	ok "the forge holds exactly the authorized signed head" ||
+	fail "forge head" "$(git -C "$BARE" rev-parse "refs/heads/$branch")"
+[ "$(ship_field "$tid" '.results.push.adopted')" = true ] &&
+	ok "the completed push was adopted rather than repeated" ||
+	fail "push adoption" "$(ship_field "$tid" '.results.push')"
+[ "$($FORGE receives local-test/sandbox)" = "$receives_before" ] &&
+	ok "the daemon wrote nothing to the forge (receives still $receives_before)" ||
+	fail "no repeated push" "receives moved to $($FORGE receives local-test/sandbox)"
+
+# --- leg 2: a pull request created under a lost reply is found by its marker --
+
+tid2=$(spawn_task "$(unique_slug lostpr)" "[[scenario:commit]]\nLost-PR E2E: do the work and commit it.")
+_ready "$tid2"
+
+$GHCTL lose-next create >/dev/null
+ship_deliver "$tid2" pr squash "ship: lost create reply" "Lost reply" "b"
+wait_for "the delivery resolves the lost pull request" 120 ship_done "$tid2" pr
+
+# The marker Ompire actually authorized, read back from the attempt that used
+# it — the preview shows the same value before the write.
+marker=$(ship_field "$tid2" '[.actions[] | select(.kind == "pr")][-1].expected.marker')
+[ -n "$marker" ] && ok "the delivery recorded the correlation marker it wrote ($marker)" ||
+	fail "recorded marker" "$(ship_field "$tid2" '[.actions[] | select(.kind == "pr")]')"
+
+[ "$(_prs_with_marker "$marker")" = 1 ] &&
+	ok "exactly one pull request carries this delivery's marker" ||
+	fail "duplicate or missing pull request" "$(_prs_with_marker "$marker") match $marker"
+[ "$(ship_field "$tid2" '.results.pr.adopted')" = true ] &&
+	ok "the created pull request was adopted, not created a second time" ||
+	fail "pr adoption" "$(ship_field "$tid2" '.results.pr')"
+[ -n "$(task_field "$tid2" pr_url)" ] &&
+	ok "the adopted pull request reached the task: $(task_field "$tid2" pr_url)" ||
+	fail "adopted pr url" "empty"
+
+# --- leg 3: an unsearchable forge leaves the outcome unknown ------------------
+
+tid3=$(spawn_task "$(unique_slug unknownpr)" "[[scenario:commit]]\nUnknown-PR E2E: do the work and commit it.")
+_ready "$tid3"
+
+# The pull request is created and both the reply and the lookup are lost.
+$GHCTL lose-next create >/dev/null
+$GHCTL lose-next list >/dev/null
+ship_deliver "$tid3" pr squash "ship: unknown outcome" "Unknown" "b"
+wait_for "the unknown outcome blocks the task" 120 ship_unresolved "$tid3" pr
+ok "the effect is recorded as unresolved: $(ship_field "$tid3" '.blocked_reason')"
+[ -z "$(task_field "$tid3" pr_url)" ] &&
+	ok "no pull request was claimed while its existence was unknown" ||
+	fail "premature pr url" "$(task_field "$tid3" pr_url)"
+
+# Cleanup is refused while the effect is unresolved: destroying the workspace
+# would destroy the evidence.
+_api_run POST "/api/tasks/$tid3/cleanup"
+[ "$API_CODE" = 409 ] &&
+	ok "cleanup is refused while the outcome is unknown" ||
+	fail "cleanup refusal" "code $API_CODE: $API_BODY"
+
+# An explicit recheck, once the forge answers again, adopts the real result.
+ship_reconcile "$tid3" pr recheck "the forge is reachable again"
+[ "$API_CODE" = 200 ] || die "reconcile rejected ($API_CODE): $API_BODY"
+wait_for "the recheck resolves the delivery" 60 ship_done "$tid3" pr
+marker3=$(ship_field "$tid3" '[.actions[] | select(.kind == "pr")][-1].expected.marker')
+[ "$(_prs_with_marker "$marker3")" = 1 ] &&
+	ok "the recheck adopted the single correlated pull request" ||
+	fail "recheck adoption" "$(_prs_with_marker "$marker3") PRs match $marker3"
+[ -n "$(task_field "$tid3" pr_url)" ] &&
+	ok "the adopted pull request reached the task after the decision" ||
+	fail "post-recheck pr url" "empty"
+ship_field "$tid3" '[.decisions[] | select(.kind == "recheck" or .kind == "adopt")] | length' |
+	grep -qv '^0$' &&
+	ok "the operator's decision is on record" ||
+	fail "decision recorded" "$(ship_field "$tid3" '[.decisions[].kind]')"
+
+assert "task $tid never failed" task_not_failed "$tid"
+assert "task $tid2 never failed" task_not_failed "$tid2"
+assert "task $tid3 never failed" task_not_failed "$tid3"

@@ -1,4 +1,5 @@
 import {
+  type ApprovalBinding,
   formatReviewCommentCount,
   formatReviewOutcome,
   formatReviewRecordedAt,
@@ -10,13 +11,15 @@ import "./ReviewSummary.css";
 export function ReviewSummary({
   review,
   primarySession,
+  approvalBinding = "usable",
   compact = false,
 }: {
   review: ReviewState | undefined;
   primarySession: SessionInfo | undefined;
+  approvalBinding?: ApprovalBinding;
   compact?: boolean;
 }) {
-  const presentation = projectReview(review, primarySession);
+  const presentation = projectReview(review, primarySession, approvalBinding);
 
   return (
     <div
@@ -24,8 +27,15 @@ export function ReviewSummary({
       data-testid={compact ? "review-summary-compact" : "review-summary"}
     >
       <div className="reviewSummaryStatus">
-        <span className={`reviewStatusBadge ${presentation.state}`}>{presentation.label}</span>
-        <span className="reviewSummaryHint">{presentation.hint}</span>
+        <span
+          className={`reviewStatusBadge ${presentation.state}`}
+          data-approval={presentation.approvalBinding ?? undefined}
+        >
+          {presentation.label}
+        </span>
+        <span className="reviewSummaryHint" data-testid="review-summary-hint">
+          {presentation.hint}
+        </span>
       </div>
       {presentation.url && presentation.state === "open" && (
         <a

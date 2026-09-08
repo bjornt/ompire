@@ -273,14 +273,26 @@ See [The attention model](../../use/explanation/attention.md).
 
 ## Review and publishing sit outside the sandbox
 
-Review runs against the host side of the clone, so the reviewed agent cannot
-mediate its own verdict. The agent may draft commit and PR text; the daemon
-performs the signed commit, the push, and the PR creation with host-side
+Review runs on the host side, so the reviewed agent cannot mediate its own
+verdict. The agent may draft commit and pull-request text; the daemon performs
+the signed commit, the push, and the pull-request creation with host-side
 credentials.
 
-Both operations protect their temporary Git state with durable refs —
-`refs/ompire/review-orig` and `refs/ompire/ship-orig` — so an interrupted
-sequence is restorable at the next startup rather than lost.
+Both are bound to *content* rather than to a task's live state
+([ADR-0032](../../adr/0032-bind-trusted-delivery-to-retained-candidates.md)).
+Review captures a candidate — the whole publishable delta, identified by a hash
+of its normalized content — into an owner-private repository, and reads an
+isolated checkout of it. Signing then happens against that same candidate, and
+the result is installed into the clone under a compare-and-swap against the HEAD
+it was captured at. An agent that keeps working therefore cannot change what is
+under review or what gets signed; it can only make its own approval visibly
+unusable.
+
+Publishing is three independently admitted operations — commit, push, pull
+request — and the operator selects how far a delivery goes. Every attempt
+journals what it intends to write before it runs, so an interrupted sequence is
+reconciled against the specific result it was going for rather than repeated or
+assumed lost.
 
 See [Why the control plane is trusted and the agent is not](trust-model.md).
 
@@ -290,10 +302,11 @@ Documentation that only described the intended architecture would mislead. Two
 areas are known-unreconciled and tracked in `ADR.PLAN.md`:
 
 **[The durability boundary](../../adr/0016-persist-authority-bearing-task-history-and-provenance.md).**
-Workflow steps, session identity, tasks, settings, and PR state are durable.
-Session status, review history, attention state, and most ship progress are not.
-ADR-0016 proposes enough durable history to resume safely and explain external
-side effects.
+Workflow steps, session identity, tasks, settings, PR state, review history, and
+delivery authorization, intent and outcomes are durable. Session status and
+attention state are not, and neither is full commit lineage or transcript
+retention — which is the part ADR-0016 still names and this design has not
+reached. The gap is narrower than it was, not closed.
 
 **[Publishing identity](../../adr/0017-use-dedicated-bot-as-default-publishing-identity.md).**
 Shipping currently inherits the host identity and is documented as producing

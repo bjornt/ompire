@@ -1,7 +1,18 @@
 # ADR 0011: Keep review and publishing authority outside the agent sandbox
 
-- Status: Accepted
+- Status: Accepted; live-workspace review and signing mechanics superseded by ADR-0032
 - Date: 2026-08-14
+
+[ADR-0032](0032-bind-trusted-delivery-to-retained-candidates.md) supersedes the
+*mechanics* recorded here — reviewing and signing a task's live workspace, and
+protecting that temporary Git state with a recovery ref — and replaces them with
+a retained candidate that review grades and signing covers. Everything else in
+this record stands and is carried forward unchanged: review and publishing
+authority outside the sandbox, the control plane selecting and verifying the
+signing key, agent-proposed text as untrusted suggestion rather than
+authorization, the trusted side owning the destination, and credentials never
+entering the task environment. Legacy recovery refs written by the superseded
+mechanics are still recognized and restored.
 
 ## Context
 

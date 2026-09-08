@@ -103,6 +103,10 @@ and the real exit contract remains abortable exactly as in production.
 Review is where the trust boundary lives; faking it would test nothing worth
 testing.
 
+Because review reads an isolated checkout of the task's captured candidate, a
+runbook has to give the task something to review before starting one. An empty
+delta is a refusal, not an empty review.
+
 ### GPG
 
 Signing stays real, against a throwaway passphrase-protected key. Both
@@ -218,10 +222,11 @@ Steering happens through published surfaces only:
 
 | Tool | Steers |
 |---|---|
-| `ghctl` | GitHub fake identity/authentication, repository policy/permission, credential-shaped output, pull-request lifecycle, and one-shot create/view failures |
+| `ghctl` | GitHub fake identity/authentication, repository policy/permission, credential-shaped output, pull-request lifecycle, one-shot create/view failures, and one-shot *lost replies* (`lose-next`) where the write lands and the caller is told nothing |
 | `wsctl` | Workshop registry and launch injection |
 | `ompctl` | One-shot agent scenarios by task, clone, session, or global key; lists sessions and transcripts |
 | `gpgctl` | The ship-gate signing state |
+| `forge` | The local Git forge: one-shot push rejection, a receive counter that proves a push was not repeated, and a gate that holds a receive open so a runbook can catch the daemon inside the write window |
 
 All share the state root.
 
@@ -240,7 +245,9 @@ to assertions.
 | `workflow-decisions` | A bugfix run's declared results, frozen evidence, and human decisions |
 | `review-comments` | Comment loopback through the real reviewer UI |
 | `ship-retain` | Multi-commit re-signing |
-| `ship-failures` | GitHub auth/target denial before clone mutation, redaction, GPG, PR, push, and retain recovery |
+| `ship-endings` | Local, pushed, and pull-request endings; going further later without re-signing; local-only cleanup |
+| `ship-failures` | Every refusal named before any effect — missing/stale review, GitHub auth and target denial, signing, retain preconditions — and recovery from each |
+| `ship-interrupted` | Lost replies: an already-landed push adopted rather than repeated, a pull request found by its correlation marker, and an unsearchable forge left explicitly unresolved |
 | `merge-poll` | The poll observes merging |
 | `crash-recovery` | Daemon `kill -9` recovery |
 | `cleanup` | Task teardown |

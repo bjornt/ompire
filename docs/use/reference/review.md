@@ -2,12 +2,18 @@
 
 ## Overview
 
-Review runs a real review tool against the **host side** of a task's clone,
-driven by the daemon. The agent being reviewed does not run it, does not see
-its output before the daemon does, and cannot influence the verdict.
+Review runs a real review tool on the **host side**, driven by the daemon,
+against a protected snapshot of the task's publishable work. The agent being
+reviewed does not run it, does not see its output before the daemon does,
+cannot influence the verdict, and — since the reviewer never reads the live
+clone — cannot change what is being reviewed while it runs.
 
 The review is the check that stands between agent output and publishing. An
 agent that could grade its own work would make it ceremonial.
+
+An approval **names the content it graded** (ADR-0032). That binding is what
+delivery checks: an approval whose content has since changed stays on record as
+history and cannot authorize publishing.
 
 ## Using review
 
@@ -37,46 +43,68 @@ count, and expandable captured stderr.
 session** is `idle` with a live agent and no review already open. Other
 sessions of the task neither gate nor block it.
 
-The daemon fetches the clone, runs the reset dance, and launches the
-configured llmvet command with `-no-open -port <n>` as a supervised
-subprocess with the clone as working directory.
+The daemon fetches the clone, captures the task's candidate, builds an isolated
+checkout of it, and launches the configured llmvet command with
+`-no-open -port <n>` as a supervised subprocess with that checkout as its
+working directory.
 
 The review is recorded as `open` with its `http://127.0.0.1:<n>` URL and
 `review_started` is broadcast. The subprocess then runs in the background —
 the request does not block on the operator's browser session.
 
 `POST /api/tasks/{id}/review/cancel` terminates an open review's process
-(interrupt first, kill as fallback), restores the clone, and records the
-review aborted.
+(interrupt first, kill as fallback), removes the isolated checkout, and records
+the review aborted. The task clone needs no restoration — the reviewer never
+wrote to it.
 
 ## States and behavior
 
-### The reset dance
+### The candidate
 
-Before launching the reviewer the daemon saves the clone's current `HEAD` as
-the Git ref `refs/ompire/review-orig`, then runs `git reset --mixed` to the
-merge-base of `origin/<base>` and `HEAD`.
+Before launching the reviewer the daemon resolves what this task would publish:
+the base branch it was accepted with, the base commit its delta is measured
+from, the HEAD it was captured at, the complete candidate tree — committed
+checkpoints, pending edits, deletions, and non-ignored new files together — and,
+for retain delivery, the ordered source commits with their trees and messages.
 
-Two properties matter:
+The candidate's identity is a hash of exactly that normalized content. Capturing
+an unchanged workspace twice yields the same identity; any change to what would
+be published yields a different one. That is the whole approval binding.
 
-- **The working tree is never modified.** `--mixed` moves `HEAD` and the index
-  but leaves file contents byte-for-byte intact.
-- **The full task delta becomes visible.** The reviewer sees everything from
-  the merge-base, whether or not the agent committed along the way. Reviewing
-  only the uncommitted remainder would silently hide checkpoint commits.
+Capture is read-only against the task: it uses a daemon-private index, so the
+task's own index, working tree, and HEAD are untouched. It runs with the clone's
+hooks disabled and refuses a clone that configures content filters or a hooks
+path — the clone is agent-writable, and either would let task-authored code run
+on the host as the operator.
 
-When the reviewer exits, the daemon restores the clone with
-`git reset --mixed refs/ompire/review-orig` and deletes the ref.
+The candidate's Git objects are copied into an owner-private repository under
+the daemon's data directory, outside the workshop mount, so the task cannot
+rewrite or garbage-collect what the review graded.
+
+### What the reviewer sees
+
+The reviewer's checkout has its HEAD and index at the candidate's base commit
+and the candidate's tree on disk. `git status` and `git diff` therefore expose
+the **full task delta** — exactly what the earlier in-clone reset exposed — and
+nothing about the task's live state can change it mid-review.
+
+Reviewing only the uncommitted remainder would silently hide checkpoint commits,
+which is why the whole delta is the unit.
+
+Starting a review is refused when the delta is empty, when another daemon-managed
+writer owns the task's workspace, and when a previous privileged effect's outcome
+is unresolved.
 
 ### Crash safety
 
-The ref is the recovery artifact for the clone. On startup, any non-archived
-task whose clone still carries `refs/ompire/review-orig` is restored — reset
-to the ref, ref deleted — before the daemon serves its first snapshot.
+The isolated checkout is disposable: a crash mid-review leaves the task clone
+exactly as it was, with no parked or detached `HEAD` to restore. The review's own
+status and history are restored from the database — see
+[Retention and restart](#retention-and-restart).
 
-A crash mid-review therefore never leaves a clone with a detached or parked
-`HEAD`. The review's own status and history are restored separately, from the
-database — see [Retention and restart](#retention-and-restart).
+Clones parked by an older Ompire's in-clone review are still recognized on
+startup and restored, and the marker is removed only when the restoration
+verifies.
 
 ### Outcomes
 
@@ -105,7 +133,13 @@ agent addresses the comments in its own session, moving from `reviewing` to
 ends — ready for a fresh review.
 
 Re-triggering review records a further iteration in the same review's history,
-so the loop is visible rather than being a sequence of unrelated reviews.
+so the loop is visible rather than being a sequence of unrelated reviews. Each
+round captures the corrected content and binds its own iteration to it, so a
+second approval covers what the agent actually changed.
+
+Ownership of the workspace is released before the comments are handed to the
+agent: the reviewer is finished with it, and the correction turn is admitted on
+its own.
 
 ## Failures and recovery
 
@@ -117,6 +151,9 @@ so the loop is visible rather than being a sequence of unrelated reviews.
 | Cancel with no open review | `409` |
 | The task's launch configuration is not confirmed yet | Refused; confirm the task's configuration first (see [States](states.md)) |
 | Comments arrive but the primary session has no live agent | Review recorded `error` naming the missing agent; the session is left unchanged |
+| Nothing to review — the task's content matches its base | `409` naming the empty delta |
+| Another writer owns the workspace, or an unresolved delivery effect blocks it | `409` naming the holder or the effect |
+| The clone configures content filters or a hooks path | `409` naming the settings Ompire refuses to capture under |
 
 ### Retention and restart
 
@@ -147,6 +184,11 @@ it was, still labelled **Comments submitted**.
 A task that never ran a review has no review entry. Ompire does not infer one
 from Git state or from an existing pull request.
 
+An approval recorded before content-bound review carries no candidate. It is
+preserved exactly as it was and shown as historical evidence; it is never
+backfilled from today's workspace, and delivering that task needs a fresh
+review.
+
 Cleanup terminates any open reviewer process, records that review **Aborted**,
 and **keeps** the review history: a shipped, cleaned-up task retains the
 evidence explaining why it was allowed to publish, and never shows as still
@@ -169,14 +211,15 @@ records.
 
 | Event | Payload |
 |---|---|
-| `review_started` | `{task_id, url, port}` |
+| `review_started` | `{task_id, url, port, candidate_id}` |
 | `review_iteration` | `{task_id, iteration}` |
 | `review_finished` | `{task_id, status}` |
 
 The snapshot carries a `reviews` map from task id to `{status, url, port,
-iterations}` for every task with a review, including cleaned-up tasks. `url`
-and `port` are `null` whenever no reviewer process is live — always the case
-after a restart.
+candidate_id, iterations}` for every task with a review, including cleaned-up
+tasks. `url` and `port` are `null` whenever no reviewer process is live — always
+the case after a restart. Each iteration carries the `candidate_id` it graded,
+`null` for history recorded before content binding.
 
 An iteration's `outcome` is one of `approved`, `comments`, `aborted`, `error`,
 or `interrupted`. The last is restart-only and always accompanies an `aborted`

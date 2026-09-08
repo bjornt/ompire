@@ -26,7 +26,7 @@ import type {
   PendingQuestion,
   ReviewState,
   SessionInfo,
-  ShipState,
+  ShipProjection,
   StatsPayload,
   Task,
   WorkflowState,
@@ -172,7 +172,7 @@ function TaskCard({
   stats: Record<string, StatsPayload> | undefined;
   advisories: Record<string, Partial<Record<AdvisoryKind, AdvisoryPayload>>> | undefined;
   review: ReviewState | undefined;
-  ship: ShipState | undefined;
+  ship: ShipProjection | undefined;
 }) {
   const [showError, setShowError] = useState(false);
   const spawning = isSpawning(task);

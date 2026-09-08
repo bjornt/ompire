@@ -50,14 +50,37 @@ recorded — every task predating this — the record says so explicitly, with t
 sequence boundary marking which attempts ran under an unretained procedure,
 instead of attributing them to a definition that never produced them.
 
-The gaps this record names are otherwise untouched. Ship drafts and progress,
-the rewritten commit identity, publishing errors, and most attention state
-remain transient; a successful commit, push, or PR creation can still land
-before the durable task update, so restart recovery still cannot always
-distinguish "not attempted" from "completed but not recorded". Raw agent events
-still have a bounded live buffer and native session material is still removed
-with the task environment. Nothing here claims exactly-once agent or tool
-execution, transcript retention, or full commit lineage.
+The gaps this record names are otherwise untouched by that decision. Raw agent
+events still have a bounded live buffer and native session material is still
+removed with the task environment. Nothing there claims exactly-once agent or
+tool execution, transcript retention, or full commit lineage.
+
+## Progress: delivery intent and outcomes are now durable
+
+[ADR-0032](0032-bind-trusted-delivery-to-retained-candidates.md), 2026-09-08.
+This record stays **Proposed**; a second narrow slice of it is delivered.
+
+The specific gap named above — "a successful commit, push, or pull-request
+creation can occur before the corresponding durable task update, leaving restart
+recovery unable to distinguish *not attempted* from *completed but not
+recorded*" — is closed for delivery. Every privileged action now journals what it
+is about to write before it runs, and its verified outcome before anything
+dependent is scheduled. An attempt reaches `failed` only when non-execution or a
+verified rollback was established; anything less certain is recorded as
+unresolved and blocks the task rather than being guessed either way.
+
+The operator's authorization, the ending it selected, the content identity that
+authorization names, the review identity that covered it, safe execution-identity
+facts, and every reconciliation decision are durable and survive cleanup. Ship
+drafts are durable too, including the interrupted state of one. Git recovery refs
+are no longer the only evidence: they were never an audit history, and the
+journal is.
+
+What remains transient is what this record still names. Live session state,
+pending agent questions and approvals, and most attention state exist only in
+memory. Full checkpoint-to-mainline commit lineage and transcript retention are
+not delivered, and no exactly-once claim is made about agent or tool execution.
+Those are why this record is still `Proposed`.
 
 ## Consequences
 
