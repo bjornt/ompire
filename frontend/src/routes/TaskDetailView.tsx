@@ -30,6 +30,7 @@ import type {
   StepRecord,
   Task,
   TaskDetail,
+  TaskExecutionInputs,
   WorkflowState,
   WorkshopStatus,
 } from "../types";
@@ -564,6 +565,74 @@ function workshopLabel(detail: TaskDetail): { text: string; status: WorkshopStat
  * records. Answering a gate and retrying a pause remain the existing
  * attempt-scoped controls above — there is no action here on a step the run
  * has merely not reached. */
+/** The handoff inputs this task was launched with (ADR-0035).
+ *
+ * Read off the task's own pinned document, so it keeps saying what the task
+ * ran with after the producing revision is purged or its task is cleaned up.
+ * The agent's working copies may since have been edited or deleted; that
+ * changes nothing here, and nothing here changes the retained revision.
+ *
+ * The publication restriction is stated on every entry because it is the fact
+ * an operator most needs when they later come to ship this task's code. */
+function PinnedHandoffInputs({ inputs }: { inputs: TaskExecutionInputs }) {
+  const comparisons = new Map(
+    inputs.base_comparisons.map((entry) => [entry.result_id, entry]),
+  );
+  return (
+    <div className="panel" data-testid="pinned-handoff-inputs">
+      <h2 className="panelTitle">Handoff inputs</h2>
+      <p className="hint">
+        Exact accepted revisions, installed into this task&apos;s own clone
+        before its first step ran. They are never published: Review and Ship
+        refuse a delivery whose Git result carries one of these paths.
+      </p>
+      {inputs.source_commit && (
+        <p className="hint" data-testid="pinned-source-commit">
+          Built from <code>{inputs.source_commit.slice(0, 12)}</code>.
+          {inputs.acknowledged_base_difference
+            ? " The operator acknowledged that these files were not validated against it."
+            : ""}
+        </p>
+      )}
+      {inputs.result_attachments.map((attachment) => {
+        const comparison = comparisons.get(attachment.result_id);
+        return (
+          <div
+            className="pinnedAttachment"
+            key={attachment.result_id}
+            data-testid="pinned-attachment"
+          >
+            <p>
+              <code>{attachment.result_id}</code> — produced by task{" "}
+              {attachment.producer_task_id}, accepted{" "}
+              {new Date(attachment.accepted_at).toLocaleString()}
+            </p>
+            <p className="spawnHandoffLabel">Handoff input — not publishable</p>
+            <ul className="spawnAttachmentPaths">
+              {attachment.files.map((file) => (
+                <li key={file.path}>
+                  <code>{file.path}</code> · {file.length} B ·{" "}
+                  <code>{file.sha256.slice(0, 12)}</code>
+                </li>
+              ))}
+            </ul>
+            {comparison && (
+              <p className="hint" data-testid="pinned-attachment-base">
+                {comparison.state === "match"
+                  ? "Captured against this task's exact base."
+                  : comparison.state === "unknown"
+                    ? (comparison.detail ??
+                      "The producing capture recorded no base observation.")
+                    : `Captured against ${(comparison.producer_observation ?? "").slice(0, 12)}, not this base.`}
+              </p>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function PinnedProcedure({
   revision,
   workflow,
@@ -841,6 +910,10 @@ export function TaskDetailView() {
 
       {workflow !== null && workflow.status === "waiting" && (
         <GateCard taskId={taskId} workflow={workflow} />
+      )}
+
+      {(liveTask?.execution_inputs?.result_attachments ?? []).length > 0 && (
+        <PinnedHandoffInputs inputs={liveTask!.execution_inputs!} />
       )}
 
       {workflow !== null && liveTask?.workflow_revision != null && (

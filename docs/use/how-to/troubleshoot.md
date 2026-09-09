@@ -83,14 +83,15 @@ gone; check its logs.
 
 ## A task failed during spawn
 
-The failing step and its stderr are attached to the task. The four steps fail
-for characteristic reasons:
+The failing step and its stderr are attached to the task. The steps fail for
+characteristic reasons:
 
 | Step | Common cause |
 |---|---|
 | `fetch` | The project's checkout has gone missing, or its [fetch remote](../reference/projects.md#fetch-remote) is unreachable |
 | `clone` | No write access to `task_dir_root`, or the target path exists |
 | `branch` | `origin/<base_branch>` does not exist — check the base branch the task was accepted with, on its detail view |
+| `inputs` | A [handoff input](../reference/task-spawn.md#handoff-inputs) could not be installed: its destination is occupied, an ancestor is not an ordinary directory, the retained bytes no longer match what was accepted, or the base branch moved after the launch was accepted. The message names the path or identity. Nothing ran, and the clone is left for you to inspect |
 | `workshop` | Container tooling unavailable, or the launch exceeded its timeout |
 
 A `workshop` failure after a successful launch usually means the container

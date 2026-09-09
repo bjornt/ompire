@@ -23,6 +23,7 @@ from ompire_daemon.db import (
     task_results,
 )
 from ompire_daemon.migrate import upgrade_head
+from ompire_daemon.registry.model_profiles import reserved_write
 from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.results import (
     STATE_FAILED,
@@ -32,7 +33,9 @@ from ompire_daemon.registry.results import (
     DamagedManifestError,
     InvalidSelectionError,
     ResultFile,
+    ResultNotAttachableError,
     ResultPurgedError,
+    ResultReferencedError,
     ResultsRetainedError,
     ResultStateError,
     SelectionMismatchError,
@@ -40,10 +43,12 @@ from ompire_daemon.registry.results import (
     accept_result,
     assert_no_retained_results,
     build_manifest,
+    consumers_by_result,
     content_identity,
     fail_capture,
     finish_capture,
     get_result,
+    insert_references_on,
     list_results,
     manifest_files,
     manifest_identity,
@@ -52,11 +57,20 @@ from ompire_daemon.registry.results import (
     open_capture,
     purge_result,
     read_all_files,
+    read_result_on,
     reconcile_interrupted_captures,
+    references_for_consumer,
     results_version,
     retained_counts,
+    verify_attachable_on,
+    verify_payload_on,
 )
-from ompire_daemon.registry.tasks import create_task, mark_archived
+from ompire_daemon.registry.tasks import (
+    TaskNotArchivedError,
+    create_task,
+    mark_archived,
+    purge_task,
+)
 from tests.conftest import make_execution_inputs
 
 
@@ -567,3 +581,188 @@ def test_a_damaged_manifest_is_refused_rather_than_trusted(engine, task) -> None
     damaged = get_result(engine, result.id)
     with pytest.raises(DamagedManifestError):
         manifest_files(damaged.manifest)
+
+
+# --- Pinned-input references (ADR-0035) --------------------------------------
+
+
+def _accept(engine, result):
+    return accept_result(
+        engine, result.id, expected_manifest_id=result.manifest_id or ""
+    )
+
+
+def _consumer(engine, tmp_path: Path, slug: str):
+    return create_task(
+        engine,
+        project_name="demo",
+        slug=slug,
+        branch=f"ompire/{slug}",
+        clone_path=str(tmp_path / "tasks" / "demo" / slug),
+        prompt="implement the plan",
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(tmp_path / "proj" / "demo"),
+            project_name="demo",
+            branch=f"ompire/{slug}",
+        ),
+    )
+
+
+def test_verify_attachable_refuses_a_revision_the_operator_never_accepted(
+    engine, task
+) -> None:
+    """Retention and acceptance are different facts. A complete bundle nobody
+    read is a downloadable result; it is not an input a task may be launched
+    with."""
+    result = _capture(engine, task, request_id="req-1")
+    with engine.connect() as conn, pytest.raises(ResultNotAttachableError) as exc:
+        verify_attachable_on(
+            conn, result.id, expected_manifest_id=result.manifest_id or ""
+        )
+    assert exc.value.reason == "not-accepted"
+
+
+def test_verify_attachable_refuses_a_stale_manifest_rather_than_retargeting(
+    engine, task
+) -> None:
+    """The manifest id is what makes a selection name a *revision*. A caller
+    holding an old one is told its selection is stale, never handed a
+    successor it did not review."""
+    result = _accept(engine, _capture(engine, task, request_id="req-1"))
+    with engine.connect() as conn, pytest.raises(StaleRevisionError):
+        verify_attachable_on(conn, result.id, expected_manifest_id="not-this-one")
+
+
+def test_verify_payload_refuses_bytes_that_no_longer_hash_to_the_manifest(
+    engine, task
+) -> None:
+    """Re-checked at consumption, not merely trusted from capture time: an
+    accepted revision is read back from a database that may have been
+    restored, copied, or damaged since the decision was made."""
+    result = _accept(engine, _capture(engine, task, request_id="req-1"))
+    with engine.begin() as conn:
+        conn.execute(
+            task_result_files.update()
+            .where(task_result_files.c.result_id == result.id)
+            .values(content=b"tampered")
+        )
+    with engine.connect() as conn:
+        stored = read_result_on(conn, result.id)
+        assert stored is not None
+        with pytest.raises(ResultNotAttachableError) as exc:
+            verify_payload_on(conn, stored)
+    assert exc.value.reason == "damaged"
+
+
+def test_a_pinned_revision_cannot_be_purged_and_the_refusal_names_its_consumers(
+    engine, task, tmp_path: Path
+) -> None:
+    """Retention is a dependency, not a preference. The consumer tasks are
+    named because purging those records is the only correction — there is no
+    force."""
+    result = _accept(engine, _capture(engine, task, request_id="req-1"))
+    consumer = _consumer(engine, tmp_path, "consumer-1")
+    with reserved_write(engine) as conn:
+        insert_references_on(
+            conn,
+            consumer_task_id=consumer.id,
+            references=[(result.id, task.id, result.manifest_id or "")],
+        )
+    with pytest.raises(ResultReferencedError) as exc:
+        purge_result(
+            engine,
+            result.id,
+            expected_manifest_id=result.manifest_id or "",
+            expected_version=results_version(engine, task.id),
+        )
+    assert exc.value.consumer_task_ids == [consumer.id]
+    # Refused before anything was deleted: the bytes are still readable.
+    assert read_all_files(engine, result.id)
+    assert get_result(engine, result.id).state == STATE_READY
+
+
+def test_archiving_a_consumer_does_not_release_its_pinned_inputs(
+    engine, task, tmp_path: Path
+) -> None:
+    """A cleaned-up consumer still says what it ran with, so the files that
+    record has to explain must still be readable."""
+    result = _accept(engine, _capture(engine, task, request_id="req-1"))
+    consumer = _consumer(engine, tmp_path, "consumer-1")
+    with reserved_write(engine) as conn:
+        insert_references_on(
+            conn,
+            consumer_task_id=consumer.id,
+            references=[(result.id, task.id, result.manifest_id or "")],
+        )
+    mark_archived(engine, consumer.id)
+    with pytest.raises(ResultReferencedError):
+        purge_result(
+            engine,
+            result.id,
+            expected_manifest_id=result.manifest_id or "",
+            expected_version=results_version(engine, task.id),
+        )
+
+
+def test_purging_the_consumer_task_releases_the_reference_and_moves_the_producer(
+    engine, task, tmp_path: Path
+) -> None:
+    """The one release, and it reports the producer whose reverse-dependency
+    list moved so a purge dialog open elsewhere converges."""
+    result = _accept(engine, _capture(engine, task, request_id="req-1"))
+    consumer = _consumer(engine, tmp_path, "consumer-1")
+    with reserved_write(engine) as conn:
+        insert_references_on(
+            conn,
+            consumer_task_id=consumer.id,
+            references=[(result.id, task.id, result.manifest_id or "")],
+        )
+    before = results_version(engine, task.id)
+    mark_archived(engine, consumer.id)
+    _paths, released = purge_task(engine, consumer.id)
+
+    assert released == [task.id]
+    assert results_version(engine, task.id) > before
+    assert consumers_by_result(engine) == {}
+    purged = purge_result(
+        engine,
+        result.id,
+        expected_manifest_id=result.manifest_id or "",
+        expected_version=results_version(engine, task.id),
+    )
+    assert purged.state == STATE_PURGED
+
+
+def test_a_refused_consumer_purge_releases_nothing(
+    engine, task, tmp_path: Path
+) -> None:
+    """Every refusal is decided before any deletion. A consumer that is not
+    archived keeps both its own history and its hold on the bytes."""
+    result = _accept(engine, _capture(engine, task, request_id="req-1"))
+    consumer = _consumer(engine, tmp_path, "consumer-1")
+    with reserved_write(engine) as conn:
+        insert_references_on(
+            conn,
+            consumer_task_id=consumer.id,
+            references=[(result.id, task.id, result.manifest_id or "")],
+        )
+    with pytest.raises(TaskNotArchivedError):
+        purge_task(engine, consumer.id)
+    assert consumers_by_result(engine) == {result.id: [consumer.id]}
+
+
+def test_the_reverse_dependency_is_visible_without_decoding_launch_documents(
+    engine, task, tmp_path: Path
+) -> None:
+    result = _accept(engine, _capture(engine, task, request_id="req-1"))
+    first = _consumer(engine, tmp_path, "consumer-1")
+    second = _consumer(engine, tmp_path, "consumer-2")
+    for consumer in (first, second):
+        with reserved_write(engine) as conn:
+            insert_references_on(
+                conn,
+                consumer_task_id=consumer.id,
+                references=[(result.id, task.id, result.manifest_id or "")],
+            )
+    assert consumers_by_result(engine) == {result.id: [first.id, second.id]}
+    assert references_for_consumer(engine, first.id) == [result.id]

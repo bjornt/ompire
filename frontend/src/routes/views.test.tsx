@@ -144,6 +144,10 @@ function makeInputs(overrides: Partial<TaskExecutionInputs> = {}): TaskExecution
     upstream_url: "https://example.com/maas.git",
     fork_url: null,
     unknown_inputs: [],
+    result_attachments: [],
+    source_commit: null,
+    base_comparisons: [],
+    acknowledged_base_difference: false,
     ...overrides,
   };
 }

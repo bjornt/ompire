@@ -35,8 +35,10 @@ from sqlalchemy import Connection
 
 from ompire_daemon.db import model_profiles as model_profiles_table
 from ompire_daemon.db import projects as projects_table
+from ompire_daemon.db import tasks as tasks_table
 from ompire_daemon.execution_inputs import (
     AUXILIARY_CONSUMERS,
+    HANDOFF_CLASSIFICATION,
     PROFILE_SOURCE_PROJECT,
     PROFILE_SOURCE_STEP,
     PROFILE_SOURCE_TASK,
@@ -45,18 +47,29 @@ from ompire_daemon.execution_inputs import (
     ROLE_SOURCE_WORKFLOW,
     WORKFLOW_SOURCE_ACCEPTED,
     WORKSPACE_FIELDS,
+    AttachedFile,
+    BaseComparison,
     ConsumerBinding,
+    ResultAttachment,
     TaskExecutionInputs,
     WorkflowBinding,
     WorkspaceInputs,
     decode_roles,
     encode_binding,
 )
+from ompire_daemon.handoff import HandoffError, plan_destinations
 from ompire_daemon.model_config import MODEL_ROLES, validate_model_role
 from ompire_daemon.registry.model_profiles import RoleBinding
 from ompire_daemon.registry.projects import (
     validate_branch_pattern,
     validate_workshop_additions,
+)
+from ompire_daemon.registry.results import (
+    ResultNotAttachableError,
+    ResultNotFoundError,
+    StaleRevisionError,
+    verify_attachable_on,
+    verify_payload_on,
 )
 from ompire_daemon.registry.workflow_library import (
     UnknownWorkflowNameError,
@@ -148,6 +161,46 @@ class LaunchRequest:
     workspace_overrides: Mapping[str, str]
     step_overrides: Mapping[str, ConsumerOverride] = field(default_factory=dict)
     auxiliary_overrides: Mapping[str, ConsumerOverride] = field(default_factory=dict)
+    # Accepted result revisions to install before the first step runs
+    # (ADR-0035). Empty is an ordinary launch, not an error.
+    result_attachments: tuple[AttachmentSelection, ...] = ()
+    # The operator's acknowledgement that a plan captured against a different
+    # or unknown base has not been validated against this target. Bound to
+    # *this* attachment set and target commit by the fingerprint, so it cannot
+    # be carried over to a different selection.
+    acknowledge_result_base_difference: bool = False
+
+
+@dataclass(frozen=True)
+class AttachmentSelection:
+    """One selected revision, named the only way that identifies it exactly.
+
+    `expected_manifest_id` is what makes this a *revision* rather than a
+    pointer: a successor capture on the same producing task does not match it,
+    so a stale selection is refused instead of silently upgraded.
+    """
+
+    producer_task_id: int
+    result_id: str
+    expected_manifest_id: str
+
+
+@dataclass(frozen=True)
+class TargetEvidence:
+    """The Git reading a launch is reviewed against, made outside any lock.
+
+    Resolution stays pure with respect to the world: this is passed *in*, so
+    the same evidence is used by the preview the operator read and by the
+    acceptance that recomputes it. `commit` is immutable, which is what makes
+    binding it into the fingerprint meaningful — and what makes a ref that
+    moved afterwards a visible refusal rather than a silent retarget.
+    """
+
+    commit: str
+    # `(reason, detail, path)` per refused destination, already classified.
+    conflicts: tuple[tuple[str, str, str | None], ...] = ()
+    # result id → the comparison observed for that attachment.
+    comparisons: Mapping[str, BaseComparison] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -201,6 +254,9 @@ class ResolvedLaunch:
     # The task-wide effective profile's own four-role map: what a row that
     # inherits both dimensions resolves against.
     task_roles: dict[str, RoleBinding]
+    # Whether this launch still needs the operator to acknowledge an
+    # unvalidated base. False both when nothing needs it and when it was given.
+    needs_base_acknowledgement: bool = False
 
 
 def _now_iso() -> str:
@@ -410,6 +466,158 @@ def _resolve_consumers(
     return step_bindings, tuple(rows)
 
 
+def resolve_target_context(conn: Connection, request: LaunchRequest) -> tuple[str, str]:
+    """The `(checkout_path, base_branch)` an attachment observation is made
+    against, by exactly the rules resolution will apply.
+
+    Read separately because the Git work has to happen *outside* the write
+    reservation, and it needs to know which checkout and which branch before
+    the full resolution runs. It reuses the same project read and the same
+    workspace override resolution, so the observation can never be made against
+    a different base than the one the launch is then pinned to.
+    """
+    project_row = _read_project(conn, request.project_name)
+    workspace, _applied = _resolve_workspace(project_row, request.workspace_overrides)
+    return project_row.checkout_path, workspace.base_branch
+
+
+def _read_task_project(conn: Connection, task_id: int) -> str | None:
+    row = conn.execute(
+        tasks_table.select()
+        .with_only_columns(tasks_table.c.project_name)
+        .where(tasks_table.c.id == task_id)
+    ).first()
+    return row.project_name if row is not None else None
+
+
+def _resolve_attachments(
+    conn: Connection,
+    request: LaunchRequest,
+    evidence: TargetEvidence | None,
+    *,
+    project_name: str,
+) -> tuple[tuple[ResultAttachment, ...], tuple[BaseComparison, ...], bool]:
+    """Turn the selected revisions into pinned inputs, or refuse the launch.
+
+    Everything here reads on the caller's connection. Inside acceptance that
+    connection holds the write reservation, so a purge committing alongside
+    cannot land between "these bytes are intact" and "this task now references
+    them" — the two are one transaction or neither happens (ADR-0035).
+
+    Project membership is decided through *current* task records: the manifest
+    also carries a project label, but that is what the project was called when
+    the bundle was captured. Reading it as authority would turn an ordinary
+    project rename into a refused cross-project transfer.
+    """
+    if not request.result_attachments:
+        return (), (), False
+    if evidence is None:
+        raise LaunchInputError(
+            "result_attachments",
+            "attaching a result needs the target base to have been read; no "
+            "target observation was supplied",
+        )
+
+    attachments: list[ResultAttachment] = []
+    for selection in request.result_attachments:
+        field_name = f"result_attachments.{selection.result_id}"
+        producer_project = _read_task_project(conn, selection.producer_task_id)
+        if producer_project is None:
+            raise LaunchInputError(
+                field_name,
+                f"the producing task {selection.producer_task_id} no longer "
+                "exists, so its result cannot be attached",
+            )
+        if producer_project != project_name:
+            raise LaunchInputError(
+                field_name,
+                f"result {selection.result_id} belongs to project "
+                f"{producer_project!r}; a task can only attach results from its "
+                "own project",
+            )
+        try:
+            result = verify_attachable_on(
+                conn,
+                selection.result_id,
+                expected_manifest_id=selection.expected_manifest_id,
+            )
+        except ResultNotFoundError as exc:
+            raise LaunchInputError(field_name, str(exc)) from exc
+        except StaleRevisionError as exc:
+            raise LaunchInputError(field_name, str(exc)) from exc
+        except ResultNotAttachableError as exc:
+            raise LaunchInputError(field_name, str(exc)) from exc
+        if result.task_id != selection.producer_task_id:
+            raise LaunchInputError(
+                field_name,
+                f"result {selection.result_id} was produced by task "
+                f"{result.task_id}, not {selection.producer_task_id}",
+            )
+        try:
+            # Re-checked at consumption, not merely trusted from capture time:
+            # an accepted revision is read back from a database that may have
+            # been restored or damaged since the decision was made.
+            verify_payload_on(conn, result)
+        except ResultNotAttachableError as exc:
+            raise LaunchInputError(field_name, str(exc)) from exc
+        manifest = result.manifest or {}
+        attachments.append(
+            ResultAttachment(
+                result_id=result.id,
+                producer_task_id=result.task_id,
+                manifest_id=result.manifest_id or "",
+                content_id=result.content_id,
+                accepted_at=result.accepted_at or "",
+                manifest_project_name=str(manifest.get("project_name") or ""),
+                files=tuple(
+                    AttachedFile(
+                        path=entry.path,
+                        length=entry.length,
+                        sha256=entry.sha256,
+                        media_type=entry.media_type,
+                    )
+                    for entry in result.files
+                ),
+                provenance=dict(manifest.get("provenance") or {}),
+                classification=HANDOFF_CLASSIFICATION,
+            )
+        )
+
+    try:
+        plan_destinations(attachments)
+    except HandoffError as exc:
+        raise LaunchInputError("result_attachments", exc.detail) from exc
+
+    # The destinations the operator reviewed against this exact commit. A
+    # conflict here is resolved by choosing differently — never by overwriting,
+    # skipping a file, or merging.
+    if evidence.conflicts:
+        _reason, detail, _path = evidence.conflicts[0]
+        raise LaunchInputError("result_attachments", detail)
+
+    comparisons: list[BaseComparison] = []
+    for attachment in attachments:
+        comparison = evidence.comparisons.get(attachment.result_id)
+        if comparison is None:
+            raise LaunchInputError(
+                f"result_attachments.{attachment.result_id}",
+                "the target base was not compared with this revision's recorded "
+                "base observation; review the launch again",
+            )
+        comparisons.append(comparison)
+    needs_acknowledgement = any(
+        comparison.needs_acknowledgement for comparison in comparisons
+    )
+    if needs_acknowledgement and not request.acknowledge_result_base_difference:
+        raise LaunchInputError(
+            "acknowledge_result_base_difference",
+            "these files were captured against a different or unknown base, so "
+            "they have not been validated against this target; acknowledge that "
+            "before launching",
+        )
+    return tuple(attachments), tuple(comparisons), needs_acknowledgement
+
+
 def launch_fingerprint(
     request: LaunchRequest,
     inputs: TaskExecutionInputs,
@@ -469,6 +677,17 @@ def launch_fingerprint(
                     "workspace_overrides": dict(sorted(request.workspace_overrides.items())),
                     "step_overrides": override_digest(request.step_overrides),
                     "auxiliary_overrides": override_digest(request.auxiliary_overrides),
+                    "result_attachments": [
+                        [
+                            selection.producer_task_id,
+                            selection.result_id,
+                            selection.expected_manifest_id,
+                        ]
+                        for selection in request.result_attachments
+                    ],
+                    "acknowledge_result_base_difference": (
+                        request.acknowledge_result_base_difference
+                    ),
                 },
                 "resolved": {
                     "profile": inputs.model_profile_name,
@@ -488,6 +707,34 @@ def launch_fingerprint(
                     "fetch_remote": inputs.fetch_remote,
                     "upstream_url": inputs.upstream_url,
                     "fork_url": inputs.fork_url,
+                    # Immutable commit and tree data only (ADR-0035). No read
+                    # timestamp is covered: re-reading an unchanged base must
+                    # leave a reviewed preview valid, while a base that moved,
+                    # a revision that was replaced, or a destination that
+                    # became occupied must not.
+                    "source_commit": inputs.source_commit,
+                    "attachments": [
+                        {
+                            "result_id": attachment.result_id,
+                            "producer_task_id": attachment.producer_task_id,
+                            "manifest_id": attachment.manifest_id,
+                            "content_id": attachment.content_id,
+                            "classification": attachment.classification,
+                            "destinations": list(attachment.destinations),
+                        }
+                        for attachment in inputs.result_attachments
+                    ],
+                    "base_comparisons": [
+                        [
+                            comparison.result_id,
+                            comparison.state,
+                            comparison.producer_observation,
+                        ]
+                        for comparison in inputs.base_comparisons
+                    ],
+                    "acknowledged_base_difference": (
+                        inputs.acknowledged_base_difference
+                    ),
                 },
                 "workflow": {
                     "name": revision.name,
@@ -511,9 +758,20 @@ def launch_fingerprint(
     return digest.hexdigest()[:32]
 
 
-def resolve_launch(conn: Connection, request: LaunchRequest) -> ResolvedLaunch:
+def resolve_launch(
+    conn: Connection,
+    request: LaunchRequest,
+    *,
+    evidence: TargetEvidence | None = None,
+) -> ResolvedLaunch:
     """Resolve one launch, or refuse it. Reads only; the caller decides
-    whether that read sits in a reservation."""
+    whether that read sits in a reservation.
+
+    `evidence` is the Git reading made outside the lock — the target commit and
+    what its tree already holds at the attached destinations. It is required
+    for a launch with attachments and unused without them, which is what keeps
+    an ordinary launch resolving exactly as it did before.
+    """
     project_row = _read_project(conn, request.project_name)
     if project_row.setup_state != "ready":
         raise ProjectNotLaunchableError(
@@ -572,6 +830,10 @@ def resolve_launch(conn: Connection, request: LaunchRequest) -> ResolvedLaunch:
     workspace, applied = _resolve_workspace(project_row, request.workspace_overrides)
     branch = workspace.branch_pattern.replace("<slug>", request.slug)
 
+    attachments, comparisons, needs_acknowledgement = _resolve_attachments(
+        conn, request, evidence, project_name=project_row.name
+    )
+
     now = _now_iso()
     inputs = TaskExecutionInputs(
         provenance=PROVENANCE_ACCEPTED,
@@ -595,6 +857,15 @@ def resolve_launch(conn: Connection, request: LaunchRequest) -> ResolvedLaunch:
         fetch_remote=project_row.fetch_remote,
         upstream_url=project_row.upstream_url,
         fork_url=project_row.fork_url,
+        result_attachments=attachments,
+        # Pinned only for an attachment launch. An ordinary launch keeps its
+        # branch-based behavior and records no commit observation, so nothing
+        # about it changes.
+        source_commit=evidence.commit if attachments and evidence else None,
+        base_comparisons=comparisons,
+        acknowledged_base_difference=(
+            needs_acknowledgement and request.acknowledge_result_base_difference
+        ),
     )
     return ResolvedLaunch(
         inputs=inputs,
@@ -610,6 +881,7 @@ def resolve_launch(conn: Connection, request: LaunchRequest) -> ResolvedLaunch:
             preamble=project_row.preamble,
         ),
         task_roles=roles,
+        needs_base_acknowledgement=needs_acknowledgement,
     )
 
 
@@ -664,6 +936,51 @@ def resolution_payload(resolved: ResolvedLaunch) -> dict[str, Any]:
         },
         "workspace_overrides": list(inputs.workspace_overrides),
         "branch": inputs.branch,
+        # The exact commit this launch was resolved against, null for an
+        # ordinary launch. Named so the operator reviews an identity, not "the
+        # tip of main, whenever the clone happens to run".
+        "source_commit": inputs.source_commit,
+        "needs_base_acknowledgement": resolved.needs_base_acknowledgement,
+        "acknowledged_base_difference": inputs.acknowledged_base_difference,
+        "result_attachments": [
+            {
+                "result_id": attachment.result_id,
+                "producer_task_id": attachment.producer_task_id,
+                "manifest_id": attachment.manifest_id,
+                "content_id": attachment.content_id,
+                "accepted_at": attachment.accepted_at,
+                "manifest_project_name": attachment.manifest_project_name,
+                # The fixed policy every destination carries. Rendered as a
+                # label, never as an editable control: there is no
+                # declassification.
+                "classification": attachment.classification,
+                "publishable": False,
+                "files": [
+                    {
+                        "path": entry.path,
+                        "length": entry.length,
+                        "sha256": entry.sha256,
+                        "media_type": entry.media_type,
+                    }
+                    for entry in attachment.files
+                ],
+                "destinations": list(attachment.destinations),
+                "provenance": attachment.provenance,
+            }
+            for attachment in inputs.result_attachments
+        ],
+        "base_comparisons": [
+            {
+                "result_id": comparison.result_id,
+                "state": comparison.state,
+                "target_commit": comparison.target_commit,
+                "producer_observation": comparison.producer_observation,
+                "changed_paths": list(comparison.changed_paths),
+                "truncated": comparison.truncated,
+                "detail": comparison.detail,
+            }
+            for comparison in inputs.base_comparisons
+        ],
         "steps": [
             {
                 "step": row.step,

@@ -93,6 +93,17 @@ The candidate's identity is a hash of exactly that normalized content. Capturing
 an unchanged workspace twice yields the same identity; any change to what would
 be published yields a different one. That is the whole approval binding.
 
+For a task launched with [handoff inputs](task-spawn.md#handoff-inputs), the
+protected destinations are part of that identity too, so an approval is bound to
+the publication policy it was reviewed under. A task without them is unchanged:
+its identity is exactly what it always was.
+
+Capture also refuses, before the reviewer starts, if the proposed tree carries
+one of those destinations. That refusal is mode-neutral and comes first
+deliberately — contamination cannot be hidden behind a successful content
+review. It names the paths; nothing is filtered out of the tree to make the
+review proceed. See [Ship flow](ship-flow.md#handoff-inputs).
+
 Capture is read-only against the task: it uses a daemon-private index, so the
 task's own index, working tree, and HEAD are untouched. It runs with the clone's
 hooks disabled and refuses a clone that configures content filters or a hooks

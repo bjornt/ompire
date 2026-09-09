@@ -37,10 +37,11 @@ import logging
 import os
 import shutil
 import tempfile
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import Engine
 
@@ -55,8 +56,13 @@ from ompire_daemon.registry.tasks import Task
 logger = logging.getLogger(__name__)
 
 
-def _ensure_excludes(clone_path: str) -> None:
+def _ensure_excludes(clone_path: str, protected: Sequence[str] = ()) -> None:
     """Apply Ompire's own Git exclude policy to the clone.
+
+    `protected` is the task's pinned handoff destinations, passed so the
+    delivery path writes exactly the same entries the spawn pipeline did. It
+    improves what `git add --all` picks up; it proves nothing, and the tree
+    checks below never trust it (ADR-0035).
 
     Imported lazily: the spawn pipeline reaches the workflow runner, which
     admits through this module's guard, and a module-level import would close
@@ -64,7 +70,7 @@ def _ensure_excludes(clone_path: str) -> None:
     """
     from ompire_daemon.spawn import _ensure_git_excludes
 
-    _ensure_git_excludes(clone_path, "delivery-exclude")
+    _ensure_git_excludes(clone_path, "delivery-exclude", protected=protected)
 
 # Where candidate staging repositories live: under the daemon's own data
 # directory, never inside the task clone or the workshop mount.
@@ -85,6 +91,35 @@ class DeliveryWorkspaceError(Exception):
 
 class UnsafeCloneConfigError(DeliveryWorkspaceError):
     """The clone configures something the daemon refuses to run under."""
+
+
+class ProtectedPathError(DeliveryWorkspaceError):
+    """The proposed Git result carries a handoff destination (ADR-0035).
+
+    A `DeliveryWorkspaceError` on purpose: review already turns one of those
+    into a content refusal before llmvet starts, so contamination cannot be
+    hidden behind a successful content review.
+
+    Nothing is filtered, reset, or rewritten to make the refusal go away.
+    Ompire does not delete an operator's files or rewrite their history on
+    their behalf; it says exactly which paths — and, for retained history,
+    which commit — are in the way, and the correction is theirs to make.
+    """
+
+    def __init__(self, paths: Sequence[str], *, commit: str | None = None) -> None:
+        listed = ", ".join(paths[:8]) + ("…" if len(paths) > 8 else "")
+        where = (
+            f"commit {commit[:12]} in the range this delivery would publish"
+            if commit
+            else "the tree this delivery would publish"
+        )
+        super().__init__(
+            f"{where} contains handoff input(s) that are never publishable: "
+            f"{listed}. Remove them from what is being published — Ompire will "
+            "not delete files or rewrite history for you — then review again."
+        )
+        self.paths = tuple(paths)
+        self.commit = commit
 
 
 class EmptyCandidateError(DeliveryWorkspaceError):
@@ -427,6 +462,23 @@ async def assert_clone_config_safe(clone_path: str, timeout: int) -> None:
 # --- candidate capture -----------------------------------------------------
 
 
+def protected_destinations(task: Task) -> tuple[str, ...]:
+    """The paths this task may never publish, from its own pinned inputs.
+
+    Derived from the accepted launch document and nothing else (ADR-0035): not
+    from an ignore file, not from a pattern like `epics/` or `PLAN.md`, and not
+    from anything the task or its agent supplies. An ordinary task returns
+    nothing, which is what keeps its candidate identity and its delivery
+    exactly as they were.
+
+    A stored attachment whose classification cannot be read raises out of the
+    decoder rather than arriving here as an empty tuple — refusing to publish
+    is the only safe reading of a policy nobody can parse.
+    """
+    inputs = task.execution_inputs
+    return inputs.protected_destinations if inputs is not None else ()
+
+
 @dataclass(frozen=True)
 class CandidateInputs:
     """Everything a capture needs that comes from outside the workspace."""
@@ -450,31 +502,127 @@ def compute_candidate_id(
     base_commit: str,
     tree_id: str,
     source_commits: tuple[SourceCommit, ...],
+    protected: Sequence[str] = (),
 ) -> str:
     """Hash the normalized semantic content, and only that.
 
     Not the rendered preview, not the agent's draft, not a timestamp: the same
     workspace has to capture to the same identity across restarts, or "unchanged
     since review" would be unanswerable.
+
+    `protected` is folded in *only when it is non-empty* (ADR-0035). A task with
+    no handoff inputs keeps byte-identical identities to the ones it had before
+    attachments existed, so nothing already reviewed goes stale; a task that has
+    them binds the publication policy to what was reviewed, so a candidate
+    cannot be carried into a delivery that thinks the policy is different.
     """
-    payload = json.dumps(
-        {
-            "task_id": task_id,
-            "base_commit": base_commit,
-            "tree_id": tree_id,
-            "source_commits": [
-                {
-                    "commit_id": c.commit_id,
-                    "tree_id": c.tree_id,
-                    "message": c.message,
-                    "parent_ids": list(c.parent_ids),
-                }
-                for c in source_commits
-            ],
-        },
-        sort_keys=True,
+    document: dict[str, Any] = {
+        "task_id": task_id,
+        "base_commit": base_commit,
+        "tree_id": tree_id,
+        "source_commits": [
+            {
+                "commit_id": c.commit_id,
+                "tree_id": c.tree_id,
+                "message": c.message,
+                "parent_ids": list(c.parent_ids),
+            }
+            for c in source_commits
+        ],
+    }
+    if protected:
+        document["protected_paths"] = sorted(protected)
+    return hashlib.sha256(
+        json.dumps(document, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+async def protected_paths_in_tree(
+    clone_path: str, tree_ish: str, protected: Sequence[str], timeout: int
+) -> tuple[str, ...]:
+    """Which protected destinations a given tree actually contains.
+
+    Asks the *tree*, never the working directory, the index, or an ignore file:
+    an exclude an agent can edit is not evidence, and a file force-staged into
+    the agent's own index may never reach the proposed tree at all. What is
+    published is a tree, so a tree is what gets inspected.
+
+    `-r` recurses, so a protected file later replaced by a directory is caught
+    through its descendants rather than slipping past a name that no longer
+    matches a blob. `--literal-pathspecs` keeps a captured filename containing
+    Git pathspec metacharacters a path rather than a pattern — a `[` in a
+    filename must not turn its own protection into a character class.
+    """
+    if not protected:
+        return ()
+    stdout = await git_out(
+        clone_path,
+        [
+            "--literal-pathspecs",
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            "--name-only",
+            tree_ish,
+            "--",
+            *protected,
+        ],
+        timeout=timeout,
+        step="candidate-protected-paths",
     )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return tuple(sorted({name for name in stdout.split("\0") if name.strip()}))
+
+
+async def assert_tree_unprotected(
+    clone_path: str,
+    tree_ish: str,
+    protected: Sequence[str],
+    timeout: int,
+    *,
+    commit: str | None = None,
+) -> None:
+    found = await protected_paths_in_tree(clone_path, tree_ish, protected, timeout)
+    if found:
+        raise ProtectedPathError(found, commit=commit)
+
+
+async def assert_range_unprotected(
+    repo_path: str | Path,
+    base: str,
+    tip: str,
+    protected: Sequence[str],
+    timeout: int,
+) -> None:
+    """Refuse if *any* commit that would be published carries a protected path.
+
+    A final-tree check alone is not enough for retained history: a handoff file
+    added in one checkpoint and deleted before HEAD leaves a clean final tree
+    and a published commit that still contains it. Anyone reading that branch
+    can recover the file, so every tree in the range is inspected — that is the
+    difference between "the result is clean" and "nothing published is dirty".
+
+    Squash never reaches here with more than the one commit it creates, which
+    is why a contaminated *unpublished* checkpoint does not block a clean
+    squash: those commits are not published at all.
+    """
+    if not protected:
+        return
+    stdout = await git_out(
+        str(repo_path),
+        ["log", "--format=%H%x00%T", f"{base}..{tip}"],
+        timeout=timeout,
+        step="delivery-protected-range",
+    )
+    for line in stdout.splitlines():
+        commit, _sep, tree = line.strip().partition("\0")
+        if not commit or not tree:
+            continue
+        found = await protected_paths_in_tree(
+            str(repo_path), tree, protected, timeout
+        )
+        if found:
+            raise ProtectedPathError(found, commit=commit)
 
 
 async def _capture_tree(clone_path: str, timeout: int) -> str:
@@ -633,9 +781,10 @@ async def capture_candidate(
     """
     clone_path = task.clone_path
     timeout = config.spawn_step_timeout
+    protected = protected_destinations(task)
 
     await assert_clone_config_safe(clone_path, timeout)
-    await asyncio.to_thread(_ensure_excludes, clone_path)
+    await asyncio.to_thread(_ensure_excludes, clone_path, protected)
     if fetch:
         await run_git(
             safe_git(clone_path, "fetch", "origin"),
@@ -678,6 +827,13 @@ async def capture_candidate(
             "there is nothing to deliver: the task's content is identical to "
             f"its base ({base[:12]})."
         )
+    # Mode-neutral, and before anything is retained or reviewed: a proposed
+    # tree carrying a handoff input is refused whichever way it would be
+    # committed. The base tree is checked too — an upstream-tracked path at a
+    # protected destination would otherwise be published implicitly, without
+    # this task having done anything wrong.
+    await assert_tree_unprotected(clone_path, base_tree, protected, timeout)
+    await assert_tree_unprotected(clone_path, tree_id, protected, timeout)
 
     source_commits = await _capture_source_commits(clone_path, base, timeout)
     status = (
@@ -694,6 +850,7 @@ async def capture_candidate(
         base_commit=base,
         tree_id=tree_id,
         source_commits=source_commits,
+        protected=protected,
     )
     store = candidate_store_path(config, task.id, candidate_id)
     await _store_candidate_objects(
@@ -729,9 +886,12 @@ async def workspace_tree_id(config: Config, task: Task) -> str:
     """
     clone_path = task.clone_path
     timeout = config.spawn_step_timeout
+    protected = protected_destinations(task)
     await assert_clone_config_safe(clone_path, timeout)
-    await asyncio.to_thread(_ensure_excludes, clone_path)
-    return await _capture_tree(clone_path, timeout)
+    await asyncio.to_thread(_ensure_excludes, clone_path, protected)
+    tree_id = await _capture_tree(clone_path, timeout)
+    await assert_tree_unprotected(clone_path, tree_id, protected, timeout)
+    return tree_id
 
 
 async def candidate_identity(
@@ -747,8 +907,9 @@ async def candidate_identity(
     """
     clone_path = task.clone_path
     timeout = config.spawn_step_timeout
+    protected = protected_destinations(task)
     await assert_clone_config_safe(clone_path, timeout)
-    await asyncio.to_thread(_ensure_excludes, clone_path)
+    await asyncio.to_thread(_ensure_excludes, clone_path, protected)
     if fetch:
         await run_git(
             safe_git(clone_path, "fetch", "origin"),
@@ -782,12 +943,15 @@ async def candidate_identity(
             "there is nothing to deliver: the task's content is identical to "
             f"its base ({base[:12]})."
         )
+    await assert_tree_unprotected(clone_path, base_tree, protected, timeout)
+    await assert_tree_unprotected(clone_path, tree_id, protected, timeout)
     source_commits = await _capture_source_commits(clone_path, base, timeout)
     return compute_candidate_id(
         task_id=task.id,
         base_commit=base,
         tree_id=tree_id,
         source_commits=source_commits,
+        protected=protected,
     )
 
 

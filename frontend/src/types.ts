@@ -326,6 +326,45 @@ export interface TaskExecutionInputs {
   /** Historical inputs a legacy task could not recover. Empty for anything
    * accepted through the normal launch path. */
   unknown_inputs: string[];
+  /** Accepted result revisions installed before the first step ran
+   * (ADR-0035). Empty for an ordinary launch and for every task accepted
+   * before attachments existed. */
+  result_attachments: PinnedResultAttachment[];
+  /** The exact commit an attachment launch was built from. Null for an
+   * ordinary launch, and for a task written before version 4 — no observation
+   * was made then and none is invented. */
+  source_commit: string | null;
+  base_comparisons: PinnedBaseComparison[];
+  acknowledged_base_difference: boolean;
+}
+
+/** One bundle this task was launched with, exactly as accepted. The files are
+ * copied from the producer's manifest rather than referenced, so the task
+ * still says what it ran with after the producing revision becomes
+ * unreadable. */
+export interface PinnedResultAttachment {
+  result_id: string;
+  producer_task_id: number;
+  manifest_id: string;
+  content_id: string | null;
+  accepted_at: string;
+  manifest_project_name: string;
+  /** Always `handoff-input`. There is no declassification: a value this
+   * client does not recognize means the daemon refused to read the document,
+   * not that the paths became publishable. */
+  classification: string;
+  files: TaskResultFile[];
+  provenance: TaskResultProvenance | null;
+}
+
+export interface PinnedBaseComparison {
+  result_id: string;
+  state: "match" | "different" | "unknown";
+  target_commit: string;
+  producer_observation: string | null;
+  changed_paths: string[];
+  truncated: boolean;
+  detail: string | null;
 }
 
 export type TaskState = "created" | "failed" | "archived";
@@ -404,7 +443,17 @@ export interface TaskDetail extends Task {
   workshop_status: WorkshopStatus | null;
 }
 
-export type SpawnStepName = "fetch" | "clone" | "branch" | "workshop" | "agent" | "prompt";
+/** `inputs` appears only for a launch with pinned result attachments
+ * (ADR-0035): it installs the reviewed bytes after the branch exists and
+ * before the workshop starts, so nothing runs on partial inputs. */
+export type SpawnStepName =
+  | "fetch"
+  | "clone"
+  | "branch"
+  | "inputs"
+  | "workshop"
+  | "agent"
+  | "prompt";
 
 export interface SpawnStepPayload {
   task_id: number;
@@ -1195,6 +1244,10 @@ export interface TaskResult {
   accepted_by: string | null;
   purged_at: string | null;
   purged_by: string | null;
+  /** Tasks that pinned this exact revision as a launch input (ADR-0035), and
+   * therefore the reason a purge would be refused. Released only when such a
+   * consumer's own task record is explicitly purged. */
+  consumer_task_ids: number[];
 }
 
 /** One task's whole result document, versioned so a missed or duplicated

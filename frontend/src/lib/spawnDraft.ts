@@ -33,6 +33,16 @@ export interface DraftConsumerOverride {
 
 export type DraftConsumerOverrides = Record<string, DraftConsumerOverride>;
 
+/** One selected result revision, held by the exact identity the daemon
+ * requires. The manifest id is what makes this a revision rather than a
+ * pointer: a successor capture on the same producing task does not match it,
+ * so a stale selection is refused instead of quietly upgraded. */
+export interface DraftAttachment {
+  producer_task_id: number;
+  result_id: string;
+  expected_manifest_id: string;
+}
+
 export interface SpawnDraft {
   workflow: string;
   project: string;
@@ -49,6 +59,16 @@ export interface SpawnDraft {
   stepOverrides: DraftConsumerOverrides;
   /** Keyed by engine-reserved consumer name (today: `judge`). Also
    * workflow-scoped — its declared role comes from the workflow descriptor. */
+  /** Accepted result revisions to attach (ADR-0035). Project-scoped, not
+   * workflow-scoped: a bundle belongs to a project, and changing which
+   * workflow runs does not change which files were reviewed. Kept even when a
+   * selection has become incompatible, so it is visible with its reason
+   * instead of silently disappearing. */
+  attachments: DraftAttachment[];
+  /** The operator acknowledging an unvalidated base. Cleared whenever the
+   * selection changes, because an acknowledgement is about a specific set of
+   * files and a specific target. */
+  acknowledgeBaseDifference: boolean;
 }
 
 /** Drop rows that override nothing, so an opened-and-reset selector leaves
@@ -74,6 +94,8 @@ export const emptySpawnDraft: SpawnDraft = {
   prompt: "",
   overrides: {},
   stepOverrides: {},
+  attachments: [],
+  acknowledgeBaseDifference: false,
 };
 
 /** Restore the draft a Settings or Workflows round trip interrupted.
@@ -101,6 +123,13 @@ export function loadSpawnDraft(preselectedProject?: string): SpawnDraft {
         overrides: { ...(parsed.overrides ?? {}) },
         // A draft written before row overrides existed simply has none.
         stepOverrides: pruneConsumerOverrides(parsed.stepOverrides ?? {}),
+        // Likewise for a draft written before attachments existed. An
+        // acknowledgement is never restored without the selection it was
+        // about.
+        attachments: parsed.attachments ?? [],
+        acknowledgeBaseDifference:
+          (parsed.attachments ?? []).length > 0 &&
+          (parsed.acknowledgeBaseDifference ?? false),
       };
     }
   } catch {

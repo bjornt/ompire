@@ -114,7 +114,7 @@ never sees a task in a state the daemon is about to correct.
 
 | Condition | Result |
 |---|---|
-| Spawn never completed — restarted mid-spawn | `failed`, restart-related reason |
+| Spawn never completed — restarted mid-spawn | `failed`, restart-related reason — including one interrupted while installing handoff inputs |
 | Spawn completed, container gone | `failed`, reason names the missing container |
 | Spawn completed, no recorded session identity | **Not** failed — recovered instead |
 | Resume attempted, agent cannot be started | That session becomes `failed` with a resume-failure reason |
@@ -275,6 +275,31 @@ Integrity is checked at the read boundary rather than at startup: a revision
 whose bytes no longer match its manifest is classified unavailable when
 something tries to read it, keeping its acceptance and its history, and is never
 reconstructed from the workspace.
+
+### Handoff-input preparation
+
+The `inputs` step runs after the branch exists and before the workshop starts,
+so a restart during it lands in the "spawn never completed" row above: the task
+becomes `failed`, and no container, session, or workflow step ever ran on
+partial inputs
+([ADR-0035](../../adr/0035-refuse-to-publish-handoff-destinations.md)).
+
+Nothing is retried and nothing is rolled back. A partially prepared clone is
+left exactly as it was, inspectable, until ordinary cleanup removes it —
+deleting on the way out could remove work that was already there, and a replay
+journal would be a second source of truth about a workspace nobody has looked
+at. The operator cleans the task up and starts another with a new slug, which
+gets a fresh preview against the base as it now stands.
+
+Recovery of a task whose spawn **did** complete never installs again. Those
+files are the agent's working copies by then, possibly edited or deleted on
+purpose, and re-materializing over them would overwrite work under the guise of
+recovery. The retained revision and every other consumer are unaffected either
+way.
+
+The task's references to the revisions it pinned are durable and need no
+recovery: they were written in the same transaction as the task row, so a task
+that exists holds its references and a task that was never created holds none.
 
 ### Legacy parked clones
 

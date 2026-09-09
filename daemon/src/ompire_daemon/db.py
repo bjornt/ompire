@@ -612,6 +612,34 @@ task_result_files = Table(
     Column("content", LargeBinary, nullable=False),
 )
 
+# Which consumer task pinned which retained revision (ADR-0035).
+#
+# The immutable execution-inputs document remains the execution contract; this
+# is the *index* over it, so "may these bytes be purged?" and "who is holding
+# them?" are answerable without decoding every launch document in the database.
+# Rows are inserted in the same reservation that creates the consumer task, and
+# removed only when that consumer's own record is explicitly purged — a failed,
+# completed, or archived consumer keeps its inputs, so it keeps its references.
+#
+# No foreign-key cascade is assumed: connections do not enable foreign-key
+# enforcement, so both deletions are written explicitly.
+task_result_references = Table(
+    "task_result_references",
+    metadata,
+    Column(
+        "consumer_task_id", Integer, ForeignKey("tasks.id"), primary_key=True
+    ),
+    Column(
+        "result_id", String, ForeignKey("task_results.id"), primary_key=True
+    ),
+    # Denormalized from the result row so a purge refusal can name the
+    # producing task without joining through bytes that may be gone.
+    Column("producer_task_id", Integer, nullable=False),
+    Column("manifest_id", String, nullable=False),
+    Column("created_at", String, nullable=False),
+    Index("ix_task_result_references_result", "result_id"),
+)
+
 # ADR-0013: UI-editable overrides are persisted as JSON-encoded scalar
 # values and layered over operator-owned config.toml.
 settings = Table(

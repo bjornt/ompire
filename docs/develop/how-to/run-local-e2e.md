@@ -243,6 +243,52 @@ Interruptions worth including: a daemon restart with the panel open, a second
 tab accepting the revision this one is showing, and a capture attempted while a
 review holds the workspace.
 
+### Verify a result handoff
+
+The journey this exists to prove: a plan written by one task is read by another,
+and cannot be published by it.
+
+Against a producer task that has captured and accepted planning files (the
+`durable-results` pass above leaves one):
+
+1. On the accepted revision, select **Start task from this result**. Spawn must
+   open with that revision attached and the project selected, and with nothing
+   started. Confirm the destinations are listed and labelled **Handoff input —
+   not publishable**.
+2. Read the base comparison. Against an unmoved checkout it says *match* and
+   asks for no acknowledgement. Move the base branch on and re-open the form:
+   it must switch to *different*, list what changed, and refuse submission
+   until the acknowledgement is ticked.
+3. Submit. Watch the pipeline: `inputs` appears between `branch` and
+   `workshop`, and only for this launch.
+4. On the new task, open **Handoff inputs**. Compare the listed checksums with
+   the producer's accepted manifest, and compare the bytes on disk in the new
+   clone with the retained bytes. They must be identical.
+5. Confirm the agent can read the file at the previewed path, and that its
+   prompt context names the path and says it is untrusted and non-publishable.
+6. Clean up the **producer**. The consumer keeps working, and its Handoff inputs
+   panel still says exactly what it ran with.
+7. Try to purge the producer's revision. It must be refused, naming the consumer
+   task, with nothing deleted — the files are still readable afterwards.
+8. Have the consumer produce ordinary code and ship it. A squash delivery must
+   succeed while the handoff files sit untracked in the clone.
+9. Now commit a handoff file in the consumer's clone by hand and review again.
+   Review must refuse before llmvet starts, naming the path. For a retain
+   delivery, add the file in one checkpoint and delete it in the next: the final
+   tree is clean, and the delivery must still be blocked naming the offending
+   commit. Confirm Ompire deleted nothing and rewrote nothing.
+10. Purge the consumer's task record, then purge the producer's revision. Only
+    now does it succeed.
+
+Interruptions worth including: killing the daemon during `inputs` (the task must
+be `failed`, with no container, and must not be retried), moving the base branch
+between preview and submit (a visible spawn failure, never a silent repin), and
+a destination already occupied in the clone.
+
+Use the existing `durable-results`, `ship-retain`, and `ship-failures` scenarios
+for the non-browser evidence around this; never use the real developer checkout
+as a target.
+
 ### When there is no browser
 
 Say which property you could not verify in the browser, report the non-browser

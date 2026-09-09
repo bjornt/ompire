@@ -26,7 +26,9 @@ import type {
   ShipProjection,
   Task,
   TaskResultDiff,
+  TaskResultFile,
   TaskResultFileContent,
+  TaskResultProvenance,
   TaskResultLimits,
   TaskResultsProjection,
   TaskDetail,
@@ -191,6 +193,23 @@ export interface LaunchInput {
   workspace_overrides?: WorkspaceOverridesInput;
   step_overrides?: Record<string, ConsumerOverrideInput>;
   auxiliary_overrides?: Record<string, ConsumerOverrideInput>;
+  /** Accepted result revisions to install before the first step runs
+   * (ADR-0035). Destinations are the manifest's own paths — the request never
+   * chooses where retained bytes land. */
+  result_attachments?: ResultAttachmentInput[];
+  /** The operator acknowledging that a plan captured against a different or
+   * unknown base has not been validated against this target. Bound by the
+   * preview token to this exact selection and target commit. */
+  acknowledge_result_base_difference?: boolean;
+}
+
+/** One selected revision. All three fields together: the manifest id is what
+ * refuses a stale selection once a successor capture has landed, and the
+ * producing task is what a refusal can name. */
+export interface ResultAttachmentInput {
+  producer_task_id: number;
+  result_id: string;
+  expected_manifest_id: string;
 }
 
 /** One row of the launch preview. A command, decision, or gate carries no
@@ -249,6 +268,52 @@ export interface LaunchPreview {
   workspace_overrides: string[];
   branch: string;
   steps: LaunchPreviewStep[];
+  /** The exact commit this launch resolved against. Null for a launch with no
+   * attachments, which pins a branch exactly as before. */
+  source_commit: string | null;
+  /** True while an unvalidated base still needs the operator's explicit
+   * acknowledgement. False both when nothing needs one and once it is given. */
+  needs_base_acknowledgement: boolean;
+  acknowledged_base_difference: boolean;
+  result_attachments: LaunchAttachment[];
+  base_comparisons: BaseComparison[];
+}
+
+/** One pinned bundle, as the preview and the accepted task both describe it. */
+export interface LaunchAttachment {
+  result_id: string;
+  producer_task_id: number;
+  manifest_id: string;
+  content_id: string | null;
+  accepted_at: string;
+  /** The project label the producer's manifest recorded. Provenance only —
+   * membership is decided through current task and project records, so a
+   * rename is not mistaken for a cross-project transfer. */
+  manifest_project_name: string;
+  /** Always `handoff-input`, and always non-publishable. Rendered as a label,
+   * never as a control: there is no declassification. */
+  classification: string;
+  publishable: false;
+  files: TaskResultFile[];
+  destinations: string[];
+  provenance: TaskResultProvenance | null;
+}
+
+/** How one attachment's recorded base observation relates to the commit this
+ * task is actually built from. Per attachment, because two bundles can have
+ * been captured against different bases and one must not vouch for the
+ * other. */
+export interface BaseComparison {
+  result_id: string;
+  state: "match" | "different" | "unknown";
+  target_commit: string;
+  /** The producer's `capture_merge_base` — what Git said when its files were
+   * captured, deliberately not the commit the producing task was launched
+   * from. */
+  producer_observation: string | null;
+  changed_paths: string[];
+  truncated: boolean;
+  detail: string | null;
 }
 
 /** Resolve the operator's selections without creating anything. Same rules,

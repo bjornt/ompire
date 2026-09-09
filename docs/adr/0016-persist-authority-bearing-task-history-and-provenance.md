@@ -116,6 +116,26 @@ or session-material retention. Full checkpoint-to-mainline commit lineage and
 transcript retention remain undone, which is why this record is still
 `Proposed`.
 
+## Progress: an artifact now links to the task that consumed it
+
+[ADR-0035](0035-refuse-to-publish-handoff-destinations.md), 2026-09-09. This
+record stays **Proposed**; a fourth narrow slice of it is delivered.
+
+A retained bundle can be pinned as an input to a later task. That linkage is
+durable in both directions: the consumer's immutable launch document records the
+exact revision, its manifest identity, its files and their checksums, the
+producer's recorded provenance, and the exact commit the consumer was built
+from; and a reference index records which consumers hold which revisions, so a
+purge is refused while any consumer exists and names it. The link survives
+daemon restart, producer cleanup, and consumer failure or archival, and is
+released only by an explicit purge of the consumer's own task record.
+
+The linkage is artifact-to-consumer only. It is not the commit lineage this
+record describes: nothing here traces an artifact to the commits produced from
+it, and a consumer's own output is related to its inputs by the operator reading
+both, not by a recorded derivation. Transcript and session-material retention
+remain undone. Both are why this record is still `Proposed`.
+
 ## Consequences
 
 Recovery becomes evidence-driven. Completed step attempts and privileged effects are not replayed merely because their in-memory manager disappeared. An interrupted operation can be reconciled against a durable intent and external identifier, while an ambiguous operation stops visibly. This reduces duplicate commits, pushes, comments, and pull requests and makes crash behavior independent of whether a browser observed the original events.

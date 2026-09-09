@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -266,11 +267,27 @@ async def _paths_on_branch(
 
 
 async def validate_mentions(
-    prompt: str, *, checkout_path: str, base_branch: str, timeout: int
+    prompt: str,
+    *,
+    checkout_path: str,
+    base_branch: str,
+    timeout: int,
+    extra_paths: Sequence[str] = (),
 ) -> list[MentionRejection]:
     """Every reason this prompt's mentions cannot become file context.
 
     An empty list means every mention will resolve inside the task's clone.
+
+    `extra_paths` are repository-relative files the clone will hold that the
+    base branch does not: an accepted result's attached destinations, which the
+    spawn pipeline installs before the agent runs (ADR-0035). They widen only
+    the branch-membership question — an attached path still has to be a real,
+    confined, non-traversing mention like any other, and a token that resolves
+    to neither the base nor an attachment keeps its existing refusal.
+
+    A mention naming an attachment is checked against the *pinned* destination
+    list, never against whatever happens to be in a checkout: the file does not
+    exist anywhere yet at this point in the launch.
     """
     tokens = mention_tokens(prompt)
     if not tokens:
@@ -280,25 +297,45 @@ async def validate_mentions(
         raise CheckoutMissingError(checkout_path)
     root = root.resolve()
 
+    attached = set(extra_paths)
     rejections: list[MentionRejection] = []
     resolved: dict[str, str] = {}  # token -> repo-relative path
     for token in tokens:
         path, reason = resolve_mention(root, token)
-        if path is None:
-            rejections.append(MentionRejection(token, reason))
-        else:
+        if path is not None:
             resolved[token] = path
+            continue
+        # An attached destination does not exist in the checkout, so the
+        # filesystem check above cannot see it. Only a `missing` verdict is
+        # reconsidered: traversal, absolute and outside-checkout tokens stay
+        # refused whatever they name.
+        candidate = _attached_candidate(token, attached)
+        if reason == "missing" and candidate is not None:
+            resolved[token] = candidate
+        else:
+            rejections.append(MentionRejection(token, reason))
     if not resolved:
         return rejections
 
-    on_branch = await _paths_on_branch(
-        checkout_path, base_branch, sorted(set(resolved.values())), timeout
-    )
+    from_base = sorted({path for path in resolved.values() if path not in attached})
+    on_branch = await _paths_on_branch(checkout_path, base_branch, from_base, timeout)
     if on_branch is not None:
         for token, path in resolved.items():
-            if path not in on_branch:
+            if path not in attached and path not in on_branch:
                 rejections.append(MentionRejection(token, "not_on_base_branch"))
     return rejections
+
+
+def _attached_candidate(token: str, attached: set[str]) -> str | None:
+    """The attached destination this token names, trying the same candidate
+    forms `resolve_mention` does so trailing prose punctuation behaves
+    identically for attachments and for checkout files."""
+    for candidate in _candidates(token):
+        if candidate.startswith("/") or ".." in Path(candidate).parts:
+            return None
+        if candidate in attached:
+            return candidate
+    return None
 
 
 def unresolved_mentions(prompt: str, root_path: str) -> list[str]:

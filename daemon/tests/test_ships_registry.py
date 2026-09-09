@@ -490,8 +490,10 @@ def test_purge_deletes_the_journal_and_names_the_storage_to_remove(
     # Archival alone keeps the evidence.
     assert list_deliveries(engine, task.id)
 
-    paths = purge_task(engine, task.id)
+    paths, released = purge_task(engine, task.id)
     assert paths == ["/tmp/ompire-candidate.git"]
+    # This task pinned no result revisions, so it releases none.
+    assert released == []
     assert list_deliveries(engine, task.id) == []
     assert get_candidate(engine, "cand-1") is None
 

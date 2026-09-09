@@ -12,6 +12,11 @@ Extended by [ADR-0031](0031-let-operators-own-a-workflow-library-above-retained-
 which makes the prospective name lookup below a transactional read of an
 editable library rather than of a fixed packaged catalog.
 
+Extended by [ADR-0035](0035-refuse-to-publish-handoff-destinations.md), which
+adds pinned result attachments and — for a launch that has them — an exact
+pinned source commit, so a reviewed resolution names immutable bytes and an
+immutable base rather than a branch and a producing task.
+
 ## Context
 
 Starting a task used to require a template: a saved, mutable preset naming a

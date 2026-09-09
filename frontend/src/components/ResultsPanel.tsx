@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
   acceptTaskResult,
   captureTaskResult,
@@ -345,15 +346,18 @@ function DiffView({ taskId, result }: { taskId: number; result: TaskResult }) {
 
 function RevisionActions({
   taskId,
+  projectName,
   result,
   version,
   onUpdated,
 }: {
   taskId: number;
+  projectName: string;
   result: TaskResult;
   version: number;
   onUpdated: (projection: TaskResultsProjection) => void;
 }) {
+  const navigate = useNavigate();
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const locked = useRef(false);
@@ -403,6 +407,35 @@ function RevisionActions({
           {error}
         </div>
       )}
+      {result.available && result.accepted_at !== null && manifestId !== null && (
+        <>
+          <button
+            type="button"
+            className="resultsAction"
+            disabled={pending !== null}
+            onClick={() =>
+              navigate("/spawn", {
+                state: {
+                  project: projectName,
+                  attachment: {
+                    producer_task_id: result.task_id,
+                    result_id: result.id,
+                    expected_manifest_id: manifestId,
+                  },
+                },
+              })
+            }
+            data-testid="results-start-task"
+          >
+            Start task from this result
+          </button>
+          <p className="resultsHint" data-testid="results-start-task-scope">
+            Opens the ordinary launch form with exactly this revision attached.
+            Nothing starts until you review and submit it there. The files are
+            installed as handoff inputs and are never published.
+          </p>
+        </>
+      )}
       {result.available && result.accepted_at === null && manifestId !== null && (
         <>
           <button
@@ -446,11 +479,20 @@ function RevisionActions({
           </button>
         </div>
       )}
+      {result.consumer_task_ids.length > 0 && (
+        <p className="resultsHint" data-testid="results-consumers">
+          {result.consumer_task_ids.length === 1
+            ? `Pinned as a launch input by task ${result.consumer_task_ids[0]}. These files cannot be purged while that task's record exists — purge the task itself first.`
+            : `Pinned as a launch input by tasks ${result.consumer_task_ids.join(", ")}. These files cannot be purged while those tasks' records exist — purge the tasks themselves first.`}{" "}
+          Cleaning a consumer up or archiving it releases nothing: its record
+          still says it ran with these files.
+        </p>
+      )}
       {result.state !== "purged" && result.state !== "capturing" && manifestId !== null && (
         <button
           type="button"
           className="resultsAction danger"
-          disabled={pending !== null}
+          disabled={pending !== null || result.consumer_task_ids.length > 0}
           onClick={purge}
           data-testid="results-purge"
         >
@@ -463,11 +505,13 @@ function RevisionActions({
 
 function Revision({
   taskId,
+  projectName,
   result,
   version,
   onUpdated,
 }: {
   taskId: number;
+  projectName: string;
   result: TaskResult;
   version: number;
   onUpdated: (projection: TaskResultsProjection) => void;
@@ -515,6 +559,7 @@ function Revision({
       <DiffView taskId={taskId} result={result} />
       <RevisionActions
         taskId={taskId}
+        projectName={projectName}
         result={result}
         version={version}
         onUpdated={onUpdated}
@@ -611,6 +656,7 @@ export function ResultsPanel({
             <Revision
               key={active.id}
               taskId={task.id}
+              projectName={task.project_name}
               result={active}
               version={version}
               onUpdated={onProjection}

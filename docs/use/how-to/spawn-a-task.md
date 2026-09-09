@@ -6,14 +6,15 @@ workflow.
 
 ## What spawning does
 
-Spawn runs four steps in order. Each publishes progress, and a failure leaves
+Spawn runs these steps in order. Each publishes progress, and a failure leaves
 the task in `failed` with the step name and its stderr attached.
 
 | Step | Action |
 |---|---|
 | `fetch` | `git fetch` the project's [fetch remote](../reference/projects.md#fetch-remote) in its checkout, so the clone starts from current refs |
 | `clone` | Local clone of the checkout into `task_dir_root/<project>/<slug>` |
-| `branch` | Branch off `origin/<base>` using the accepted branch pattern |
+| `branch` | Branch off `origin/<base>` using the accepted branch pattern — or off the reviewed commit, for a launch with handoff inputs |
+| `inputs` | Install the accepted [handoff inputs](../reference/task-spawn.md#handoff-inputs). Runs only for a launch that has them |
 | `workshop` | Launch the task's container and confirm it registered |
 
 The clone is a local clone of your checkout, not a Git worktree. It has its
@@ -102,6 +103,46 @@ sent.
 If you have no profiles yet, the form says so and links to Settings. Your draft
 is kept while you go and create one.
 
+### Start a task from an accepted result
+
+When an earlier task produced a plan you accepted — an epic, a change proposal,
+a piece of research — open its Results panel and select **Start task from this
+result** on the revision you want. Spawn opens with that exact revision
+attached and its project selected. Nothing has started yet: choose the
+workflow, model profile, slug, and prompt as usual, then submit.
+
+The **Handoff inputs** section lists the accepted revisions this project can
+offer, so you can add another or remove the one you arrived with. Each one
+shows the paths it will install, labelled **Handoff input — not publishable**.
+Ompire copies those files into the new task's own clone before the agent
+starts, and the agent reads them there — the producing task's workspace does
+not have to still exist, and its container and sessions are not involved at
+all.
+
+If the files were captured against a different base than the one this task will
+be built from, Ompire says so and lists what changed since, and you have to
+tick the acknowledgement before submitting. That is a statement that the plan
+has not been validated against this target, not a formality: a plan written
+against a tree that has moved may no longer describe the code.
+
+If a destination is not free — already tracked on the base, occupied by a
+directory, or claimed by another attachment — the launch is refused and names
+the path. Nothing is overwritten or merged. Remove that attachment, choose a
+different accepted bundle, or pick another base, and review again.
+
+An incompatible selection stays visible with its reason rather than
+disappearing, so you always submit the set you can see.
+
+When you later ship the code this task produced, the handoff files cannot ride
+along: Ompire refuses a delivery whose Git result carries one, and says which
+path is in the way. See [Ship flow](../reference/ship-flow.md#handoff-inputs).
+
+If the `inputs` step fails — a path turned out to be occupied, or the base moved
+under the launch — the task fails before any agent runs, and the failure names
+what stopped it. The clone is left as it is so you can look at it. Clean the
+task up, then use **Start another task** with a new slug: you get a fresh
+preview against the base as it now stands.
+
 ### Attach a file to the prompt
 
 Type `@` in the prompt to search the project's repository, then pick a path
@@ -118,6 +159,10 @@ created and the message says why. The usual reason is a file that is not on the
 effective base branch: the task's clone is made from that branch, so a file you
 only just created locally would not be there. Commit it to the base branch, or
 drop the mention, and submit again — nothing you typed is lost.
+
+You can also mention a path from an attached handoff input. Those files are not
+on the base branch, but Ompire installs them into the clone before the agent
+runs, so "implement @epics/demo/PLAN.md" resolves.
 
 Submitting locks the form until the launch resolves, so a second click
 cannot create a second task. Pipeline progress is shown per step, and a failed
@@ -179,6 +224,33 @@ entry takes `model_profile`, `role`, or both; what you leave out is inherited:
 Send the same map to the preview and to acceptance. An unknown step, a step
 with no model, an invalid role, or a profile that does not exist is refused
 with the offending field named, and creates nothing.
+
+`result_attachments` pins accepted result revisions as
+[handoff inputs](../reference/task-spawn.md#handoff-inputs). Each entry names
+all three of the producing task, the revision, and the manifest identity the
+operator accepted — the manifest id is what makes it an exact revision rather
+than a pointer that a successor capture could move:
+
+```json
+{
+  "result_attachments": [
+    {
+      "producer_task_id": 12,
+      "result_id": "res_1f0c…",
+      "expected_manifest_id": "9a3e…"
+    }
+  ],
+  "acknowledge_result_base_difference": false
+}
+```
+
+Destinations come from the revision's own manifest; the request cannot choose
+where files land. Send `acknowledge_result_base_difference: true` when the
+preview reports a `different` or `unknown` base comparison — without it the
+launch is refused. The preview echoes `source_commit` (the exact commit the
+clone will be built from), `result_attachments` with their destinations, and
+`base_comparisons`; the preview token covers all of it, so a changed selection,
+a moved base, or a replaced revision invalidates the review.
 
 `auxiliary_overrides` is retired along with the engine's judge. A request that
 still names it is refused with a field-level `422` rather than having the

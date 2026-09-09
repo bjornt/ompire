@@ -51,6 +51,27 @@ cannot land between the check and the pin. An archived, draft-only, or
 unreadable entry is a `workflow_name` refusal rather than a fallback to any
 other revision.
 
+A launch with [handoff inputs](../../use/reference/task-spawn.md#handoff-inputs)
+does its Git reading in the same "slow work first" position as file mentions:
+the target commit is resolved, its tree inspected for the attached
+destinations, and each attachment's recorded base compared against it, all
+outside every lock. That bounded observation is passed *into* both resolutions,
+so the preview the operator read and the acceptance that recomputes it are
+decided against the same immutable commit. Resolution itself stays pure with
+respect to the world — it runs no Git and touches no filesystem, which is what
+lets it run inside the reservation
+([ADR-0035](../../adr/0035-refuse-to-publish-handoff-destinations.md)).
+
+The token covers that commit, each attachment's manifest identity and
+destinations, and the base acknowledgement, so a moved base, a replaced
+revision, or a changed selection invalidates a review. Every revision's state,
+acceptance and payload checksums are then re-checked on the reserved
+connection, through helpers that open no second connection — a refusal must
+never nest a reservation — and the task, its pinned inputs, and its result
+references are inserted together. SQLite cannot freeze a Git ref, so the
+pipeline verifies the cloned base still resolves to the reviewed commit and
+fails the spawn if it does not; it never repins the task.
+
 Acceptance then resolves twice. The first resolution validates and is what the
 Git and file-mention work runs against; the authoritative one is taken again
 inside a `BEGIN IMMEDIATE` reservation, compared against the same token, and

@@ -149,3 +149,4 @@ nav:
           - 0032 Content-bound trusted delivery: adr/0032-bind-trusted-delivery-to-retained-candidates.md
           - 0033 Workflow-scoped delivery authority: adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md
           - 0034 Durable task results: adr/0034-retain-durable-task-results-outside-the-workspace.md
+          - 0035 Non-publishable handoff destinations: adr/0035-refuse-to-publish-handoff-destinations.md

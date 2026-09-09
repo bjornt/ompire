@@ -50,6 +50,26 @@ A session whose process is being replaced to apply a different policy reads as
 verified. Transitioning is never shown as a successfully applied new policy,
 and it is not a failure: the conversation is resumed, not restarted.
 
+### Handoff inputs panel
+
+Present only for a task launched with
+[handoff inputs](task-spawn.md#handoff-inputs). It names the exact commit the
+task was built from and, per pinned revision, the producing task, the
+acceptance timestamp, and every installed file with its length and checksum.
+Every entry is labelled **Handoff input — not publishable**. If the operator
+acknowledged an unvalidated base, the panel says so, and each attachment states
+how its own recorded base compared with this task's.
+
+These are the task's stored inputs, read from its accepted launch document. The
+panel keeps saying what the task ran with after the producing task is cleaned
+up, after its revision is purged, and after the agent edited or deleted its own
+working copies — none of which changes a retained revision or any other task
+that pinned it.
+
+The publication restriction is stated here because it is what matters when this
+task's code is later shipped: Review and Ship refuse a delivery whose Git result
+carries one of these paths. See [Ship flow](ship-flow.md#handoff-inputs).
+
 A task created before launch inputs were recorded shows a **Configuration
 needed** form instead: what is known, what is unknown and unrecoverable, and
 the fields to confirm for future behavior. Confirming requires an explicit
@@ -212,6 +232,18 @@ successful acceptance changes nothing. Capturing or accepting a later revision
 leaves every earlier revision and decision untouched; there is no floating
 "latest accepted".
 
+#### Starting a task from a revision
+
+**Start task from this result**, on an accepted, readable revision, opens the
+[Spawn form](task-spawn.md#handoff-inputs) with exactly that revision attached
+and this project selected. It starts nothing: the operator chooses the
+workflow, model profile, slug, and prompt, reviews the attachment and its base
+comparison, and submits.
+
+The action is offered only on an accepted revision. A complete revision nobody
+accepted is a downloadable result, not an input another task may be launched
+with.
+
 #### Downloading
 
 Any complete revision can be downloaded before or after acceptance, as a single
@@ -233,6 +265,13 @@ confirms first, naming the revision, whether it was accepted, and the files and
 bytes being removed. Purge is never part of cleanup. A purged revision stays
 visible as a record — its identity, manifest, provenance, acceptance and purge
 decision — with no readable or downloadable files.
+
+A revision that a task was launched with cannot be purged. The panel names the
+tasks holding it and the control is unavailable, because those tasks' records
+say they ran with these files and an operator reading such a record has to be
+able to read them. Cleaning up, failing, or archiving a consumer releases
+nothing; purging that task's record is the only release, and it is refused by
+the ordinary task-purge rules until the task is archived.
 
 Purge is logical removal. It makes no promise about database free space,
 backups, or copies already downloaded, and the database file need not shrink.

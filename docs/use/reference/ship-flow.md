@@ -103,12 +103,49 @@ content, the target, and the identities the authorization is about.
 | `signing-unavailable` | The signing key is not ready; the message names the specific state. |
 | `github-unavailable` | GitHub identity or repository eligibility blocks a pushing ending. A local ending is unaffected. |
 | `retain-dirty` / `retain-empty` / `retain-merges` | Retain publishes existing commits; this range cannot be retained as it stands. |
+| `retain-protected-paths` | A commit this delivery would publish carries a [handoff input](#handoff-inputs). Names the paths and the commit. |
+| `retain-protected-unreadable` | Ompire could not check every commit for handoff inputs, so it will not publish them. |
 | `workspace-busy` | A review, draft, or delivery already owns the task workspace. |
 | `unresolved-effect` | A previous privileged action's outcome is unknown; nothing dependent may run. |
 | `already-delivered` | This ending's actions have all completed. |
 | `archived` | The task is archived. |
 | `predecessor-missing` | An action was asked for before the one it consumes completed. No action performs a missing predecessor. |
 | `action-mismatch` / `not-at-action` | The action requested is not the one the run is at. |
+
+### Handoff inputs
+
+A task launched with [handoff inputs](task-spawn.md#handoff-inputs) may never
+publish those files. The protected set is exactly that task's attached
+destinations, read from its own accepted launch document — not a naming
+convention, and not an ignore file the agent can edit. A task without handoff
+inputs has an empty set and is completely unaffected.
+
+Ordinary code ships normally while those files sit untracked and excluded in
+the clone. What is refused is a *Git result* that carries one:
+
+| When | What happens |
+|---|---|
+| The proposed tree contains a handoff destination | Capture refuses, so review will not start and no mode can deliver |
+| Retain mode, and any commit in the published range contains one | The delivery is blocked with `retain-protected-paths`, naming the commit |
+| Squash mode, with a clean final tree | Delivers normally, even if unpublished agent checkpoints carried one — those commits are not published |
+| The merge-base itself tracks the path | Capture refuses rather than publishing an upstream-tracked handoff implicitly |
+| A handoff file was replaced by a directory | Refused through its descendants; protection covers the path's namespace |
+
+The check runs again at every trusted admission — before signing, before the
+push, and before the pull request — against the objects that exist at that
+moment. A continuation, a restart reconciliation, or a direct service call
+inherits no earlier answer.
+
+**Ompire never deletes a file or rewrites history to clear this.** The refusal
+names the paths and, for retained history, the offending commit. Removing them
+from what is published is yours to do, and afterwards the content has changed,
+so a fresh review and a new delivery approval are required.
+
+There is no override, force, or declassification. Deleting a working copy,
+editing ignore rules, or accepting another result does not lift the
+restriction. It is a destination-path contract, so it also does not catch text
+deliberately copied or renamed into unrelated source files — ordinary code
+review still has to.
 
 ### Credentials by ending
 

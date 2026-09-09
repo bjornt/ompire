@@ -10,6 +10,11 @@ of [ADR-0016](0016-persist-authority-bearing-task-history-and-provenance.md).
 Preserves [ADR-0026](0026-resolve-launch-inputs-once-and-pin-them-to-the-task.md)'s
 accepted-input boundary.
 
+Constrained by [ADR-0035](0035-refuse-to-publish-handoff-destinations.md): a
+task with pinned handoff inputs binds those protected destinations into its
+candidate identity, and candidate capture refuses a proposed tree that carries
+one. Candidates for tasks without such inputs are unchanged.
+
 Its policy that an operator may extend a completed delivery to a further ending
 is superseded, for workflow format 3, by
 [ADR-0033](0033-scope-trusted-delivery-authority-to-the-workflow-run.md): a run

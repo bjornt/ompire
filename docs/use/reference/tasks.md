@@ -52,11 +52,22 @@ never recomputed (ADR-0026). It carries:
 | `branch` | The rendered branch name |
 | `checkout_path`, `fetch_remote`, `upstream_url`, `fork_url` | The project-derived checkout and publishing routing this task uses |
 | `unknown_inputs` | Historical inputs a legacy task could not recover; empty for a normally accepted task |
+| `result_attachments` | The accepted result revisions installed as [handoff inputs](task-spawn.md#handoff-inputs) before the first step ran: each one's revision and manifest identity, its acceptance, its files with checksums, the producer's recorded provenance, and its fixed `handoff-input` classification. Empty for an ordinary launch. |
+| `source_commit` | The exact commit an attachment launch was built from. `null` for a launch with no attachments, and for every task accepted before attachments existed — no observation was made then, and none is invented. |
+| `base_comparisons` | Per attachment: how its recorded capture-time base compared with `source_commit` |
+| `acknowledged_base_difference` | Whether the operator acknowledged that the attached files were not validated against this base |
 
 The profile name is provenance, not a live reference. Editing the profile,
 renaming the project, or deleting a profile nothing references does not change
 this document — or what the task runs. No credential material is copied here;
 signing keys and forge credentials are read live at the moment they are used.
+
+The same is true of the attachments. Their file lists are copied from the
+producer's manifest rather than referenced, so this document keeps saying what
+the task ran with after the producing revision becomes unreadable. The
+destinations it records are also this task's *protected paths*: the set Review
+and Ship refuse to publish
+([ADR-0035](../../adr/0035-refuse-to-publish-handoff-destinations.md)).
 
 ### Tasks without recorded launch inputs
 
@@ -145,6 +156,13 @@ result revisions are not
 
 Purge is separate and deletes an archived task's registry row. Purging a task
 that is not archived is refused with `409`.
+
+Purging a task is also the only thing that releases the result revisions it was
+launched with. Those references survive the task failing, being cleaned up, and
+being archived — its record still says what it ran with — so a producer's
+revision cannot be purged until every consumer's record is purged. The
+release happens in the transaction that deletes the task, after every purge
+refusal below has passed, so a refused purge releases nothing.
 
 Purge also refuses while the task still owns any complete result revision or an
 in-flight capture, naming the revisions to purge first. That refusal is decided

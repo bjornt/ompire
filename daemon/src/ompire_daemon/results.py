@@ -43,6 +43,7 @@ import os
 import stat
 import time
 import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -83,6 +84,7 @@ from ompire_daemon.registry.results import (
     TaskResult,
     accept_result,
     build_manifest,
+    consumers_by_result,
     fail_capture,
     finish_capture,
     get_result,
@@ -593,10 +595,14 @@ class ResultManager:
         operator actually selected.
         """
         results = list_results(self._engine, task_id)
+        consumers = consumers_by_result(self._engine)
         return {
             "task_id": task_id,
             "version": results_version(self._engine, task_id),
-            "results": [self.result_payload(result) for result in results],
+            "results": [
+                self.result_payload(result, consumers=consumers)
+                for result in results
+            ],
         }
 
     def snapshot(self) -> dict[int, dict[str, Any]]:
@@ -604,6 +610,7 @@ class ResultManager:
         rather than carrying an empty document around the fleet."""
         grouped = list_tasks_with_results(self._engine)
         versions = {task.id: task for task in list_tasks(self._engine)}
+        consumers = consumers_by_result(self._engine)
         payload: dict[int, dict[str, Any]] = {}
         for task_id, results in grouped.items():
             if task_id not in versions:
@@ -611,7 +618,10 @@ class ResultManager:
             payload[task_id] = {
                 "task_id": task_id,
                 "version": results_version(self._engine, task_id),
-                "results": [self.result_payload(result) for result in results],
+                "results": [
+                    self.result_payload(result, consumers=consumers)
+                    for result in results
+                ],
             }
         return payload
 
@@ -624,9 +634,20 @@ class ResultManager:
         self._hub.publish("task_results_updated", projection)
         return projection
 
-    def result_payload(self, result: TaskResult) -> dict[str, Any]:
+    def result_payload(
+        self,
+        result: TaskResult,
+        *,
+        consumers: Mapping[str, list[int]] | None = None,
+    ) -> dict[str, Any]:
         """The wire shape of one revision, shared by REST and the projection so
-        a client cannot see two different shapes for the same row."""
+        a client cannot see two different shapes for the same row.
+
+        `consumer_task_ids` is the reverse dependency (ADR-0035): the tasks
+        that pinned this exact revision as an input, and therefore the reason a
+        purge would be refused. Passed in rather than queried per row so a
+        fleet projection stays one query.
+        """
         try:
             files = [
                 {
@@ -666,6 +687,10 @@ class ResultManager:
             "accepted_by": result.accepted_by,
             "purged_at": result.purged_at,
             "purged_by": result.purged_by,
+            "consumer_task_ids": list(
+                (consumers if consumers is not None else consumers_by_result(self._engine))
+                .get(result.id, ())
+            ),
         }
 
     # -- capture --

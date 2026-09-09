@@ -3,6 +3,11 @@
 - Status: Accepted
 - Date: 2026-09-08
 
+Constrained by [ADR-0035](0035-refuse-to-publish-handoff-destinations.md): an
+authorized effect is still refused when the Git result it would publish carries
+a handoff destination. Authority decides *whether* an effect may run; that
+record decides what may be in it.
+
 Extends [ADR-0028](0028-retain-declarative-workflow-revisions.md) and
 [ADR-0029](0029-declare-domain-outcomes-and-evidence-handoffs.md) with workflow
 format 3, preserving format-1 and format-2 canonical semantics unchanged.

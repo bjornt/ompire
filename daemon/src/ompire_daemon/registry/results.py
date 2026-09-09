@@ -33,7 +33,12 @@ from typing import Any
 
 from sqlalchemy import Connection, Engine, func, select
 
-from ompire_daemon.db import task_result_files, task_results, tasks
+from ompire_daemon.db import (
+    task_result_files,
+    task_result_references,
+    task_results,
+    tasks,
+)
 from ompire_daemon.registry.model_profiles import reserved_write
 
 # --- The fixed bounds -------------------------------------------------------
@@ -186,6 +191,42 @@ class ResultsRetainedError(Exception):
         )
         self.task_id = task_id
         self.result_ids = result_ids
+
+
+class ResultReferencedError(Exception):
+    """Result purge refused: consumer tasks were launched with these exact
+    bytes as pinned inputs (ADR-0035).
+
+    Names the consumers, because that is the only actionable correction: the
+    operator purges those task records — under the ordinary task-purge rules,
+    which have their own refusals — or keeps the revision. There is no force,
+    and a refused consumer purge releases nothing.
+    """
+
+    def __init__(self, result_id: str, consumer_task_ids: list[int]) -> None:
+        super().__init__(
+            f"result {result_id} is pinned as an input by "
+            f"{len(consumer_task_ids)} task(s) "
+            f"({', '.join(str(task_id) for task_id in consumer_task_ids)}); "
+            "purge those task records explicitly before purging this revision"
+        )
+        self.result_id = result_id
+        self.consumer_task_ids = consumer_task_ids
+
+
+class ResultNotAttachableError(Exception):
+    """This revision cannot be pinned as a launch input, and why.
+
+    Deliberately distinct from `ResultStateError`: attachment additionally
+    requires the operator's acceptance and an intact payload, so "you have not
+    accepted this" and "this is still capturing" are different corrections.
+    """
+
+    def __init__(self, result_id: str, reason: str, detail: str) -> None:
+        super().__init__(f"result {result_id}: {detail}")
+        self.result_id = result_id
+        self.reason = reason
+        self.detail = detail
 
 
 @dataclass(frozen=True)
@@ -592,10 +633,21 @@ def read_file_bytes(engine: Engine, result_id: str, path: str) -> bytes | None:
 
 def read_all_files(engine: Engine, result_id: str) -> dict[str, bytes]:
     with engine.connect() as conn:
-        rows = conn.execute(
-            select(task_result_files.c.relative_path, task_result_files.c.content)
-            .where(task_result_files.c.result_id == result_id)
-        ).all()
+        return read_all_files_on(conn, result_id)
+
+
+def read_all_files_on(conn: Connection, result_id: str) -> dict[str, bytes]:
+    """Every retained file on the caller's connection.
+
+    The connection-scoped form so materialization can read the bytes on the
+    same connection that just re-verified their identity, rather than proving
+    one thing and then reading another.
+    """
+    rows = conn.execute(
+        select(task_result_files.c.relative_path, task_result_files.c.content).where(
+            task_result_files.c.result_id == result_id
+        )
+    ).all()
     return {row.relative_path: bytes(row.content) for row in rows}
 
 
@@ -853,6 +905,10 @@ def purge_result(
     command. Repeating a completed purge is idempotent; a retry can therefore
     never remove a different revision.
 
+    A revision pinned as a launch input by any consumer task is refused
+    outright, naming those consumers: retention is a dependency, not a
+    preference, and there is no force (ADR-0035).
+
     This is logical removal. The row keeps identity, manifest, provenance, and
     both decisions; the bytes are deleted from the table. SQLite may reuse the
     freed pages later, and it makes no promise about backups or copies the
@@ -873,6 +929,12 @@ def purge_result(
             raise StaleRevisionError(result_id, expected_manifest_id, row.manifest_id)
         if row.state == STATE_PURGED:
             return _row_to_result(row)
+        # Checked on *this* reservation, before anything is deleted: a launch
+        # accepting these bytes commits its task and its references in one
+        # transaction, so either that consumer exists and this purge is
+        # refused, or it does not and the purge proceeds. There is no ordering
+        # in which both win (ADR-0035).
+        assert_result_unpinned_on(conn, result_id)
         current = conn.execute(
             select(tasks.c.results_version).where(tasks.c.id == row.task_id)
         ).first()
@@ -1006,3 +1068,217 @@ def count_in_flight(engine: Engine, task_id: int) -> int:
             .where(task_results.c.state == STATE_CAPTURING)
         ).first()
     return int(row[0]) if row is not None else 0
+
+
+# --- Attachment: connection-scoped validation ------------------------------
+#
+# Everything below takes a `Connection` rather than an `Engine`, because a
+# launch validates these revisions *inside* the reservation that creates the
+# consumer task. Opening a second connection there would put the check and the
+# admission in different transactions, which is exactly how a purge committing
+# between them would leave a task pinned to bytes that are already gone.
+#
+# They are also deliberately free of the manager's side effects: no
+# damage-classification write, no version bump, no broadcast. A refusal must
+# never nest a second write reservation inside the caller's.
+
+
+def read_result_on(conn: Connection, result_id: str) -> TaskResult | None:
+    """One result's metadata on the caller's connection, or None."""
+    row = conn.execute(
+        _metadata_select().where(task_results.c.id == result_id)
+    ).first()
+    return _row_to_result(row) if row is not None else None
+
+
+def verify_attachable_on(
+    conn: Connection, result_id: str, *, expected_manifest_id: str
+) -> TaskResult:
+    """The revision this launch may pin, or a refusal naming the reason.
+
+    Checks identity before content: a caller naming a manifest that is no
+    longer this result's is told its selection is stale, rather than having a
+    successor revision quietly substituted for the one it reviewed.
+    """
+    result = read_result_on(conn, result_id)
+    if result is None:
+        raise ResultNotFoundError(result_id)
+    if result.state == STATE_PURGED:
+        raise ResultNotAttachableError(
+            result_id,
+            "purged",
+            "was purged; its files are gone and it cannot be attached",
+        )
+    if result.state != STATE_READY:
+        raise ResultNotAttachableError(
+            result_id, "incomplete", f"is {result.state} and cannot be attached"
+        )
+    if result.unavailable_reason is not None:
+        raise ResultNotAttachableError(
+            result_id,
+            "unavailable",
+            f"is unavailable ({result.unavailable_reason}) and cannot be attached",
+        )
+    if result.manifest_id != expected_manifest_id:
+        raise StaleRevisionError(result_id, expected_manifest_id, result.manifest_id)
+    if not result.accepted:
+        raise ResultNotAttachableError(
+            result_id,
+            "not-accepted",
+            "has not been accepted; review and accept the revision before "
+            "launching a task from it",
+        )
+    return result
+
+
+def verify_payload_on(conn: Connection, result: TaskResult) -> None:
+    """Re-check the retained bytes against the manifest acceptance was bound to.
+
+    Run at consumption, not only at capture: a revision accepted months ago is
+    read back from a database that may have been restored, copied, or damaged
+    since. A mismatch refuses the launch; it never repairs the manifest and
+    never rewrites the bytes to agree with it.
+    """
+    entries = result.files
+    rows = conn.execute(
+        select(
+            task_result_files.c.relative_path, task_result_files.c.content
+        ).where(task_result_files.c.result_id == result.id)
+    ).all()
+    stored = {row.relative_path: row.content for row in rows}
+    for entry in entries:
+        data = stored.get(entry.path)
+        if data is None:
+            raise ResultNotAttachableError(
+                result.id,
+                "damaged",
+                f"is missing retained bytes for {entry.path!r}",
+            )
+        if len(data) != entry.length:
+            raise ResultNotAttachableError(
+                result.id,
+                "damaged",
+                f"retained bytes for {entry.path!r} are {len(data)} bytes, "
+                f"not the accepted {entry.length}",
+            )
+        if hashlib.sha256(data).hexdigest() != entry.sha256:
+            raise ResultNotAttachableError(
+                result.id,
+                "damaged",
+                f"retained bytes for {entry.path!r} do not match the accepted "
+                "checksum",
+            )
+    extra = sorted(set(stored) - {entry.path for entry in entries})
+    if extra:
+        raise ResultNotAttachableError(
+            result.id,
+            "damaged",
+            f"retains files the accepted manifest does not describe: {extra}",
+        )
+
+
+# --- Attachment: the reference index ---------------------------------------
+
+
+def insert_references_on(
+    conn: Connection,
+    *,
+    consumer_task_id: int,
+    references: Sequence[tuple[str, int, str]],
+) -> list[int]:
+    """Reserve every referenced revision for one consumer, on this connection.
+
+    `references` is `(result_id, producer_task_id, manifest_id)`. Returns the
+    producing task ids whose result projection moved, so the caller can publish
+    them *after* the transaction commits — a reverse-dependency list that a
+    purge dialog is reading has to converge without the operator refreshing.
+    """
+    if not references:
+        return []
+    now = _now_iso()
+    conn.execute(
+        task_result_references.insert(),
+        [
+            {
+                "consumer_task_id": consumer_task_id,
+                "result_id": result_id,
+                "producer_task_id": producer_task_id,
+                "manifest_id": manifest_id,
+                "created_at": now,
+            }
+            for result_id, producer_task_id, manifest_id in references
+        ],
+    )
+    producers = sorted({producer for _id, producer, _m in references})
+    for producer in producers:
+        _bump_version(conn, producer)
+    return producers
+
+
+def assert_result_unpinned_on(conn: Connection, result_id: str) -> None:
+    """Refuse a result purge while any consumer task pins it.
+
+    Called on the purge's own reserved connection, before a byte is deleted,
+    so a refusal cannot happen after the tombstone was written.
+    """
+    rows = conn.execute(
+        select(task_result_references.c.consumer_task_id)
+        .where(task_result_references.c.result_id == result_id)
+        .order_by(task_result_references.c.consumer_task_id)
+    ).all()
+    if rows:
+        raise ResultReferencedError(
+            result_id, [int(row.consumer_task_id) for row in rows]
+        )
+
+
+def release_consumer_references_on(conn: Connection, consumer_task_id: int) -> list[int]:
+    """Drop one consumer's references once its own purge is certain.
+
+    Only reachable after every task-purge refusal has passed, and inside the
+    transaction that deletes the consumer row: a refused consumer purge
+    releases nothing, and there is no window in which the task is gone while
+    its references still protect bytes.
+    """
+    rows = conn.execute(
+        select(task_result_references.c.producer_task_id).where(
+            task_result_references.c.consumer_task_id == consumer_task_id
+        )
+    ).all()
+    if not rows:
+        return []
+    conn.execute(
+        task_result_references.delete().where(
+            task_result_references.c.consumer_task_id == consumer_task_id
+        )
+    )
+    producers = sorted({int(row.producer_task_id) for row in rows})
+    for producer in producers:
+        _bump_version(conn, producer)
+    return producers
+
+
+def consumers_by_result(engine: Engine) -> dict[str, list[int]]:
+    """Reverse dependencies for the whole database, for result projections."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(
+                task_result_references.c.result_id,
+                task_result_references.c.consumer_task_id,
+            ).order_by(task_result_references.c.consumer_task_id)
+        ).all()
+    consumers: dict[str, list[int]] = {}
+    for row in rows:
+        consumers.setdefault(row.result_id, []).append(int(row.consumer_task_id))
+    return consumers
+
+
+def references_for_consumer(engine: Engine, consumer_task_id: int) -> list[str]:
+    """The revisions one consumer task pins, in insertion order."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            select(task_result_references.c.result_id)
+            .where(task_result_references.c.consumer_task_id == consumer_task_id)
+            .order_by(task_result_references.c.created_at, task_result_references.c.result_id)
+        ).all()
+    return [row.result_id for row in rows]

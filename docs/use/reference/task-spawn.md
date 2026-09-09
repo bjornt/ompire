@@ -186,7 +186,7 @@ request, then renders per-step pipeline progress. A failed step expands its
 stderr or error text in place — there is no separate failure screen.
 
 The authoring form is the wider of the two panels wherever they sit side by
-side, and the pipeline panel is capped: it has four steps and an optional
+side, and the pipeline panel is capped: it has at most five steps and an optional
 stderr block to show, so extra width on a large monitor goes to the prompt
 rather than to the panel that is blank until something is submitted. Long
 paths in a captured error wrap inside the panel instead of widening it. Below
@@ -218,6 +218,113 @@ Leaving the form to create a model profile in Settings — or to save a workflow
 in Workflows — keeps the draft: coming back restores the workflow, project,
 slug, prompt, and every override, including the per-row choices. Arriving from a
 workflow's **Launch in Spawn** selects that workflow and keeps the rest.
+
+## Handoff inputs
+
+A launch can attach accepted [durable results](task-detail.md#results-panel)
+from the same project. Ompire installs those exact files into the new task's
+own clone before its first step runs, so an agent can read a plan another task
+wrote without any link back to that task's workspace, clone, container, or
+session.
+
+### Selecting a revision
+
+**Start task from this result**, on an accepted revision in a task's Results
+panel, opens this form with that revision attached and its project selected. It
+starts nothing. You choose the workflow, model profile, slug, and prompt as
+usual, review the attachment, and submit.
+
+The **Handoff inputs** section also offers every accepted, readable revision in
+the selected project, and lets you add or remove them. An older accepted
+revision stays selectable after a successor is captured: a selection names one
+exact revision, and nothing floats to the latest.
+
+Only complete, accepted, integrity-checked revisions from the recipient's own
+project can be attached. A revision that was never accepted, was purged, whose
+retained bytes no longer match the manifest they were accepted under, or that
+belongs to another project is refused with the reason. Attachments travel as
+whole bundles: there is no partial selection.
+
+### Destinations
+
+Files land at their original repository-relative paths. There is no remapping,
+so relative paths and internal links between the attached files still work.
+
+Every destination is labelled **Handoff input — not publishable**. That is a
+fixed classification, not a setting: there is no control to make one
+publishable, and no action later in the task's life can lift it.
+
+A destination that is not free blocks submission — it is not overwritten,
+skipped, or merged. This applies whether the obstruction is on the target base
+or between two attachments, and it applies even when the existing bytes are
+identical:
+
+- a path already tracked on the target base;
+- a path that is a directory, symlink, or submodule on the target base;
+- an ancestor directory that is a file, symlink, or submodule on the target base;
+- two attachments naming the same path, or one attachment's file being another's
+  parent directory;
+- `workshop.yaml` and `workshop.my.yaml` at the repository root, which configure
+  the container launcher and can never be written by an attachment.
+
+Resolve it by removing an attachment, choosing another accepted bundle, or
+choosing another base and reviewing again.
+
+### The target base
+
+An attachment launch names the exact commit its clone will be built from, and
+branches from that commit rather than from wherever the base branch points when
+the clone lands. If the base moves between acceptance and the pipeline, the
+`inputs` step fails and says so; the task is never repinned to a base nobody
+reviewed.
+
+Each attachment's own base is compared against that target. The value compared
+is the producer's `capture_merge_base` — what Git said in the producing
+workspace at capture time, which is deliberately *not* the commit the producing
+task was launched from. The comparison is one of three things:
+
+| Comparison | Meaning |
+|---|---|
+| **match** | The files were captured against exactly this commit |
+| **different** | They were captured against another commit; a bounded changed-path list is offered when both commits are readable here, and says so when truncated |
+| **unknown** | The capture recorded no base observation, or the producer's commit is not in this checkout — the difference cannot be listed, and no comparison is invented |
+
+`different` and `unknown` both require you to acknowledge explicitly that the
+plan has not been validated against this target. That acknowledgement is bound
+to this exact set of attachments and this exact commit: changing either
+invalidates the reviewed preview.
+
+A **match** is not evidence that the plan is correct — only that it was written
+against these files.
+
+### What the recipient gets
+
+The pipeline's `inputs` step writes each file as an ordinary, non-executable
+regular file inside the recipient's own clone, and verifies the complete
+installed set against the accepted manifest before the container starts. The
+agent's standing prompt context names the installed paths and states that they
+are untrusted reference material and are never publishable.
+
+The recipient may edit or delete its own copies. That changes neither the
+retained revision nor any other task that pinned it, and Ompire never
+re-installs over later edits — a restart of a task whose spawn already completed
+does not repeat this step.
+
+### Publication
+
+Handoff destinations are never published. Review and Ship refuse a delivery
+whose proposed Git result carries one, and retained-history delivery
+additionally refuses a range in which any published commit carries one — even
+if a later commit deleted it. See [Ship flow](ship-flow.md#handoff-inputs) for
+what a refusal says and how to correct it.
+
+### Retention
+
+A revision that a task was launched with cannot be purged while that task's
+record exists. The refusal names the tasks holding it. Cleaning up, failing, or
+archiving such a task releases nothing: its record still says what it ran with,
+so those files stay readable. Purging the task record itself is the only
+release.
 
 ## File mentions
 
@@ -262,6 +369,12 @@ not on the base branch — one you just created, or one committed to another
 branch — is offered by the search but refused at submit, because it would not
 be in the clone.
 
+A destination of an attached [handoff input](#handoff-inputs) can also be
+mentioned. Those files are not on the base branch and do not exist anywhere
+yet, but the pipeline installs them into the clone before the agent runs, so
+the mention resolves. A token that names neither the base branch nor an
+attached destination keeps its existing refusal.
+
 The refusal names the path and the reason, nothing is created, and the form
 keeps everything you typed.
 
@@ -281,8 +394,12 @@ delivered as a reference omp would silently drop.
 |---|---|
 | `fetch` | `git fetch <project fetch remote>` in the project's checkout |
 | `clone` | Local hardlink clone of the checkout to `<task_root>/<project>/<slug>` |
-| `branch` | New branch from the accepted pattern, off `origin/<base_branch>` |
+| `branch` | New branch from the accepted pattern, off `origin/<base_branch>` — or off the reviewed commit, for a launch with handoff inputs |
+| `inputs` | Install the accepted [handoff inputs](#handoff-inputs), if the launch has any |
 | `workshop` | Launch the task's container in the clone |
+
+`inputs` runs only for a launch with handoff inputs. Without them the pipeline
+is exactly the four steps it has always been.
 
 Git runs as subprocesses with argument lists, never through a shell. Each git
 step is bounded by `spawn_step_timeout`; the workshop step has its own,
@@ -296,7 +413,8 @@ points back at that base checkout.
 
 The clone step also appends `.ompire/` to the clone's `.git/info/exclude`, so
 structured step outcomes never appear as untracked files in the agent's view
-of the tree.
+of the tree. A launch with handoff inputs adds each of their destinations to
+that same file, as a literal root-anchored pattern.
 
 Spawn completion is recorded only after the last workspace step succeeds.
 
@@ -368,9 +486,25 @@ manage it later.
 | Any step exits non-zero or times out | Pipeline stops, task `failed`, stderr stored on the task |
 | Resolved clone path falls outside the task root | Spawn rejected before any git command |
 | Target clone directory already exists | Clone step fails; the directory is never reused |
+| An attached revision is unaccepted, purged, damaged, or from another project | `422`, nothing created |
+| The named manifest id is no longer that revision's | `422`, nothing created — the selection is stale, not upgraded |
+| Two attachments claim one destination, or one's file is another's directory | `422`, nothing created |
+| An attached destination is tracked, a directory, a symlink, or a submodule on the target base | `422`, nothing created |
+| An ancestor of an attached destination is not an ordinary directory on the target base | `422`, nothing created |
+| An attachment was captured against a different or unknown base, unacknowledged | `422`, nothing created |
+| The base branch does not resolve to a commit, for an attachment launch | `422`, nothing created — there is no target to attach against |
+| The base moved between acceptance and the clone | `inputs` step fails; the task is never repinned |
+| A destination is already occupied in the clone, or an ancestor is not an ordinary directory | `inputs` step fails before the container starts |
+| Installed bytes do not match the accepted manifest | `inputs` step fails before the container starts |
 
 A leftover directory fails loudly on purpose. Reusing it would mean an agent
 starting in a workspace whose contents nobody has accounted for.
+
+A failed `inputs` step leaves the clone exactly as it was when the step
+stopped: partly installed, and inspectable. Nothing is rolled back, because
+deleting on the way out could remove work that was already there. No container,
+session, or workflow step runs, so the task never executes on partial inputs.
+Clean it up and start another task with a new slug and a fresh preview.
 
 Every failure stores the step's captured stderr or error text on the task,
 reachable from its card.
@@ -387,9 +521,11 @@ reachable from its card.
 ## Interfaces
 
 Each step broadcasts `spawn_step` carrying the task id, the step name
-(`fetch`, `clone`, `branch`, `workshop`), and a status of started, ok, or
-failed with stderr. The workshop step is preceded by a `workshop_additions`
-event naming the source that applied and whether it was absent.
+(`fetch`, `clone`, `branch`, `inputs`, `workshop`), and a status of started,
+ok, or failed with stderr. The workshop step is preceded by a
+`workshop_additions` event naming the source that applied and whether it was
+absent.
 
-A successful run produces started/ok pairs for all four steps in order,
-followed by `workflow_step` events as the run executes.
+A successful run produces started/ok pairs for every step of that launch's
+pipeline, in order, followed by `workflow_step` events as the run executes. A
+launch with no handoff inputs emits no `inputs` events at all.

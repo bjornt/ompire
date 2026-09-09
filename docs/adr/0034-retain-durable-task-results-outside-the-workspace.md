@@ -3,6 +3,11 @@
 - Status: Accepted
 - Date: 2026-09-08
 
+Extended by [ADR-0035](0035-refuse-to-publish-handoff-destinations.md), which
+gives a retained revision a reference-protected lifetime: a revision pinned by a
+consumer task cannot be purged, and the reference is released only by that
+consumer's own explicit task purge.
+
 Advances the artifact-retention slice of
 [ADR-0016](0016-persist-authority-bearing-task-history-and-provenance.md);
 that ADR stays `Proposed`, because transcript retention and commit lineage

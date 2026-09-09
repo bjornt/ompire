@@ -24,8 +24,10 @@ from ompire_daemon.config import Config
 from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.delivery import (
     DeliveryWorkspaceError,
+    ProtectedPathError,
     WorkspaceGuard,
     capture_candidate,
+    compute_candidate_id,
 )
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import (
@@ -2476,3 +2478,228 @@ async def test_an_interrupted_action_waits_for_an_explicit_continuation(
     assert {a.workflow_seq for a in attempts} == {
         next(r for r in list_step_records(engine, task.id) if r.step == "commit").seq
     }
+
+
+# --- the non-publishable handoff boundary (ADR-0035) -------------------------
+
+
+def _attached_task(engine, tmp_root, *paths: str, ending: str = "pr", mode: str = "squash"):
+    """A project and a task pinned to handoff destinations at `paths`."""
+    from tests.conftest import make_result_attachment
+
+    checkout_dir = tmp_root / "proj" / "myproject"
+    checkout_dir.mkdir(parents=True, exist_ok=True)
+    project = create_project(
+        engine,
+        name="myproject",
+        title="My Project",
+        upstream_url="https://github.com/owner/repo",
+        fork_url=None,
+        checkout_path=str(checkout_dir),
+        default_checkout_root=tmp_root / "proj",
+    )
+    clone_path = tmp_root / "tasks" / "myproject" / "task-1"
+    clone_path.parent.mkdir(parents=True, exist_ok=True)
+    revision = install_delivery_workflow(engine, ending=ending, mode=mode)
+    task = create_task(
+        engine,
+        project_name="myproject",
+        slug="task-1",
+        branch="ompire/task-1",
+        clone_path=str(clone_path),
+        prompt="do the thing",
+        workflow_name=revision.name,
+        execution_inputs=make_execution_inputs(
+            checkout_path=str(checkout_dir),
+            project_name="myproject",
+            branch="ompire/task-1",
+            upstream_url="https://github.com/owner/repo",
+            workflow_name=revision.name,
+            revision=revision,
+            result_attachments=(make_result_attachment(*paths),),
+        ),
+    )
+    return project, task
+
+
+async def test_an_ordinary_task_captures_exactly_the_identity_it_always_did(
+    tmp_root, engine, config
+):
+    """The regression that protects every reviewed candidate in the wild: a
+    task with no handoff inputs has an empty protected set, so nothing is
+    folded into its identity and nothing already approved goes stale."""
+    _project, task = _make_project_and_task(engine, tmp_root)
+    _setup_git_clone(tmp_root / "plain-origin.git", Path(task.clone_path))
+
+    candidate = await capture_candidate(config, engine, task, base_branch="main")
+    assert candidate.candidate_id == compute_candidate_id(
+        task_id=task.id,
+        base_commit=candidate.base_commit,
+        tree_id=candidate.tree_id,
+        source_commits=candidate.source_commits,
+    )
+
+
+async def test_a_task_with_handoff_inputs_binds_them_into_its_candidate_identity(
+    tmp_root, engine, config
+):
+    """A candidate is bound to the publication policy it was reviewed under, so
+    it cannot be carried into a delivery that believes the policy differs."""
+    _project, task = _attached_task(engine, tmp_root, "epics/demo/PLAN.md")
+    _setup_git_clone(tmp_root / "attached-origin.git", Path(task.clone_path))
+
+    candidate = await capture_candidate(config, engine, task, base_branch="main")
+    unbound = compute_candidate_id(
+        task_id=task.id,
+        base_commit=candidate.base_commit,
+        tree_id=candidate.tree_id,
+        source_commits=candidate.source_commits,
+    )
+    assert candidate.candidate_id != unbound
+
+
+async def test_capture_refuses_a_proposed_tree_carrying_a_handoff_input(
+    tmp_root, engine, config
+):
+    """Mode-neutral, and before anything is retained or reviewed — which is
+    what stops contamination hiding behind a successful content review."""
+    _project, task = _attached_task(engine, tmp_root, "epics/demo/PLAN.md")
+    clone = Path(task.clone_path)
+    _setup_git_clone(tmp_root / "contaminated-origin.git", clone)
+    (clone / "epics" / "demo").mkdir(parents=True)
+    (clone / "epics" / "demo" / "PLAN.md").write_text("# Plan\n", encoding="utf-8")
+    _run_git(clone, "add", "-f", "epics/demo/PLAN.md")
+    _run_git(clone, "commit", "-m", "oops, committed the plan")
+
+    with pytest.raises(ProtectedPathError) as excinfo:
+        await capture_candidate(config, engine, task, base_branch="main")
+    assert "epics/demo/PLAN.md" in str(excinfo.value)
+    # Named, not repaired: the file is still exactly where the operator left it.
+    assert (clone / "epics" / "demo" / "PLAN.md").exists()
+
+
+async def test_an_uncommitted_handoff_file_does_not_block_ordinary_code(
+    tmp_root, engine, config
+):
+    """The everyday case. The installed files sit in the clone, excluded from
+    staging, while the task's real work ships normally."""
+    _project, task = _attached_task(engine, tmp_root, "epics/demo/PLAN.md")
+    clone = Path(task.clone_path)
+    _setup_git_clone(tmp_root / "clean-origin.git", clone)
+    (clone / "epics" / "demo").mkdir(parents=True)
+    (clone / "epics" / "demo" / "PLAN.md").write_text("# Plan\n", encoding="utf-8")
+
+    candidate = await capture_candidate(config, engine, task, base_branch="main")
+    assert candidate.candidate_id
+
+
+async def test_a_handoff_file_replaced_by_a_directory_is_still_refused(
+    tmp_root, engine, config
+):
+    """Protection covers the path's namespace. Recursing is what catches a
+    protected file that became a directory full of the same content."""
+    _project, task = _attached_task(engine, tmp_root, "epics/demo/PLAN.md")
+    clone = Path(task.clone_path)
+    _setup_git_clone(tmp_root / "dir-origin.git", clone)
+    (clone / "epics" / "demo" / "PLAN.md").mkdir(parents=True)
+    (clone / "epics" / "demo" / "PLAN.md" / "part.md").write_text("# Plan\n", encoding="utf-8")
+    _run_git(clone, "add", "-f", "epics/demo/PLAN.md")
+    _run_git(clone, "commit", "-m", "split the plan up")
+
+    with pytest.raises(ProtectedPathError):
+        await capture_candidate(config, engine, task, base_branch="main")
+
+
+async def test_a_handoff_path_with_git_metacharacters_is_matched_literally(
+    tmp_root, engine, config
+):
+    """`[1]` in a filename is punctuation, not a character class. Reading it as
+    a pattern would protect the wrong paths and leave the real one open."""
+    _project, task = _attached_task(engine, tmp_root, "epics/plan[1].md")
+    clone = Path(task.clone_path)
+    _setup_git_clone(tmp_root / "meta-origin.git", clone)
+    (clone / "epics").mkdir(parents=True)
+    (clone / "epics" / "plan[1].md").write_text("# Plan\n", encoding="utf-8")
+    _run_git(clone, "add", "-f", "--", "epics/plan[1].md")
+    _run_git(clone, "commit", "-m", "committed the plan")
+
+    with pytest.raises(ProtectedPathError) as excinfo:
+        await capture_candidate(config, engine, task, base_branch="main")
+    assert "epics/plan[1].md" in str(excinfo.value)
+
+
+async def test_a_handoff_path_tracked_on_the_base_refuses_rather_than_publishing_it(
+    tmp_root, engine, config
+):
+    """An upstream-tracked file at a protected destination would be published
+    implicitly, without this task having done anything at all."""
+    _project, task = _attached_task(engine, tmp_root, "docs/PLAN.md")
+    clone = Path(task.clone_path)
+    _setup_git_clone(tmp_root / "base-origin.git", clone)
+    # On `main`, and then in the task branch's own ancestry: the merge-base is
+    # what a candidate is captured against, so that is where the collision has
+    # to be for this refusal to be about the right tree.
+    _run_git(clone, "add", "-A")
+    _run_git(clone, "commit", "-m", "settle the working tree")
+    _run_git(clone, "checkout", "main")
+    (clone / "docs").mkdir(parents=True)
+    (clone / "docs" / "PLAN.md").write_text("upstream plan\n", encoding="utf-8")
+    _run_git(clone, "add", ".")
+    _run_git(clone, "commit", "-m", "upstream tracks a plan")
+    _run_git(clone, "push", "origin", "HEAD:main")
+    _run_git(clone, "checkout", "ompire/task-1")
+    _run_git(clone, "rebase", "main")
+
+    with pytest.raises(ProtectedPathError):
+        await capture_candidate(config, engine, task, base_branch="main")
+
+
+async def test_retain_refuses_a_checkpoint_that_carried_a_handoff_input(
+    tmp_root, engine, ships, config
+):
+    """The failure a final-tree check cannot see.
+
+    The file was added in one commit and deleted in the next, so the tree that
+    would be published is clean — and, in retain mode, the commit that still
+    contains it is published anyway. Squash of the same history is fine,
+    because those checkpoints are not published at all.
+    """
+    _project, task = _attached_task(
+        engine, tmp_root, "epics/demo/PLAN.md", ending="commit", mode="retain"
+    )
+    clone = Path(task.clone_path)
+    _setup_git_clone(tmp_root / "retain-origin.git", clone)
+    _run_git(clone, "add", "-A")
+    _run_git(clone, "commit", "-m", "settle the working tree")
+    (clone / "epics" / "demo").mkdir(parents=True)
+    (clone / "epics" / "demo" / "PLAN.md").write_text("# Plan\n", encoding="utf-8")
+    _run_git(clone, "add", "-f", "epics/demo/PLAN.md")
+    _run_git(clone, "commit", "-m", "checkpoint with the plan")
+    _run_git(clone, "rm", "-q", "epics/demo/PLAN.md")
+    _run_git(clone, "commit", "-m", "remove the plan again")
+
+    # The final tree is clean, so capture and review both pass.
+    candidate = await capture_candidate(config, engine, task, base_branch="main")
+    gate_seq = park_at_delivery_gate(
+        engine, task, candidate_id=candidate.candidate_id
+    )
+    clear_process_marker(engine, task.id)
+
+    preview = await ships.preview(
+        task,
+        gate_seq=gate_seq,
+        choice_id="publish",
+        commit_message="m",
+        pr_title="t",
+        pr_body="b",
+        request_id="r1",
+    )
+    codes = [blocker.code for blocker in preview.blockers]
+    assert "retain-protected-paths" in codes
+    message = next(
+        b.message for b in preview.blockers if b.code == "retain-protected-paths"
+    )
+    assert "epics/demo/PLAN.md" in message
+    # The offending commit is named, and nothing was rewritten to hide it.
+    assert "in the range this delivery would publish" in message
+    assert not preview.deliverable

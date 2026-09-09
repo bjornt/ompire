@@ -720,7 +720,11 @@ function PreviewPanel({
         {preview.remaining_actions.map((action) => (
           <li key={action} data-testid={`preview-action-${action}`}>
             {action === "commit"
-              ? `Sign ${preview.mode === "retain" ? `${preview.candidate?.commit_count ?? 0} commits` : "one commit"} onto ${preview.candidate?.base_branch}`
+              ? // The candidate is null whenever a blocker stopped it being
+                // resolved — an empty delta, an unreadable workspace, or a
+                // tree carrying a handoff input. The accepted routing still
+                // names the branch, so say that rather than "onto undefined".
+                `Sign ${preview.mode === "retain" ? `${preview.candidate?.commit_count ?? 0} commits` : "one commit"} onto ${preview.candidate?.base_branch ?? preview.routing.base_branch}`
               : action === "push"
                 ? `Push to ${preview.routing.remote_url} ${preview.routing.ref}`
                 : `Open a pull request into ${preview.routing.slug ?? preview.routing.upstream_url} (${preview.routing.base_branch})`}

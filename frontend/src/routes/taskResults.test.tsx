@@ -101,6 +101,10 @@ function makeInputs(): TaskExecutionInputs {
     upstream_url: "https://example.com/maas.git",
     fork_url: null,
     unknown_inputs: [],
+    result_attachments: [],
+    source_commit: null,
+    base_comparisons: [],
+    acknowledged_base_difference: false,
   } as TaskExecutionInputs;
 }
 
@@ -180,6 +184,7 @@ function makeResult(overrides: Partial<TaskResult> = {}): TaskResult {
     accepted_by: null,
     purged_at: null,
     purged_by: null,
+    consumer_task_ids: [],
     ...overrides,
   };
 }

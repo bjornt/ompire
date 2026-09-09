@@ -47,14 +47,22 @@ from ompire_daemon.gpg import (
     FINGERPRINT_RE,
     GpgProbe,
 )
+from ompire_daemon.handoff import (
+    HandoffError,
+    observe_base_difference,
+    observe_target,
+)
 from ompire_daemon.launch import (
+    AttachmentSelection,
     ConsumerOverride,
     LaunchInputError,
     LaunchRequest,
     PreviewChangedError,
     ProjectNotLaunchableError,
+    TargetEvidence,
     resolution_payload,
     resolve_launch,
+    resolve_target_context,
 )
 from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.projectcheckout import (
@@ -127,13 +135,18 @@ from ompire_daemon.registry.results import (
     MAX_TOTAL_BYTES,
     SUPPORTED_EXTENSIONS,
     CaptureInProgressError,
+    DamagedManifestError,
     InvalidSelectionError,
+    ResultNotAttachableError,
     ResultNotFoundError,
     ResultPurgedError,
+    ResultReferencedError,
     ResultsRetainedError,
     ResultStateError,
     SelectionMismatchError,
     StaleRevisionError,
+    insert_references_on,
+    read_result_on,
     results_version,
 )
 from ompire_daemon.registry.settings import (
@@ -1764,6 +1777,22 @@ class ConsumerOverrideIn(BaseModel):
     role: str | None = None
 
 
+class ResultAttachmentIn(BaseModel):
+    """One selected revision.
+
+    All three fields together, because two of them alone would not identify an
+    immutable revision: the manifest id is what refuses a stale selection when
+    a successor capture has landed, and the producing task is what the refusal
+    can name.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    producer_task_id: int
+    result_id: str
+    expected_manifest_id: str
+
+
 class TaskCreate(BaseModel):
     """The one supported creation contract (ADR-0026, ADR-0027).
 
@@ -1788,6 +1817,15 @@ class TaskCreate(BaseModel):
     # rather than having its choice silently dropped (ADR-0028).
     step_overrides: dict[str, ConsumerOverrideIn] = Field(default_factory=dict)
     auxiliary_overrides: dict[str, ConsumerOverrideIn] = Field(default_factory=dict)
+    # Accepted result revisions to install before the first step runs
+    # (ADR-0035). Destinations are the manifest's own paths — deliberately not
+    # a caller-supplied mapping, so a request cannot choose where retained
+    # bytes land.
+    result_attachments: list[ResultAttachmentIn] = Field(default_factory=list)
+    # Explicit, and bound by the preview token to this exact attachment set and
+    # target commit: an acknowledgement cannot be carried over to a different
+    # selection or a base that moved.
+    acknowledge_result_base_difference: bool = False
 
     @field_validator("slug")
     @classmethod
@@ -1833,6 +1871,15 @@ def _launch_request(body: TaskCreate) -> LaunchRequest:
             "model_profile" in body.model_fields_set and body.model_profile is not None
         ),
         workspace_overrides=overrides,
+        result_attachments=tuple(
+            AttachmentSelection(
+                producer_task_id=entry.producer_task_id,
+                result_id=entry.result_id,
+                expected_manifest_id=entry.expected_manifest_id,
+            )
+            for entry in body.result_attachments
+        ),
+        acknowledge_result_base_difference=body.acknowledge_result_base_difference,
         step_overrides=_consumer_overrides(body.step_overrides, "step_overrides"),
         # Not normalized: an empty override for a consumer that no longer
         # exists is still a caller believing it configures something, and it
@@ -1875,6 +1922,72 @@ def _consumer_overrides(
     return normalized
 
 
+async def _target_evidence(
+    engine: Engine, config: Config, request: LaunchRequest
+) -> TargetEvidence | None:
+    """Read the target base for an attachment launch, outside any lock.
+
+    Returns None when nothing is attached, which is what keeps an ordinary
+    launch on exactly its previous path: no commit is resolved, no tree is
+    read, and nothing new can refuse it.
+
+    A revision that cannot be read here contributes no destinations. It is not
+    refused *here* — resolution owns that refusal, and it has to be the same
+    refusal in the preview and in the acceptance.
+    """
+    if not request.result_attachments:
+        return None
+    with engine.connect() as conn:
+        try:
+            checkout_path, base_branch = resolve_target_context(conn, request)
+        except (LaunchInputError, ProjectNotLaunchableError) as exc:
+            raise _launch_error(exc) from exc
+        observations: dict[str, str | None] = {}
+        destinations: set[str] = set()
+        for selection in request.result_attachments:
+            result = read_result_on(conn, selection.result_id)
+            if result is None or result.manifest is None:
+                continue
+            try:
+                paths = [entry.path for entry in result.files]
+            except DamagedManifestError:
+                continue
+            destinations.update(paths)
+            provenance = result.manifest.get("provenance") or {}
+            observations[selection.result_id] = provenance.get("capture_merge_base")
+
+    timeout = config.spawn_step_timeout
+    try:
+        observation = await observe_target(
+            checkout_path=checkout_path,
+            base_branch=base_branch,
+            destinations=tuple(sorted(destinations)),
+            timeout=timeout,
+        )
+        comparisons = {
+            result_id: await observe_base_difference(
+                result_id=result_id,
+                checkout_path=checkout_path,
+                target_commit=observation.commit,
+                producer_observation=producer_observation,
+                timeout=timeout,
+            )
+            for result_id, producer_observation in observations.items()
+        }
+    except HandoffError as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"result_attachments: {exc.detail}"
+        ) from exc
+    return TargetEvidence(
+        commit=observation.commit,
+        conflicts=tuple(
+            (conflict.reason, conflict.detail, conflict.path)
+            for conflict in observation.conflicts
+        ),
+        comparisons=comparisons,
+    )
+
+
 def _preview_changed(resolved) -> HTTPException:
     """409 with a machine-readable reason and the current resolution, so the
     form can show the operator exactly what changed instead of retrying under
@@ -1901,8 +2014,10 @@ def _launch_error(exc: Exception) -> HTTPException:
 
 
 @router.post("/tasks/preview")
-def preview_task_route(
-    body: TaskCreate, engine: Engine = Depends(_engine)
+async def preview_task_route(
+    body: TaskCreate,
+    engine: Engine = Depends(_engine),
+    config: Config = Depends(_config),
 ) -> dict[str, Any]:
     """Resolve the operator's selections without creating anything.
 
@@ -1910,9 +2025,10 @@ def preview_task_route(
     what makes reviewing a preview worth anything.
     """
     request = _launch_request(body)
+    evidence = await _target_evidence(engine, config, request)
     with engine.connect() as conn:
         try:
-            resolved = resolve_launch(conn, request)
+            resolved = resolve_launch(conn, request, evidence=evidence)
         except (LaunchInputError, ProjectNotLaunchableError) as exc:
             raise _launch_error(exc) from exc
     return resolution_payload(resolved)
@@ -2012,12 +2128,17 @@ async def spawn_task_route(
     """
     launch_request = _launch_request(body)
 
+    # The Git reading, before anything is resolved and outside every lock. It
+    # is taken once and used by both resolutions below, so the accepted task is
+    # pinned to the same immutable commit the refusals were decided against.
+    evidence = await _target_evidence(engine, config, launch_request)
+
     # First resolution: validation only. Its results are what the Git work
     # below is done against; the authoritative one is taken again under the
     # write reservation.
     with engine.connect() as conn:
         try:
-            resolved = resolve_launch(conn, launch_request)
+            resolved = resolve_launch(conn, launch_request, evidence=evidence)
         except (LaunchInputError, ProjectNotLaunchableError) as exc:
             raise _launch_error(exc) from exc
     if resolved.fingerprint != body.preview_token:
@@ -2034,6 +2155,12 @@ async def spawn_task_route(
             checkout_path=resolved.inputs.checkout_path,
             base_branch=resolved.inputs.workspace.base_branch,
             timeout=config.spawn_step_timeout,
+            # An attached destination is a file the clone *will* contain by the
+            # time the agent runs, so a mention naming one resolves (ADR-0035).
+            # Everything else keeps its existing refusal: Omp drops a mention it
+            # cannot resolve without a word, so one that will not survive into
+            # the clone must be refused here, not discovered afterwards.
+            extra_paths=resolved.inputs.protected_destinations,
         )
     except ProjectFilesError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
@@ -2056,7 +2183,7 @@ async def spawn_task_route(
     # or published happens inside it.
     with reserved_write(engine) as conn:
         try:
-            final = resolve_launch(conn, launch_request)
+            final = resolve_launch(conn, launch_request, evidence=evidence)
         except (LaunchInputError, ProjectNotLaunchableError) as exc:
             raise _launch_error(exc) from exc
         if final.fingerprint != body.preview_token:
@@ -2075,6 +2202,27 @@ async def spawn_task_route(
             )
         except DuplicateTaskError as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        # Same transaction as the task and its pinned inputs (ADR-0035).
+        # Accepting the launch and reserving the bytes it depends on are one
+        # durable operation: a purge racing this either loses the reservation
+        # and is refused, or wins and leaves no consumer behind.
+        pinned_producers = insert_references_on(
+            conn,
+            consumer_task_id=task.id,
+            references=[
+                (
+                    attachment.result_id,
+                    attachment.producer_task_id,
+                    attachment.manifest_id,
+                )
+                for attachment in final.inputs.result_attachments
+            ],
+        )
+
+    # After the commit: a producer's reverse-dependency list moved, and a purge
+    # dialog open elsewhere has to converge without a refresh.
+    for producer_task_id in pinned_producers:
+        request.app.state.results.publish(producer_task_id)
 
     payload = task_payload(task, engine=engine)
     events.publish("task_created", payload)
@@ -2452,6 +2600,8 @@ def _result_error(exc: Exception) -> HTTPException:
             SelectionMismatchError,
             StaleRevisionError,
             ResultStateError,
+            ResultReferencedError,
+            ResultNotAttachableError,
             ResultUnavailableError,
             WorkspaceBusyError,
             WorkspaceBlockedError,
@@ -3682,9 +3832,10 @@ def purge_task_route(
     ships: ShipManager = Depends(_ships),
     guard: WorkspaceGuard = Depends(_guard),
     notifications: AttentionNotifier = Depends(_notifications),
+    results: ResultManager = Depends(_results),
 ) -> dict[str, int]:
     try:
-        storage_paths = purge_task(engine, task_id)
+        storage_paths, released_producers = purge_task(engine, task_id)
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     except (TaskNotArchivedError, ResultsRetainedError) as exc:
@@ -3692,6 +3843,11 @@ def purge_task_route(
         # (ADR-0034). The refusal names the revisions to purge first, and — by
         # construction — nothing has been deleted by the time it is raised.
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    # This consumer released its pinned inputs (ADR-0035). Publish the
+    # producers *after* the commit, so a purge dialog open in another tab stops
+    # showing a blocker that no longer exists.
+    for producer_task_id in released_producers:
+        results.publish(producer_task_id)
     reviews.drop_review(task_id)
     ships.drop_ship(task_id)
     ships.purge_candidate_storage(storage_paths)

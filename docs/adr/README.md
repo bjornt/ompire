@@ -52,6 +52,7 @@ relying on it.
 | [0032](0032-bind-trusted-delivery-to-retained-candidates.md) | Bind trusted delivery to retained candidates and write-ahead action intent | Accepted |
 | [0033](0033-scope-trusted-delivery-authority-to-the-workflow-run.md) | Scope trusted delivery authority to the workflow run | Accepted |
 | [0034](0034-retain-durable-task-results-outside-the-workspace.md) | Retain durable task results outside the workspace | Accepted |
+| [0035](0035-refuse-to-publish-handoff-destinations.md) | Refuse to publish handoff destinations | Accepted |
 
 ## Template
 

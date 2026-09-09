@@ -455,23 +455,31 @@ def mark_archived(engine: Engine, task_id: int) -> Task:
     return _update(engine, task_id, state="archived")
 
 
-def purge_task(engine: Engine, task_id: int) -> list[str]:
+def purge_task(engine: Engine, task_id: int) -> tuple[list[str], list[int]]:
     """Delete a task and every durable child row it owns.
 
-    Returns the candidate staging repositories that are now unreferenced, so
-    the caller can remove them from disk — foreign-key cascades cannot be
-    assumed on this connection, and nothing else knows those paths once the
-    rows are gone.
+    Returns `(storage_paths, released_producers)`: the candidate staging
+    repositories that are now unreferenced, so the caller can remove them from
+    disk, and the producing tasks whose result projection moved because this
+    consumer released its pinned inputs. Foreign-key cascades cannot be assumed
+    on this connection, and nothing else knows those paths once the rows are
+    gone.
 
     Purge is the only operation that deletes durable history; cleanup
     deliberately retains the review and the delivery journal (ADR-0016), and
     result bytes are never destroyed here at all — an unpurged complete
     revision refuses the whole purge and names itself (ADR-0034).
+
+    This is also the only thing that releases a *consumer's* references
+    (ADR-0035), and it happens after every refusal above has passed, in the
+    same transaction that deletes the task. A task that is merely archived,
+    failed, or cleaned up keeps its inputs, so it keeps its protection of them.
     """
     from ompire_daemon.registry.model_profiles import reserved_write
     from ompire_daemon.registry.results import (
         assert_no_retained_results,
         delete_task_results,
+        release_consumer_references_on,
     )
     from ompire_daemon.registry.ships import delete_task_deliveries_on
 
@@ -495,13 +503,14 @@ def purge_task(engine: Engine, task_id: int) -> list[str]:
         # the rest of the history.
         assert_no_retained_results(conn, task_id)
         storage_paths = delete_task_deliveries_on(conn, task_id)
+        released_producers = release_consumer_references_on(conn, task_id)
         delete_task_results(conn, task_id)
         conn.execute(workflow_step_records.delete().where(workflow_step_records.c.task_id == task_id))
         conn.execute(task_sessions.delete().where(task_sessions.c.task_id == task_id))
         conn.execute(review_iterations.delete().where(review_iterations.c.task_id == task_id))
         conn.execute(reviews.delete().where(reviews.c.task_id == task_id))
         conn.execute(tasks.delete().where(tasks.c.id == task_id))
-    return storage_paths
+    return storage_paths, released_producers
 
 
 def reconcile_startup(engine: Engine) -> tuple[list[Task], list[Task]]:

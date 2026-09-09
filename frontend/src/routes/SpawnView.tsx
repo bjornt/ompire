@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate } from "react-router-dom";
 import { WorkflowRevision } from "../components/WorkflowRevision";
 import { previewTask, spawnTask } from "../lib/api";
 import type {
+  BaseComparison,
   ConsumerOverrideInput,
   LaunchInput,
   LaunchPreview,
@@ -15,15 +16,22 @@ import {
   loadSpawnDraft,
   pruneConsumerOverrides,
   saveSpawnDraft,
+  type DraftAttachment,
   type DraftConsumerOverrides,
   type SpawnDraft,
 } from "../lib/spawnDraft";
+import {
+  formatResultBytes,
+  revisionStatus,
+  shortResultId,
+} from "../lib/resultPresentation";
 import type {
   ConsumerBinding,
   ModelRole,
   SpawnStepName,
   SpawnStepPayload,
   Task,
+  TaskResult,
 } from "../types";
 import "./SpawnView.css";
 
@@ -53,14 +61,34 @@ const PIPELINE_STEPS: { name: SpawnStepName; label: string; detail: (task: Task)
   { name: "fetch", label: "Fetch", detail: (t) => `git fetch (project ${t.project_name})` },
   { name: "clone", label: "Clone", detail: (t) => `git clone → ${t.clone_path}` },
   { name: "branch", label: "Branch", detail: (t) => `${t.branch} off origin base` },
+  {
+    name: "inputs",
+    label: "Inputs",
+    detail: (t) =>
+      `install ${attachedFileCount(t)} reviewed handoff file(s) into the clone`,
+  },
   { name: "workshop", label: "Workshop", detail: () => "my-workshop: container + SDKs (can take a while)" },
   { name: "agent", label: "Agent", detail: () => "omp --mode rpc-ui: spawn + ready handshake" },
   { name: "prompt", label: "Prompt", detail: () => "deliver the stored prompt to the agent" },
 ];
 
-/** An empty prompt skips the prompt step server-side; hide it too. */
+function attachedFileCount(task: Task): number {
+  return (task.execution_inputs?.result_attachments ?? []).reduce(
+    (total, attachment) => total + attachment.files.length,
+    0,
+  );
+}
+
+/** An empty prompt skips the prompt step server-side; hide it too, and show
+ * `inputs` only for a task that actually has pinned attachments — a launch
+ * without them keeps exactly the pipeline, and the progress shape, it had. */
 function stepsFor(task: Task) {
-  return task.prompt ? PIPELINE_STEPS : PIPELINE_STEPS.filter((s) => s.name !== "prompt");
+  const attached = (task.execution_inputs?.result_attachments ?? []).length > 0;
+  return PIPELINE_STEPS.filter(
+    (step) =>
+      (step.name !== "prompt" || task.prompt) &&
+      (step.name !== "inputs" || attached),
+  );
 }
 
 type StepStatus = "pending" | "running" | "ok" | "failed";
@@ -92,6 +120,213 @@ const WORKSPACE_LABELS: Record<(typeof WORKSPACE_FIELDS)[number], string> = {
   preamble: "Prompt preamble",
 };
 
+/** Result attachments: what is selected, what the target base says about it,
+ * and the acknowledgement an unvalidated base requires (ADR-0035).
+ *
+ * Everything authoritative here comes from the daemon's preview. The list of
+ * offers is a convenience for choosing; the *consequences* — destinations,
+ * conflicts, base comparison, and whether an acknowledgement is still needed —
+ * are rendered from what the daemon resolved, never computed locally. A client
+ * that decided for itself that a launch was safe would be inventing an
+ * authority it does not have.
+ *
+ * File text is not rendered here. It is inspected in the producing task's
+ * Results panel, through the existing escaped-source viewer. */
+function HandoffInputs({
+  projectName,
+  selected,
+  available,
+  preview,
+  acknowledged,
+  onAcknowledge,
+  onToggle,
+  disabled,
+}: {
+  projectName: string;
+  selected: DraftAttachment[];
+  available: TaskResult[];
+  preview: LaunchPreview | null;
+  acknowledged: boolean;
+  onAcknowledge: (value: boolean) => void;
+  onToggle: (entry: DraftAttachment) => void;
+  disabled: boolean;
+}) {
+  const chosen = new Set(selected.map((entry) => entry.result_id));
+  const comparisons = new Map(
+    (preview?.base_comparisons ?? []).map((entry) => [entry.result_id, entry]),
+  );
+  // A selection the daemon did not resolve: the project changed under it, the
+  // revision was purged, or a successor made it stale. Kept visible with that
+  // reason rather than dropped — a silently shrinking selection is a launch
+  // the operator did not choose.
+  const resolved = new Set(
+    (preview?.result_attachments ?? []).map((entry) => entry.result_id),
+  );
+  const unresolved = selected.filter((entry) => !resolved.has(entry.result_id));
+
+  return (
+    <details className="advanced" data-testid="spawn-attachments">
+      <summary>
+        Handoff inputs — accepted results to attach
+        {selected.length > 0 ? ` (${selected.length})` : ""}
+      </summary>
+      {!projectName ? (
+        <p className="hint">Choose a project to see the results it can offer.</p>
+      ) : available.length === 0 && selected.length === 0 ? (
+        <p className="hint" data-testid="spawn-attachments-empty">
+          This project has no accepted result revisions. Capture and accept one
+          in a task&apos;s Results panel first — an unaccepted or unreadable
+          revision cannot be attached.
+        </p>
+      ) : (
+        <>
+          <ul className="spawnAttachmentList">
+            {available.map((result) => {
+              const isChosen = chosen.has(result.id);
+              const detail = preview?.result_attachments.find(
+                (entry) => entry.result_id === result.id,
+              );
+              const comparison = comparisons.get(result.id);
+              return (
+                <li key={result.id} data-testid="spawn-attachment-option">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={isChosen}
+                      disabled={disabled || result.manifest_id === null}
+                      onChange={() =>
+                        onToggle({
+                          producer_task_id: result.task_id,
+                          result_id: result.id,
+                          expected_manifest_id: result.manifest_id ?? "",
+                        })
+                      }
+                    />{" "}
+                    <code>{shortResultId(result.id)}</code> — task{" "}
+                    {result.task_id} · {result.file_count} file
+                    {result.file_count === 1 ? "" : "s"} ·{" "}
+                    {formatResultBytes(result.total_bytes)} ·{" "}
+                    {revisionStatus(result)}
+                  </label>
+                  {isChosen && detail && (
+                    <div className="spawnAttachmentDetail">
+                      <p className="spawnHandoffLabel" data-testid="spawn-attachment-policy">
+                        Handoff input — not publishable
+                      </p>
+                      <ul className="spawnAttachmentPaths">
+                        {detail.destinations.map((path) => (
+                          <li key={path}>
+                            <code>{path}</code>
+                          </li>
+                        ))}
+                      </ul>
+                      {comparison && <BaseComparisonNote comparison={comparison} />}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          {unresolved.length > 0 && (
+            <div className="spawnAttachmentProblem" data-testid="spawn-attachment-unresolved">
+              {unresolved.length} selected revision
+              {unresolved.length === 1 ? "" : "s"} could not be resolved for this
+              launch. The refusal above says why. Remove the selection, or choose
+              another accepted bundle — nothing is dropped for you.
+              <ul>
+                {unresolved.map((entry) => (
+                  <li key={entry.result_id}>
+                    <code>{shortResultId(entry.result_id)}</code>{" "}
+                    <button
+                      type="button"
+                      className="linkButton"
+                      disabled={disabled}
+                      onClick={() => onToggle(entry)}
+                    >
+                      remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {preview?.source_commit && (
+            <p className="hint" data-testid="spawn-attachment-target">
+              Target base: <code>{preview.source_commit.slice(0, 12)}</code> —
+              the exact commit this task will be built from.
+            </p>
+          )}
+          {selected.length > 0 && (
+            <label className="spawnAcknowledge" data-testid="spawn-acknowledge">
+              <input
+                type="checkbox"
+                checked={acknowledged}
+                disabled={disabled}
+                onChange={(e) => onAcknowledge(e.target.checked)}
+              />{" "}
+              I understand these files were not validated against this target
+              base.
+              {preview && !preview.needs_base_acknowledgement && (
+                <span className="hint">
+                  {" "}
+                  Not required for this selection — every attachment was captured
+                  against exactly this commit. That is not evidence the plan is
+                  correct.
+                </span>
+              )}
+            </label>
+          )}
+        </>
+      )}
+    </details>
+  );
+}
+
+/** What the daemon observed about one attachment's base, in its own words. */
+function BaseComparisonNote({ comparison }: { comparison: BaseComparison }) {
+  if (comparison.state === "match") {
+    return (
+      <p className="hint" data-testid="spawn-base-match">
+        Captured against this exact base. Matching identities do not prove the
+        plan is right for it.
+      </p>
+    );
+  }
+  if (comparison.state === "unknown") {
+    return (
+      <p className="spawnAttachmentProblem" data-testid="spawn-base-unknown">
+        {comparison.detail ??
+          "The producing capture recorded no base observation."}{" "}
+        This plan has not been validated against this target.
+      </p>
+    );
+  }
+  return (
+    <div className="spawnAttachmentProblem" data-testid="spawn-base-different">
+      <p>
+        Captured against{" "}
+        <code>{(comparison.producer_observation ?? "").slice(0, 12)}</code>, not
+        this target. The plan has not been validated against this base.
+      </p>
+      {comparison.detail && <p className="hint">{comparison.detail}</p>}
+      {comparison.changed_paths.length > 0 && (
+        <>
+          <p className="hint">
+            Changed since then{comparison.truncated ? " (list truncated)" : ""}:
+          </p>
+          <ul className="spawnAttachmentPaths">
+            {comparison.changed_paths.map((path) => (
+              <li key={path}>
+                <code>{path}</code>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </div>
+  );
+}
+
 export function SpawnView() {
   const {
     snapshotReady,
@@ -100,6 +335,7 @@ export function SpawnView() {
     workflowCatalog,
     workflowLibrary,
     tasks,
+    taskResults,
     spawnProgress,
   } = useDaemonState();
   const navigate = useNavigate();
@@ -196,6 +432,50 @@ export function SpawnView() {
     navigate(location.pathname, { replace: true, state: null });
   }, [location.state, location.pathname, navigate, selectWorkflow]);
 
+  /** "Start task from this result" hands over one revision.
+   *
+   * Applied once, like the workflow handoff: it is an explicit "attach this
+   * one", not a preference to reapply on every mount. The project comes with
+   * it, because a result can only be attached inside its own project. */
+  useEffect(() => {
+    const handoff = (location.state as { attachment?: DraftAttachment } | null)
+      ?.attachment;
+    const project = (location.state as { project?: string } | null)?.project;
+    if (!handoff) return;
+    setDraft((current) => {
+      const already = current.attachments.some(
+        (entry) => entry.result_id === handoff.result_id,
+      );
+      return {
+        ...current,
+        project: project ?? current.project,
+        attachments: already ? current.attachments : [...current.attachments, handoff],
+        acknowledgeBaseDifference: false,
+      };
+    });
+    navigate(location.pathname, { replace: true, state: null });
+  }, [location.state, location.pathname, navigate]);
+
+  /** Add or remove one attachment.
+   *
+   * Every change clears the acknowledgement: it was about a specific set of
+   * files against a specific target, and carrying it to a different selection
+   * would be an approval nobody gave. */
+  const toggleAttachment = useCallback((entry: DraftAttachment) => {
+    setDraft((current) => {
+      const present = current.attachments.some(
+        (item) => item.result_id === entry.result_id,
+      );
+      return {
+        ...current,
+        attachments: present
+          ? current.attachments.filter((item) => item.result_id !== entry.result_id)
+          : [...current.attachments, entry],
+        acknowledgeBaseDifference: false,
+      };
+    });
+  }, []);
+
   const launchInput: LaunchInput | null = useMemo(() => {
     if (!draft.project || !draft.workflow || !draft.slug) return null;
     const overrides: WorkspaceOverridesInput = {};
@@ -226,8 +506,40 @@ export function SpawnView() {
       ...(draft.profile ? { model_profile: draft.profile } : {}),
       ...(Object.keys(overrides).length > 0 ? { workspace_overrides: overrides } : {}),
       ...(Object.keys(stepOverrides).length > 0 ? { step_overrides: stepOverrides } : {}),
+      // Omitted entirely when nothing is attached, so an ordinary launch sends
+      // exactly the request it always did.
+      ...(draft.attachments.length > 0
+        ? {
+            result_attachments: draft.attachments,
+            acknowledge_result_base_difference: draft.acknowledgeBaseDifference,
+          }
+        : {}),
     };
   }, [draft]);
+
+  /** Every accepted, still-readable revision this project can offer.
+   *
+   * Same-project only, decided through the *task* each revision belongs to —
+   * the daemon decides membership the same way, and a manifest's own project
+   * label is provenance rather than authority. An unaccepted, damaged, or
+   * purged revision is simply not on offer; the daemon refuses it too, so the
+   * form never presents a choice that acceptance would reject. */
+  const availableResults = useMemo(() => {
+    if (!draft.project) return [];
+    const owned = new Set(
+      tasks.filter((task) => task.project_name === draft.project).map((task) => task.id),
+    );
+    const offered: TaskResult[] = [];
+    for (const projection of Object.values(taskResults)) {
+      for (const result of projection.results) {
+        if (!owned.has(result.task_id)) continue;
+        if (!result.available || result.accepted_at === null) continue;
+        if (result.manifest_id === null) continue;
+        offered.push(result);
+      }
+    }
+    return offered.sort((a, b) => b.captured_at.localeCompare(a.captured_at));
+  }, [draft.project, tasks, taskResults]);
 
   const workflow = workflowCatalog.find((w) => w.name === draft.workflow) ?? null;
 
@@ -582,6 +894,17 @@ export function SpawnView() {
               Type <code>@</code> to attach a file from the project&apos;s repository.
             </div>
           </div>
+
+          <HandoffInputs
+            projectName={draft.project}
+            selected={draft.attachments}
+            available={availableResults}
+            preview={preview}
+            acknowledged={draft.acknowledgeBaseDifference}
+            onAcknowledge={(value) => update({ acknowledgeBaseDifference: value })}
+            onToggle={toggleAttachment}
+            disabled={locked}
+          />
 
           <details
             className="advanced"

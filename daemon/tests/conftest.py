@@ -369,6 +369,39 @@ def spawn_task(
     )
 
 
+def make_result_attachment(*paths: str, result_id: str = "res_test", body: bytes = b"# Plan\n"):
+    """One pinned handoff attachment, for a task built directly rather than
+    through preview/accept. The classification is the fixed handoff value —
+    there is no other legal one (ADR-0035)."""
+    import hashlib
+
+    from ompire_daemon.execution_inputs import (
+        HANDOFF_CLASSIFICATION,
+        AttachedFile,
+        ResultAttachment,
+    )
+
+    return ResultAttachment(
+        result_id=result_id,
+        producer_task_id=99,
+        manifest_id=f"manifest-{result_id}",
+        content_id=None,
+        accepted_at="2026-09-09T00:00:00+00:00",
+        manifest_project_name="myproject",
+        files=tuple(
+            AttachedFile(
+                path=path,
+                length=len(body),
+                sha256=hashlib.sha256(body).hexdigest(),
+                media_type="text/markdown",
+            )
+            for path in paths
+        ),
+        provenance={},
+        classification=HANDOFF_CLASSIFICATION,
+    )
+
+
 def make_execution_inputs(
     *,
     checkout_path: str,
@@ -387,6 +420,8 @@ def make_execution_inputs(
     step_roles: dict | None = None,
     step_profile_names: dict | None = None,
     step_profiles: dict | None = None,
+    result_attachments: tuple = (),
+    source_commit: str | None = None,
     revision=None,
     engine=None,
 ):
@@ -458,6 +493,8 @@ def make_execution_inputs(
         return (step_profiles or {})[profile]
 
     return TaskExecutionInputs(
+        result_attachments=tuple(result_attachments),
+        source_commit=source_commit,
         provenance=PROVENANCE_ACCEPTED,
         accepted_at="2026-09-05T00:00:00+00:00",
         project_name=project_name,

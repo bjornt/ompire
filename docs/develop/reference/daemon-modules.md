@@ -38,7 +38,7 @@ All paths are under `daemon/src/ompire_daemon/`.
 | `registry/workflow_library.py` | The operator-owned library above those revisions: entries, inert drafts, current-revision selection, archive/restore, edit versions, and the single transactional prospective lookup. See [ADR-0031](../../adr/0031-let-operators-own-a-workflow-library-above-retained-revisions.md) |
 | `registry/reviews.py` | Review status and ordered iteration history, each bound to the candidate it graded |
 | `registry/ships.py` | Delivery candidates, operator authorizations, write-ahead action attempts, and reconciliation decisions |
-| `registry/results.py` | Durable task results: the manifest contract and its identities, the purely syntactic selection rules, the reserved-write capture/accept/purge mutations, and metadata projections that never load a BLOB. See [ADR-0034](../../adr/0034-retain-durable-task-results-outside-the-workspace.md) |
+| `registry/results.py` | Durable task results: the manifest contract and its identities, the purely syntactic selection rules, the reserved-write capture/accept/purge mutations, the connection-scoped attachment checks and consumer reference index, and metadata projections that never load a BLOB. See [ADR-0034](../../adr/0034-retain-durable-task-results-outside-the-workspace.md) and [ADR-0035](../../adr/0035-refuse-to-publish-handoff-destinations.md) |
 | `registry/settings.py` | Layered settings: override, then TOML, then default |
 | `registry/launch.py` | Inert upgrade evidence and the operator decisions that close out a reconciliation. Nothing here is read to execute anything. |
 
@@ -48,7 +48,8 @@ All paths are under `daemon/src/ompire_daemon/`.
 |---|---|
 | `launch.py` | Launch resolution: one set of rules shared by preview, acceptance, and legacy confirmation. Pure with respect to the world outside the database, so it can run inside a write reservation. |
 | `launchconfig.py` | Startup initialization for the template retirement, plus the project and legacy-task reconciliation flows — including the workflow continuation candidate, its compatibility check, and the history boundary a confirmation records. |
-| `spawn.py` | The four-step spawn pipeline: fetch, clone, branch, workshop. Resolves nothing — every value comes off the task's accepted inputs. |
+| `spawn.py` | The spawn pipeline: fetch, clone, branch, `inputs` for a launch with handoff inputs, workshop. Resolves nothing — every value comes off the task's accepted inputs. |
+| `handoff.py` | Handoff inputs: the destination and bounds rules an attached result revision must satisfy, the read-only Git observation a launch is reviewed against, and the no-follow exclusive materialization that installs reviewed bytes into a recipient's clone. Shared by launch resolution and the spawn pipeline so the two cannot disagree. See [ADR-0035](../../adr/0035-refuse-to-publish-handoff-destinations.md) |
 | `workshopadditions.py` | The bounded staging that makes the accepted Workshop additions source the one the launcher actually applies, with restoration and crash recovery. |
 | `projectcheckout.py` | Read-only inspection of a base checkout, plus the URL and remote-name validators that guard `git clone` argv. Never writes to a checkout. |
 | `projectsetup.py` | `ProjectSetupManager`: the supervised clone-mode setup job, its step events, retry, and startup reconciliation of interrupted clones. |

@@ -162,7 +162,7 @@ Published on the dashboard channel:
 | `stats`, `advisory` | Session telemetry and decorations |
 | `review_started`, `review_iteration`, `review_finished` | Review lifecycle |
 | `ship_updated` | A task's delivery projection changed; carries the whole versioned document |
-| `task_results_updated` | A task's durable results changed — a capture opened, finished or failed, a revision was accepted, found unavailable, or purged. Carries the whole versioned document for that task, metadata only, and is published only after the daemon committed the change. A client drops an older `version` and treats an equal one as already applied; `task_deleted` clears the task's results |
+| `task_results_updated` | A task's durable results changed — a capture opened, finished or failed, a revision was accepted, found unavailable, or purged, or a consumer task pinned or released it as a launch input. Carries the whole versioned document for that task, metadata only, and is published only after the daemon committed the change. A client drops an older `version` and treats an equal one as already applied; `task_deleted` clears the task's results |
 | `gpg_status` | The signing-key probe result changes |
 | `gh_status` | A completed GitHub identity or target probe replaced the full safe `gh` projection |
 | `settings_changed` | Effective settings change |
@@ -174,7 +174,11 @@ the durable outcome is the project's own `setup_state`/`setup_error`, which
 are broadcast as `project_updated` and are what a reconnecting client renders.
 
 `spawn_step` payloads carry `status` — `started`, `ok`, or `failed` — and a
-failure carries the relevant detail.
+failure carries the relevant detail. The step names are `fetch`, `clone`,
+`branch`, `inputs`, and `workshop`; `inputs` is emitted only for a task
+launched with handoff inputs, so a client keys off the events it receives
+rather than off a fixed count
+([ADR-0035](../../adr/0035-refuse-to-publish-handoff-destinations.md)).
 
 A task's `authority` block is the same resolution the trusted service admits
 against, projected: how authority would be established right now — an

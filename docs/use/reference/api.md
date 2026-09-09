@@ -211,6 +211,35 @@ null field inherits, and an entry overriding neither resolves to the same
 `default`/`smol`/`slow`/`plan`, an unknown profile, and any unknown field
 inside an entry are all `422` at the named field, creating nothing.
 
+`result_attachments` pins accepted result revisions as
+[handoff inputs](task-spawn.md#handoff-inputs)
+([ADR-0035](../../adr/0035-refuse-to-publish-handoff-destinations.md)). Each
+entry carries `producer_task_id`, `result_id`, and `expected_manifest_id`; all
+three are required, and the manifest id is what refuses a stale selection
+instead of silently resolving to a successor. Destinations are the revision's
+own manifest paths — there is no caller-supplied mapping. An omitted or empty
+list is an ordinary launch, and resolves exactly as it did before.
+
+`acknowledge_result_base_difference` is a boolean the operator sets when the
+preview reports a `different` or `unknown` base comparison. Without it such a
+launch is `422`. It is covered by the preview token, so it cannot be carried
+across a changed selection or a moved base.
+
+For a launch with attachments, both calls also return:
+
+| Field | Meaning |
+|---|---|
+| `source_commit` | The exact commit the clone will be built from. `null` for a launch with no attachments |
+| `result_attachments` | Each pinned revision with its `manifest_id`, `destinations`, file list with checksums, producer provenance, `classification: "handoff-input"`, and `publishable: false` |
+| `base_comparisons` | Per attachment: `state` (`match`/`different`/`unknown`), `target_commit`, `producer_observation`, a bounded `changed_paths` list, `truncated`, and a `detail` naming any gap |
+| `needs_base_acknowledgement` | Whether an acknowledgement is still required |
+
+Refusals are `422` at `result_attachments` — an unaccepted, purged, damaged,
+cross-project, duplicated, or stale revision; a destination collision; a
+destination or ancestor that is tracked, a directory, a symlink, or a submodule
+on the target base; a reserved launcher path; or a base branch that resolves to
+no commit — and create nothing.
+
 `auxiliary_overrides` is retired with the engine's judge. Any entry in it is
 `422` at the named field rather than silently dropped: the model it names no
 longer runs.
@@ -290,8 +319,9 @@ variant.
 
 A result carries its `state` (`capturing`, `failed`, `ready`, `purged`),
 `available`, `manifest_id`, `content_id`, `predecessor_id`, the file list with
-lengths, media types and SHA-256 checksums, `provenance`, and the acceptance and
-purge decisions. Content is never in the projection — it is fetched per selected
+lengths, media types and SHA-256 checksums, `provenance`, the acceptance and
+purge decisions, and `consumer_task_ids` — the tasks that pinned this exact
+revision as a launch input. Content is never in the projection — it is fetched per selected
 revision.
 
 | Condition | Response |
@@ -299,7 +329,14 @@ revision.
 | Malformed or ineligible selection, missing acknowledgement | `422` |
 | Unknown task, revision, or file | `404` |
 | Capture already in flight, replay under a changed selection, stale manifest or version, unavailable revision, no workspace, workspace busy | `409` |
+| Purge of a revision a consumer task pinned | `409`, naming those tasks; nothing is deleted |
 | Purged revision's content | `410` |
+
+A revision with a non-empty `consumer_task_ids` cannot be purged. Cleaning up,
+failing, or archiving a consumer releases nothing; only `DELETE /api/tasks/{id}`
+on that consumer does, and only once every task-purge refusal has passed. Both
+creating and releasing a reference advance the *producer's* result version and
+broadcast its document.
 
 Capture and acceptance advance no workflow, answer no review, and make nothing
 publishable. Downloads use ordinary bearer authentication and carry

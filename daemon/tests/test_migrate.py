@@ -52,7 +52,7 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0020"
+    assert version == "0021"
     assert "projects" in tables
     assert "tasks" in tables
     # Templates are retired (ADR-0026): the live table is gone and only inert
@@ -205,7 +205,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0020"
+    assert version == "0021"
     assert row == "demo"
 
 
@@ -1452,7 +1452,8 @@ def test_0015_leaves_the_workflow_binding_null_rather_than_inventing_one(
             text("SELECT count(*) FROM workflow_revisions")
         ).scalar_one()
 
-    assert document["version"] == 3
+    # 0021 carries it forward to version 4 without inventing anything either.
+    assert document["version"] == 4
     assert document["workflow_binding"] is None
     assert document["workflow_name"] == "bugfix"
     # A migration cannot know what the old definition said, so it retains none.
@@ -1956,7 +1957,7 @@ def test_0020_adds_results_without_inventing_any(tmp_path: Path) -> None:
     with engine.connect() as conn:
         assert (
             conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "0020"
+            == "0021"
         )
         assert conn.execute(text("SELECT COUNT(*) FROM task_results")).scalar_one() == 0
         row = conn.execute(
@@ -1966,3 +1967,57 @@ def test_0020_adds_results_without_inventing_any(tmp_path: Path) -> None:
     assert row.state == "archived"
     # A task with no results is at version 0, not at some inherited counter.
     assert row.results_version == 0
+
+
+def test_0021_carries_pinned_inputs_forward_without_inventing_a_source_commit(
+    tmp_path: Path,
+) -> None:
+    """The load-bearing refusal of this migration.
+
+    A task accepted before attachments existed was built from *some* commit,
+    and nobody recorded which. Filling `source_commit` in from today's branch
+    head would claim the task was reviewed against a base that may have moved
+    many times since. Null is the honest value, and no attachment reference is
+    invented for a task that never had one.
+    """
+    db_path = tmp_path / "ompire.db"
+    _land_at_0014(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "upgraded", _v2_document())
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        document = _pinned(conn, "upgraded")
+        references = conn.execute(
+            text("SELECT count(*) FROM task_result_references")
+        ).scalar_one()
+
+    assert document["version"] == 4
+    assert document["result_attachments"] == []
+    assert document["source_commit"] is None
+    assert document["base_comparisons"] == []
+    assert document["acknowledged_base_difference"] is False
+    assert references == 0
+
+
+def test_0021_leaves_a_task_with_no_pinned_inputs_null(tmp_path: Path) -> None:
+    """NULL means "no launch was ever accepted here". The upgrade must not
+    turn that into an empty accepted document, which would read as a task that
+    was reviewed and simply had no attachments."""
+    db_path = tmp_path / "ompire.db"
+    _land_at_0014(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "unpinned", None)
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        raw = conn.execute(
+            text("SELECT execution_inputs_json FROM tasks WHERE slug = 'unpinned'")
+        ).scalar_one()
+    assert raw is None

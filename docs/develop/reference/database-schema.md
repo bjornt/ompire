@@ -190,6 +190,24 @@ gone, so filling the binding in from whatever ships today would claim the task
 accepted a document it never saw. It retained no revision, because a migration
 cannot know what the code it is upgrading from actually executed.
 
+`result_attachments`, `source_commit`, `base_comparisons`, and
+`acknowledged_base_difference` — version 4 — record the accepted result
+revisions this task was launched with, the exact commit its clone was built
+from, and how each attachment's recorded capture-time base compared with that
+commit
+([ADR-0035](../../adr/0035-refuse-to-publish-handoff-destinations.md)). Every
+attachment carries a fixed `handoff-input` classification; a document holding
+any other value is refused on read rather than decoded as "no protection",
+because reading an unparseable policy permissively is the one failure mode the
+non-publication contract cannot survive. The attachments' destinations are also
+the task's protected paths, which is what candidate capture and delivery check
+the proposed Git result against.
+
+Migration `0021` converted version 3 into version 4 by adding an empty
+attachment list, a null `source_commit`, no comparisons, and a false
+acknowledgement. It invented no commit observation, and left every NULL
+document NULL.
+
 It follows the registry's existing JSON-text convention rather than a dozen
 columns: nothing queries a task by a nested binding, and a partial update would
 be a different decision, so there is no field-level write API. The source
@@ -648,6 +666,52 @@ No filesystem work and no `await` happens while a write reservation is held: the
 whole bounded read runs on a worker thread first, and only the commit is
 reserved.
 
+## `task_result_references`
+
+| Column | Type | Notes |
+|---|---|---|
+| `consumer_task_id` | integer | FK to `tasks.id`, primary key with `result_id` |
+| `result_id` | string | FK to `task_results.id`, primary key with the consumer; separately indexed |
+| `producer_task_id` | integer | Denormalized, so a purge refusal names the producer without joining through bytes that may be gone |
+| `manifest_id` | string | The exact revision this consumer pinned |
+| `created_at` | string | ISO-8601 |
+
+Added by migration `0021`
+([ADR-0035](../../adr/0035-refuse-to-publish-handoff-destinations.md)), which
+also moves `tasks.execution_inputs_json` from version 3 to version 4. That
+upgrade invents nothing: an existing document gains an empty attachment list, a
+null `source_commit`, no base comparison, and no acknowledgement, and a NULL
+document stays NULL. A task built before attachments existed was built from
+*some* commit and nobody recorded which; filling it in from today's branch head
+would claim a review that never happened.
+
+This table is an index, not the contract. The consumer's immutable
+`execution_inputs_json` is what execution reads and what the task's record says
+it ran with; this exists so "may these bytes be purged?" and "who is holding
+them?" are answerable without decoding every launch document in the database.
+
+Foreign-key enforcement is off on these connections, so both deletions are
+written explicitly — there is no cascade to rely on.
+
+### Reference transaction boundaries
+
+- **Admission**: the task row, its pinned inputs, its retained workflow
+  revision, and every reference are inserted in the *one* `BEGIN IMMEDIATE`
+  reservation that `POST /api/tasks` already held. Every revision's state,
+  acceptance, manifest identity and payload checksums are checked on that same
+  connection, through connection-scoped helpers that perform no writes and open
+  no second connection — so a refusal never nests a reservation, and a purge
+  racing the launch either loses the reservation and is refused or wins and
+  leaves no consumer behind.
+- **Result purge** checks references on its own reserved connection, before any
+  byte is deleted.
+- **Release** happens only in the transaction that deletes a consumer's task
+  row, after every task-purge refusal has passed.
+
+Both admission and release advance the *producer's* `results_version`, and the
+REST layer publishes those producers' documents after the commit, so a purge
+dialog open in another tab converges without a refresh.
+
 ### Logical purge and retention
 
 Result purge deletes the file rows and leaves the `task_results` row as a
@@ -664,6 +728,13 @@ Task purge refuses while any `ready` or `capturing` revision remains. That check
 runs on the caller's own reserved connection *before* any deletion, alongside
 the delivery-row deletion that used to run in its own earlier transaction — so a
 refused purge leaves every child row this task owns exactly where it was.
+
+Result purge additionally refuses while any row in `task_result_references`
+names the revision, listing the consumer tasks. Retention there is a
+dependency, not a preference: the consumers' own records say they ran with
+those files. There is no force variant and no automatic eviction, so a database
+with many failed or archived consumers keeps their references until those task
+records are purged.
 
 ## `settings`
 

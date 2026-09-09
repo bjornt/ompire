@@ -37,7 +37,7 @@ import os
 import re
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,12 +49,16 @@ from ompire_daemon.config import Config
 from ompire_daemon.delivery import (
     DeliveryWorkspaceError,
     EmptyCandidateError,
+    ProtectedPathError,
     WorkspaceBlockedError,
     WorkspaceBusyError,
     WorkspaceGuard,
+    assert_range_unprotected,
+    assert_tree_unprotected,
     candidate_identity,
     capture_candidate,
     git_out,
+    protected_destinations,
     remove_candidate_storage,
     run_git,
     safe_git,
@@ -1002,6 +1006,9 @@ class ShipManager:
                 }
             if mode == "retain" and candidate is not None:
                 blockers.extend(self._retain_blockers(candidate))
+                blockers.extend(
+                    await self._retain_protected_blockers(task, candidate)
+                )
         if candidate is not None:
             identity["git"] = await self._git_identity(task.clone_path)
 
@@ -1339,6 +1346,88 @@ class ShipManager:
                     ),
                 )
             ]
+        return []
+
+    async def _assert_publishable(
+        self, task: Task, delivery: DeliveryRecord, tip: str
+    ) -> str | None:
+        """Refuse a push or pull request whose commits carry a handoff input.
+
+        Every trusted admission asks again, against the objects that exist now
+        (ADR-0035). The commit gate already checked the signed result, but a
+        push may be a continuation, a restart reconciliation, or a direct
+        service call reached without replaying the earlier step — so none of
+        them is allowed to inherit an earlier answer. Returns the refusal, or
+        None when the range is clean.
+        """
+        protected = protected_destinations(task)
+        if not protected:
+            return None
+        candidate = (
+            get_candidate(self._engine, delivery.candidate_id)
+            if delivery.candidate_id
+            else None
+        )
+        if candidate is None:
+            return (
+                "this task has handoff inputs that may never be published, and "
+                "the candidate that would prove what is being published is no "
+                "longer retained; review the current content again"
+            )
+        try:
+            await assert_range_unprotected(
+                task.clone_path,
+                candidate.base_commit,
+                tip,
+                protected,
+                self._config.spawn_step_timeout,
+            )
+        except ProtectedPathError as exc:
+            return str(exc)
+        except DeliveryWorkspaceError as exc:
+            return (
+                "Ompire could not check what this delivery would publish for "
+                f"handoff inputs, so it will not publish it: {exc}"
+            )
+        return None
+
+    async def _retain_protected_blockers(
+        self, task: Task, candidate: CandidateRecord
+    ) -> list[Blocker]:
+        """Retain-mode contamination: any commit that would be published.
+
+        Mode-specific on purpose (ADR-0035). The candidate's *final* tree was
+        already checked when it was captured, mode-neutrally, so squash is
+        settled by then. Retain publishes the commits themselves, so a handoff
+        file that was added in a checkpoint and deleted before HEAD is still
+        published — and is refused here, naming the commit, rather than being
+        hidden behind a clean final tree.
+
+        This blocks the delivery; it never rewrites, resets, or drops a commit
+        to make the range publishable.
+        """
+        protected = protected_destinations(task)
+        if not protected:
+            return []
+        for commit in candidate.source_commits:
+            try:
+                await assert_tree_unprotected(
+                    task.clone_path,
+                    commit.tree_id,
+                    protected,
+                    self._config.spawn_step_timeout,
+                    commit=commit.commit_id,
+                )
+            except ProtectedPathError as exc:
+                return [Blocker("retain-protected-paths", str(exc))]
+            except DeliveryWorkspaceError as exc:
+                return [
+                    Blocker(
+                        "retain-protected-unreadable",
+                        "Ompire could not check every commit this delivery "
+                        f"would publish for handoff inputs: {exc}",
+                    )
+                ]
         return []
 
     def _retain_blockers(self, candidate: CandidateRecord) -> list[Blocker]:
@@ -1880,7 +1969,13 @@ class ShipManager:
                 timeout=timeout,
             )
             await self._verify_signed(
-                store, tip, candidate, delivery.mode or "squash", signing_key, timeout
+                store,
+                tip,
+                candidate,
+                delivery.mode or "squash",
+                signing_key,
+                timeout,
+                protected_destinations(task),
             )
             installed, install_note = await self._install_signed(
                 task, store, tip, candidate, signed_ref, timeout
@@ -2062,6 +2157,7 @@ class ShipManager:
         mode: str,
         signing_key: str,
         timeout: int,
+        protected: Sequence[str] = (),
     ) -> None:
         """Prove the result is exactly what was authorized, before it is
         installed or published.
@@ -2070,6 +2166,12 @@ class ShipManager:
         Checking both is what makes the explicit `-S<key>` verifiable rather
         than merely requested. Verification runs under the operator-owned
         signing configuration for the same reason the signature does.
+
+        `protected` is re-checked here against the *actual signed commits*, not
+        against the candidate record they came from (ADR-0035). This is the
+        last gate before anything is installed or pushed, and it asks the
+        object store what it really holds rather than trusting an earlier
+        reading of a workspace.
         """
         expected_count = 1 if mode == "squash" else candidate.commit_count
         stdout = await self._store_log(store, tip, candidate.base_commit, timeout)
@@ -2135,6 +2237,11 @@ class ShipManager:
                 "the signed range does not start from the reviewed base "
                 f"({candidate.base_commit[:12]})"
             )
+        # Every tree that would actually be published, read out of the store
+        # that holds the signed objects.
+        await assert_range_unprotected(
+            store, candidate.base_commit, tip, protected, timeout
+        )
 
     async def _store_log(
         self, store: Path, tip: str, base: str, timeout: int
@@ -2316,6 +2423,12 @@ class ShipManager:
             )
             return False
         tip = (commit.result or {})["signed_tip"]
+        refusal = await self._assert_publishable(task, delivery, tip)
+        if refusal is not None:
+            set_disposition(
+                self._engine, delivery.id, "blocked", blocked_reason=refusal
+            )
+            return False
         destination = delivery.routing or self._destination(task)
         clone = task.clone_path
         timeout = self._config.spawn_step_timeout
@@ -2562,6 +2675,16 @@ class ShipManager:
                 "blocked",
                 blocked_reason="there is no verified pushed result to open a "
                 "pull request for",
+            )
+            return False
+        # A pull request publishes the pushed range to reviewers, so it asks
+        # the same question the push did rather than inheriting its answer.
+        refusal = await self._assert_publishable(
+            task, delivery, str((push.result or {}).get("signed_tip") or "")
+        )
+        if refusal is not None:
+            set_disposition(
+                self._engine, delivery.id, "blocked", blocked_reason=refusal
             )
             return False
         destination = delivery.routing or self._destination(task)
@@ -3095,6 +3218,9 @@ class ShipManager:
                 str(expected.get("mode") or delivery.mode or "squash"),
                 str(expected.get("signing_key")),
                 timeout,
+                # Reconciliation re-derives the policy from the task, so a
+                # restart mid-delivery cannot resume under a weaker one.
+                protected_destinations(task),
             )
         except DeliveryWorkspaceError as exc:
             return {

@@ -52,8 +52,28 @@ from ompire_daemon.registry.model_profiles import RoleBinding
 # written by a newer daemon is refused rather than half-understood. Version 2
 # replaced the single task-wide role map with per-consumer bindings; version 3
 # added the pinned workflow revision and retired the engine's auxiliary judge
-# consumer.
-EXECUTION_INPUTS_VERSION = 3
+# consumer; version 4 added pinned result attachments and the exact source
+# commit an attachment launch was reviewed against.
+EXECUTION_INPUTS_VERSION = 4
+
+# The one classification an attached destination can carry. It is a constant,
+# not a field an operator or an agent can set: there is no declassification,
+# so a stored value other than this one is a damaged document rather than a
+# different policy (ADR-0035).
+HANDOFF_CLASSIFICATION = "handoff-input"
+
+# How a reviewed launch compared the producer's recorded base observation with
+# the commit this task will actually be built from.
+BASE_COMPARISON_MATCH = "match"
+BASE_COMPARISON_DIFFERENT = "different"
+BASE_COMPARISON_UNKNOWN = "unknown"
+
+# A comparison that is not `match` needs the operator to acknowledge it: the
+# plan was not validated against this target.
+BASE_COMPARISON_NEEDS_ACKNOWLEDGEMENT = (
+    BASE_COMPARISON_DIFFERENT,
+    BASE_COMPARISON_UNKNOWN,
+)
 
 # The workspace/prompt fields a project supplies as defaults and a single task
 # may override. Order is presentation order.
@@ -94,6 +114,25 @@ class UnsupportedExecutionInputsVersionError(ValueError):
             f"understands version {EXECUTION_INPUTS_VERSION}"
         )
         self.version = version
+
+
+class DamagedAttachmentPolicyError(ValueError):
+    """A stored attachment does not carry the handoff policy this daemon
+    implements.
+
+    Refused rather than decoded as "no protection". A document whose
+    classification cannot be read is a document whose publication restrictions
+    cannot be enforced, and reading it permissively is the one failure mode the
+    non-publishable contract cannot survive (ADR-0035).
+    """
+
+    def __init__(self, result_id: object, found: object) -> None:
+        super().__init__(
+            f"attachment {result_id!r} carries an unreadable handoff policy "
+            f"({found!r}); this daemon enforces {HANDOFF_CLASSIFICATION!r} only"
+        )
+        self.result_id = result_id
+        self.found = found
 
 
 class MissingConsumerBindingError(LookupError):
@@ -148,6 +187,83 @@ class ConsumerBinding:
     def binding(self) -> RoleBinding:
         """The concrete pair this consumer's turns run under."""
         return self.roles[self.role]
+
+
+@dataclass(frozen=True)
+class AttachedFile:
+    """One attached file, exactly as the producer's manifest describes it.
+
+    Copied into the launch document rather than referenced, so the recipient's
+    inputs still say what it was accepted with after the producing revision is
+    unreadable. The retained manifest is re-checked against these values at
+    materialization: a disagreement is an integrity failure, never a repair.
+    """
+
+    path: str
+    length: int
+    sha256: str
+    media_type: str
+
+
+@dataclass(frozen=True)
+class ResultAttachment:
+    """One accepted result revision pinned as an input to this task.
+
+    `manifest_id` is the whole point: it names an *exact immutable revision*,
+    so a successor capture or a later acceptance on the producing task cannot
+    reach a consumer that was already accepted. `manifest_project_name` is the
+    label the producer's manifest recorded and is provenance only — project
+    membership is decided through current task/project records, so renaming a
+    project is not mistaken for a cross-project transfer.
+
+    Every destination is non-publishable, and that is not stored per file:
+    there is one classification for the whole contract, checked on read.
+    """
+
+    result_id: str
+    producer_task_id: int
+    manifest_id: str
+    content_id: str | None
+    accepted_at: str
+    manifest_project_name: str
+    files: tuple[AttachedFile, ...]
+    # The producer's recorded provenance, copied verbatim. Observations, not
+    # claims: `capture_merge_base` is what Git said at capture time, never the
+    # commit the producing task was launched from.
+    provenance: dict[str, Any]
+    classification: str = HANDOFF_CLASSIFICATION
+
+    @property
+    def destinations(self) -> tuple[str, ...]:
+        return tuple(entry.path for entry in self.files)
+
+
+@dataclass(frozen=True)
+class BaseComparison:
+    """How one attachment's producer base observation relates to the commit
+    this task is actually built from.
+
+    Per attachment, not per task: two bundles can have been captured against
+    different bases, and collapsing them into one verdict would let a matching
+    bundle vouch for a stale one.
+
+    `state` is one of match/different/unknown. `changed_paths` is a bounded
+    name-status summary offered only when both objects were locally readable;
+    `truncated` says so out loud rather than presenting a partial list as the
+    whole difference. `detail` names the gap when no comparison was possible.
+    """
+
+    result_id: str
+    state: str
+    target_commit: str
+    producer_observation: str | None
+    changed_paths: tuple[str, ...] = ()
+    truncated: bool = False
+    detail: str | None = None
+
+    @property
+    def needs_acknowledgement(self) -> bool:
+        return self.state in BASE_COMPARISON_NEEDS_ACKNOWLEDGEMENT
 
 
 @dataclass(frozen=True)
@@ -210,10 +326,42 @@ class TaskExecutionInputs:
     # Historical inputs that could not be recovered for a legacy task. Empty
     # for anything accepted through the normal launch path.
     unknown_inputs: tuple[str, ...] = ()
+    # The accepted result revisions this task materializes before its first
+    # step runs (ADR-0035). Empty is the ordinary case and is not an error.
+    result_attachments: tuple[ResultAttachment, ...] = ()
+    # The exact commit an attachment launch was reviewed against. `None` for a
+    # launch with no attachments, which pins a branch exactly as before — and
+    # for every task written before version 4, where no observation was made
+    # and none is invented.
+    source_commit: str | None = None
+    # One comparison per attachment, in attachment order. Empty for a launch
+    # with none.
+    base_comparisons: tuple[BaseComparison, ...] = ()
+    # Whether the operator acknowledged that the plan was not validated against
+    # this target. Meaningful only when the comparison asked for it.
+    acknowledged_base_difference: bool = False
 
     @property
     def preamble(self) -> str:
         return self.workspace.preamble
+
+    @property
+    def protected_destinations(self) -> tuple[str, ...]:
+        """Every repository-relative path this task may not publish.
+
+        Derived from the stored attachments and nothing else: not from an
+        ignore file the agent can edit, not from a pattern like `epics/`, and
+        not from anything the task itself supplies. Empty for an ordinary task,
+        which is what keeps its candidate identity unchanged.
+        """
+        paths: set[str] = set()
+        for attachment in self.result_attachments:
+            paths.update(attachment.destinations)
+        return tuple(sorted(paths))
+
+    @property
+    def has_attachments(self) -> bool:
+        return bool(self.result_attachments)
 
     def binding_for_step(self, step: str) -> ConsumerBinding:
         try:
@@ -290,6 +438,91 @@ def decode_workflow_binding(document: Mapping[str, Any]) -> WorkflowBinding:
     )
 
 
+def encode_attachment(attachment: ResultAttachment) -> dict[str, Any]:
+    return {
+        "result_id": attachment.result_id,
+        "producer_task_id": attachment.producer_task_id,
+        "manifest_id": attachment.manifest_id,
+        "content_id": attachment.content_id,
+        "accepted_at": attachment.accepted_at,
+        "manifest_project_name": attachment.manifest_project_name,
+        "classification": attachment.classification,
+        "files": [
+            {
+                "path": entry.path,
+                "length": entry.length,
+                "sha256": entry.sha256,
+                "media_type": entry.media_type,
+            }
+            for entry in attachment.files
+        ],
+        "provenance": dict(attachment.provenance),
+    }
+
+
+def decode_attachment(document: Mapping[str, Any]) -> ResultAttachment:
+    """Read one stored attachment, refusing a policy this daemon does not
+    implement.
+
+    A `classification` other than the single handoff value is a damaged
+    document, not a second policy: decoding it as "no protection" is exactly
+    the silent declassification this contract exists to prevent.
+    """
+    classification = document.get("classification")
+    if classification != HANDOFF_CLASSIFICATION:
+        raise DamagedAttachmentPolicyError(
+            document.get("result_id"), classification
+        )
+    files = document.get("files")
+    if not isinstance(files, list) or not files:
+        raise DamagedAttachmentPolicyError(
+            document.get("result_id"), "no attached file list"
+        )
+    return ResultAttachment(
+        result_id=document["result_id"],
+        producer_task_id=document["producer_task_id"],
+        manifest_id=document["manifest_id"],
+        content_id=document.get("content_id"),
+        accepted_at=document["accepted_at"],
+        manifest_project_name=document["manifest_project_name"],
+        files=tuple(
+            AttachedFile(
+                path=entry["path"],
+                length=entry["length"],
+                sha256=entry["sha256"],
+                media_type=entry["media_type"],
+            )
+            for entry in files
+        ),
+        provenance=dict(document.get("provenance") or {}),
+        classification=classification,
+    )
+
+
+def encode_base_comparison(comparison: BaseComparison) -> dict[str, Any]:
+    return {
+        "result_id": comparison.result_id,
+        "state": comparison.state,
+        "target_commit": comparison.target_commit,
+        "producer_observation": comparison.producer_observation,
+        "changed_paths": list(comparison.changed_paths),
+        "truncated": comparison.truncated,
+        "detail": comparison.detail,
+    }
+
+
+def decode_base_comparison(document: Mapping[str, Any]) -> BaseComparison:
+    return BaseComparison(
+        result_id=document["result_id"],
+        state=document["state"],
+        target_commit=document["target_commit"],
+        producer_observation=document.get("producer_observation"),
+        changed_paths=tuple(document.get("changed_paths", ())),
+        truncated=bool(document.get("truncated", False)),
+        detail=document.get("detail"),
+    )
+
+
 def execution_inputs_document(inputs: TaskExecutionInputs) -> dict[str, Any]:
     return {
         "version": EXECUTION_INPUTS_VERSION,
@@ -318,6 +551,15 @@ def execution_inputs_document(inputs: TaskExecutionInputs) -> dict[str, Any]:
         "upstream_url": inputs.upstream_url,
         "fork_url": inputs.fork_url,
         "unknown_inputs": list(inputs.unknown_inputs),
+        "result_attachments": [
+            encode_attachment(attachment) for attachment in inputs.result_attachments
+        ],
+        "source_commit": inputs.source_commit,
+        "base_comparisons": [
+            encode_base_comparison(comparison)
+            for comparison in inputs.base_comparisons
+        ],
+        "acknowledged_base_difference": inputs.acknowledged_base_difference,
     }
 
 
@@ -360,6 +602,18 @@ def decode_execution_inputs(raw: str) -> TaskExecutionInputs:
         upstream_url=document["upstream_url"],
         fork_url=document["fork_url"],
         unknown_inputs=tuple(document.get("unknown_inputs", ())),
+        result_attachments=tuple(
+            decode_attachment(entry)
+            for entry in document.get("result_attachments", ())
+        ),
+        source_commit=document.get("source_commit"),
+        base_comparisons=tuple(
+            decode_base_comparison(entry)
+            for entry in document.get("base_comparisons", ())
+        ),
+        acknowledged_base_difference=bool(
+            document.get("acknowledged_base_difference", False)
+        ),
     )
 
 
