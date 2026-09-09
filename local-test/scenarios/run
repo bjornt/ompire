@@ -71,10 +71,24 @@ tree_checksum() { # tree_checksum ROOT — names, modes, links, and file bytes
 		-cf - -C "$1" . | sha256sum | awk '{print $1}'
 }
 
+# The runbook set is exactly the matrix. `scenarios/` also holds things that
+# are executable but are not runbooks — `ws-watch` is a recorder tool that
+# runbooks drive through `ws_start`, and it needs `--url`/`--out` and the
+# daemon venv. Dispatching on the executable bit alone handed one of those to
+# `run` and produced its internal failure instead of "unknown runbook".
+is_runbook() { # is_runbook NAME
+	local candidate
+	for candidate in "${MATRIX[@]}"; do
+		[ "$candidate" = "$1" ] && return 0
+	done
+	return 1
+}
+
 run_one() { # run_one NAME
 	local name=$1
+	is_runbook "$name" || die "unknown runbook: $name (run --list)"
+	[ -x "$DIR/$name" ] || die "runbook not executable: $DIR/$name"
 	printf '==> runbook: %s\n' "$name"
-	[ -x "$DIR/$name" ] || die "unknown runbook: $name (run --list)"
 	if "$DIR/$name"; then
 		printf '==> %s: PASS\n' "$name"
 	else

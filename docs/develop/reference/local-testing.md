@@ -270,8 +270,10 @@ to assertions.
 A driver runs a single runbook, or the whole matrix in a throwaway
 environment.
 
-`ws-watch` also exists but is **not** in the matrix — run it explicitly when
-changing the WebSocket layer.
+`ws-watch` is **not** a runbook. It is the recorder `ws_start` launches under
+the daemon's venv, and it takes a `--url` and an `--out`; `run` rejects it as an
+unknown runbook rather than executing it. The WebSocket layer is covered by the
+eleven runbooks that record and assert against `/api/ws` through it.
 
 ### Fidelity
 

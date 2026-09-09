@@ -76,8 +76,22 @@ the daemon, and `cleanup` runs last.
 | `durable-results` | Capturing planning files with no commit, reviewing and accepting one revision, downloading it, a successor and its comparison, a refused capture, identical bytes after a daemon restart and after cleanup, and guarded purge |
 | `cleanup` | Workshop removal, clone deletion, archival |
 
-`ws-watch` also exists but is **not** in the `--all` matrix. Run it explicitly
-if you are changing the WebSocket layer — `--all` will not cover it.
+`scenarios/ws-watch` sits beside these but is **not** a runbook — it is the
+recorder the runbooks use. `run ws-watch` is refused as an unknown runbook.
+
+Eleven of the scenarios above already drive `/api/ws` through it: `ws_start`
+launches it under the daemon's venv, and the runbook then asserts against the
+recorded envelopes with `ws_grep` and `ws_count`. To exercise the WebSocket
+layer, run those scenarios — `happy-path` covers the snapshot and the ordinary
+delta stream, and `crash-recovery` covers what a client sees across a restart.
+
+To record a stream by hand, invoke it the way `ws_start` does — it needs the
+daemon venv for `websockets`, and both arguments:
+
+```sh
+uv run --project daemon --quiet python local-test/scenarios/ws-watch \
+  --url "ws://127.0.0.1:$PORT/api/ws?token=$TOKEN" --out /tmp/ws.jsonl
+```
 
 Each scenario is also directly executable — it sources `lib.sh` itself. The
 `run` driver adds preflight checks and the clean-machine matrix run.
