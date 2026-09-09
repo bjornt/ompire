@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/durable-results — ADR-0034.
+#
+# The complete no-commit journey: a planning task writes real files, the
+# operator captures and reviews them, accepts one exact revision, downloads it,
+# captures a successor, restarts the daemon, cleans up the producing task, and
+# still reads and downloads exactly what was accepted. Then explicit purge, and
+# the refusals that guard it.
+#
+# What this proves that a unit test cannot: the retained bytes came out of a
+# real workspace through the real daemon, survive a real process restart and a
+# real `rm -rf` of the clone, and arrive in a real ZIP with matching checksums.
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+PLAN_DIR=epics/local-e2e
+
+# Downloads land in a scratch directory of this run's own, never in the
+# operator's checkout or the task clone.
+WORKDIR=$(mktemp -d /tmp/ompire-results-XXXXXX)
+_results_cleanup() { rm -rf "$WORKDIR"; }
+register_cleanup _results_cleanup
+
+# --- helpers ------------------------------------------------------------------
+
+results_doc() { api_json GET "/api/tasks/$1/results"; }
+
+result_field() { # result_field TASK_ID RESULT_ID JQ-PATH
+	results_doc "$1" | jq -r --arg id "$2" \
+		"(.results[] | select(.id == \$id)) | $3 // empty"
+}
+
+latest_result() { # latest_result TASK_ID — newest revision id
+	results_doc "$1" | jq -r '.results[0].id // empty'
+}
+
+results_version() { results_doc "$1" | jq -r '.version'; }
+
+capture() { # capture TASK_ID REQUEST_ID PATH… — returns the new revision id
+	local task=$1 request=$2
+	shift 2
+	local body
+	body=$(jq -n --arg r "$request" --args '{paths: $ARGS.positional, request_id: $r}' "$@")
+	api_json POST "/api/tasks/$task/results" "$body" >/dev/null
+	[ "$API_CODE" = 202 ] || die "capture rejected ($API_CODE): $API_BODY"
+	local deadline=$((SECONDS + 60)) state id
+	while [ $SECONDS -lt $deadline ]; do
+		id=$(latest_result "$task")
+		state=$(result_field "$task" "$id" .state)
+		case "$state" in
+		ready | failed) printf '%s' "$id"; return 0 ;;
+		esac
+		sleep 0.5
+	done
+	die "capture did not settle for task $task"
+}
+
+download_zip() { # download_zip TASK_ID RESULT_ID OUT
+	curl -sS -o "$3" -w '%{http_code}' \
+		-H "Authorization: Bearer $(_api_token)" \
+		"$DAEMON_URL/api/tasks/$1/results/$2/download"
+}
+
+# `unzip` is not guaranteed on a contributor's machine; python3 already is
+# (the harness uses it to pick a free port).
+zip_names() { python3 -c '
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    print("\n".join(z.namelist()))' "$1"; }
+
+zip_member_sha() { # zip_member_sha ZIP MEMBER
+	python3 -c '
+import hashlib, sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    print(hashlib.sha256(z.read(sys.argv[2])).hexdigest())' "$1" "$2"
+}
+
+# --- a planning task that commits nothing ---------------------------------------
+
+slug=$(unique_slug results)
+tid=$(spawn_work_only "$slug" \
+	"Durable results E2E: write the plan. [[scenario:plan-files]]")
+wait_for "planning step completes" 180 workflow_complete "$tid"
+clone=$(task_field "$tid" clone_path)
+
+[ -f "$clone/$PLAN_DIR/PLAN.md" ] && ok "agent wrote $PLAN_DIR/PLAN.md" ||
+	fail "agent wrote planning files" "missing $clone/$PLAN_DIR/PLAN.md"
+# The whole premise: a useful outcome with no source commit behind it.
+assert "planning files are uncommitted in the workspace" \
+	bash -c "cd '$clone' && git status --porcelain -- '$PLAN_DIR' | grep -q ."
+
+# --- capture, review, accept ------------------------------------------------------
+
+first=$(capture "$tid" "req-first" "$PLAN_DIR")
+state=$(result_field "$tid" "$first" .state)
+[ "$state" = ready ] && ok "captured revision $first" || \
+	fail "capture ready" "state=$state error=$(result_field "$tid" "$first" .error)"
+
+files=$(result_field "$tid" "$first" '[.files[].path] | join(",")')
+[ "$files" = "$PLAN_DIR/PLAN.md,$PLAN_DIR/SPEC.md" ] &&
+	ok "manifest lists exactly the planning files" ||
+	fail "manifest file list" "got $files"
+
+# The retained text is the actual file, byte for byte.
+retained=$(api_json GET "/api/tasks/$tid/results/$first/file?path=$PLAN_DIR/PLAN.md" |
+	jq -r .text)
+[ "$retained" = "$(cat "$clone/$PLAN_DIR/PLAN.md")" ] &&
+	ok "retained text matches the workspace file" ||
+	fail "retained text" "differs from $clone/$PLAN_DIR/PLAN.md"
+
+# Provenance is honest about what a manual capture cannot know.
+step=$(result_field "$tid" "$first" .provenance.producing_step)
+[ "$step" = unknown ] && ok "producing step recorded as unknown" ||
+	fail "producing step" "got $step (recency is not evidence of authorship)"
+
+# …and records what it can observe, labelled as an observation. The clone is a
+# real repository, so this is the positive path through the disarmed Git reads.
+observed=$(result_field "$tid" "$first" .provenance.capture_head_commit)
+actual=$(cd "$clone" && git rev-parse HEAD)
+[ "$observed" = "$actual" ] && ok "capture-time HEAD recorded (${observed:0:12})" ||
+	fail "capture head" "got '$observed', clone is at '$actual'"
+[ "$(result_field "$tid" "$first" .provenance.git_observation)" = "capture-time observation" ] &&
+	ok "the commit is labelled an observation, not the spawn base" ||
+	fail "git observation label" "$(result_field "$tid" "$first" .provenance.git_observation)"
+
+manifest=$(result_field "$tid" "$first" .manifest_id)
+api_json POST "/api/tasks/$tid/results/$first/accept" \
+	"$(jq -n --arg m "$manifest" '{expected_manifest_id: $m}')" >/dev/null
+[ "$API_CODE" = 200 ] || die "acceptance rejected ($API_CODE): $API_BODY"
+accepted_at=$(result_field "$tid" "$first" .accepted_at)
+[ -n "$accepted_at" ] && ok "revision accepted at $accepted_at" ||
+	fail "acceptance recorded" "no accepted_at"
+
+# Accepting a result is not a publication decision.
+stale_manifest=$(api_code POST "/api/tasks/$tid/results/$first/accept" \
+	'{"expected_manifest_id": "not-the-reviewed-one"}')
+[ "$stale_manifest" = 409 ] && ok "a stale manifest identity is refused" ||
+	fail "stale acceptance refused" "code $stale_manifest"
+
+# --- download and compare bytes -----------------------------------------------------
+
+zip_before=$WORKDIR/before.zip
+code=$(download_zip "$tid" "$first" "$zip_before")
+[ "$code" = 200 ] && ok "downloaded the accepted revision" ||
+	fail "download" "code $code"
+names=$(zip_names "$zip_before")
+grep -qx "$PLAN_DIR/PLAN.md" <<<"$names" &&
+	ok "ZIP carries the original relative paths" ||
+	fail "ZIP relative paths" "members: $(tr '\n' ' ' <<<"$names")"
+grep -qx '__ompire_result_manifest__.json' <<<"$names" &&
+	ok "ZIP carries the Ompire manifest" ||
+	fail "ZIP manifest member" "members: $(tr '\n' ' ' <<<"$names")"
+sum_workspace=$(sha256sum <"$clone/$PLAN_DIR/PLAN.md" | cut -d' ' -f1)
+sum_zip=$(zip_member_sha "$zip_before" "$PLAN_DIR/PLAN.md")
+[ "$sum_workspace" = "$sum_zip" ] && ok "downloaded bytes match the source ($sum_zip)" ||
+	fail "downloaded bytes" "$sum_zip != $sum_workspace"
+
+# --- a successor revision leaves the first alone --------------------------------------
+
+follow_up "$tid" "Revise the plan. [[scenario:plan-files]]"
+wait_for "revised planning files land" 120 \
+	bash -c "grep -q 'revised point' '$clone/$PLAN_DIR/PLAN.md'"
+second=$(capture "$tid" "req-second" "$PLAN_DIR")
+[ "$(result_field "$tid" "$second" .state)" = ready ] &&
+	ok "captured successor revision $second" || fail "successor capture" "not ready"
+[ "$(result_field "$tid" "$second" .predecessor_id)" = "$first" ] &&
+	ok "successor records its predecessor" || fail "predecessor" "not $first"
+
+diff_doc=$(api_json GET "/api/tasks/$tid/results/$second/diff")
+jq -e '.changed | index("'"$PLAN_DIR"'/PLAN.md")' >/dev/null <<<"$diff_doc" &&
+	ok "comparison reports the changed file" ||
+	fail "diff changed" "$(jq -c '{added, changed, omitted}' <<<"$diff_doc")"
+
+# The earlier decision is untouched by later work.
+[ "$(result_field "$tid" "$first" .accepted_at)" = "$accepted_at" ] &&
+	ok "the first acceptance is unchanged by the successor" ||
+	fail "first acceptance" "acceptance moved"
+
+# --- a refused capture is visible and harmless -----------------------------------------
+
+mkdir -p "$clone/$PLAN_DIR/nested"
+printf 'binary-ish \xff\xfe\n' >"$clone/$PLAN_DIR/nested/bad.md"
+bad=$(capture "$tid" "req-bad" "$PLAN_DIR")
+[ "$(result_field "$tid" "$bad" .state)" = failed ] &&
+	ok "invalid content fails the capture: $(result_field "$tid" "$bad" .error)" ||
+	fail "invalid capture refused" "state=$(result_field "$tid" "$bad" .state)"
+rm -rf "$clone/$PLAN_DIR/nested"
+[ "$(result_field "$tid" "$first" .state)" = ready ] &&
+	ok "the accepted revision survives a failed capture" ||
+	fail "accepted revision after failure" "state changed"
+
+# --- restart: the result outlives the process -------------------------------------------
+
+daemon_stop
+daemon_start
+[ "$(result_field "$tid" "$first" .accepted_at)" = "$accepted_at" ] &&
+	ok "acceptance survives a daemon restart" || fail "acceptance after restart" "lost"
+zip_after=$WORKDIR/after-restart.zip
+code=$(download_zip "$tid" "$first" "$zip_after")
+[ "$code" = 200 ] || fail "download after restart" "code $code"
+sum_after=$(zip_member_sha "$zip_after" "$PLAN_DIR/PLAN.md")
+[ "$sum_after" = "$sum_zip" ] && ok "identical bytes after restart ($sum_after)" ||
+	fail "bytes after restart" "$sum_after != $sum_zip"
+
+# --- cleanup: the result outlives the workspace ------------------------------------------
+
+api_json POST "/api/tasks/$tid/cleanup" >/dev/null
+[ "$API_CODE" = 200 ] || die "cleanup rejected ($API_CODE)"
+[ ! -d "$clone" ] && ok "clone removed by cleanup" || fail "clone removed" "still present"
+
+[ "$(result_field "$tid" "$first" .state)" = ready ] &&
+	ok "the accepted revision survives cleanup" || fail "revision after cleanup" "lost"
+zip_cleaned=$WORKDIR/after-cleanup.zip
+code=$(download_zip "$tid" "$first" "$zip_cleaned")
+[ "$code" = 200 ] || fail "download after cleanup" "code $code"
+sum_cleaned=$(zip_member_sha "$zip_cleaned" "$PLAN_DIR/PLAN.md")
+[ "$sum_cleaned" = "$sum_zip" ] && ok "identical bytes after cleanup ($sum_cleaned)" ||
+	fail "bytes after cleanup" "$sum_cleaned != $sum_zip"
+
+# Capture needs a workspace; the archived task no longer has one.
+gone=$(api_code POST "/api/tasks/$tid/results" \
+	'{"paths": ["'"$PLAN_DIR"'"], "request_id": "req-after-cleanup"}')
+[ "$gone" = 409 ] && ok "capture refused after cleanup" ||
+	fail "capture after cleanup" "code $gone"
+
+# The task never opened a pull request, so nothing but its retained results
+# keeps it reachable. The Tasks index renders this same count.
+retained_count=$(results_doc "$tid" | jq '[.results[] | select(.state == "ready")] | length')
+[ "$retained_count" -ge 2 ] && ok "$retained_count revisions retained after cleanup" ||
+	fail "retained revisions" "got $retained_count"
+
+# --- task purge refuses before it deletes anything -------------------------------------
+
+# Called without command substitution: a subshell would take API_CODE with it.
+api DELETE "/api/tasks/$tid" >/dev/null
+refused=$API_BODY
+[ "$API_CODE" = 409 ] && ok "task purge refused while results are retained" ||
+	fail "task purge refusal" "code $API_CODE"
+grep -q "$first" <<<"$refused" && ok "the refusal names the revision to purge first" ||
+	fail "refusal names revisions" "$refused"
+# Nothing was destroyed on the way to the refusal.
+[ "$(result_field "$tid" "$first" .accepted_at)" = "$accepted_at" ] &&
+	ok "the refused purge left every revision intact" ||
+	fail "refused purge" "history was damaged"
+
+# --- explicit result purge, then task purge ----------------------------------------------
+
+for rid in $(results_doc "$tid" | jq -r '.results[] | select(.state == "ready") | .id'); do
+	m=$(result_field "$tid" "$rid" .manifest_id)
+	v=$(results_version "$tid")
+	api_json DELETE "/api/tasks/$tid/results/$rid" \
+		"$(jq -n --arg m "$m" --argjson v "$v" \
+			'{expected_manifest_id: $m, expected_version: $v, acknowledge_purge: true}')" \
+		>/dev/null
+	[ "$API_CODE" = 200 ] || die "result purge rejected ($API_CODE): $API_BODY"
+done
+ok "every retained revision explicitly purged"
+
+# The tombstone is still a readable record of what happened.
+[ "$(result_field "$tid" "$first" .state)" = purged ] && ok "purged revision keeps its record" ||
+	fail "tombstone" "state=$(result_field "$tid" "$first" .state)"
+[ -n "$(result_field "$tid" "$first" .accepted_at)" ] &&
+	ok "the tombstone still records that it was accepted" ||
+	fail "tombstone acceptance" "acceptance lost"
+gone_code=$(api_code GET "/api/tasks/$tid/results/$first/download")
+[ "$gone_code" = 410 ] && ok "purged content reads as gone (410)" ||
+	fail "purged download" "code $gone_code"
+
+api_json DELETE "/api/tasks/$tid" >/dev/null
+[ "$API_CODE" = 200 ] && ok "task purge succeeds once results are purged" ||
+	fail "task purge" "code $API_CODE"
+[ "$(api_code GET "/api/tasks/$tid")" = 404 ] && ok "task is gone" ||
+	fail "task purged" "still present"

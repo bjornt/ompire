@@ -88,6 +88,34 @@ memory. Full checkpoint-to-mainline commit lineage and transcript retention are
 not delivered, and no exactly-once claim is made about agent or tool execution.
 Those are why this record is still `Proposed`.
 
+## Progress: captured result artifacts are now durable
+
+[ADR-0034](0034-retain-durable-task-results-outside-the-workspace.md),
+2026-09-08. This record stays **Proposed**; a third narrow slice of it is
+delivered.
+
+The "artifacts" listed among the durable records above now exist for one bounded
+case: an operator-captured bundle of small text files. Its bytes, its immutable
+manifest, its content and revision identities, its provenance, and the
+operator's acceptance and purge decisions are retained outside the workspace and
+survive daemon restart, workspace cleanup, and the task's archival. Removing
+them requires an explicit purge, which leaves a tombstone rather than silence,
+and task purge refuses before it deletes any other history while retained bytes
+remain.
+
+Provenance here is deliberately partial and says so. A manual capture is
+attributed to the operator, and the producing run, step, and session are
+recorded as `unknown` rather than inferred from whichever step ran most
+recently; Git values are labelled as capture-time observations, not the commit a
+task was spawned from, and unrecorded facts are listed as gaps.
+
+That is the whole of what is delivered. This is not the artifact system this
+record describes: there is no automatic capture, no binary or large artifact,
+no lineage from an artifact to the commits that produced it, and no transcript
+or session-material retention. Full checkpoint-to-mainline commit lineage and
+transcript retention remain undone, which is why this record is still
+`Proposed`.
+
 ## Consequences
 
 Recovery becomes evidence-driven. Completed step attempts and privileged effects are not replayed merely because their in-memory manager disappeared. An interrupted operation can be reconciled against a durable intent and external identifier, while an ambiguous operation stops visibly. This reduces duplicate commits, pushes, comments, and pull requests and makes crash behavior independent of whether a browser observed the original events.

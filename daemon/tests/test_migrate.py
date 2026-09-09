@@ -52,7 +52,7 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0019"
+    assert version == "0020"
     assert "projects" in tables
     assert "tasks" in tables
     # Templates are retired (ADR-0026): the live table is gone and only inert
@@ -94,6 +94,10 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
     # Global model profiles and the optional project reference (ADR-0025).
     assert "model_profiles" in tables
     assert "default_model_profile" in project_columns
+    # Durable task results retained outside the workspace (ADR-0034).
+    assert "task_results" in tables
+    assert "task_result_files" in tables
+    assert "results_version" in task_columns
 
 
 def test_0011_backfills_existing_projects_as_adopted(tmp_path: Path) -> None:
@@ -201,7 +205,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0019"
+    assert version == "0020"
     assert row == "demo"
 
 
@@ -1915,3 +1919,50 @@ def test_0019_marks_pre_upgrade_grants_without_inventing_run_links(
             ).scalar_one()
             == "push"
         )
+
+
+def test_0020_adds_results_without_inventing_any(tmp_path: Path) -> None:
+    """An existing task keeps its history and gains *no* result.
+
+    A task that ran before durable results existed genuinely produced none.
+    Reconstructing one from its outcome text, its clone, or its last workflow
+    step would manufacture exactly the provenance ADR-0034 exists to keep
+    honest — so the upgrade adds storage and nothing else.
+    """
+    from alembic import command
+
+    db_path = tmp_path / "ompire.db"
+    command.upgrade(_alembic_cfg(db_path), "0019")
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO projects (name, title, upstream_url, fork_url, "
+                "checkout_path) VALUES ('demo', 'Demo', "
+                "'https://example.com/demo', NULL, '/tmp/demo')"
+            )
+        )
+        conn.execute(
+            text(
+                "INSERT INTO tasks (id, project_name, slug, branch, clone_path, "
+                "state, prompt, created_at, updated_at) VALUES (1, 'demo', "
+                "'legacy', 'ompire/legacy', '/tmp/clone', 'archived', 'explore', "
+                "'t', 't')"
+            )
+        )
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        assert (
+            conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
+            == "0020"
+        )
+        assert conn.execute(text("SELECT COUNT(*) FROM task_results")).scalar_one() == 0
+        row = conn.execute(
+            text("SELECT slug, state, results_version FROM tasks WHERE id = 1")
+        ).one()
+    assert row.slug == "legacy"
+    assert row.state == "archived"
+    # A task with no results is at version 0, not at some inherited counter.
+    assert row.results_version == 0

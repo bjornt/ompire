@@ -1,0 +1,316 @@
+/* Results panel (ADR-0034). Visually separate from the review and ship
+ * surfaces: accepting a result is not an approval, and the panel should not
+ * borrow the vocabulary of one. */
+
+.resultsPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.resultsHint {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--muted, #6b7280);
+  line-height: 1.5;
+}
+
+.resultsNote {
+  font-style: italic;
+  color: var(--muted, #6b7280);
+}
+
+.resultsEmpty {
+  margin: 0;
+  padding: 0.75rem;
+  border: 1px dashed var(--border, #d1d5db);
+  border-radius: 6px;
+  color: var(--muted, #6b7280);
+  font-size: 0.9rem;
+}
+
+.resultsCapture {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.resultsLabel {
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted, #6b7280);
+}
+
+.resultsPaths {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.85rem;
+  padding: 0.5rem;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 6px;
+  resize: vertical;
+}
+
+.resultsAction {
+  align-self: flex-start;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 6px;
+  background: var(--surface, #fff);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.resultsAction:hover:not(:disabled) {
+  background: var(--surface-hover, #f3f4f6);
+}
+
+.resultsAction:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Purge is the one irreversible action here, and it looks like it. */
+.resultsAction.danger {
+  border-color: #b91c1c;
+  color: #b91c1c;
+}
+
+.resultsLink {
+  align-self: flex-start;
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 0.85rem;
+  color: var(--link, #2563eb);
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.resultsError {
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid #fca5a5;
+  background: #fef2f2;
+  color: #991b1b;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+}
+
+.resultsRevisionTabs,
+.resultsFileList,
+.resultsDiffSummary {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.resultsRevisionTabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.resultsRevisionTab {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 999px;
+  background: var(--surface, #fff);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.resultsRevisionTab.selected {
+  border-color: var(--accent, #2563eb);
+  background: var(--surface-hover, #eff6ff);
+}
+
+.resultsRevision {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 8px;
+}
+
+.resultsRevisionHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.resultsRevisionMeta {
+  font-size: 0.8rem;
+  color: var(--muted, #6b7280);
+}
+
+.resultsId {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.8rem;
+}
+
+.resultsStatus {
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+}
+
+.resultsStatus.accepted {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.resultsStatus.complete {
+  background: #e0e7ff;
+  color: #3730a3;
+}
+
+.resultsStatus.capturing {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.resultsStatus.failed,
+.resultsStatus.unavailable {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.resultsStatus.purged {
+  background: #f3f4f6;
+  color: #4b5563;
+}
+
+.resultsAccepted {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #166534;
+}
+
+.resultsProvenance {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.75rem;
+  margin: 0;
+  font-size: 0.8rem;
+}
+
+.resultsProvenance dt {
+  color: var(--muted, #6b7280);
+}
+
+.resultsProvenance dd {
+  margin: 0;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+
+.resultsFileList li {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.resultsFileButton {
+  flex: 1;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  font-size: 0.85rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.resultsFileButton:hover:not(:disabled) {
+  background: var(--surface-hover, #f3f4f6);
+}
+
+.resultsFileButton.selected {
+  border-color: var(--accent, #2563eb);
+}
+
+.resultsFilePath {
+  font-family: var(--mono, ui-monospace, monospace);
+}
+
+.resultsFileMeta,
+.resultsChecksum {
+  font-size: 0.75rem;
+  color: var(--muted, #6b7280);
+  font-family: var(--mono, ui-monospace, monospace);
+}
+
+/* Retained bytes as source. Never rendered as Markdown or HTML: this is
+ * untrusted content the task's agent wrote. */
+.resultsSource {
+  max-height: 22rem;
+  overflow: auto;
+  margin: 0;
+  padding: 0.6rem;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 6px;
+  background: var(--code-bg, #f9fafb);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.resultsDiff,
+.resultsFiles,
+.resultsRevisionActions,
+.resultsDownloads {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.resultsDiffSummary li {
+  font-size: 0.8rem;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+
+/* Tasks index: the section that keeps a cleaned-up, never-published task
+ * reachable through what it produced. */
+.retainedResults {
+  margin-top: 1.5rem;
+}
+
+.retainedList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.retainedEntry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.retainedMeta {
+  font-size: 0.8rem;
+  color: var(--muted, #6b7280);
+}

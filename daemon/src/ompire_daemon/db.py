@@ -16,6 +16,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     MetaData,
     String,
     Table,
@@ -221,6 +222,15 @@ tasks = Table(
     Column("spawn_completed_at", String, nullable=True),
     Column("created_at", String, nullable=False),
     Column("updated_at", String, nullable=False),
+    # Monotonic version over this task's *durable result* projection
+    # (ADR-0034), advanced in the same transaction as every observable result
+    # mutation: a finished capture, an acceptance, a purge, a detected
+    # integrity failure. It is what a reconnecting client compares a queued
+    # `task_results_updated` delta against, and it is deliberately separate
+    # from `updated_at` — capturing a result changes nothing about the task
+    # row itself, and a task edit must not make a client think its result
+    # projection moved.
+    Column("results_version", Integer, nullable=False, server_default="0"),
     # A slug is reusable after archive; uniqueness applies to live rows only.
     Index(
         "uq_tasks_live_project_slug",
@@ -519,6 +529,87 @@ delivery_authority_boundary = Table(
     Column("max_delivery_id", Integer, nullable=False),
     Column("max_action_id", Integer, nullable=False),
     Column("recorded_at", String, nullable=False),
+)
+
+# Durable task results (ADR-0034): the bytes a task produced, retained outside
+# its disposable workspace so exploration and planning are complete outcomes
+# without a commit, a push, or a pull request.
+#
+# `id` is an opaque capture identity, stable across restarts and independent of
+# content: two captures of byte-identical files are two results with two
+# provenances, because they were produced at different times by different work.
+# `manifest_json` is the immutable, canonical description of exactly what was
+# retained — every relative path, byte length, media type and SHA-256 — and
+# `manifest_id` hashes that whole document. That hash is the revision binding:
+# acceptance names it, and a client that acts on a stale one is refused rather
+# than silently retargeted at newer files.
+#
+# `content_id` hashes only the sorted path/media/length/checksum entries, so an
+# unchanged file set is *recognizable* without merging two captures' identities.
+#
+# `request_id` is the caller's replay key, unique per task: a lost response is
+# recovered by repeating the request, never by capturing different bytes. It is
+# paired with `selection_fingerprint` so a repeat under the same id that asks
+# for a *different* selection is refused instead of answering about files
+# nobody requested.
+#
+# `state` is `capturing`, `failed`, `ready`, or `purged`. Acceptance is a
+# separate, independent decision: `accepted_at`/`accepted_by` record it, and a
+# result that later becomes unreadable keeps them, because the operator really
+# did accept it. `unavailable_reason` is that classified damage, set without
+# discarding history and never repaired from today's workspace.
+#
+# `predecessor_id` is the most recent ready result at admission time, frozen
+# then. A failed capture never becomes anyone's predecessor, and a purged one
+# keeps its identity while losing its ability to supply a text diff.
+task_results = Table(
+    "task_results",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("task_id", Integer, ForeignKey("tasks.id"), nullable=False),
+    Column("request_id", String, nullable=False),
+    Column("selection_fingerprint", String, nullable=False),
+    Column("selection_json", Text, nullable=False),
+    Column("state", String, nullable=False),
+    Column("error", Text, nullable=True),
+    Column("unavailable_reason", Text, nullable=True),
+    Column("manifest_json", Text, nullable=True),
+    Column("manifest_id", String, nullable=True),
+    Column("content_id", String, nullable=True),
+    Column("predecessor_id", String, nullable=True),
+    Column("started_at", String, nullable=False),
+    Column("finished_at", String, nullable=True),
+    Column("accepted_at", String, nullable=True),
+    Column("accepted_by", String, nullable=True),
+    Column("purged_at", String, nullable=True),
+    Column("purged_by", String, nullable=True),
+    Index("ix_task_results_task", "task_id", "started_at"),
+    Index(
+        "uq_task_results_request",
+        "task_id",
+        "request_id",
+        unique=True,
+    ),
+)
+
+# The retained bytes, one row per file. Deliberately carries *only* the bytes:
+# length, checksum and media type live in the manifest, which is hashed into
+# the revision identity, so there is no second independently mutable
+# description of a file to disagree with the one acceptance was bound to.
+#
+# Bytes are exact. Line endings, final newlines and zero-length files are
+# preserved as captured; nothing here normalizes text.
+task_result_files = Table(
+    "task_result_files",
+    metadata,
+    Column(
+        "result_id",
+        String,
+        ForeignKey("task_results.id"),
+        primary_key=True,
+    ),
+    Column("relative_path", String, primary_key=True),
+    Column("content", LargeBinary, nullable=False),
 )
 
 # ADR-0013: UI-editable overrides are persisted as JSON-encoded scalar

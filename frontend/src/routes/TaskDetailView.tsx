@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { ResultsPanel } from "../components/ResultsPanel";
 import { ReviewSummary } from "../components/ReviewSummary";
 import { WorkflowRevision } from "../components/WorkflowRevision";
 import { StepAttempts } from "../components/workflow/StepAttempts";
@@ -7,7 +8,7 @@ import { attemptsFor } from "../lib/workflowAttempts";
 import { asObject } from "../lib/workflowDocument";
 import { useAgentChannel } from "../lib/agentChannel";
 import { isStreaming, useAgentStatus } from "../lib/agentStatus";
-import { cancelReview, getTaskDetail, resumeWorkflow, startReview } from "../lib/api";
+import { cancelReview, cleanupTask, getTaskDetail, resumeWorkflow, startReview } from "../lib/api";
 import {
   currentStepRecord,
   defaultSessionName,
@@ -17,10 +18,12 @@ import {
 } from "../lib/daemonReducer";
 import { type ApprovalBinding, projectReview } from "../lib/reviewPresentation";
 import { approvalBindingFor, hasShipFlowHandoff } from "../lib/shipPresentation";
-import { useDaemonState } from "../lib/useDaemonState";
+import { useDaemonReconcile, useDaemonState } from "../lib/useDaemonState";
+import { confirmCleanup } from "../lib/cleanup";
 import type {
   GateChoice,
   GateSnapshot,
+  RetainedResultCounts,
   ReviewState,
   RunAuthority,
   SessionInfo,
@@ -616,10 +619,67 @@ function PinnedProcedure({
   );
 }
 
+/** Cleanup, on task detail.
+ *
+ * It lived only on the task card and in Ship flow, which assumed every task
+ * ends by shipping. A task that produced a durable result and no pull request
+ * never enters Ship flow at all (ADR-0034), so the action it needs to finish
+ * has to be reachable from the task itself. Same confirmation wording as
+ * everywhere else, and the same daemon refusals — a busy workspace or an
+ * unresolved delivery still says no. */
+function CleanupPanel({ task, retained }: { task: Task; retained?: RetainedResultCounts }) {
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const reconcile = useDaemonReconcile();
+
+  if (task.state === "archived") {
+    return null;
+  }
+
+  async function cleanup() {
+    if (!confirmCleanup(task, null, retained)) return;
+    setPending(true);
+    setError(null);
+    try {
+      reconcile("task_updated", await cleanupTask(task.id));
+    } catch (caught: unknown) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <section className="panel" data-testid="task-detail-cleanup-panel">
+      <h2 className="panelTitle">Cleanup</h2>
+      <p className="resultsHint">
+        Removes this task&apos;s workspace and container. Captured results are
+        retained — cleanup never deletes one.
+      </p>
+      {error && (
+        <div className="resultsError" data-testid="task-detail-cleanup-error">
+          {error}
+        </div>
+      )}
+      <button
+        type="button"
+        className="resultsAction danger"
+        disabled={pending}
+        onClick={() => void cleanup()}
+        data-testid="task-detail-cleanup"
+      >
+        {pending ? "Cleaning up…" : "Clean up workspace"}
+      </button>
+    </section>
+  );
+}
+
 export function TaskDetailView() {
   const { id } = useParams();
   const taskId = Number(id);
-  const { tasks, sessions, workflows, reviews, ships } = useDaemonState();
+  const { tasks, sessions, workflows, reviews, ships, taskResults, retainedResults } =
+    useDaemonState();
+  const reconcileResults = useDaemonReconcile();
   const [detail, setDetail] = useState<TaskDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Tab selection is local UI state (design D-9); null means "follow the
@@ -770,6 +830,14 @@ export function TaskDetailView() {
         authority={ship?.authority}
       />
 
+
+      <ResultsPanel
+        task={taskForShipFlow}
+        projection={taskResults[taskId]}
+        onProjection={(projection) => reconcileResults("task_results_updated", projection)}
+      />
+
+      <CleanupPanel task={taskForShipFlow} retained={retainedResults[taskId]} />
 
       {workflow !== null && workflow.status === "waiting" && (
         <GateCard taskId={taskId} workflow={workflow} />

@@ -40,6 +40,7 @@ from ompire_daemon.prwatch import PrWatcher
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
 from ompire_daemon.registry.settings import SettingsStore
 from ompire_daemon.registry.tasks import list_tasks
+from ompire_daemon.results import ResultManager
 from ompire_daemon.review import ReviewManager, restore_reviews
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import ShipManager
@@ -120,6 +121,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await project_setup.shutdown()
         await agents.shutdown()
         await reviews.shutdown()
+        await app.state.results.shutdown()
 
 
 async def _prepare_startup(
@@ -129,6 +131,7 @@ async def _prepare_startup(
     sessions: SessionTracker,
     project_setup: ProjectSetupManager,
     ships: ShipManager,
+    results: ResultManager,
     guard: WorkspaceGuard,
 ) -> list[Any]:
     """Retain the packaged workflow definitions, finish the upgrade, resolve
@@ -164,6 +167,18 @@ async def _prepare_startup(
     # filesystem before any client can see the project list, so a card can
     # never sit pending forever (ADR-0022).
     await project_setup.reconcile_pending()
+    # Captures the last daemon was running are turned into visible interrupted
+    # failures before any client can see them and before any new result command
+    # is accepted (ADR-0034). Nothing is re-read from a workspace: the files
+    # that capture was reading may be long gone, and retaining today's bytes
+    # under yesterday's request id is exactly the substitution the request-id
+    # contract exists to prevent.
+    for interrupted in results.restore():
+        logger.warning(
+            "task %d capture %s did not survive the restart",
+            interrupted.task_id,
+            interrupted.id,
+        )
     # Durable review history is corrected before anything else reads it, so
     # the first snapshot never carries an open review whose llmvet process
     # died with the daemon (review capability; ADR-0016).
@@ -305,6 +320,16 @@ def create_app(
         app.state.gh,
         app.state.workspace_guard,
     )
+    # Durable result capture (ADR-0034). It takes the same workspace guard as
+    # a HOST owner, so a capture and a review, a delivery, or a cleanup exclude
+    # each other; it is deliberately not wired into the workflow runner, since
+    # nothing about a captured result advances a run or authorizes a delivery.
+    app.state.results = ResultManager(
+        config,
+        app.state.engine,
+        app.state.events,
+        app.state.workspace_guard,
+    )
     # A format-3 run drives review and delivery as steps, but it never
     # performs either itself: the managers stay the only trusted operation
     # owners, and the runner asks them. Wired after construction because the
@@ -345,6 +370,7 @@ def create_app(
             app.state.sessions,
             app.state.project_setup,
             app.state.ships,
+            app.state.results,
             app.state.workspace_guard,
         )
     )

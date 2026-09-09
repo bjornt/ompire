@@ -29,6 +29,7 @@ and publishing. The agent gets a clone, a container, and a prompt.
 | Review verdict | Review tool, host side, plus you |
 | Writing code | Agent |
 | Drafting commit and PR text | Agent |
+| Retained result bytes | Daemon, outside the workspace |
 
 The agent may propose. It does not publish.
 
@@ -74,14 +75,48 @@ who signs — or, through `gpg.program`, which binary the daemon runs on the
 host. The daemon then verifies that the commits it produced really carry the
 intended key's signature before pushing anything.
 
+## Keeping a result without publishing
+
+Not every task ends in a commit. One that investigates a problem or drafts a
+plan produces files worth keeping, and keeping them is a different decision from
+publishing them.
+
+Capture is a trusted daemon operation. It reads the task's workspace under the
+daemon's privileges, not the agent's, and the agent has no say in what is
+captured: the operator names the paths, and the retained bytes live in the
+daemon's own owner-private store, outside the clone and unreachable from the
+container. Cleanup can then delete the workspace without destroying the result.
+
+What comes back out is still the agent's writing, and it is treated that way.
+Retained text is shown as escaped source — Markdown is not rendered, HTML and
+SVG are not executed, embedded resources are not fetched, and links are not
+followed. Nothing downloaded is executable. A manifest and matching checksums
+prove *identity*: they say these are the bytes you accepted, never that the
+bytes are correct or that anything they declare is permitted.
+
+Accepting a result is retention, not authority. It advances no workflow, answers
+no review, and makes nothing publishable — which is why the Results panel is a
+separate surface from Review and Ship rather than another approval on the same
+one.
+
+Capture refuses recognizable credential material rather than storing a redacted
+copy, because a redacted file retained under a checksum you later trust is worse
+than no file. That check is bounded and cannot recognize every secret, so a
+retained result is still sensitive content a human has to read.
+
 ## Where the boundary is currently weaker than intended
 
-One gap is worth knowing about, because documentation that only describes the
+Two gaps are worth knowing about, because documentation that only describes the
 intended model would be misleading.
 
 **Network access is ambient.** Policy-controlled network access per workflow
 is direction, not current behavior. The container has the network access its
 environment gives it.
+
+**Secret detection in captured results is bounded.** It recognizes private-key
+blocks, GitHub tokens, authorization-header values, credential-bearing URLs, and
+the daemon's own token. It is a guard against the obvious mistake, not a
+guarantee that a retained result contains no secret.
 
 ## Single operator, localhost
 

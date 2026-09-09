@@ -23,7 +23,9 @@ import type {
   ReviewState,
   SessionInfo,
   SettingsChangedPayload,
+  RetainedResultCounts,
   ShipProjection,
+  TaskResultsProjection,
   SessionModelPayload,
   SnapshotPayload,
   SpawnStepPayload,
@@ -105,6 +107,15 @@ export interface DaemonState {
    * task deletion. Cleanup keeps the projection — the record of what a task
    * published outlives its workspace. */
   ships: Record<number, ShipProjection>;
+  /** Durable result projections per task id (ADR-0034): metadata only, loaded
+   * from the snapshot, replaced wholesale by each committed
+   * `task_results_updated`, dropped by task deletion. Cleanup keeps them —
+   * retaining a result is the whole point of it surviving the workspace. */
+  taskResults: Record<number, TaskResultsProjection>;
+  /** Per-task retained/accepted counts for the Tasks index. Snapshot-loaded
+   * and kept in step with `taskResults` by every result delta, so the index
+   * and the panel cannot disagree about what is retained. */
+  retainedResults: Record<number, RetainedResultCounts>;
   /** Current GPG signing-key cache state (ship capability): loaded from the
    * snapshot, upserted by gpg_status events. */
   gpg: GpgStatus | null;
@@ -132,10 +143,33 @@ export const initialDaemonState: DaemonState = {
   advisories: {},
   reviews: {},
   ships: {},
+  taskResults: {},
+  retainedResults: {},
   gpg: null,
   gh: null,
   settings: {},
 };
+
+/** The Tasks index's counts, derived from a task's whole result document.
+ *
+ * Deliberately computed from the same projection the panel renders rather than
+ * carried as a second number the daemon also sends: a count that could drift
+ * from the list it summarizes is a count nobody can trust. Byte totals come
+ * from the manifests, so a revision whose manifest is damaged contributes
+ * none — the revision's own view reports the damage. */
+export function summarizeResults(projection: TaskResultsProjection): RetainedResultCounts {
+  let retained = 0;
+  let accepted = 0;
+  let bytes = 0;
+  for (const result of projection.results) {
+    if (result.state === "ready") {
+      retained += 1;
+      bytes += result.total_bytes;
+    }
+    if (result.accepted_at !== null) accepted += 1;
+  }
+  return { total: projection.results.length, retained, accepted, bytes };
+}
 
 /** Projects are keyed by name, and the same project can arrive twice: once as
  * a mutation's own REST response and once as its WebSocket event. Replacing in
@@ -256,6 +290,14 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       for (const [taskId, ship] of Object.entries(payload.ships ?? {})) {
         ships[Number(taskId)] = ship;
       }
+      const taskResults: Record<number, TaskResultsProjection> = {};
+      for (const [taskId, projection] of Object.entries(payload.task_results ?? {})) {
+        taskResults[Number(taskId)] = projection;
+      }
+      const retainedResults: Record<number, RetainedResultCounts> = {};
+      for (const [taskId, counts] of Object.entries(payload.retained_results ?? {})) {
+        retainedResults[Number(taskId)] = counts;
+      }
       return {
         ...state,
         snapshotReady: true,
@@ -273,6 +315,8 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         advisories: {},
         reviews,
         ships,
+        taskResults,
+        retainedResults,
         gpg: payload.gpg ?? null,
         gh: normalizeGitHubStatus(payload.gh),
         settings: payload.settings ?? {},
@@ -355,6 +399,8 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       const { [id]: _droppedAdvisories, ...advisories } = state.advisories;
       const { [id]: _droppedReview, ...reviews } = state.reviews;
       const { [id]: _droppedShip, ...ships } = state.ships;
+      const { [id]: _droppedResults, ...taskResults } = state.taskResults;
+      const { [id]: _droppedCounts, ...retainedResults } = state.retainedResults;
       return {
         ...state,
         tasks: state.tasks.filter((t) => t.id !== id),
@@ -366,6 +412,8 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         advisories,
         reviews,
         ships,
+        taskResults,
+        retainedResults,
       };
     }
     case "project_setup_step": {
@@ -564,6 +612,33 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
       return {
         ...state,
         ships: { ...state.ships, [projection.task_id]: projection },
+      };
+    }
+    case "task_results_updated": {
+      // The whole versioned result document for one task, published only
+      // after the daemon committed the mutation. REST responses go through
+      // this same reducer, so a response and its broadcast converge instead of
+      // racing, and an older or duplicated version is dropped rather than
+      // moving the client backwards (ADR-0034).
+      const projection = envelope.payload as TaskResultsProjection;
+      // A payload that is not a result document is dropped rather than
+      // applied. This reducer runs both incoming deltas and REST command
+      // responses, and a single malformed one must not be able to take the
+      // whole dashboard down with it.
+      if (!projection || !Array.isArray(projection.results)) return state;
+      const existing = state.taskResults[projection.task_id];
+      if (existing !== undefined && existing.version > projection.version) {
+        return state;
+      }
+      return {
+        ...state,
+        taskResults: { ...state.taskResults, [projection.task_id]: projection },
+        // Derived from the same document, so the Tasks index cannot claim a
+        // count the panel disagrees with.
+        retainedResults: {
+          ...state.retainedResults,
+          [projection.task_id]: summarizeResults(projection),
+        },
       };
     }
     case "workflow_step": {

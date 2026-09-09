@@ -21,7 +21,7 @@ reference](../../use/reference/api.md); the generated OpenAPI schema at
 profile contract, including its identifier grammar and status codes, is in
 [Model profiles](../../use/reference/model-profiles.md).
 
-Five mutation boundaries are worth knowing before adding routes near them.
+Six mutation boundaries are worth knowing before adding routes near them.
 
 Profile input schemas forbid unknown fields at every nesting level, so a
 misspelled role or binding key is a `422` rather than silently ignored
@@ -145,6 +145,40 @@ Every one of these responds with the task's whole versioned delivery
 projection, the same document the WebSocket publishes — so a response and its
 broadcast converge through one reducer instead of racing.
 
+Durable result capture is the sixth, and it is the one boundary that guards
+*bytes* rather than authority
+([ADR-0034](../../adr/0034-retain-durable-task-results-outside-the-workspace.md)).
+
+`POST /api/tasks/{id}/results` is a two-part boundary. Admission — the task
+exists, is not archived, its clone is confined to the task root, and the
+workspace guard admits a new `HOST` owner — happens before any identity is
+recorded. Then the request id and normalized selection commit, and only after
+that does `capturing` become visible. The route returns `202` and the metadata
+projection; the manager supervises the capture to `ready` or `failed`
+independently of the browser connection, so a lost response is recovered from
+result history rather than by capturing whatever the workspace holds now.
+
+The request id is the replay key. The same id with the same selection returns
+the original operation *including its failure*; the same id with a different
+selection is `409`. Nothing here retries on the caller's behalf.
+
+Revision-scoped commands carry the expectation they were decided under —
+`expected_manifest_id` for acceptance, plus `expected_version` and an explicit
+acknowledgement for purge — and are refused rather than retargeted when it no
+longer holds. Every one of them responds with the task's whole versioned result
+document, the same one the WebSocket publishes, so a response and its broadcast
+converge through one reducer.
+
+Status codes are narrow on purpose: `422` for a request that was never well
+formed, `404` for an unknown task, revision, or file, `409` for a state or
+expectation that no longer holds, and `410` for a purged revision — a real,
+permanent answer with a readable record behind it, not a missing resource.
+
+Downloads are ordinary authenticated responses with a body. They carry
+`Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`, and
+`Cache-Control: private, no-store`; there is no token-bearing URL and no static
+result directory, because a result is untrusted agent-authored content.
+
 `POST /api/tasks/{id}/workflow/resume` carries the same shape of guard for a
 *human* decision. The request names the waiting attempt, the daemon decides
 from that attempt which of three waits it is, and — for a gate with declared
@@ -175,6 +209,8 @@ protocol](websocket-protocol.md).
 | WebSocket upgrade without the valid token | Upgrade refused |
 | Agent channel for an unknown or undeclared session name | Channel closes with an error, no events sent |
 | Agent channel for a session with no live agent | Closes with code `4404` |
+| Result command against a revision belonging to another task | `404` — the task scope in the path is part of the authorization |
+| Read or download of a purged revision | `410`, its record still readable |
 | Token rotated while sockets are open | All closed with code `1008` |
 
 A reconnect produces a fresh snapshot reflecting everything that changed while

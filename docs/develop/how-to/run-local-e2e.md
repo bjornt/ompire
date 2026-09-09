@@ -73,6 +73,7 @@ the daemon, and `cleanup` runs last.
 | `merge-poll` | Pull-request state polling to a terminal state |
 | `advisories-stalls` | Stall detection and context advisories |
 | `crash-recovery` | Killing the daemon mid-work and recovering, including inside a delivery's push window |
+| `durable-results` | Capturing planning files with no commit, reviewing and accepting one revision, downloading it, a successor and its comparison, a refused capture, identical bytes after a daemon restart and after cleanup, and guarded purge |
 | `cleanup` | Workshop removal, clone deletion, archival |
 
 `ws-watch` also exists but is **not** in the `--all` matrix. Run it explicitly
@@ -192,6 +193,41 @@ followed by reopening the old task.
 The `workflow-decisions` scenario establishes a run with declared results,
 evidence handoffs and a gate, which is the state task-detail inspection is
 worth checking against.
+
+### Verify durable results
+
+Retention is a claim about bytes surviving things, so the browser pass is about
+watching them survive. The `durable-results` runbook already proves the
+filesystem and checksum side; what a browser adds is that the operator can see
+and do it.
+
+A reproducible pass, against a task that has written planning files (spawn one
+with `[[scenario:plan-files]]`):
+
+1. Open the task at 1440×1200. The **Results** panel says nothing is retained
+   until you capture, and states the supported types and limits.
+2. Capture a directory using the form. Check the revision's file list, sizes,
+   checksums, and provenance — the producing step must read `unknown`, and the
+   commit must be labelled as a capture-time observation.
+3. Open a file. It must render as escaped source: an agent-authored heading is
+   text, not a heading, and there is no `<img>` or `<script>` element inside the
+   preview.
+4. Accept the revision, and confirm the Review and Ship surfaces are unchanged
+   by it. Accepting a result is not an approval.
+5. Have the agent revise the files, capture again, and open the comparison.
+   Then reselect the earlier revision and confirm its acceptance is untouched.
+6. Download the ZIP, then **Clean up workspace** from task detail. Read the
+   confirmation: it must say uncaptured edits are lost *and* how many revisions
+   are retained.
+7. After cleanup, capture is unavailable and the revisions are still readable
+   and downloadable. Find the task again from **Tasks → Retained results** — a
+   task with no pull request has no other way back — and follow the link.
+8. Purge a revision. The confirmation names it, whether it was accepted, and the
+   bytes being removed; afterwards the record stays visible with no files.
+
+Interruptions worth including: a daemon restart with the panel open, a second
+tab accepting the revision this one is showing, and a capture attempted while a
+review holds the workspace.
 
 ### When there is no browser
 

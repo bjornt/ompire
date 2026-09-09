@@ -1125,6 +1125,134 @@ export interface DaemonInfo {
   audit_log_path: string | null;
 }
 
+/** --- Durable task results (ADR-0034) ------------------------------------ */
+
+/** What state a captured revision is in. Acceptance is deliberately *not* one
+ * of these: it is an independent decision that survives a revision becoming
+ * unreadable, so it lives on `accepted_at` instead. */
+export type TaskResultState = "capturing" | "failed" | "ready" | "purged";
+
+/** One retained file, as the immutable manifest describes it. The daemon
+ * verifies length and checksum before serving any content, so these are what
+ * the operator accepted rather than a description of whatever is stored. */
+export interface TaskResultFile {
+  path: string;
+  length: number;
+  sha256: string;
+  media_type: string;
+}
+
+/** What is actually known about who produced a revision's files. Every value
+ * that was never recorded reads `unknown` and is listed in `gaps`: a manual
+ * capture does not know which run, step, or session authored a file, and the
+ * run's most recent step is not evidence that it did. */
+export interface TaskResultProvenance {
+  capture_actor: string;
+  workflow_name: string | null;
+  workflow_revision: string | null;
+  producing_run: string;
+  producing_step: string;
+  producing_session: string;
+  /** The base branch the task was launched against, or null when its launch
+   * configuration was never recorded — never today's project default. */
+  launch_base_branch: string | null;
+  /** Observations made *at capture time*, not the commit the task was spawned
+   * from. Null when the workspace had no readable Git repository. */
+  capture_head_commit: string | null;
+  capture_merge_base: string | null;
+  git_observation: string;
+  gaps: string[];
+}
+
+/** One captured revision, metadata only. Content, diffs, and downloads are
+ * fetched for the revision the operator selected — they are never broadcast. */
+export interface TaskResult {
+  id: string;
+  task_id: number;
+  state: TaskResultState;
+  /** Why a capture produced no bundle. Bounded and actionable, and never
+   * carrying file content or a matched credential. */
+  error: string | null;
+  /** Why a retained revision cannot be read, if it cannot. */
+  unavailable_reason: string | null;
+  available: boolean;
+  /** The revision binding. Acceptance and purge both name it, so a decision
+   * can never be applied to content the operator did not review. */
+  manifest_id: string | null;
+  /** Identifies an equal *file set*. Two captures of the same bytes share it
+   * and keep separate identities and provenance. */
+  content_id: string | null;
+  predecessor_id: string | null;
+  selection: string[];
+  files: TaskResultFile[];
+  file_count: number;
+  total_bytes: number;
+  provenance: TaskResultProvenance | null;
+  captured_at: string;
+  started_at: string;
+  finished_at: string | null;
+  accepted_at: string | null;
+  accepted_by: string | null;
+  purged_at: string | null;
+  purged_by: string | null;
+}
+
+/** One task's whole result document, versioned so a missed or duplicated
+ * delta still converges on what the daemon stored. */
+export interface TaskResultsProjection {
+  task_id: number;
+  version: number;
+  results: TaskResult[];
+}
+
+/** The fixed bounds, served by the daemon so the UI states them before
+ * submission rather than reproducing them and drifting. */
+export interface TaskResultLimits {
+  max_files: number;
+  max_file_bytes: number;
+  max_total_bytes: number;
+  max_path_components: number;
+  capture_deadline_seconds: number;
+  supported_extensions: string[];
+}
+
+/** Per-task counts behind the Tasks index's Retained results section. */
+export interface RetainedResultCounts {
+  total: number;
+  retained: number;
+  accepted: number;
+  bytes: number;
+}
+
+/** One retained file's content, fetched on demand and displayed as inert
+ * escaped source. */
+export interface TaskResultFileContent {
+  result_id: string;
+  manifest_id: string | null;
+  path: string;
+  media_type: string;
+  length: number;
+  sha256: string;
+  text: string;
+}
+
+/** A revision compared with its recorded predecessor. An unavailable
+ * predecessor is named as unavailable, never treated as an empty bundle. */
+export interface TaskResultDiff {
+  result_id: string;
+  predecessor_id: string | null;
+  predecessor_available: boolean;
+  predecessor_reason: string | null;
+  added: string[];
+  changed: string[];
+  /** Paths this revision does not contain. A bundle difference — never an
+   * instruction to delete a workspace file. */
+  omitted: string[];
+  unchanged: string[];
+  text: string;
+  truncated: boolean;
+}
+
 export interface SnapshotPayload {
   projects: Project[];
   /** The complete sorted model-profile registry (ADR-0025); absent from
@@ -1152,6 +1280,11 @@ export interface SnapshotPayload {
   /** Durable per-task delivery projections, keyed by task id (JSON object keys
    * arrive as strings); absent from snapshots emitted before the ship chunk. */
   ships?: Record<string, ShipProjection>;
+  /** Durable per-task result projections, keyed by task id (ADR-0034);
+   * metadata only, and absent from snapshots emitted before this chunk. */
+  task_results?: Record<string, TaskResultsProjection>;
+  /** Per-task retained/accepted counts for the Tasks index. */
+  retained_results?: Record<string, RetainedResultCounts>;
   /** Current GPG signing-key cache state; absent from snapshots emitted before
    * the ship chunk. */
   gpg?: GpgStatus;

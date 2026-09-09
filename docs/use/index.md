@@ -7,8 +7,15 @@ instead.
 Ompire runs as a daemon on your machine and serves a web UI at
 `http://127.0.0.1:4173`. You register a project, spawn a task against it, and
 Ompire prepares an isolated clone and container, runs a coding agent inside a
-declared workflow, and tells you when it needs you. When the work is done you
+declared workflow, and tells you when it needs you. When the work is code, you
 review it and ship it as a signed commit and pull request.
+
+Not every task ends there. A task that investigates a problem or drafts a plan
+produces files worth keeping and not worth committing, so you can capture them
+as a durable result instead: review the actual bytes, accept one exact revision,
+and read or download it after the task's workspace is cleaned up. Nothing is
+published, and no commit is needed. See
+[Task detail](reference/task-detail.md#results-panel).
 
 That is the daily loop of a workbench built from four parts — agent
 isolation, parallel task oversight, the workflow engine, and the refinement

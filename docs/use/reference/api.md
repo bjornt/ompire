@@ -258,6 +258,59 @@ when launch inputs are also missing. A stale `preview_token` is `409` before
 anything else is checked; an incompatible candidate is `422` naming the
 problems. Confirmation pins the future only — it starts nothing.
 
+## Task results
+
+Durable results are retained outside the task's workspace
+([ADR-0034](../../adr/0034-retain-durable-task-results-outside-the-workspace.md)).
+Every route is task-scoped, and the task in the path is part of the
+authorization: a revision addressed under the wrong task is `404`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/tasks/{id}/results` | The task's whole result document plus the fixed `limits` |
+| `POST` | `/api/tasks/{id}/results` | Capture. `202`; the capture continues in the background |
+| `GET` | `/api/tasks/{id}/results/{rid}` | One revision's detail and its complete manifest |
+| `GET` | `/api/tasks/{id}/results/{rid}/file?path=…` | One retained file as JSON text, for an escaped source preview |
+| `GET` | `/api/tasks/{id}/results/{rid}/diff` | Comparison with the recorded predecessor |
+| `GET` | `/api/tasks/{id}/results/{rid}/download` | The whole revision as a ZIP, or one file with `?path=…` |
+| `POST` | `/api/tasks/{id}/results/{rid}/accept` | Record the operator's decision about this exact revision |
+| `DELETE` | `/api/tasks/{id}/results/{rid}` | Purge this revision's retained files |
+
+Capture takes `paths` (repository-relative files or directories, at least one)
+and `request_id`. The request id is a replay key: repeating a request with the
+same selection returns the original operation, including its failure, so a lost
+response is recovered from result history rather than by capturing whatever the
+workspace holds now. The same id with a *different* selection is `409`. A retry
+uses a new id.
+
+`accept` takes `expected_manifest_id`. `DELETE` takes `expected_manifest_id`,
+`expected_version` (the document's `version`), and `acknowledge_purge: true`.
+Both bind the decision to exactly what the operator reviewed; there is no force
+variant.
+
+A result carries its `state` (`capturing`, `failed`, `ready`, `purged`),
+`available`, `manifest_id`, `content_id`, `predecessor_id`, the file list with
+lengths, media types and SHA-256 checksums, `provenance`, and the acceptance and
+purge decisions. Content is never in the projection — it is fetched per selected
+revision.
+
+| Condition | Response |
+|---|---|
+| Malformed or ineligible selection, missing acknowledgement | `422` |
+| Unknown task, revision, or file | `404` |
+| Capture already in flight, replay under a changed selection, stale manifest or version, unavailable revision, no workspace, workspace busy | `409` |
+| Purged revision's content | `410` |
+
+Capture and acceptance advance no workflow, answer no review, and make nothing
+publishable. Downloads use ordinary bearer authentication and carry
+`Content-Disposition: attachment`, `X-Content-Type-Options: nosniff`, and
+`Cache-Control: private, no-store`. There are no token-bearing download URLs and
+no unauthenticated result directory.
+
+Committed changes broadcast `task_results_updated`, the whole versioned document
+for one task. See [Task detail](task-detail.md#results-panel) for the limits and
+the operator flow.
+
 ## Sessions
 
 All paths are under `/api/tasks/{id}/sessions/{session}/agent`.

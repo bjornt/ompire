@@ -39,6 +39,8 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
             "attention",
             "reviews",
             "ships",
+            "task_results",
+            "retained_results",
             "gpg",
             "gh",
             "settings",

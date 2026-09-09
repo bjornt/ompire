@@ -89,7 +89,7 @@ _PARAM_RE = re.compile(r"\[\[scenario-param:([a-z0-9-]+)=([^\]]*)\]\]")
 KNOWN_SCENARIOS = {
     # behavior
     "happy", "outcome-failed", "no-outcome", "ship-draft", "review-comments",
-    "resume-nudge", "retry-prefix", "commit",
+    "resume-nudge", "retry-prefix", "commit", "plan-files",
     # protocol (promoted from daemon/tests/fake_omp.py)
     "die", "fail", "garbage", "big", "queue", "no-end", "ask", "approve",
     "ask-cancel", "bad-ask", "auto-retry", "auto-retry-hang",
@@ -342,6 +342,33 @@ def mark_fixed() -> None:
     path = Path.cwd() / FIXED_MARKER
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("fixed by fake omp\n", encoding="utf-8")
+
+
+# A planning task's real output: ordinary Markdown at the paths the planning
+# skills use, written into the workspace and committed nowhere. This is what
+# makes durable-result capture testable end to end — the daemon has to retain
+# bytes an agent actually wrote, and a second turn has to change them so a
+# successor revision differs from its predecessor in a checkable way.
+PLAN_DIR_DEFAULT = "epics/local-e2e"
+
+
+def write_plan_files(turn: int, params: dict) -> list[str]:
+    """Write (or revise) planning files, and deliberately commit nothing."""
+    relative = params.get("plan-dir", PLAN_DIR_DEFAULT)
+    directory = Path.cwd() / relative
+    directory.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+    for name, heading in (("SPEC.md", "Spec"), ("PLAN.md", "Plan")):
+        body = [f"# {heading}", "", f"Revision {turn} written by fake omp.", ""]
+        body.append("- the original point")
+        # A later turn revises one line and adds another, so a successor
+        # capture has both a change and an addition to show.
+        if turn > 1:
+            body[-1] = f"- the revised point (turn {turn})"
+            body.append(f"- an added point (turn {turn})")
+        (directory / name).write_text("\n".join(body) + "\n", encoding="utf-8")
+        written.append(f"{relative}/{name}")
+    return written
 
 
 def append_work_artifact(scenario: str, turn: int) -> None:
@@ -708,6 +735,11 @@ class Engine:
             subject, error = git_commit(turn)
             assistant_text = (
                 f"committed: {subject}" if subject else f"commit failed: {error}")
+        elif scenario == "plan-files":
+            written = write_plan_files(turn, params)
+            assistant_text = (
+                f"wrote planning files (revision {turn}): " + ", ".join(written)
+            )
         elif scenario == "no-outcome":
             # A prompted, outcome-bearing step that leaves nothing readable.
             # The engine must stop and say so rather than classify it

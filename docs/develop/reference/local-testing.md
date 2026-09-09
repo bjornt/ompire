@@ -83,6 +83,13 @@ Claiming `script_available` also leaves a real `.ompire/repro.sh` behind that
 fails until a fix lands — a claim without the script would make the engine read
 the shell's "no such file" as the bug still being present.
 
+The `plan-files` scenario writes ordinary Markdown planning files into the
+workspace — `SPEC.md` and `PLAN.md` under a directory the `plan-dir` parameter
+names — and commits nothing. A later turn revises one line and adds another, so
+a successor capture differs from its predecessor in a checkable way. It is what
+makes durable result capture testable end to end: the daemon has to retain bytes
+an agent actually wrote, out of a real workspace.
+
 Sessions persist transcripts, and resume restores context, which is what makes
 crash-recovery testable.
 
@@ -257,6 +264,7 @@ to assertions.
 | `merge-poll` | The poll observes merging |
 | `crash-recovery` | Daemon `kill -9` recovery |
 | `cleanup` | Task teardown |
+| `durable-results` | The no-commit journey: planning files captured, reviewed, accepted, downloaded, superseded; a refused capture; the same bytes after a daemon restart and after cleanup deletes the clone; task purge refused while results are retained, then explicit result purge, tombstone, and task purge |
 | `advisories-stalls` | Stall and advisory surfaces |
 
 A driver runs a single runbook, or the whole matrix in a throwaway

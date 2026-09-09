@@ -112,6 +112,151 @@ Every iteration is ordered from oldest to newest and records its outcome,
 recorded time, optional comment count, and any captured reviewer stderr. Error
 output is available in an expandable, readable disclosure.
 
+### Results panel
+
+Files this task produced, retained outside its workspace. Capturing a result
+needs no commit, push, or pull request, and a captured result survives cleanup.
+The panel is independent of Review and Ship flow: keeping a result and approving
+code are different decisions, and this panel makes only the first.
+
+An empty panel says so — workspace files are not retained until they are
+captured.
+
+#### Capturing
+
+Enter repository-relative file or directory paths, one per line, and choose
+**Capture result**. A selected directory contributes its supported files
+recursively, with their repository-relative paths preserved.
+
+The panel states the limits before submission, and the daemon enforces them:
+
+| Limit | Value |
+|---|---|
+| File types | UTF-8 `.md`, `.txt`, `.json`, `.yaml`, `.yml` |
+| Files per bundle | 128 |
+| Bytes per file | 1 MiB |
+| Bytes per bundle | 8 MiB |
+| Path components | 16 |
+| Path length | 1,024 bytes |
+| Capture deadline | 30 seconds |
+
+These are fixed. They are not settings, and there is no way to raise them for
+one capture.
+
+Capture refuses, rather than interrupts, while another Ompire operation owns the
+task's workspace — a review, a draft, a delivery, or a cleanup. Wait for that to
+finish and capture again.
+
+#### What is refused
+
+An ineligible entry fails the whole capture and names the entry. A partially
+honoured selection would be a bundle nobody asked for, so there is no such
+result. Refused: paths outside the workspace, absolute paths and traversal,
+symlinks in any component, multiply linked and special files, cross-device
+entries, dot-prefixed names (`.git`, `.ompire`, credential and session
+directories), the whole clone or its root, the reserved
+`__ompire_result_manifest__.json` name, unsupported file types, invalid UTF-8,
+and any bound above.
+
+Files inside a selected directory whose names begin with a dot are skipped
+rather than refused — the incidental metadata beside a planning directory is not
+what was selected.
+
+Recognizable credential material is refused too: private-key blocks, GitHub
+tokens, authorization-header values, credential-bearing URLs, and Ompire's own
+bearer token. The failure names the file and the reason and never quotes what it
+found. This check is bounded and cannot recognize every secret. Retained files
+are still sensitive, untrusted content — review them, and treat a download as
+you would any file an agent wrote.
+
+A capture that fails is recorded as a failed revision with its reason. It
+retains nothing, never becomes another revision's predecessor, and leaves every
+existing revision exactly as it was. Correct the selection or the workspace and
+capture again.
+
+#### Reviewing a revision
+
+A completed capture appears as an unaccepted revision with its exact file list,
+sizes, media types, and SHA-256 checksums, plus its provenance.
+
+Provenance says what is actually known. A manual capture is attributed to the
+operator, and the producing run, step, and session read **unknown**: the run's
+most recent step is evidence that something executed, not evidence that it wrote
+these files. The commit shown is labelled as an observation made at capture
+time, distinct from the base branch recorded when the task was launched.
+Anything unrecorded is listed as a gap rather than guessed at.
+
+Selecting a file shows its retained text as escaped source. Markdown is not
+rendered, HTML and SVG are not executed, embedded resources are not fetched, and
+agent-authored links are not followed. What is shown is the retained content,
+not a fresh read of the workspace — later edits to the workspace do not change
+it.
+
+A revision captured after an earlier one offers **Compare with previous
+revision**: added, changed, and omitted paths plus a text difference. An omitted
+path means it is not in this bundle. It is not an instruction to delete
+anything. A very large comparison is truncated, and says so; every file's
+complete source and download stay available. When the previous revision was
+purged or is unavailable, the panel names that instead of treating it as empty.
+
+#### Accepting
+
+**Accept this revision** records that the operator reviewed and is keeping
+exactly the displayed files. The label beside it states the scope: it does not
+approve code, answer a workflow question, or allow anything to be published.
+
+Acceptance names the exact revision. A stale page — one showing a revision that
+has since been superseded, purged, or found damaged — is refused, and the
+operator reviews what is actually there before deciding again. Repeating a
+successful acceptance changes nothing. Capturing or accepting a later revision
+leaves every earlier revision and decision untouched; there is no floating
+"latest accepted".
+
+#### Downloading
+
+Any complete revision can be downloaded before or after acceptance, as a single
+file or as one ZIP containing the original relative paths plus an Ompire
+manifest at `__ompire_result_manifest__.json`. Downloads carry the retained
+bytes, never a fresh read of the workspace, and work after the workspace is
+gone. Nothing downloaded is executable. If any file in a revision is
+unavailable, the whole download fails rather than producing a partial archive.
+
+#### Unavailable and purged revisions
+
+A retained revision whose bytes no longer match its manifest reads
+**Unavailable** with the reason. It keeps its history, including its acceptance
+if it had one, cannot be newly accepted or downloaded, and is never rebuilt from
+current workspace files. Other revisions and the task stay usable.
+
+**Purge this revision** permanently deletes one revision's retained files. It
+confirms first, naming the revision, whether it was accepted, and the files and
+bytes being removed. Purge is never part of cleanup. A purged revision stays
+visible as a record — its identity, manifest, provenance, acceptance and purge
+decision — with no readable or downloadable files.
+
+Purge is logical removal. It makes no promise about database free space,
+backups, or copies already downloaded, and the database file need not shrink.
+
+An older task that captured nothing shows **No captured results**, rather than a
+result reconstructed from its outcome text.
+
+### Cleanup
+
+**Clean up workspace** removes this task's clone and container. It is available
+here as well as on the task card, because a task that produced a durable result
+and no pull request never enters Ship flow at all.
+
+The confirmation names the clone directory and the container, warns that any
+workspace edits not captured as a result will be lost, and reports how many
+result revisions are retained. Cleanup never purges a result: retained
+revisions stay readable and downloadable afterwards, and the Results panel then
+offers every action except capture, because there is no longer a workspace to
+capture from.
+
+Cleanup is refused while another host-side operation owns the workspace —
+including an in-flight capture — and while a delivery is unresolved. See
+[Tasks](tasks.md#cleanup-and-purge).
+
 ### Escape-hatch instructions
 
 Copyable instructions for entering the task's container by hand: change to the
@@ -315,3 +460,9 @@ gates and pauses — carrying the waiting attempt's sequence number and, at a
 gate with declared choices, the chosen `choice_id` — and to
 `POST /api/tasks/{id}/review` or
 `POST /api/tasks/{id}/review/cancel` for the Review panel.
+
+The Results panel reads and commands `/api/tasks/{id}/results` and its
+revision-scoped routes, and receives committed changes as `task_results_updated`
+on the main socket. Downloads use ordinary bearer authentication — there are no
+token-bearing download links. Cleanup posts to `/api/tasks/{id}/cleanup`. See
+the [API reference](api.md#task-results).

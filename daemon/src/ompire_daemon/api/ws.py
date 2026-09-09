@@ -103,7 +103,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 # Event types the client orders by a version carried in the payload, so an
 # out-of-order or duplicate delivery is dropped rather than applied. Only these
 # are safe to forward from the window the snapshot was being read in.
-VERSION_ORDERED_TYPES = frozenset({"workflow_library_updated", "ship_updated"})
+VERSION_ORDERED_TYPES = frozenset(
+    {"workflow_library_updated", "ship_updated", "task_results_updated"}
+)
 
 
 async def _drain_snapshot_overlap(
@@ -189,6 +191,21 @@ async def _deliver_snapshot(
         str(task_id): info
         for task_id, info in websocket.app.state.ships.snapshot().items()
     }
+    # Durable result projections (ADR-0034): metadata only — manifests, file
+    # lists, decisions and errors, versioned per task. File content, diffs and
+    # ZIPs are never broadcast: they are fetched for the one revision an
+    # operator selected, so a dashboard with twenty tasks open does not carry
+    # every retained byte to every connected client.
+    task_results_payload = {
+        str(task_id): info
+        for task_id, info in websocket.app.state.results.snapshot().items()
+    }
+    # Per-task retained/accepted counts, for the Tasks index's Retained results
+    # section. Derived from the same rows, so the two cannot disagree.
+    retained_results_payload = {
+        str(task_id): counts
+        for task_id, counts in websocket.app.state.results.retained_index().items()
+    }
     gpg_payload = asdict(websocket.app.state.gpg.current())
     gh_payload = asdict(websocket.app.state.gh.current())
     settings = SettingsStore(engine, websocket.app.state.config).effective()
@@ -207,6 +224,8 @@ async def _deliver_snapshot(
             "attention": attention_payload,
             "reviews": reviews_payload,
             "ships": ships_payload,
+            "task_results": task_results_payload,
+            "retained_results": retained_results_payload,
             "gpg": gpg_payload,
             "gh": gh_payload,
             "settings": settings,

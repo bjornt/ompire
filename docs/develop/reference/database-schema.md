@@ -146,6 +146,7 @@ quiet across restarts while a *changed* one reopens as new evidence.
 | `workflow_result` | string, nullable | The declared ending a finished format-2 run reached |
 | `pr_url`, `pr_state`, `pr_merged_at` | string, nullable | Publishing state |
 | `spawn_completed_at` | string, nullable | |
+| `results_version` | integer | Monotonic version over this task's result projection; `0` for a task with no results |
 | `created_at`, `updated_at` | string | ISO-8601 |
 
 `execution_inputs_json` carries the effective workspace values with their
@@ -581,6 +582,89 @@ as its own decision.
 completed ending. Existing rows keep it and stay readable; a workflow-authorized
 run performs the chain its answer named and produces no new ones.
 
+## `task_results`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | string | Primary key. Opaque capture identity (`res_<32 hex>`), independent of content |
+| `task_id` | integer | FK to `tasks.id`, indexed with `started_at` |
+| `request_id` | string | The caller's replay key; unique per `(task_id, request_id)` |
+| `selection_fingerprint` | string | Hash of the normalized selection, so a replay under a *changed* selection is refused |
+| `selection_json` | text | The normalized selection itself |
+| `state` | string | `capturing`, `failed`, `ready`, `purged` |
+| `error` | text, nullable | Why a capture produced no bundle |
+| `unavailable_reason` | text, nullable | Classified damage found at the read boundary |
+| `manifest_json` | text, nullable | The immutable canonical manifest |
+| `manifest_id` | string, nullable | SHA-256 of that whole manifest — the revision binding |
+| `content_id` | string, nullable | SHA-256 over the sorted path/media/length/checksum entries only |
+| `predecessor_id` | string, nullable | The most recent `ready` revision at admission, frozen then |
+| `started_at`, `finished_at` | string, nullable | ISO-8601 |
+| `accepted_at`, `accepted_by` | string, nullable | The operator's decision |
+| `purged_at`, `purged_by` | string, nullable | The tombstone |
+
+## `task_result_files`
+
+| Column | Type | Notes |
+|---|---|---|
+| `result_id` | string | FK to `task_results.id`, primary key with the path |
+| `relative_path` | string | Repository-relative, re-validated on read |
+| `content` | blob | The exact captured bytes |
+
+Added by migration `0020`
+([ADR-0034](../../adr/0034-retain-durable-task-results-outside-the-workspace.md)).
+Purely additive: no row is created for an existing task, and
+`tasks.results_version` backfills to `0`. A task that ran before results existed
+produced none, and reconstructing one from its outcome text, its clone, or its
+last workflow step would manufacture exactly the provenance this feature exists
+to keep honest.
+
+The file rows carry *only* bytes. Length, checksum and media type live in the
+manifest, which is hashed into `manifest_id`, so there is no second
+independently mutable description of a file to disagree with the one acceptance
+was bound to.
+
+Acceptance is not a state. A `ready` revision that later fails its integrity
+check keeps `accepted_at` and gains `unavailable_reason`: the decision really
+happened, even though the payload no longer matches it.
+
+### Transaction boundaries
+
+Every mutation runs inside `registry/model_profiles.reserved_write` (`BEGIN
+IMMEDIATE`), and every one of them advances `tasks.results_version` in the same
+transaction, so an observable change and its version cannot separate.
+
+- **Capture admission** records the identity, the request key, and the frozen
+  predecessor before a byte is read, and publishes `capturing` only once that
+  commits.
+- **Finalization** inserts every file row, writes the manifest, and sets `ready`
+  together. There is no state in which a revision is `ready` with some of its
+  files — which is why restart recovery never has to adopt a partial bundle or
+  re-read a workspace that may be gone.
+- **Acceptance** and **purge** are each their own transaction, comparing the
+  expected manifest identity (and, for purge, the expected task result version)
+  under the reservation.
+
+No filesystem work and no `await` happens while a write reservation is held: the
+whole bounded read runs on a worker thread first, and only the commit is
+reserved.
+
+### Logical purge and retention
+
+Result purge deletes the file rows and leaves the `task_results` row as a
+tombstone with its identity, manifest, provenance, acceptance and purge
+decision. It is logical removal: SQLite may reuse the freed pages later, and the
+database file need not shrink. It makes no claim about backups or copies already
+downloaded.
+
+Nothing expires. There is no automatic eviction, no garbage collection of
+unaccepted revisions, and no disk-pressure collection — retained bytes go when
+an operator purges them and not before.
+
+Task purge refuses while any `ready` or `capturing` revision remains. That check
+runs on the caller's own reserved connection *before* any deletion, alongside
+the delivery-row deletion that used to run in its own earlier transaction — so a
+refused purge leaves every child row this task owns exactly where it was.
+
 ## `settings`
 
 | Column | Type | Notes |
@@ -641,6 +725,10 @@ Delivery rows survive task archival: a cleaned-up task keeps the record of what
 it published and under whose authorization. Only purge deletes them, and purge
 returns the candidate storage paths that are now unreferenced so the caller can
 remove them from disk — nothing else knows those paths once the rows are gone.
+
+Result rows and their bytes survive task archival too, and survive task purge's
+refusal. They are removed only by an explicit result purge; the tombstones that
+remain travel with the rest of the task's history when it is eventually purged.
 
 ## Migrations
 

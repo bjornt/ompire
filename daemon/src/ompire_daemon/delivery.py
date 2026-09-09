@@ -252,6 +252,35 @@ class WorkspaceGuard:
             _current_hold.reset(token)
             self.release(task_id, owner)
 
+    @contextlib.asynccontextmanager
+    async def cleanup_hold(self, task_id: int, owner: str) -> AsyncIterator[None]:
+        """Own the workspace for the whole of cleanup, agent work included.
+
+        Cleanup is the one operation that legitimately abandons the task's own
+        agent: it tears the container down and deletes the clone. So it admits
+        on `assert_host_free` — refusing another host operation and an
+        unresolved effect, exactly as before — and then *takes* ownership for
+        the duration, displacing any agent hold.
+
+        The reservation is what is new. `assert_host_free` alone left the
+        workspace unowned across cleanup's awaits, so a capture admitted during
+        the container teardown would have been reading files while the clone
+        was being deleted underneath it (ADR-0034). Holding through teardown
+        makes the two mutually exclusive in both orders: a busy capture refuses
+        cleanup, and a started cleanup refuses a new capture.
+
+        Ownership is released on failure as well as success — an aborted
+        cleanup must not leave the task permanently unwritable.
+        """
+        self.assert_host_free(task_id)
+        self._owners[task_id] = (owner, self.HOST)
+        token = _current_hold.set((task_id, owner))
+        try:
+            yield
+        finally:
+            _current_hold.reset(token)
+            self.release(task_id, owner)
+
     @contextlib.contextmanager
     def released(self, task_id: int, owner: str) -> Iterator[None]:
         """Temporarily give ownership back while `owner` still holds it.

@@ -24,6 +24,7 @@ import type {
   AdvisoryKind,
   AdvisoryPayload,
   PendingQuestion,
+  RetainedResultCounts,
   ReviewState,
   SessionInfo,
   ShipProjection,
@@ -31,6 +32,7 @@ import type {
   Task,
   WorkflowState,
 } from "../types";
+import "../components/ResultsPanel.css";
 import "./TasksView.css";
 
 /** A pending `ask` fits a one-tap inline answer when it's a single,
@@ -165,6 +167,7 @@ function TaskCard({
   advisories,
   review,
   ship,
+  retained,
 }: {
   task: Task;
   sessions: Record<string, SessionInfo> | undefined;
@@ -173,6 +176,9 @@ function TaskCard({
   advisories: Record<string, Partial<Record<AdvisoryKind, AdvisoryPayload>>> | undefined;
   review: ReviewState | undefined;
   ship: ShipProjection | undefined;
+  /** So the confirmation can say what cleanup keeps as well as what it
+   * destroys (ADR-0034). */
+  retained: RetainedResultCounts | undefined;
 }) {
   const [showError, setShowError] = useState(false);
   const spawning = isSpawning(task);
@@ -221,7 +227,7 @@ function TaskCard({
     }
   }
   async function onCleanup() {
-    if (!confirmCleanup(task)) return;
+    if (!confirmCleanup(task, null, retained)) return;
     await cleanupTask(task.id);
   }
 
@@ -368,8 +374,19 @@ function TaskCard({
 }
 
 export function TasksView() {
-  const { tasks, projects, sessions, workflows, stats, advisories, reviews, ships, attention, settings } =
-    useDaemonState();
+  const {
+    tasks,
+    projects,
+    sessions,
+    workflows,
+    stats,
+    advisories,
+    reviews,
+    ships,
+    retainedResults,
+    attention,
+    settings,
+  } = useDaemonState();
   const [searchParams] = useSearchParams();
   // Project filter (projects-view capability): the Projects card's
   // active-tasks pill lands here via `?project=<name>`.
@@ -385,6 +402,20 @@ export function TasksView() {
   // pr_url, live or archived, most-recently-updated first.
   const shipped = tasks
     .filter((t) => t.pr_url && (projectFilter === null || t.project_name === projectFilter))
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+
+  // Retained results (ADR-0034): archived tasks that produced something worth
+  // keeping. A task that explored a problem and never opened a pull request is
+  // invisible in every other section once it is cleaned up — Shipped needs a
+  // `pr_url` it does not have — so this is what keeps it reachable. Tasks with
+  // only failed or purged captures stay listed as history-only rather than
+  // disappearing: the record of an attempt is part of what happened.
+  const retained = tasks
+    .filter((t) => {
+      if (t.state !== "archived") return false;
+      if (projectFilter !== null && t.project_name !== projectFilter) return false;
+      return (retainedResults[t.id]?.total ?? 0) > 0;
+    })
     .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
 
   // Partition into sections (ROADMAP2 chunk 1: make-attention-actionable).
@@ -454,6 +485,7 @@ export function TasksView() {
                     advisories={advisories[task.id]}
                     review={reviews[task.id]}
                     ship={ships[task.id]}
+                    retained={retainedResults[task.id]}
                   />
                 ))}
               </div>
@@ -473,6 +505,7 @@ export function TasksView() {
                     advisories={advisories[task.id]}
                     review={reviews[task.id]}
                     ship={ships[task.id]}
+                    retained={retainedResults[task.id]}
                   />
                 ))}
               </div>
@@ -492,12 +525,32 @@ export function TasksView() {
                     advisories={advisories[task.id]}
                     review={reviews[task.id]}
                     ship={ships[task.id]}
+                    retained={retainedResults[task.id]}
                   />
                 ))}
               </div>
             </section>
           )}
         </>
+      )}
+
+      {retained.length > 0 && (
+        <section className="retainedResults" data-testid="retained-results-section">
+          <div className="shippedHeader">
+            <span>Retained results</span>
+            <span className="shippedCount">{retained.length}</span>
+            <span className="shippedRule" />
+          </div>
+          <ul className="retainedList">
+            {retained.map((task) => (
+              <RetainedRow
+                key={task.id}
+                task={task}
+                counts={retainedResults[task.id]}
+              />
+            ))}
+          </ul>
+        </section>
       )}
 
       {shipped.length > 0 && (
@@ -515,6 +568,40 @@ export function TasksView() {
         </section>
       )}
     </>
+  );
+}
+
+/** One cleaned-up task with capture history, linking back to its detail view.
+ *
+ * A task whose only revisions failed or were purged is labelled history-only:
+ * there is nothing to read, and saying so is more useful than either hiding
+ * the task or implying it still has files. */
+function RetainedRow({
+  task,
+  counts,
+}: {
+  task: Task;
+  counts: RetainedResultCounts | undefined;
+}) {
+  const retainedCount = counts?.retained ?? 0;
+  const historyOnly = retainedCount === 0;
+  return (
+    <li className="retainedEntry" data-testid={`retained-row-${task.id}`}>
+      <Link to={`/tasks/${task.id}`} data-testid={`retained-link-${task.id}`}>
+        {task.project_name}/{task.slug}
+      </Link>
+      {historyOnly ? (
+        <span className="retainedMeta" data-testid={`retained-history-only-${task.id}`}>
+          history only — no retained files
+        </span>
+      ) : (
+        <span className="retainedMeta">
+          {retainedCount} revision{retainedCount === 1 ? "" : "s"} retained
+          {counts && counts.accepted > 0 ? ` · ${counts.accepted} accepted` : ""}
+        </span>
+      )}
+      <span className="retainedMeta">cleaned up {formatElapsed(task.updated_at)} ago</span>
+    </li>
   );
 }
 

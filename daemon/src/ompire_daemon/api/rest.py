@@ -15,7 +15,15 @@ from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    status,
+)
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import Engine
 
@@ -111,6 +119,23 @@ from ompire_daemon.registry.projects import (
     update_project,
     validate_slug,
 )
+from ompire_daemon.registry.results import (
+    CAPTURE_DEADLINE_SECONDS,
+    MAX_FILE_BYTES,
+    MAX_FILES,
+    MAX_PATH_COMPONENTS,
+    MAX_TOTAL_BYTES,
+    SUPPORTED_EXTENSIONS,
+    CaptureInProgressError,
+    InvalidSelectionError,
+    ResultNotFoundError,
+    ResultPurgedError,
+    ResultsRetainedError,
+    ResultStateError,
+    SelectionMismatchError,
+    StaleRevisionError,
+    results_version,
+)
 from ompire_daemon.registry.settings import (
     SettingsStore,
     SettingsValidationError,
@@ -170,6 +195,11 @@ from ompire_daemon.registry.workflows import (
     WorkflowWaitConflictError,
     latest_step_record,
     list_step_records,
+)
+from ompire_daemon.results import (
+    CaptureError,
+    ResultManager,
+    ResultUnavailableError,
 )
 from ompire_daemon.review import (
     ReviewAlreadyOpenError,
@@ -2276,14 +2306,6 @@ async def cleanup_task_route(
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
 
-    # Cleanup deletes the clone, so it is refused while anything owns the
-    # workspace and while a privileged effect's outcome is unknown (ADR-0032).
-    # Abandoning remaining work does not make an unresolved effect safe to
-    # destroy the evidence for; it has to be reconciled first.
-    try:
-        guard.assert_host_free(task_id)
-    except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     active = get_active_delivery(engine, task_id)
     if active is not None and active.disposition in ("authorized", "unresolved"):
         raise HTTPException(
@@ -2304,26 +2326,45 @@ async def cleanup_task_route(
             f"refusing to delete {clone_path}: outside task root {task_root}",
         )
 
-    # Tear down the container before deleting the clone under it (design D-4);
-    # an already-gone workshop is fine, any other failure aborts un-archived.
-    if task.workshop_id is not None:
-        try:
-            await remove_workshop(str(clone_path), config.workshop_step_timeout)
-        except WorkshopRemoveError as exc:
-            raise HTTPException(
-                status.HTTP_502_BAD_GATEWAY,
-                f"workshop remove failed; clone retained:\n{exc.stderr}",
-            ) from exc
+    # Cleanup deletes the clone, so it is refused while another host operation
+    # owns the workspace and while a privileged effect's outcome is unknown
+    # (ADR-0032). Abandoning remaining agent work does not make an unresolved
+    # effect safe to destroy the evidence for; it has to be reconciled first.
+    #
+    # The hold is retained through teardown rather than only checked here: a
+    # result capture admitted between this check and the `rmtree` below would
+    # be reading files out of a clone that is being deleted (ADR-0034). A busy
+    # capture therefore refuses cleanup, and a started cleanup refuses a new
+    # capture.
+    try:
+        async with guard.cleanup_hold(task_id, "cleanup"):
+            # Tear down the container before deleting the clone under it
+            # (design D-4); an already-gone workshop is fine, any other failure
+            # aborts un-archived.
+            if task.workshop_id is not None:
+                try:
+                    await remove_workshop(
+                        str(clone_path), config.workshop_step_timeout
+                    )
+                except WorkshopRemoveError as exc:
+                    raise HTTPException(
+                        status.HTTP_502_BAD_GATEWAY,
+                        f"workshop remove failed; clone retained:\n{exc.stderr}",
+                    ) from exc
 
-    # Idempotent: a missing directory is already cleaned up.
-    await asyncio.to_thread(shutil.rmtree, clone_path, ignore_errors=True)
+            # Idempotent: a missing directory is already cleaned up.
+            await asyncio.to_thread(shutil.rmtree, clone_path, ignore_errors=True)
 
-    await reviews.cancel_and_drop(task_id)
-    await ships.cancel_and_drop(task_id)
+            await reviews.cancel_and_drop(task_id)
+            await ships.cancel_and_drop(task_id)
+    except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     # The delivery journal is deliberately retained across cleanup: a
     # cleaned-up task keeps the record of what it published and under whose
-    # authorization. Only the candidate staging repositories go, and only the
-    # ones no unresolved work still needs as evidence.
+    # authorization. Retained results are retained too — cleanup destroys the
+    # workspace, never a captured result or its history (ADR-0034). Only the
+    # candidate staging repositories go, and only the ones no unresolved work
+    # still needs as evidence.
     ships.release_candidate_storage(task_id)
     guard.discard(task_id)
     archived = mark_archived(engine, task_id)
@@ -2333,6 +2374,298 @@ async def cleanup_task_route(
     payload = task_payload(archived, engine=engine)
     events.publish("task_updated", payload)
     return payload
+
+
+# --- Durable task results (ADR-0034) ----------------------------------------
+#
+# Task-scoped, because a result belongs to the task that produced it and the
+# task in the path is part of the authorization, not decoration. Everything
+# here addresses *retained* bytes: no route in this section reads the task's
+# workspace, and none of them grants a workflow, review, or publication effect.
+
+
+def _results(request: Request) -> ResultManager:
+    return request.app.state.results
+
+
+class ResultCaptureIn(BaseModel):
+    """One capture request.
+
+    `request_id` is the caller's replay key. A repeated request with the same
+    selection answers with the original operation — including its failure —
+    so a lost response is recovered from the task's result history rather than
+    by capturing whatever the workspace holds now.
+    """
+
+    paths: list[str] = Field(min_length=1, max_length=MAX_FILES)
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+class ResultDecisionIn(BaseModel):
+    """The exact revision a decision is about. Acceptance and purge both carry
+    it, so a decision can never be applied to content the operator did not
+    review."""
+
+    expected_manifest_id: str = Field(min_length=1, max_length=128)
+
+
+class ResultPurgeIn(ResultDecisionIn):
+    """Purge additionally carries the task's result version the operator was
+    looking at, and an explicit acknowledgement. Deleting the only copy of an
+    accepted result is not a click that should succeed against a stale page."""
+
+    expected_version: int = Field(ge=0)
+    acknowledge_purge: bool
+
+
+def _result_limits() -> dict[str, Any]:
+    """The fixed bounds, served so the UI can state them before submission
+    rather than reproducing them and drifting."""
+    return {
+        "max_files": MAX_FILES,
+        "max_file_bytes": MAX_FILE_BYTES,
+        "max_total_bytes": MAX_TOTAL_BYTES,
+        "max_path_components": MAX_PATH_COMPONENTS,
+        "capture_deadline_seconds": CAPTURE_DEADLINE_SECONDS,
+        "supported_extensions": list(SUPPORTED_EXTENSIONS),
+    }
+
+
+def _result_error(exc: Exception) -> HTTPException:
+    """One place where every result refusal picks its status code.
+
+    422 is a request that was never well formed, 404 an unknown revision or
+    file, 409 a state or expectation that no longer holds, and 410 a purged
+    revision — which is a real, permanent answer with a readable record behind
+    it, not a missing resource.
+    """
+    if isinstance(exc, InvalidSelectionError):
+        return HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+    if isinstance(exc, ResultNotFoundError):
+        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    if isinstance(exc, ResultPurgedError):
+        return HTTPException(status.HTTP_410_GONE, str(exc))
+    if isinstance(
+        exc,
+        (
+            CaptureInProgressError,
+            SelectionMismatchError,
+            StaleRevisionError,
+            ResultStateError,
+            ResultUnavailableError,
+            WorkspaceBusyError,
+            WorkspaceBlockedError,
+            CaptureError,
+        ),
+    ):
+        return HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    raise exc
+
+
+def _require_result(results: ResultManager, task_id: int, result_id: str):
+    try:
+        return results.require_result(task_id, result_id)
+    except ResultNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+
+# Downloads are ordinary authenticated JSON-era responses with a body: the
+# bearer token travels in the header, never in a URL a browser would put in
+# history, and nothing is served from a static directory.
+_DOWNLOAD_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "private, no-store",
+}
+
+
+@router.get("/tasks/{task_id}/results")
+def list_task_results_route(
+    task_id: int,
+    engine: Engine = Depends(_engine),
+    results: ResultManager = Depends(_results),
+) -> dict[str, Any]:
+    _require_task(engine, task_id)
+    return {**results.projection(task_id), "limits": _result_limits()}
+
+
+@router.post("/tasks/{task_id}/results", status_code=status.HTTP_202_ACCEPTED)
+async def capture_task_result_route(
+    task_id: int,
+    body: ResultCaptureIn,
+    engine: Engine = Depends(_engine),
+    results: ResultManager = Depends(_results),
+) -> dict[str, Any]:
+    """Admit a capture and return the metadata projection.
+
+    202, because the operation outlives the request. A browser that goes away
+    still gets a committed `ready` or `failed` revision it can find in the
+    task's result history.
+    """
+    _require_task(engine, task_id)
+    try:
+        projection = await results.capture(
+            task_id, paths=body.paths, request_id=body.request_id
+        )
+    except Exception as exc:
+        raise _result_error(exc) from exc
+    return {**projection, "limits": _result_limits()}
+
+
+@router.get("/tasks/{task_id}/results/{result_id}")
+def get_task_result_route(
+    task_id: int,
+    result_id: str,
+    engine: Engine = Depends(_engine),
+    results: ResultManager = Depends(_results),
+) -> dict[str, Any]:
+    _require_task(engine, task_id)
+    result = _require_result(results, task_id, result_id)
+    return {
+        "result": results.result_payload(result),
+        "manifest": result.manifest,
+        "version": results_version(engine, task_id),
+    }
+
+
+@router.get("/tasks/{task_id}/results/{result_id}/file")
+def get_task_result_file_route(
+    task_id: int,
+    result_id: str,
+    path: str,
+    engine: Engine = Depends(_engine),
+    results: ResultManager = Depends(_results),
+) -> dict[str, Any]:
+    """One retained file as text, for the escaped source preview.
+
+    Returned as JSON rather than as a rendered document on purpose: the client
+    displays it as inert text, and nothing here invites a browser to interpret
+    agent-authored Markdown, HTML, or SVG as active content.
+    """
+    _require_task(engine, task_id)
+    result = _require_result(results, task_id, result_id)
+    try:
+        data, entry = results.read_file(result, path)
+    except Exception as exc:
+        raise _result_error(exc) from exc
+    return {
+        "result_id": result.id,
+        "manifest_id": result.manifest_id,
+        "path": entry.path,
+        "media_type": entry.media_type,
+        "length": entry.length,
+        "sha256": entry.sha256,
+        "text": data.decode("utf-8", errors="replace"),
+    }
+
+
+@router.get("/tasks/{task_id}/results/{result_id}/diff")
+def get_task_result_diff_route(
+    task_id: int,
+    result_id: str,
+    engine: Engine = Depends(_engine),
+    results: ResultManager = Depends(_results),
+) -> dict[str, Any]:
+    _require_task(engine, task_id)
+    result = _require_result(results, task_id, result_id)
+    try:
+        return results.diff(result)
+    except Exception as exc:
+        raise _result_error(exc) from exc
+
+
+@router.get("/tasks/{task_id}/results/{result_id}/download")
+def download_task_result_route(
+    task_id: int,
+    result_id: str,
+    path: str | None = None,
+    engine: Engine = Depends(_engine),
+    results: ResultManager = Depends(_results),
+) -> Response:
+    """The whole revision as one ZIP, or one file as an attachment.
+
+    Always the retained bytes, never a fresh read of the workspace — including
+    for a task whose workspace no longer exists.
+    """
+    _require_task(engine, task_id)
+    result = _require_result(results, task_id, result_id)
+    try:
+        if path is not None:
+            data, entry = results.read_file(result, path)
+            filename = entry.path.rsplit("/", 1)[-1]
+            media_type = entry.media_type
+        else:
+            data = results.zip_bundle(result)
+            filename = f"{result.id}.zip"
+            media_type = "application/zip"
+    except Exception as exc:
+        raise _result_error(exc) from exc
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={
+            **_DOWNLOAD_HEADERS,
+            # The quoted name is a plain basename derived from a manifest path
+            # that already passed the selection rules, so it carries no
+            # separators, quotes, or control characters.
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+
+@router.post("/tasks/{task_id}/results/{result_id}/accept")
+def accept_task_result_route(
+    task_id: int,
+    result_id: str,
+    body: ResultDecisionIn,
+    engine: Engine = Depends(_engine),
+    results: ResultManager = Depends(_results),
+) -> dict[str, Any]:
+    """Record that the operator reviewed and is keeping this exact revision.
+
+    It advances no workflow, answers no review, and authorizes no publication.
+    """
+    _require_task(engine, task_id)
+    result = _require_result(results, task_id, result_id)
+    try:
+        projection = results.accept(
+            result, expected_manifest_id=body.expected_manifest_id
+        )
+    except Exception as exc:
+        raise _result_error(exc) from exc
+    return {**projection, "limits": _result_limits()}
+
+
+@router.delete("/tasks/{task_id}/results/{result_id}")
+def purge_task_result_route(
+    task_id: int,
+    result_id: str,
+    body: ResultPurgeIn,
+    engine: Engine = Depends(_engine),
+    results: ResultManager = Depends(_results),
+) -> dict[str, Any]:
+    """Remove one revision's retained bytes, leaving its record behind.
+
+    Never reachable from cleanup, and it has no force variant: the two
+    expectations and the acknowledgement all have to name the revision the
+    operator was actually looking at.
+    """
+    _require_task(engine, task_id)
+    result = _require_result(results, task_id, result_id)
+    if not body.acknowledge_purge:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "purging a result deletes its retained files permanently; confirm "
+            "the purge explicitly",
+        )
+    try:
+        projection = results.purge(
+            result,
+            expected_manifest_id=body.expected_manifest_id,
+            expected_version=body.expected_version,
+        )
+    except Exception as exc:
+        raise _result_error(exc) from exc
+    return {**projection, "limits": _result_limits()}
 
 
 # --- Agent control surface --------------------------------------------------
@@ -3354,7 +3687,10 @@ def purge_task_route(
         storage_paths = purge_task(engine, task_id)
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except TaskNotArchivedError as exc:
+    except (TaskNotArchivedError, ResultsRetainedError) as exc:
+        # A retained result is the operator's, not this task's to take with it
+        # (ADR-0034). The refusal names the revisions to purge first, and — by
+        # construction — nothing has been deleted by the time it is raised.
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     reviews.drop_review(task_id)
     ships.drop_ship(task_id)

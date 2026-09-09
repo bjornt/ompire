@@ -25,6 +25,10 @@ import type {
   ShipPreview,
   ShipProjection,
   Task,
+  TaskResultDiff,
+  TaskResultFileContent,
+  TaskResultLimits,
+  TaskResultsProjection,
   TaskDetail,
   TaskExecutionInputs,
   ThinkingLevel,
@@ -267,6 +271,130 @@ export function listWorkflows(): Promise<WorkflowDescriptor[]> {
 
 export function cleanupTask(id: number): Promise<Task> {
   return request<Task>("POST", `/api/tasks/${id}/cleanup`);
+}
+
+/** --- Durable task results (ADR-0034) ------------------------------------
+ *
+ * Every one of these is an ordinary authenticated request: the bearer token
+ * travels in the header, never in a URL. Downloads therefore go through
+ * `fetch` and a short-lived object URL rather than a plain link, which would
+ * put a token-bearing address in browser history. */
+
+/** A capture's whole response: the task's result document plus the fixed
+ * bounds the form states before submission. */
+export interface TaskResultsResponse extends TaskResultsProjection {
+  limits: TaskResultLimits;
+}
+
+export function listTaskResults(taskId: number): Promise<TaskResultsResponse> {
+  return request<TaskResultsResponse>("GET", `/api/tasks/${taskId}/results`);
+}
+
+/** Ask for a capture. `requestId` is the replay key: repeating a request with
+ * the same selection answers with the original operation — including its
+ * failure — so a lost response is recovered from result history rather than by
+ * capturing whatever the workspace holds now. */
+export function captureTaskResult(
+  taskId: number,
+  paths: string[],
+  requestId: string,
+): Promise<TaskResultsResponse> {
+  return request<TaskResultsResponse>("POST", `/api/tasks/${taskId}/results`, {
+    paths,
+    request_id: requestId,
+  });
+}
+
+export function getTaskResultFile(
+  taskId: number,
+  resultId: string,
+  path: string,
+): Promise<TaskResultFileContent> {
+  return request<TaskResultFileContent>(
+    "GET",
+    `/api/tasks/${taskId}/results/${resultId}/file?path=${encodeURIComponent(path)}`,
+  );
+}
+
+export function getTaskResultDiff(
+  taskId: number,
+  resultId: string,
+): Promise<TaskResultDiff> {
+  return request<TaskResultDiff>(
+    "GET",
+    `/api/tasks/${taskId}/results/${resultId}/diff`,
+  );
+}
+
+/** Record the operator's decision about exactly this revision. The manifest
+ * identity is what makes it exact: a stale page is refused rather than
+ * retargeted at a newer capture. */
+export function acceptTaskResult(
+  taskId: number,
+  resultId: string,
+  expectedManifestId: string,
+): Promise<TaskResultsResponse> {
+  return request<TaskResultsResponse>(
+    "POST",
+    `/api/tasks/${taskId}/results/${resultId}/accept`,
+    { expected_manifest_id: expectedManifestId },
+  );
+}
+
+/** Delete one revision's retained files, permanently. Both expectations and
+ * the acknowledgement are required by the daemon; there is no force variant. */
+export function purgeTaskResult(
+  taskId: number,
+  resultId: string,
+  expectedManifestId: string,
+  expectedVersion: number,
+): Promise<TaskResultsResponse> {
+  return request<TaskResultsResponse>(
+    "DELETE",
+    `/api/tasks/${taskId}/results/${resultId}`,
+    {
+      expected_manifest_id: expectedManifestId,
+      expected_version: expectedVersion,
+      acknowledge_purge: true,
+    },
+  );
+}
+
+/** Fetch a download's bytes with the ordinary bearer header.
+ *
+ * Returns the blob and the filename the daemon named, so the caller can hand
+ * the browser a short-lived object URL. Nothing here builds a URL a viewer
+ * could share, and the daemon serves no unauthenticated result directory.
+ */
+export async function fetchTaskResultDownload(
+  taskId: number,
+  resultId: string,
+  path?: string,
+): Promise<{ blob: Blob; filename: string }> {
+  const headers: Record<string, string> = {};
+  const token = getDaemonToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const query = path === undefined ? "" : `?path=${encodeURIComponent(path)}`;
+  const response = await fetch(
+    `/api/tasks/${taskId}/results/${resultId}/download${query}`,
+    { headers },
+  );
+  if (!response.ok) {
+    let detail = `${response.status}`;
+    try {
+      const data = (await response.json()) as { detail?: unknown };
+      if (typeof data.detail === "string") detail = data.detail;
+    } catch {
+      /* non-JSON error body; keep the status code */
+    }
+    throw new DaemonError(detail, response.status, null);
+  }
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = /filename="([^"]+)"/.exec(disposition);
+  return {
+    blob: await response.blob(),
+    filename: match ? match[1] : `${resultId}.zip`,
+  };
 }
 
 export function getTaskDetail(id: number): Promise<TaskDetail> {

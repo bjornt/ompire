@@ -35,6 +35,7 @@ MATRIX=(
 	ship-interrupted
 	merge-poll
 	advisories-stalls
+	durable-results
 	crash-recovery
 	cleanup
 )

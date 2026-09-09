@@ -464,17 +464,38 @@ def purge_task(engine: Engine, task_id: int) -> list[str]:
     rows are gone.
 
     Purge is the only operation that deletes durable history; cleanup
-    deliberately retains the review and the delivery journal (ADR-0016).
+    deliberately retains the review and the delivery journal (ADR-0016), and
+    result bytes are never destroyed here at all — an unpurged complete
+    revision refuses the whole purge and names itself (ADR-0034).
     """
-    from ompire_daemon.registry.ships import delete_task_deliveries
+    from ompire_daemon.registry.model_profiles import reserved_write
+    from ompire_daemon.registry.results import (
+        assert_no_retained_results,
+        delete_task_results,
+    )
+    from ompire_daemon.registry.ships import delete_task_deliveries_on
 
-    task = get_task(engine, task_id)
-    if task.state != "archived":
-        raise TaskNotArchivedError(task_id, task.state)
-    storage_paths = delete_task_deliveries(engine, task_id)
-    # Child rows go first: session rows, step records, and review history are
-    # all keyed by task id.
-    with engine.begin() as conn:
+    # Every refusal is decided before any deletion, on one write reservation
+    # (ADR-0034). Delivery rows used to be deleted in their own transaction
+    # *before* the rest, which meant a task that turned out to be ineligible
+    # could lose its publication journal on the way to being refused. A refusal
+    # now leaves every child row this task owns exactly where it was.
+    with reserved_write(engine) as conn:
+        row = conn.execute(
+            tasks.select().with_only_columns(tasks.c.id, tasks.c.state).where(
+                tasks.c.id == task_id
+            )
+        ).first()
+        if row is None:
+            raise TaskNotFoundError(task_id)
+        if row.state != "archived":
+            raise TaskNotArchivedError(task_id, row.state)
+        # Retained result bytes are the operator's, not the task's to take with
+        # it. They are purged explicitly or not at all; tombstones travel with
+        # the rest of the history.
+        assert_no_retained_results(conn, task_id)
+        storage_paths = delete_task_deliveries_on(conn, task_id)
+        delete_task_results(conn, task_id)
         conn.execute(workflow_step_records.delete().where(workflow_step_records.c.task_id == task_id))
         conn.execute(task_sessions.delete().where(task_sessions.c.task_id == task_id))
         conn.execute(review_iterations.delete().where(review_iterations.c.task_id == task_id))

@@ -132,8 +132,27 @@ does not resolve inside the configured task root.
 Cleanup is idempotent: a task whose container and directory are already gone
 still archives successfully.
 
+Cleanup owns the workspace for the whole of its teardown. It is refused while
+another host-side operation holds it — a review, a draft, a delivery, or a
+result capture — and while a delivery's outcome is unresolved. Holding it also
+means a capture cannot start once cleanup has begun.
+
+Cleanup destroys the workspace and retains everything durable: the review, the
+delivery journal, and every captured result. Its confirmation says both halves
+— workspace edits that were never captured are about to be lost, and captured
+result revisions are not
+([ADR-0034](../../adr/0034-retain-durable-task-results-outside-the-workspace.md)).
+
 Purge is separate and deletes an archived task's registry row. Purging a task
 that is not archived is refused with `409`.
+
+Purge also refuses while the task still owns any complete result revision or an
+in-flight capture, naming the revisions to purge first. That refusal is decided
+before any of the task's history is deleted, so a refused purge leaves the
+review, the delivery journal, and every result exactly as they were. Once the
+task is archived and its result bytes have been explicitly purged, purge removes
+its remaining result tombstones along with the rest of its history. There is no
+force variant.
 
 Both cleanup and purge clear the task's attention entry. Without an explicit
 clear, an agent exit racing container removal produces an interrupt-tier
@@ -213,17 +232,37 @@ while the pull request is unresolved, a ready-for-cleanup note once it is
 merged or closed, and "cleaned up <elapsed>" once archived. Live rows link to
 the task's Ship Flow view; archived rows are inert text.
 
+### The Retained results section
+
+Below Shipped, one row per archived task that has capture history, honoring the
+same project filter.
+
+It exists because a task that explored a problem and never opened a pull request
+is otherwise unreachable once it is cleaned up: Shipped needs a `pr_url` it does
+not have. Each row links back to task detail and reports how many revisions are
+retained and how many were accepted.
+
+A task whose captures all failed or were purged stays listed as **history only —
+no retained files**. The record of an attempt is part of what happened, and its
+Results panel still offers the actions valid for each revision.
+
 ### Filtering
 
-The Tasks view honors a `project` query parameter, filtering both the cards
-and the Shipped section and naming the filter in the header subline. A project
+The Tasks view honors a `project` query parameter, filtering the cards, the
+Shipped section, and Retained results, and naming the filter in the header
+subline. A project
 card's active-tasks pill navigates to `/tasks?project=<name>`.
 
 ### Confirmation
 
 Cleanup requires explicit confirmation naming the clone path that will be
-deleted and, when one is recorded, the container that will be removed. No
-request is sent until the operator confirms.
+deleted and, when one is recorded, the container that will be removed. It also
+warns that uncaptured workspace edits will be lost and reports how many result
+revisions are retained. No request is sent until the operator confirms.
+
+Purging a result revision has its own separate confirmation, named on
+[task detail](task-detail.md#unavailable-and-purged-revisions). It is never part
+of cleanup.
 
 ## Failures and recovery
 
@@ -233,6 +272,7 @@ request is sent until the operator confirms.
 | Slug exceeds 64 characters | `422` |
 | Project/slug pair already live | `409`, registry unchanged |
 | Purge on a non-archived task | `409`, row retained |
+| Purge on a task with unpurged result revisions | `409` naming them, no history deleted |
 
 A failed spawn leaves the task `failed` with the captured stderr accessible
 from its card.
@@ -246,6 +286,9 @@ from its card.
 | `POST` | `/api/tasks` |
 | `POST` | `/api/tasks/{id}/cleanup` |
 | `DELETE` | `/api/tasks/{id}` |
+
+Result capture, inspection, acceptance, download and purge are addressed under
+`/api/tasks/{id}/results` — see the [API reference](api.md#task-results).
 
 Mutations broadcast `task_created`, `task_updated`, and `task_deleted` — the
 first two with the full payload, deletion with the id. The snapshot's `tasks`

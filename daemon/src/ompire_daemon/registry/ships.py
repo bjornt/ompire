@@ -1506,7 +1506,18 @@ def is_pre_upgrade_grant(
 
 
 def delete_task_deliveries(engine: Engine, task_id: int) -> list[str]:
-    """Delete a task's delivery history (purge path only).
+    """Delete a task's delivery history in its own transaction.
+
+    Kept for callers that own no wider transaction. Task purge uses
+    `delete_task_deliveries_on` instead, because its refusal checks and every
+    one of its deletions have to share a single write reservation (ADR-0034).
+    """
+    with engine.begin() as conn:
+        return delete_task_deliveries_on(conn, task_id)
+
+
+def delete_task_deliveries_on(conn: Connection, task_id: int) -> list[str]:
+    """Delete a task's delivery history on the caller's connection.
 
     Returns the candidate storage paths that are now unreferenced, so the
     caller can remove them from disk. Cleanup deliberately retains all of this
@@ -1515,32 +1526,31 @@ def delete_task_deliveries(engine: Engine, task_id: int) -> list[str]:
     connection does not enable SQLite foreign-key enforcement, so a cascade
     cannot be assumed.
     """
-    with engine.begin() as conn:
-        rows = conn.execute(
-            deliveries.select().where(deliveries.c.task_id == task_id)
-        ).all()
-        ids = [row.id for row in rows]
-        if ids:
-            conn.execute(
-                delivery_decisions.delete().where(
-                    delivery_decisions.c.delivery_id.in_(ids)
-                )
-            )
-            conn.execute(
-                delivery_actions.delete().where(
-                    delivery_actions.c.delivery_id.in_(ids)
-                )
-            )
-            conn.execute(deliveries.delete().where(deliveries.c.task_id == task_id))
-        candidate_rows = conn.execute(
-            delivery_candidates.select().where(
-                delivery_candidates.c.task_id == task_id
-            )
-        ).all()
-        paths = [row.storage_path for row in candidate_rows if row.storage_path]
+    rows = conn.execute(
+        deliveries.select().where(deliveries.c.task_id == task_id)
+    ).all()
+    ids = [row.id for row in rows]
+    if ids:
         conn.execute(
-            delivery_candidates.delete().where(
-                delivery_candidates.c.task_id == task_id
+            delivery_decisions.delete().where(
+                delivery_decisions.c.delivery_id.in_(ids)
             )
         )
+        conn.execute(
+            delivery_actions.delete().where(
+                delivery_actions.c.delivery_id.in_(ids)
+            )
+        )
+        conn.execute(deliveries.delete().where(deliveries.c.task_id == task_id))
+    candidate_rows = conn.execute(
+        delivery_candidates.select().where(
+            delivery_candidates.c.task_id == task_id
+        )
+    ).all()
+    paths = [row.storage_path for row in candidate_rows if row.storage_path]
+    conn.execute(
+        delivery_candidates.delete().where(
+            delivery_candidates.c.task_id == task_id
+        )
+    )
     return paths

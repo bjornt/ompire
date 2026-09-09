@@ -70,6 +70,8 @@ full current registry state:
 | `gh` | Current in-memory GitHub CLI identity plus canonical target eligibility map; no credential value or token fragment |
 | `reviews` | Per task, durable review status and iterations, each naming the candidate it graded, the workflow attempt that asked for it, and the reviewer's own report with the state of what was retained, plus the live reviewer's URL and port when one is running (`null` otherwise) |
 | `ships` | Per task, the durable delivery projection: `version`, disposition, ending and mode, candidate and review identity, draft, completed and remaining actions, concrete results, every action attempt and reconciliation decision, the delivery history, and an `authority` block saying what the run's own procedure currently permits |
+| `task_results` | Per task with any capture history, the durable result document (ADR-0034): `version` and every revision's state, availability, manifest and content identities, predecessor, selection, file list with lengths/media types/checksums, provenance, and acceptance and purge decisions. Metadata only — file text, comparisons and ZIPs are fetched for the one revision an operator selected, never broadcast |
+| `retained_results` | Per task, the counts behind the Tasks index's Retained results section: total, retained, accepted, and retained bytes. Derived from the same rows as `task_results`, so the two cannot disagree |
 | attention | Current attention entries |
 
 Every frame after the snapshot is a delta.
@@ -86,8 +88,8 @@ being assembled would otherwise fall into the gap between the read and the
 subscription and never arrive.
 
 What queued up during that overlap is then filtered: only deltas carrying a
-version the client orders by — `workflow_library_updated` and `ship_updated` —
-are forwarded. Re-delivering an entry the snapshot already holds is a no-op, so
+version the client orders by — `workflow_library_updated`, `ship_updated` and
+`task_results_updated` — are forwarded. Re-delivering an entry the snapshot already holds is a no-op, so
 nothing is lost. Every other delta is unversioned, and one published *before*
 the snapshot read but delivered after it would move the client backwards; those
 are dropped, exactly as the pre-subscription gap dropped them, because the
@@ -160,6 +162,7 @@ Published on the dashboard channel:
 | `stats`, `advisory` | Session telemetry and decorations |
 | `review_started`, `review_iteration`, `review_finished` | Review lifecycle |
 | `ship_updated` | A task's delivery projection changed; carries the whole versioned document |
+| `task_results_updated` | A task's durable results changed — a capture opened, finished or failed, a revision was accepted, found unavailable, or purged. Carries the whole versioned document for that task, metadata only, and is published only after the daemon committed the change. A client drops an older `version` and treats an equal one as already applied; `task_deleted` clears the task's results |
 | `gpg_status` | The signing-key probe result changes |
 | `gh_status` | A completed GitHub identity or target probe replaced the full safe `gh` projection |
 | `settings_changed` | Effective settings change |

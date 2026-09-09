@@ -242,6 +242,40 @@ The crash window after a gate answer commits but before any effect runs lands
 in the same place: the grant is real, no effect exists, and the run waits for a
 confirmation rather than performing something nobody has seen a preview of.
 
+### Durable result recovery
+
+A result capture is either committed whole or not at all
+([ADR-0034](../../adr/0034-retain-durable-task-results-outside-the-workspace.md)).
+The retained bytes, the manifest, and the `ready` state land in one transaction,
+so there is no state in which a revision is complete with some of its files.
+
+`ResultManager.restore()` runs before any result command is accepted and before
+the first snapshot is served. It turns every row still marked `capturing` into a
+visible interrupted failure, with a reason saying the daemon restarted and that
+nothing was retained.
+
+**It re-reads no workspace.** The files that capture was reading may have been
+edited or deleted since, and the clone may be gone entirely. Retaining today's
+bytes under yesterday's request id would silently substitute content for the
+content the operator asked about — which is exactly what the request-id replay
+contract exists to prevent. A retry is an explicit new capture with a new id.
+
+A capture cancelled before its supervising job ever ran never reaches its own
+interruption handler, so shutdown reconciles those the same way rather than
+leaving a row that looks in flight.
+
+Committed results need no recovery at all. A `ready` revision, an acceptance,
+and a completed purge are durable facts; a lost response to any of them is
+recovered by reading the task's result history. Purge is either committed or
+not, and its expectations mean a retried purge can never remove a different
+revision. A storage failure leaves an older retained result untouched and never
+marks incomplete bytes accepted.
+
+Integrity is checked at the read boundary rather than at startup: a revision
+whose bytes no longer match its manifest is classified unavailable when
+something tries to read it, keeping its acceptance and its history, and is never
+reconstructed from the workspace.
+
 ### Legacy parked clones
 
 A clone parked by an older Ompire's in-clone review or signing still carries
@@ -272,10 +306,12 @@ repository — and reviews never park it either.
 | A delivery's in-flight coordination | Discarded; the journal, its authorization, and every action attempt are restored and reconciled |
 | Attention entries | Rebuilt from recovered session status |
 | A task with no confirmed launch configuration | Skipped, not failed; run position, sessions and workspace are kept until the operator confirms |
+| An unfinished result capture | Failed as interrupted, retaining nothing; the workspace is never re-read to complete it |
 
 The durable boundary is still narrower than [`VISION.md`](../../VISION.md)
-calls for. Review history and delivery authorization, intent, and outcomes now
-sit inside it; full commit lineage and transcript retention do not, so
+calls for. Review history, delivery authorization, intent and outcomes, and now
+captured result bytes with their manifests and decisions sit inside it; full
+commit lineage and transcript retention do not, so
 [ADR-0016](../../adr/0016-persist-authority-bearing-task-history-and-provenance.md)
 remains proposed.
 

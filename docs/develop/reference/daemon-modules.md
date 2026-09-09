@@ -38,6 +38,7 @@ All paths are under `daemon/src/ompire_daemon/`.
 | `registry/workflow_library.py` | The operator-owned library above those revisions: entries, inert drafts, current-revision selection, archive/restore, edit versions, and the single transactional prospective lookup. See [ADR-0031](../../adr/0031-let-operators-own-a-workflow-library-above-retained-revisions.md) |
 | `registry/reviews.py` | Review status and ordered iteration history, each bound to the candidate it graded |
 | `registry/ships.py` | Delivery candidates, operator authorizations, write-ahead action attempts, and reconciliation decisions |
+| `registry/results.py` | Durable task results: the manifest contract and its identities, the purely syntactic selection rules, the reserved-write capture/accept/purge mutations, and metadata projections that never load a BLOB. See [ADR-0034](../../adr/0034-retain-durable-task-results-outside-the-workspace.md) |
 | `registry/settings.py` | Layered settings: override, then TOML, then default |
 | `registry/launch.py` | Inert upgrade evidence and the operator decisions that close out a reconciliation. Nothing here is read to execute anything. |
 
@@ -70,6 +71,7 @@ All paths are under `daemon/src/ompire_daemon/`.
 | `gpg.py` | Signing-key enumeration, selection (override → config → git → auto), and non-prompting agent classification: `ready`, `locked`, `ambiguous`, `no_key`, `missing`, `agent_unavailable`, `error`, `unknown`. |
 | `gh.py` | The only daemon-owned GitHub CLI boundary: configured executable discovery, non-interactive bounded execution, credential redaction, ambient identity probe, canonical upstream eligibility checks, and in-memory `gh_status` projection. |
 | `prwatch.py` | Polls pull requests to a terminal state. |
+| `results.py` | `ResultManager`: the trusted capture boundary (descriptor-relative no-follow traversal, bounded reads, source-mutation checks, encoding and credential refusals), honest provenance, integrity-checked reads, comparison, ZIP assembly, and interrupted-capture recovery. Admits through the same workspace guard as review and delivery, and grants no publication or workflow effect. The record lives in `registry/results.py`. |
 
 ## Attention
 
@@ -82,5 +84,9 @@ All paths are under `daemon/src/ompire_daemon/`.
 
 To follow one task end to end: `spawn.py` → `agent.py` → `rpc.py` →
 `sessions.py` → `workflows.py` → `delivery.py` → `review.py` → `ship.py`.
+
+For a task that ends in a retained result rather than a publication, the path is
+`spawn.py` → `agent.py` → `results.py`, and stops there: nothing in `review.py`
+or `ship.py` is involved.
 
 To understand how clients see any of it: `events.py` → `api/ws.py`.
