@@ -321,7 +321,8 @@ A result carries its `state` (`capturing`, `failed`, `ready`, `purged`),
 `available`, `manifest_id`, `content_id`, `predecessor_id`, the file list with
 lengths, media types and SHA-256 checksums, `provenance`, the acceptance and
 purge decisions, and `consumer_task_ids` — the tasks that pinned this exact
-revision as a launch input. Content is never in the projection — it is fetched per selected
+revision as a launch input, and `exports` — the checkout exports of this exact
+revision. Content is never in the projection — it is fetched per selected
 revision.
 
 | Condition | Response |
@@ -347,6 +348,72 @@ no unauthenticated result directory.
 Committed changes broadcast `task_results_updated`, the whole versioned document
 for one task. See [Task detail](task-detail.md#results-panel) for the limits and
 the operator flow.
+
+## Checkout export
+
+Explicit, previewed export of one accepted revision into the project's
+registered checkout
+([ADR-0036](../../adr/0036-install-exported-result-files-without-replacing-them.md)).
+All paths are under `/api/tasks/{id}/results/{rid}/exports`. Both the task and
+the revision in the path are part of the authorization.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `.../exports/preview` | Classify each destination against the real checkout. Read-only |
+| `POST` | `.../exports` | Confirm one reviewed preview. `202`; the install continues in the background |
+| `GET` | `.../exports/{eid}` | One export's approved detail and per-destination history |
+| `POST` | `.../exports/{eid}/reconcile` | Re-observe an unresolved export, read-only. Never a retry |
+| `POST` | `.../exports/{eid}/acknowledge` | Close an unresolved export without resolving its unknowns |
+
+No request names a host directory. The only destination root is the producing
+project's own registered checkout, which the daemon resolves.
+
+Preview and confirmation both take `expected_manifest_id`, `paths` (literal
+manifest paths — not directories and not globs), and an optional checkout-relative
+`prefix`. Confirmation additionally takes `preview_token`, `request_id`, and
+`acknowledge_export: true`.
+
+The token is the digest of a canonical document the daemon derives from what it
+observed. Confirmation re-derives it from a *fresh* observation and compares, so
+a client can neither supply a classification nor confirm against a checkout that
+has changed since. A changed revision, selection, prefix, root, or relevant
+destination is `409`.
+
+`request_id` is a replay key. The same id with the same confirmation returns the
+original operation — checked before anything is re-observed, since a completed
+export has itself changed the destinations a fresh preview would classify. The
+same id with a different confirmation is `409`.
+
+Reconcile and acknowledge both take `expected_version` (the result document's
+`version`); acknowledge also requires `acknowledge_unknown_outcome: true`.
+
+An export carries its `state` (`running`, `completed`, `incomplete`,
+`unresolved`), the checkout path and prefix, who confirmed it and when, any
+directories it created, and one entry per approved destination with its
+`classification` (`create`, `identical`, `conflict`) and its `outcome`
+(`pending`, `created`, `already-identical`, `not-installed`, `unknown`). An
+acknowledgement never rewrites an `unknown` outcome into a success.
+
+| Condition | Response |
+|---|---|
+| Empty, duplicate, or unknown path; unsafe prefix or destination; reserved launcher destination; missing acknowledgement | `422` |
+| Unknown task, revision, or export | `404` |
+| Unaccepted or unavailable revision, stale preview, selected conflict, replay under a changed confirmation, another export holding this checkout, stale version, unsupported host, nothing to reconcile or acknowledge | `409` |
+| Purged revision | `410` |
+
+A *blocked* preview is not an error: it returns `200` with `blocked: true` and
+the conflicting destinations classified. Confirming one is `409`.
+
+Preview responses carry the retained `source` text and bounded conflict `diff`
+text and are served `Cache-Control: private, no-store`; neither is ever
+persisted with the approval or broadcast over the WebSocket. Every journal
+transition advances the task's result version and broadcasts the metadata-only
+document.
+
+While an export is `running` or `unresolved`, another export to that checkout is
+`409`, purging the revision or the task record is `409` naming the export, and
+repointing the project's `checkout_path` is refused. A settled export releases
+all three. Export performs no Git action of any kind.
 
 ## Sessions
 

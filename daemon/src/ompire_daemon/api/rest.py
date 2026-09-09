@@ -24,6 +24,7 @@ from fastapi import (
     WebSocket,
     status,
 )
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import Engine
 
@@ -127,10 +128,18 @@ from ompire_daemon.registry.projects import (
     update_project,
     validate_slug,
 )
+from ompire_daemon.registry.result_exports import (
+    CheckoutBusyError,
+    ExportNotFoundError,
+    ExportRequestMismatchError,
+    ExportsActiveError,
+    ExportStateError,
+)
 from ompire_daemon.registry.results import (
     CAPTURE_DEADLINE_SECONDS,
     MAX_FILE_BYTES,
     MAX_FILES,
+    MAX_PATH_BYTES,
     MAX_PATH_COMPONENTS,
     MAX_TOTAL_BYTES,
     SUPPORTED_EXTENSIONS,
@@ -208,6 +217,11 @@ from ompire_daemon.registry.workflows import (
     WorkflowWaitConflictError,
     latest_step_record,
     list_step_records,
+)
+from ompire_daemon.result_exports import (
+    ExportError,
+    ExportUnsupportedError,
+    ResultExportManager,
 )
 from ompire_daemon.results import (
     CaptureError,
@@ -2816,6 +2830,271 @@ def purge_task_result_route(
     except Exception as exc:
         raise _result_error(exc) from exc
     return {**projection, "limits": _result_limits()}
+
+
+# --- Checkout export (ADR-0036) ---------------------------------------------
+#
+# Nested under the revision it delivers, because an export is a decision about
+# one exact retained revision and the task scope in the path is part of the
+# authorization. Nothing here accepts a host directory: the only destination
+# root is the producing project's own registered checkout, resolved by the
+# daemon.
+
+
+def _exports(request: Request) -> ResultExportManager:
+    return request.app.state.result_exports
+
+
+class ExportSelectionIn(BaseModel):
+    """The subset of a revision to export, and where to put it.
+
+    `paths` are literal manifest paths — not directories, not globs. `prefix`
+    is one optional checkout-relative directory; an empty prefix keeps the
+    revision's own repository-relative destinations. Individual files are never
+    renamed.
+    """
+
+    expected_manifest_id: str = Field(min_length=1, max_length=128)
+    paths: list[str] = Field(min_length=1, max_length=MAX_FILES)
+    prefix: str = Field(default="", max_length=MAX_PATH_BYTES)
+
+
+class ExportConfirmIn(ExportSelectionIn):
+    """A confirmation of exactly one preview.
+
+    `preview_token` names the document the operator reviewed; the daemon
+    recomputes it from a fresh observation and refuses anything else, so a
+    client can neither supply a verdict nor confirm against a checkout that has
+    changed. `request_id` is the replay key.
+    """
+
+    preview_token: str = Field(min_length=1, max_length=128)
+    request_id: str = Field(min_length=1, max_length=128)
+    acknowledge_export: bool
+
+
+class ExportVersionIn(BaseModel):
+    expected_version: int = Field(ge=0)
+
+
+class ExportAcknowledgeIn(ExportVersionIn):
+    acknowledge_unknown_outcome: bool
+
+
+def _export_error(exc: Exception) -> HTTPException:
+    """Where every export refusal picks its status code.
+
+    422 for a request that was never well formed, 404 for a revision or export
+    outside this task, 409 for a state, preview, or reservation that no longer
+    holds, and 410 for a purged source. A *blocked* preview is not an error: it
+    is a successful read whose answer is "not like this".
+    """
+    if isinstance(exc, ExportUnsupportedError):
+        return HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+    if isinstance(exc, ExportError):
+        if exc.reason in (
+            "empty-selection",
+            "duplicate-selection",
+            "unknown-file",
+            "invalid-prefix",
+            "invalid-destination",
+            "reserved-destination",
+            "destination-collision",
+        ):
+            return HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail)
+        return HTTPException(status.HTTP_409_CONFLICT, exc.detail)
+    if isinstance(exc, ExportNotFoundError):
+        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    if isinstance(
+        exc,
+        (
+            ExportStateError,
+            ExportRequestMismatchError,
+            CheckoutBusyError,
+            ExportsActiveError,
+        ),
+    ):
+        return HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    return _result_error(exc)
+
+
+def _require_export(exports: ResultExportManager, task_id: int, export_id: str):
+    try:
+        return exports.require_export(task_id, export_id)
+    except ExportNotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+
+@router.post("/tasks/{task_id}/results/{result_id}/exports/preview")
+def preview_result_export_route(
+    task_id: int,
+    result_id: str,
+    body: ExportSelectionIn,
+    engine: Engine = Depends(_engine),
+    exports: ResultExportManager = Depends(_exports),
+) -> Response:
+    """Read the retained revision and the real checkout, and classify.
+
+    Read-only: it creates nothing, writes nothing, and runs no Git command. A
+    conflict is reported, not resolved — a difference is never an approval to
+    replace. The response is `no-store` because it can carry the contents of
+    the operator's own checkout.
+    """
+    _require_task(engine, task_id)
+    try:
+        payload = exports.preview(
+            task_id=task_id,
+            result_id=result_id,
+            expected_manifest_id=body.expected_manifest_id,
+            paths=body.paths,
+            prefix=body.prefix,
+        )
+    except Exception as exc:
+        raise _export_error(exc) from exc
+    return JSONResponse(payload, headers={"Cache-Control": "private, no-store"})
+
+
+@router.post(
+    "/tasks/{task_id}/results/{result_id}/exports",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def start_result_export_route(
+    task_id: int,
+    result_id: str,
+    body: ExportConfirmIn,
+    engine: Engine = Depends(_engine),
+    results: ResultManager = Depends(_results),
+    exports: ResultExportManager = Depends(_exports),
+) -> dict[str, Any]:
+    """Admit one approved export and return the result projection.
+
+    202, because the operation outlives the request: a browser that goes away
+    still gets a settled, inspectable record rather than an effect nobody knows
+    about. A repeated `request_id` with the same confirmation returns the
+    original operation instead of exporting twice.
+    """
+    _require_task(engine, task_id)
+    if not body.acknowledge_export:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "exporting writes files into your project checkout; confirm the "
+            "reviewed preview explicitly",
+        )
+    try:
+        record, _created = await exports.start(
+            task_id=task_id,
+            result_id=result_id,
+            expected_manifest_id=body.expected_manifest_id,
+            paths=body.paths,
+            prefix=body.prefix,
+            token=body.preview_token,
+            request_id=body.request_id,
+        )
+    except Exception as exc:
+        raise _export_error(exc) from exc
+    return {
+        **results.projection(task_id),
+        "limits": _result_limits(),
+        "export_id": record.id,
+    }
+
+
+@router.get("/tasks/{task_id}/results/{result_id}/exports/{export_id}")
+def get_result_export_route(
+    task_id: int,
+    result_id: str,
+    export_id: str,
+    engine: Engine = Depends(_engine),
+    results: ResultManager = Depends(_results),
+    exports: ResultExportManager = Depends(_exports),
+) -> dict[str, Any]:
+    """One export's approved detail and per-destination history.
+
+    Reading never installs anything, and the approved preview document is
+    returned as it was recorded — the operator's own record of what they
+    agreed to, not a fresh observation dressed up as one.
+    """
+    _require_task(engine, task_id)
+    record = _require_export(exports, task_id, export_id)
+    if record.result_id != result_id:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"export {export_id!r} not found"
+        )
+    return {
+        "export": exports.export_payload(record),
+        "preview": record.preview,
+        "version": results_version(engine, task_id),
+    }
+
+
+@router.post("/tasks/{task_id}/results/{result_id}/exports/{export_id}/reconcile")
+def reconcile_result_export_route(
+    task_id: int,
+    result_id: str,
+    export_id: str,
+    body: ExportVersionIn,
+    engine: Engine = Depends(_engine),
+    results: ResultManager = Depends(_results),
+    exports: ResultExportManager = Depends(_exports),
+) -> dict[str, Any]:
+    """Re-observe an unresolved export's destinations, read-only.
+
+    Never a retry. It can only move an outcome from unknown to something that
+    can be established, and it writes no file in the checkout.
+    """
+    _require_task(engine, task_id)
+    record = _require_export(exports, task_id, export_id)
+    if record.result_id != result_id:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"export {export_id!r} not found"
+        )
+    actual = results_version(engine, task_id)
+    if actual != body.expected_version:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"the task's results changed (version {actual}, not "
+            f"{body.expected_version}); reload before reconciling",
+        )
+    try:
+        exports.recheck(record)
+    except Exception as exc:
+        raise _export_error(exc) from exc
+    return {**results.projection(task_id), "limits": _result_limits()}
+
+
+@router.post("/tasks/{task_id}/results/{result_id}/exports/{export_id}/acknowledge")
+def acknowledge_result_export_route(
+    task_id: int,
+    result_id: str,
+    export_id: str,
+    body: ExportAcknowledgeIn,
+    engine: Engine = Depends(_engine),
+    results: ResultManager = Depends(_results),
+    exports: ResultExportManager = Depends(_exports),
+) -> dict[str, Any]:
+    """Close an unresolved export without claiming its unknowns resolved.
+
+    It touches no file and rewrites no per-destination outcome: the record
+    keeps saying exactly what could not be established, and only stops holding
+    the checkout and the retained bytes.
+    """
+    _require_task(engine, task_id)
+    record = _require_export(exports, task_id, export_id)
+    if record.result_id != result_id:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"export {export_id!r} not found"
+        )
+    if not body.acknowledge_unknown_outcome:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "this export has effects nobody could classify; acknowledge that "
+            "explicitly to close it",
+        )
+    try:
+        exports.acknowledge(record, expected_version=body.expected_version)
+    except Exception as exc:
+        raise _export_error(exc) from exc
+    return {**results.projection(task_id), "limits": _result_limits()}
 
 
 # --- Agent control surface --------------------------------------------------

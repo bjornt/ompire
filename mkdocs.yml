@@ -150,3 +150,4 @@ nav:
           - 0033 Workflow-scoped delivery authority: adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md
           - 0034 Durable task results: adr/0034-retain-durable-task-results-outside-the-workspace.md
           - 0035 Non-publishable handoff destinations: adr/0035-refuse-to-publish-handoff-destinations.md
+          - 0036 Create-only checkout export: adr/0036-install-exported-result-files-without-replacing-them.md

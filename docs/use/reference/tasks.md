@@ -149,7 +149,7 @@ result capture — and while a delivery's outcome is unresolved. Holding it also
 means a capture cannot start once cleanup has begun.
 
 Cleanup destroys the workspace and retains everything durable: the review, the
-delivery journal, and every captured result. Its confirmation says both halves
+delivery journal, every captured result, and every checkout export record. Its confirmation says both halves
 — workspace edits that were never captured are about to be lost, and captured
 result revisions are not
 ([ADR-0034](../../adr/0034-retain-durable-task-results-outside-the-workspace.md)).
@@ -171,6 +171,16 @@ review, the delivery journal, and every result exactly as they were. Once the
 task is archived and its result bytes have been explicitly purged, purge removes
 its remaining result tombstones along with the rest of its history. There is no
 force variant.
+
+An unfinished checkout export refuses purge the same way, naming the export
+([ADR-0036](../../adr/0036-install-exported-result-files-without-replacing-them.md)).
+Its record is the only thing that says what it was doing in a directory Ompire
+does not own, so it is resolved or closed as unresolved first. Unlike a launch
+input's hold, this one is temporary — a settled export releases it — and it
+never blocks *cleanup*, only purge. Once the guards pass, purge removes the
+task's terminal export history with the rest of its record. The exported files
+themselves are untouched: they are ordinary files in your checkout, and they
+outlive both the task and the revision they came from.
 
 Both cleanup and purge clear the task's attention entry. Without an explicit
 clear, an agent exit racing container removal produces an interrupt-tier

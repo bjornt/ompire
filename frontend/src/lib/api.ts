@@ -26,6 +26,9 @@ import type {
   ShipProjection,
   Task,
   TaskResultDiff,
+  TaskResultExport,
+  TaskResultExportPreview,
+  TaskResultExportPreviewDocument,
   TaskResultFile,
   TaskResultFileContent,
   TaskResultProvenance,
@@ -421,6 +424,104 @@ export function purgeTaskResult(
       expected_manifest_id: expectedManifestId,
       expected_version: expectedVersion,
       acknowledge_purge: true,
+    },
+  );
+}
+
+/** --- Checkout export (ADR-0036) -----------------------------------------
+ *
+ * Nothing here names a host directory: the only destination root is the
+ * project's own registered checkout, which the daemon resolves. */
+
+/** Read the retained revision and the real checkout, and classify each
+ * destination. Read-only — it creates nothing and writes nothing. */
+export function previewResultExport(
+  taskId: number,
+  resultId: string,
+  expectedManifestId: string,
+  paths: string[],
+  prefix: string,
+): Promise<TaskResultExportPreview> {
+  return request<TaskResultExportPreview>(
+    "POST",
+    `/api/tasks/${taskId}/results/${resultId}/exports/preview`,
+    { expected_manifest_id: expectedManifestId, paths, prefix },
+  );
+}
+
+/** Confirm exactly one preview. The token names the document the operator
+ * reviewed; the daemon recomputes it and refuses anything else. `requestId` is
+ * the replay key, so a lost response is recovered as the same operation rather
+ * than exporting twice. */
+export function startResultExport(
+  taskId: number,
+  resultId: string,
+  expectedManifestId: string,
+  paths: string[],
+  prefix: string,
+  previewToken: string,
+  requestId: string,
+): Promise<TaskResultsResponse & { export_id: string }> {
+  return request<TaskResultsResponse & { export_id: string }>(
+    "POST",
+    `/api/tasks/${taskId}/results/${resultId}/exports`,
+    {
+      expected_manifest_id: expectedManifestId,
+      paths,
+      prefix,
+      preview_token: previewToken,
+      request_id: requestId,
+      acknowledge_export: true,
+    },
+  );
+}
+
+export interface TaskResultExportDetail {
+  export: TaskResultExport;
+  preview: TaskResultExportPreviewDocument;
+  version: number;
+}
+
+export function getResultExport(
+  taskId: number,
+  resultId: string,
+  exportId: string,
+): Promise<TaskResultExportDetail> {
+  return request<TaskResultExportDetail>(
+    "GET",
+    `/api/tasks/${taskId}/results/${resultId}/exports/${exportId}`,
+  );
+}
+
+/** Re-observe an unresolved export's destinations. Read-only: it can move an
+ * outcome from unknown to something established, and never retries a write. */
+export function reconcileResultExport(
+  taskId: number,
+  resultId: string,
+  exportId: string,
+  expectedVersion: number,
+): Promise<TaskResultsResponse> {
+  return request<TaskResultsResponse>(
+    "POST",
+    `/api/tasks/${taskId}/results/${resultId}/exports/${exportId}/reconcile`,
+    { expected_version: expectedVersion },
+  );
+}
+
+/** Close an unresolved export without claiming its unknowns resolved. It
+ * touches no file and rewrites no per-destination outcome. */
+export function acknowledgeResultExport(
+  taskId: number,
+  resultId: string,
+  exportId: string,
+  expectedVersion: number,
+): Promise<TaskResultsResponse> {
+  return request<TaskResultsResponse>(
+    "POST",
+    `/api/tasks/${taskId}/results/${resultId}/exports/${exportId}/acknowledge`,
+    {
+      expected_version: expectedVersion,
+      acknowledge_unknown_outcome: true,
     },
   );
 }

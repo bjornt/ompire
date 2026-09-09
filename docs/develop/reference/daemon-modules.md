@@ -39,6 +39,7 @@ All paths are under `daemon/src/ompire_daemon/`.
 | `registry/reviews.py` | Review status and ordered iteration history, each bound to the candidate it graded |
 | `registry/ships.py` | Delivery candidates, operator authorizations, write-ahead action attempts, and reconciliation decisions |
 | `registry/results.py` | Durable task results: the manifest contract and its identities, the purely syntactic selection rules, the reserved-write capture/accept/purge mutations, the connection-scoped attachment checks and consumer reference index, and metadata projections that never load a BLOB. See [ADR-0034](../../adr/0034-retain-durable-task-results-outside-the-workspace.md) and [ADR-0035](../../adr/0035-refuse-to-publish-handoff-destinations.md) |
+| `registry/result_exports.py` | The checkout-export journal: approved preview documents, per-destination intent and outcome, the durable active-root reservation, and the purge and checkout-repointing guards. See [ADR-0036](../../adr/0036-install-exported-result-files-without-replacing-them.md) |
 | `registry/settings.py` | Layered settings: override, then TOML, then default |
 | `registry/launch.py` | Inert upgrade evidence and the operator decisions that close out a reconciliation. Nothing here is read to execute anything. |
 
@@ -72,6 +73,7 @@ All paths are under `daemon/src/ompire_daemon/`.
 | `gpg.py` | Signing-key enumeration, selection (override → config → git → auto), and non-prompting agent classification: `ready`, `locked`, `ambiguous`, `no_key`, `missing`, `agent_unavailable`, `error`, `unknown`. |
 | `gh.py` | The only daemon-owned GitHub CLI boundary: configured executable discovery, non-interactive bounded execution, credential redaction, ambient identity probe, canonical upstream eligibility checks, and in-memory `gh_status` projection. |
 | `prwatch.py` | Polls pull requests to a terminal state. |
+| `result_exports.py` | `ResultExportManager`: the only boundary in the daemon that writes into a directory the operator owns. Create-only classification against the real checkout, a canonical approval document the daemon recomputes, staged `renameat2(RENAME_NOREPLACE)` installation, and read-only recovery that classifies an interrupted export without replaying or rolling back any effect. Distinct from `projectcheckout.py`, which only inspects a checkout. See [ADR-0036](../../adr/0036-install-exported-result-files-without-replacing-them.md) |
 | `results.py` | `ResultManager`: the trusted capture boundary (descriptor-relative no-follow traversal, bounded reads, source-mutation checks, encoding and credential refusals), honest provenance, integrity-checked reads, comparison, ZIP assembly, and interrupted-capture recovery. Admits through the same workspace guard as review and delivery, and grants no publication or workflow effect. The record lives in `registry/results.py`. |
 
 ## Attention
@@ -87,7 +89,8 @@ To follow one task end to end: `spawn.py` → `agent.py` → `rpc.py` →
 `sessions.py` → `workflows.py` → `delivery.py` → `review.py` → `ship.py`.
 
 For a task that ends in a retained result rather than a publication, the path is
-`spawn.py` → `agent.py` → `results.py`, and stops there: nothing in `review.py`
-or `ship.py` is involved.
+`spawn.py` → `agent.py` → `results.py`, and then either `handoff.py` (into
+another task's clone) or `result_exports.py` (into the operator's checkout).
+Nothing in `review.py` or `ship.py` is involved on any of those paths.
 
 To understand how clients see any of it: `events.py` → `api/ws.py`.

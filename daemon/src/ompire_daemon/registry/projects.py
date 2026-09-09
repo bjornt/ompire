@@ -302,7 +302,18 @@ def update_project(
 
     The workspace defaults follow the same omission rule but are never null:
     an empty `preamble` string is a value ("no preamble"), not a clear.
+
+    Repointing `checkout_path` is refused while a checkout export for this
+    project is running or unresolved (ADR-0036). That is not a claim the
+    directory cannot move on disk — nothing in SQLite can promise that — only
+    that Ompire's own registration will not be changed out from under an
+    operation that is mid-flight or unexplained. Every other field stays
+    editable throughout.
     """
+    from ompire_daemon.registry.result_exports import (
+        assert_project_exports_settled_on,
+    )
+
     if not isinstance(branch_pattern, _Unsupplied):
         validate_branch_pattern(branch_pattern)
     if not isinstance(workshop_additions, _Unsupplied):
@@ -327,6 +338,8 @@ def update_project(
         current = conn.execute(projects.select().where(projects.c.name == name)).first()
         if current is None:
             raise ProjectNotFoundError(name)
+        if current.checkout_path != checkout_path:
+            assert_project_exports_settled_on(conn, name)
         if rename:
             assert new_name is not None
             clash = conn.execute(

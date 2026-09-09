@@ -1,4 +1,9 @@
-import type { TaskResult } from "../types";
+import type {
+  ExportFileOutcome,
+  TaskResult,
+  TaskResultExport,
+  TaskResultExportState,
+} from "../types";
 
 /** Presentation rules for durable task results (ADR-0034).
  *
@@ -49,4 +54,47 @@ export function formatResultBytes(bytes: number): string {
  * The full id stays available wherever it is acted on. */
 export function shortResultId(id: string): string {
   return id.startsWith("res_") ? id.slice(4, 12) : id.slice(0, 8);
+}
+
+/** Presentation rules for checkout export (ADR-0036).
+ *
+ * The labels do the work an export's honesty depends on: "Not fully installed"
+ * and "Outcome unknown" are the states an operator has to be able to tell
+ * apart, and neither may read as a success. */
+
+export const EXPORT_STATE_LABEL: Record<TaskResultExportState, string> = {
+  running: "Exporting…",
+  completed: "Exported",
+  // Not "Failed": some approved files may well have been installed, and the
+  // per-destination outcomes are what say which.
+  incomplete: "Not fully installed",
+  unresolved: "Outcome unknown",
+};
+
+export const EXPORT_OUTCOME_LABEL: Record<ExportFileOutcome, string> = {
+  pending: "Not started",
+  created: "Created",
+  // The file already held exactly this content, so it was left untouched —
+  // including its permissions and its modification time.
+  "already-identical": "Already identical",
+  "not-installed": "Not installed",
+  unknown: "Unknown",
+};
+
+/** A one-line count of what an export actually did. */
+export function exportSummary(record: TaskResultExport): string {
+  const parts: string[] = [];
+  if (record.created_count > 0) parts.push(`${record.created_count} created`);
+  if (record.identical_count > 0) {
+    parts.push(`${record.identical_count} already identical`);
+  }
+  if (record.incomplete_count > 0) {
+    parts.push(`${record.incomplete_count} not installed`);
+  }
+  if (record.unknown_count > 0) parts.push(`${record.unknown_count} unknown`);
+  return parts.length > 0 ? parts.join(", ") : "no files";
+}
+
+export function shortExportId(id: string): string {
+  return id.startsWith("exp_") ? id.slice(4, 12) : id.slice(0, 8);
 }

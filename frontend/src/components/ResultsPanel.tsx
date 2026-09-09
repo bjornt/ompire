@@ -23,6 +23,7 @@ import {
   revisionStatus,
   shortResultId as shortId,
 } from "../lib/resultPresentation";
+import { ResultExport } from "./ResultExport";
 import "./ResultsPanel.css";
 
 /* The Results panel (ADR-0034): capture, inspect, accept, download, and purge
@@ -382,6 +383,9 @@ function RevisionActions({
   }
 
   const manifestId = result.manifest_id;
+  const unfinishedExports = result.exports.filter(
+    (record) => record.state === "running" || record.state === "unresolved",
+  );
 
   function purge() {
     if (manifestId === null) return;
@@ -488,11 +492,26 @@ function RevisionActions({
           still says it ran with these files.
         </p>
       )}
+      {unfinishedExports.length > 0 && (
+        <p className="resultsHint" data-testid="results-export-blockers">
+          {unfinishedExports.length === 1
+            ? "A checkout export of this revision has not finished."
+            : `${unfinishedExports.length} checkout exports of this revision have not finished.`}{" "}
+          These files cannot be purged until each one is resolved or closed —
+          see the export history below. Unlike a launch input, that hold is
+          temporary: a settled export releases it, because the copies it
+          delivered are ordinary files in your checkout.
+        </p>
+      )}
       {result.state !== "purged" && result.state !== "capturing" && manifestId !== null && (
         <button
           type="button"
           className="resultsAction danger"
-          disabled={pending !== null || result.consumer_task_ids.length > 0}
+          disabled={
+            pending !== null ||
+            result.consumer_task_ids.length > 0 ||
+            unfinishedExports.length > 0
+          }
           onClick={purge}
           data-testid="results-purge"
         >
@@ -560,6 +579,12 @@ function Revision({
       <RevisionActions
         taskId={taskId}
         projectName={projectName}
+        result={result}
+        version={version}
+        onUpdated={onUpdated}
+      />
+      <ResultExport
+        taskId={taskId}
         result={result}
         version={version}
         onUpdated={onUpdated}

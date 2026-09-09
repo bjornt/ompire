@@ -1,0 +1,147 @@
+/* Export to project checkout (ADR-0036). Shares the Results panel's palette
+ * deliberately: it is the same panel's work, one step further along, and a
+ * separate visual language would suggest a separate authority. */
+
+.exportPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-top: 0.75rem;
+  margin-top: 0.75rem;
+  border-top: 1px solid var(--border, #d1d5db);
+}
+
+.exportTitle {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted, #6b7280);
+}
+
+.exportSelection,
+.exportPlan,
+.exportOutcomes,
+.exportHistory {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.85rem;
+}
+
+.exportHistory {
+  gap: 0.75rem;
+}
+
+.exportPrefix {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.85rem;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 6px;
+}
+
+.exportActions,
+.exportEntryActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: flex-start;
+}
+
+.exportEntryActions {
+  flex-direction: column;
+}
+
+.exportClass,
+.exportOutcome,
+.exportState {
+  display: inline-block;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  background: var(--chip, #e5e7eb);
+  color: var(--muted, #4b5563);
+}
+
+.exportClass.create,
+.exportOutcome.created,
+.exportState.completed {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.exportClass.identical,
+.exportOutcome.already-identical,
+.exportState.running {
+  background: #e0f2fe;
+  color: #075985;
+}
+
+/* A conflict and an unknown outcome are the two things an operator must never
+ * skim past, so they carry the strongest colour in this panel. */
+.exportClass.conflict,
+.exportOutcome.unknown,
+.exportState.unresolved {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.exportOutcome.not-installed,
+.exportState.incomplete {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.exportEntry {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.6rem;
+  border: 1px solid var(--border, #d1d5db);
+  border-radius: 6px;
+}
+
+.exportEntryHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.exportEntryMeta,
+.exportNote {
+  font-size: 0.8rem;
+  color: var(--muted, #6b7280);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.exportId {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.8rem;
+}
+
+.exportError {
+  padding: 0.5rem 0.6rem;
+  border-radius: 6px;
+  background: #fef2f2;
+  color: #991b1b;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+
+.exportPreview {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}

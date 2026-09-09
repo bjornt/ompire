@@ -736,6 +736,118 @@ those files. There is no force variant and no automatic eviction, so a database
 with many failed or archived consumers keeps their references until those task
 records are purged.
 
+## `result_exports`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | string | Primary key. Opaque operation identity (`exp_<32 hex>`) |
+| `task_id` | integer | FK to `tasks.id`, indexed with `confirmed_at` |
+| `result_id` | string | FK to `task_results.id`, separately indexed |
+| `manifest_id` | string | The exact revision this export delivered |
+| `request_id` | string | The caller's replay key; unique per `(task_id, request_id)` |
+| `selection_json`, `selection_fingerprint` | text, string | The approved manifest-path subset |
+| `prefix` | string | The checkout-relative destination prefix; empty means the revision's own paths |
+| `preview_token` | string | SHA-256 of the canonical approval document |
+| `preview_json` | text | That document, stored whole |
+| `project_name`, `checkout_path` | string | The registration the approval named |
+| `root_device`, `root_inode` | integer | The root's filesystem identity, as observed at admission |
+| `state` | string | `running`, `completed`, `incomplete`, `unresolved` |
+| `error` | text, nullable | Why the operation did not complete |
+| `staging_name` | string | Journalled *before* the directory is created |
+| `staging_device`, `staging_inode` | integer, nullable | Recorded after creation, so cleanup and recovery can prove ownership |
+| `staging_error` | text, nullable | A staging directory left behind in the checkout |
+| `created_directories_json` | text, nullable | Directories this export created; effects, so they are recorded |
+| `actor`, `confirmed_at` | string | Who approved it and when |
+| `started_at`, `finished_at` | string, nullable | ISO-8601 |
+| `acknowledged_at`, `acknowledged_by` | string, nullable | An operator closing an unresolved outcome |
+
+## `result_export_files`
+
+| Column | Type | Notes |
+|---|---|---|
+| `export_id` | string | FK to `result_exports.id`, primary key with the manifest path |
+| `manifest_path` | string | The retained file being delivered |
+| `seq` | integer | Installation order, indexed with `export_id` |
+| `destination` | string | The checkout-relative path, prefix applied |
+| `classification` | string | `create` or `identical`, as the approved preview classified it |
+| `expected_length`, `expected_sha256` | integer, string | From the accepted manifest |
+| `before_json` | text, nullable | The destination observation the approval was bound to |
+| `staged_device`, `staged_inode` | integer, nullable | The staged file's identity, written before its rename |
+| `outcome` | string | `pending`, `created`, `already-identical`, `not-installed`, `unknown` |
+| `observed_json` | text, nullable | What was seen afterwards |
+| `error` | text, nullable | Why an outcome is what it is |
+
+Added by migration `0022`
+([ADR-0036](../../adr/0036-install-exported-result-files-without-replacing-them.md)).
+Purely additive and empty of invention: no historical export is backfilled,
+because none happened. A result retained before this migration has no export
+history, which is the fact — not an unknown outcome to reconcile.
+
+No bytes live here. The content is already in `task_result_files`, and the
+delivered copies are ordinary files in a directory Ompire does not own. There is
+no backup of a replaced destination either, because no destination is ever
+replaced.
+
+The approval document is stored whole rather than as a token alone. A row that
+remembered only a digest could say an export was approved but not *what* was
+approved, which is precisely the question an interrupted operation raises.
+
+### The durable root reservation
+
+`uq_result_exports_active_root` is a unique index on `(root_device, root_inode)`
+partial to `state IN ('running', 'unresolved')`. Keyed by filesystem identity
+rather than project name, so two registrations aliasing one directory cannot
+both install into it; durable in SQLite rather than in memory, so a restart or a
+second daemon process does not drop it. `registry/result_exports.py` also checks
+for an active row inside the admission reservation, which is what produces a
+readable refusal naming the blocking export; the index is the guarantee behind
+it.
+
+None of this claims the directory cannot be replaced on disk. That is detected
+separately, by comparing the reopened root's device and inode against the
+approval before anything is written.
+
+### Export transaction boundaries
+
+Every transition runs inside `reserved_write` and advances
+`tasks.results_version` in the same transaction, so export history rides the
+existing result projection.
+
+- **Admission** observes the filesystem *first*, then in one reservation
+  rechecks the project registration, the revision's acceptance, identity and
+  retained bytes, reserves the root, and writes the approval plus every intended
+  destination. The filesystem observation is revalidated after that commit, and
+  before any destination write: a database reservation proves nothing about a
+  directory.
+- **Replay** is keyed on `(task_id, request_id)` and is checked *before* the
+  filesystem is re-observed. A completed export has itself changed the
+  destinations a fresh preview would classify, so re-deriving one first would
+  answer "did my request go through?" with "the checkout changed".
+- **Per-file intent** — the staged file's device and inode — is committed before
+  its rename, and the outcome after. That pair is what lets recovery establish a
+  rename that beat its own journal entry; matching bytes alone never can.
+- **Settlement** is derived from the recorded per-file outcomes, not asserted by
+  the caller: any `unknown` forces `unresolved`, and `completed` requires every
+  destination to be `created` or `already-identical`.
+- **Acknowledgement** moves an `unresolved` operation to `incomplete` under an
+  expected-version check and leaves every per-file outcome untouched.
+
+No filesystem work and no `await` happens while a reservation is held.
+
+### Export retention
+
+A `running` or `unresolved` export refuses result purge and task purge, naming
+itself, and refuses repointing its project's `checkout_path`. All three holds
+release when it settles or is acknowledged closed — deliberately unlike
+`task_result_references`, which holds forever: a consumer's record permanently
+says what it ran with, while an export's product is a set of files that already
+outlive everything retained here.
+
+Result purge keeps the export rows beside the revision's tombstone. Task purge
+deletes them explicitly, after every refusal above has passed; foreign keys are
+not enforced on these connections, so there is no cascade to rely on. Neither
+purge, nor producer cleanup, touches an exported copy in the checkout.
+
 ## `settings`
 
 | Column | Type | Notes |

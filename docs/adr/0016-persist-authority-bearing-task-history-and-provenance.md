@@ -6,8 +6,12 @@
 Its run/review/decision/action linkage is advanced by
 [ADR-0033](0033-scope-trusted-delivery-authority-to-the-workflow-run.md):
 every review iteration and privileged action now names the workflow attempt
-that asked for it. This record stays Proposed for its outstanding commit
-lineage and transcript-retention gaps.
+that asked for it. Its durable-effect journalling is advanced again by
+[ADR-0036](0036-install-exported-result-files-without-replacing-them.md), which
+records approval and per-file intent before writing into the operator's
+checkout, and classifies an interrupted write instead of replaying it. This
+record stays Proposed for its outstanding commit lineage and
+transcript-retention gaps.
 
 ## Context
 

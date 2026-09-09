@@ -244,6 +244,98 @@ The action is offered only on an accepted revision. A complete revision nobody
 accepted is a downloadable result, not an input another task may be launched
 with.
 
+#### Exporting into the project checkout
+
+**Export to project checkout**, on an accepted, readable revision, copies
+selected files from it into this project's registered checkout. It stays
+available after the producing task has been cleaned up or archived, because it
+reads the retained bytes and never the workspace.
+
+The destination root is the project's own registered checkout and nothing else.
+There is no field for an arbitrary directory and no way to export into another
+project.
+
+Select the files to export — all of them initially — and optionally enter one
+checkout-relative destination prefix. An empty prefix keeps each file's own
+repository-relative path, so `epics/design/EPIC.md` lands at that path. A prefix
+of `handoffs` puts the whole tree under it, at
+`handoffs/epics/design/EPIC.md`. Individual files are never renamed. Selecting a
+subset can leave a relative link in an exported file pointing at something that
+was not exported; the form says so, and nothing rewrites the content.
+
+**Preview export** reads the retained revision and the actual checkout, and
+changes nothing. It shows the revision, the full checkout location, the prefix,
+the selected and omitted files, and a classification for every destination:
+
+| Classification | Meaning |
+|---|---|
+| **Create** | Nothing is there. The file would be created. |
+| **Already identical** | An ordinary file already holds exactly these bytes. It is left untouched, including its permissions and modification time. |
+| **Conflict** | Different content, a directory where the file belongs, a symlink, a special or multiply-linked file, an unreadable entry, a nested repository boundary, or an unsafe path. |
+
+A conflict shows its reason and, where the existing content is safe to display,
+a bounded difference as escaped source. Content that is not valid UTF-8, is
+past the size bound, or holds recognizable credential material is named as a
+conflict without showing it — a preview never displays your own secrets back to
+the browser. A large comparison is truncated and says so.
+
+A difference is not an approval to replace. **Ompire never overwrites, deletes,
+truncates, chmods, merges, or renames anything in your checkout, and there is no
+force option.** While a conflicting file is selected the export cannot be
+submitted. Resolve it by deselecting that file, choosing a different prefix, or
+fixing the checkout yourself.
+
+Every change to the selection or the prefix clears the preview: approval names
+one exact set of destinations, and a new selection has to be reviewed as one.
+
+**Confirm export** creates only the files listed as *Create*, plus the
+directories they need, as ordinary non-executable, owner-private copies. It
+commits nothing, pushes nothing, and opens no pull request. A target that
+changed since the preview refuses before writing. If a destination is taken
+after confirmation — an editor saved a file in between — that file wins and is
+left exactly as it is.
+
+Exported copies are ordinary files in your checkout. Unlike a task's handoff
+inputs, nothing stops you committing them yourself later; Ompire adds no ignore
+rules and takes no Git action either way.
+
+A selection where every file is already identical is a valid export. It writes
+nothing and is recorded as such.
+
+#### Export history and recovery
+
+Every export is recorded with who approved it, when, the exact revision, the
+destinations, and a per-file outcome: **Created**, **Already identical**, **Not
+installed**, or **Unknown**. The record survives a reconnect, a daemon restart,
+and a purge of the revision it delivered.
+
+Files are installed one at a time and each is installed whole. A bundle is not
+atomic. An interrupted export can therefore leave some approved files created
+and others not, plus directories it made along the way. Nothing is removed to
+make that look tidy — deleting from your checkout is exactly what export will
+not do — and the record names every created directory.
+
+- **Not fully installed** means the known outcomes do not add up to the whole
+  approved set. Nothing was overwritten. **Preview remaining export** restores
+  that export's own selection and prefix into the form and reviews it against
+  the checkout as it now stands: delivered files classify as already identical
+  and receive no second write, and anything that differs is a conflict. It is a
+  fresh review and a fresh confirmation, not a resumption of the old approval.
+- **Outcome unknown** means at least one effect could not be established. This
+  is a real answer, not a pending one. **Re-check the checkout** re-observes it
+  read-only; it never retries a write. **Close as unresolved** records that you
+  read the uncertainty and releases the revision and the checkout — it does not
+  claim the unknown files were delivered, and the per-file outcomes still read
+  Unknown afterwards.
+
+Ompire never automatically re-runs or undoes an export after a restart. It
+re-observes and classifies, and resuming is a fresh preview and confirmation.
+
+While an export is running or unresolved, exports to that same checkout are
+refused, this revision's files cannot be purged, and the project's checkout path
+cannot be repointed. All three holds are released once the export settles or is
+closed — unlike a launch input's hold, which is permanent.
+
 #### Downloading
 
 Any complete revision can be downloaded before or after acceptance, as a single
@@ -272,6 +364,14 @@ say they ran with these files and an operator reading such a record has to be
 able to read them. Cleaning up, failing, or archiving a consumer releases
 nothing; purging that task's record is the only release, and it is refused by
 the ordinary task-purge rules until the task is archived.
+
+A revision with an unfinished checkout export cannot be purged either, and the
+panel names it. That hold is temporary: it exists because the export is still
+reading those bytes, or because nobody knows what it did, and it is released
+when the export settles or is closed as unresolved. Purging afterwards deletes
+the retained bytes and leaves the exported copies in your checkout exactly where
+they are — they are ordinary files now, and the export record survives the
+revision's tombstone.
 
 Purge is logical removal. It makes no promise about database free space,
 backups, or copies already downloaded, and the database file need not shrink.

@@ -276,6 +276,55 @@ whose bytes no longer match its manifest is classified unavailable when
 something tries to read it, keeping its acceptance and its history, and is never
 reconstructed from the workspace.
 
+### Checkout export recovery
+
+Export is the one operation whose effects land in a directory Ompire does not
+own ([ADR-0036](../../adr/0036-install-exported-result-files-without-replacing-them.md)),
+so its recovery contract is the strictest here: **classify, never replay, never
+roll back.**
+
+`ResultExportManager.restore()` runs before any new export is admitted and
+before the first snapshot. It re-observes the checkout read-only and settles
+every row still marked `running`. Shutdown cancels in-flight installs and runs
+the same pass, so a cancelled job never leaves a running-looking row for the
+next start to explain.
+
+Each approved destination is classified from what is actually on disk:
+
+| Observation | Outcome |
+|---|---|
+| No staged identity was ever recorded | `not-installed` — staging precedes every install, so nothing was written |
+| The staged file's device and inode are at the destination | `created` — the rename completed before its journal entry |
+| Nothing is at the destination | `not-installed` |
+| Something else is there, with or without the expected bytes | `unknown` |
+| The root is gone, replaced, or unreadable | `unknown`, and the operation is `unresolved` |
+
+Matching bytes are deliberately not enough to claim `created`. Anyone could have
+written the same text, and an export that counted that as its own success would
+be reporting a delivery it cannot evidence.
+
+Any `unknown` makes the operation `unresolved`, which keeps holding the retained
+bytes, the task record, and the checkout root until an operator acts. **Re-check**
+repeats the same read-only classification — useful when a mount returns or a
+permission is fixed — and can only move an outcome from unknown to something
+established. **Acknowledge** closes the operation as `incomplete` and leaves
+every `unknown` exactly as it is.
+
+Recovery writes no destination and removes nothing. A partially installed export
+keeps its installed files and any directories it created; deleting them would be
+a destructive write into the operator's repository performed at the moment
+Ompire is least sure what happened, and could take an edit made since with it.
+The daemon-owned staging directory is the one thing cleaned up, and only when
+its recorded device and inode match — anything else is reported and left alone.
+
+Resuming is an operator action, not a recovery step: **Preview remaining
+export** restores the interrupted export's own selection and prefix into the
+form and reviews them again, producing a fresh preview and a new request id.
+Already-delivered files classify as already identical and receive no writes, and
+anything that differs is a conflict. The approval that was interrupted is bound
+to an observation the crash has invalidated, so re-running it would write bytes
+nobody reviewed against the current checkout.
+
 ### Handoff-input preparation
 
 The `inputs` step runs after the branch exists and before the workshop starts,
@@ -332,11 +381,13 @@ repository — and reviews never park it either.
 | Attention entries | Rebuilt from recovered session status |
 | A task with no confirmed launch configuration | Skipped, not failed; run position, sessions and workspace are kept until the operator confirms |
 | An unfinished result capture | Failed as interrupted, retaining nothing; the workspace is never re-read to complete it |
+| An unfinished checkout export | Classified read-only from the filesystem; never retried and never rolled back, and an effect that cannot be established stays `unknown` |
 
 The durable boundary is still narrower than [`VISION.md`](../../VISION.md)
-calls for. Review history, delivery authorization, intent and outcomes, and now
-captured result bytes with their manifests and decisions sit inside it; full
-commit lineage and transcript retention do not, so
+calls for. Review history, delivery authorization, intent and outcomes,
+captured result bytes with their manifests and decisions, and per-destination
+export intent and outcomes sit inside it; full commit lineage and transcript
+retention do not, so
 [ADR-0016](../../adr/0016-persist-authority-bearing-task-history-and-provenance.md)
 remains proposed.
 

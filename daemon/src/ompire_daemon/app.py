@@ -40,6 +40,7 @@ from ompire_daemon.prwatch import PrWatcher
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
 from ompire_daemon.registry.settings import SettingsStore
 from ompire_daemon.registry.tasks import list_tasks
+from ompire_daemon.result_exports import ResultExportManager
 from ompire_daemon.results import ResultManager
 from ompire_daemon.review import ReviewManager, restore_reviews
 from ompire_daemon.sessions import SessionTracker
@@ -121,6 +122,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         await project_setup.shutdown()
         await agents.shutdown()
         await reviews.shutdown()
+        await app.state.result_exports.shutdown()
         await app.state.results.shutdown()
 
 
@@ -132,6 +134,7 @@ async def _prepare_startup(
     project_setup: ProjectSetupManager,
     ships: ShipManager,
     results: ResultManager,
+    result_exports: ResultExportManager,
     guard: WorkspaceGuard,
 ) -> list[Any]:
     """Retain the packaged workflow definitions, finish the upgrade, resolve
@@ -178,6 +181,18 @@ async def _prepare_startup(
             "task %d capture %s did not survive the restart",
             interrupted.task_id,
             interrupted.id,
+        )
+    # Exports the last daemon was running are settled before any new one is
+    # admitted, and before the first snapshot can show a `running` row nobody
+    # owns (ADR-0036). This is a read-only re-observation of the operator's
+    # checkout: no destination is written, nothing is rolled back, and an
+    # effect that cannot be established honestly stays unknown.
+    for settled in result_exports.restore():
+        logger.warning(
+            "task %d checkout export %s was interrupted by a restart and is %s",
+            settled.task_id,
+            settled.id,
+            settled.state,
         )
     # Durable review history is corrected before anything else reads it, so
     # the first snapshot never carries an open review whose llmvet process
@@ -330,6 +345,17 @@ def create_app(
         app.state.events,
         app.state.workspace_guard,
     )
+    # Explicit, previewed export of an accepted revision into the project's
+    # registered checkout (ADR-0036). It takes no workspace guard: it reads
+    # retained bytes, never a task's clone, and works long after the producing
+    # workspace is gone. It is the only thing in the daemon that writes into a
+    # directory the operator owns.
+    app.state.result_exports = ResultExportManager(
+        config,
+        app.state.engine,
+        app.state.events,
+        app.state.results,
+    )
     # A format-3 run drives review and delivery as steps, but it never
     # performs either itself: the managers stay the only trusted operation
     # owners, and the runner asks them. Wired after construction because the
@@ -371,6 +397,7 @@ def create_app(
             app.state.project_setup,
             app.state.ships,
             app.state.results,
+            app.state.result_exports,
             app.state.workspace_guard,
         )
     )

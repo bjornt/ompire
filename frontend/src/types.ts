@@ -1248,6 +1248,123 @@ export interface TaskResult {
    * therefore the reason a purge would be refused. Released only when such a
    * consumer's own task record is explicitly purged. */
   consumer_task_ids: number[];
+  /** Checkout exports of this exact revision (ADR-0036), newest first. An
+   * entry that is still `running` or `unresolved` is a temporary purge
+   * blocker; a settled one is history. */
+  exports: TaskResultExport[];
+}
+
+/** What happened to one approved destination.
+ *
+ * `unknown` is a real, terminal answer, not a transient one: an interrupted
+ * export whose effect cannot be established says so, and an acknowledgement
+ * closes the operation without ever rewriting this into a success. */
+export type ExportFileOutcome =
+  | "pending"
+  | "created"
+  | "already-identical"
+  | "not-installed"
+  | "unknown";
+
+/** How a preview classified one destination against the real checkout.
+ * A conflict is a difference — never an approval to replace. */
+export type ExportClassification = "create" | "identical" | "conflict";
+
+/** One destination in an export's approved plan and its recorded history. */
+export interface TaskResultExportFile {
+  path: string;
+  destination: string;
+  classification: ExportClassification;
+  length: number;
+  sha256: string;
+  outcome: ExportFileOutcome;
+  error: string | null;
+}
+
+/** One deliberate export of a revision into the project's checkout
+ * (ADR-0036), metadata only.
+ *
+ * `running` and `unresolved` are the states that temporarily hold the source
+ * bytes and the task record; `completed` and `incomplete` release them,
+ * because what an export delivered is ordinary checkout files that outlive
+ * every record here. */
+export type TaskResultExportState =
+  | "running"
+  | "completed"
+  | "incomplete"
+  | "unresolved";
+
+export interface TaskResultExport {
+  id: string;
+  task_id: number;
+  result_id: string;
+  manifest_id: string;
+  state: TaskResultExportState;
+  error: string | null;
+  project_name: string;
+  checkout_path: string;
+  prefix: string;
+  selection: string[];
+  actor: string;
+  confirmed_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  acknowledged_at: string | null;
+  acknowledged_by: string | null;
+  /** A daemon staging directory left behind in the checkout, when one was.
+   * Reported rather than silently removed. */
+  staging_error: string | null;
+  created_directories: string[];
+  files: TaskResultExportFile[];
+  created_count: number;
+  identical_count: number;
+  unknown_count: number;
+  incomplete_count: number;
+}
+
+/** One destination as a preview classified it, with the sentence the operator
+ * reads. `before` describes the file already there, and is present only when
+ * one was readable. */
+export interface TaskResultExportPreviewFile {
+  path: string;
+  destination: string;
+  length: number;
+  sha256: string;
+  media_type: string;
+  classification: ExportClassification;
+  reason: string | null;
+  detail: string | null;
+  before: { length: number; sha256: string; mode: number } | null;
+}
+
+/** The canonical document an approval names. The daemon recomputes it at
+ * confirmation from a fresh observation, so this is a record of what was
+ * observed, never a verdict the browser supplies. */
+export interface TaskResultExportPreviewDocument {
+  format: number;
+  task_id: number;
+  result_id: string;
+  manifest_id: string;
+  project_name: string;
+  checkout_path: string;
+  prefix: string;
+  selection: string[];
+  omitted: string[];
+  files: TaskResultExportPreviewFile[];
+}
+
+export interface TaskResultExportPreview {
+  preview: TaskResultExportPreviewDocument;
+  preview_token: string;
+  /** True when at least one selected destination conflicts. Confirmation is
+   * refused while it is. */
+  blocked: boolean;
+  /** The retained text of each selected file, shown as inert source. */
+  source: Record<string, string>;
+  /** Bounded differences for the conflicting destinations whose content was
+   * safe to show. Never persisted and never broadcast. */
+  diff: string;
+  diff_truncated: boolean;
 }
 
 /** One task's whole result document, versioned so a missed or duplicated

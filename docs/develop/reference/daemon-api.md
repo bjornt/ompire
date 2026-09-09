@@ -21,7 +21,7 @@ reference](../../use/reference/api.md); the generated OpenAPI schema at
 profile contract, including its identifier grammar and status codes, is in
 [Model profiles](../../use/reference/model-profiles.md).
 
-Six mutation boundaries are worth knowing before adding routes near them.
+Seven mutation boundaries are worth knowing before adding routes near them.
 
 Profile input schemas forbid unknown fields at every nesting level, so a
 misspelled role or binding key is a `422` rather than silently ignored
@@ -200,6 +200,37 @@ Downloads are ordinary authenticated responses with a body. They carry
 `Cache-Control: private, no-store`; there is no token-bearing URL and no static
 result directory, because a result is untrusted agent-authored content.
 
+Checkout export is the seventh, and it is the only one whose external effect
+lands in a directory Ompire does not own
+([ADR-0036](../../adr/0036-install-exported-result-files-without-replacing-them.md)).
+Two things distinguish it from every boundary above.
+
+**Approval is a document the daemon derives, not a verdict the client sends.**
+`POST .../exports/preview` observes the retained revision and the real checkout
+and returns a canonical document plus its digest. `POST .../exports` re-derives
+that document from a *fresh* observation and compares digests. So a client
+cannot classify a destination, cannot name one outside the recomputed set, and
+cannot confirm against a checkout that has changed since it looked. A selected
+conflict refuses at confirmation even though the preview that reported it
+succeeded — a blocked preview is a successful read whose answer is "not like
+this".
+
+**Intent is journalled before every effect, and no effect is ever replayed.**
+Admission observes the filesystem first, then in one reserved write rechecks the
+registration, the revision, and the root reservation and records the approval
+with every intended destination; the filesystem observation is revalidated after
+that commit, before anything is written. Each staged file's identity is
+committed before its rename and its outcome after. Replay is checked on
+`(task_id, request_id)` *before* re-observing, because a completed export has
+itself changed what a fresh preview would classify. Recovery classifies
+read-only and never retries or rolls back — see [Crash
+recovery](crash-recovery.md#checkout-export-recovery).
+
+Preview responses carry source and conflict-diff text and are `no-store`; that
+text is never persisted with the approval and never broadcast. Every journal
+transition rides the existing versioned result document, so export history and
+result state converge through the same reducer.
+
 `POST /api/tasks/{id}/workflow/resume` carries the same shape of guard for a
 *human* decision. The request names the waiting attempt, the daemon decides
 from that attempt which of three waits it is, and — for a gate with declared
@@ -231,6 +262,8 @@ protocol](websocket-protocol.md).
 | Agent channel for an unknown or undeclared session name | Channel closes with an error, no events sent |
 | Agent channel for a session with no live agent | Closes with code `4404` |
 | Result command against a revision belonging to another task | `404` — the task scope in the path is part of the authorization |
+| Export command against another task's or another revision's export | `404` — both scopes in the path are part of the authorization |
+| Confirmation whose recomputed preview differs from the token | `409`, nothing written |
 | Read or download of a purged revision | `410`, its record still readable |
 | Token rotated while sockets are open | All closed with code `1008` |
 

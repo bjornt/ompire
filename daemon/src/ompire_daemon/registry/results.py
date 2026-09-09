@@ -563,9 +563,14 @@ def results_version(engine: Engine, task_id: int) -> int:
     return int(row.results_version) if row is not None else 0
 
 
-def _bump_version(conn: Connection, task_id: int) -> int:
+def bump_results_version(conn: Connection, task_id: int) -> int:
     """Advance the task's result projection version inside the caller's
-    reservation, so every observable mutation and its version move together."""
+    reservation, so every observable mutation and its version move together.
+
+    Public because the export journal (ADR-0036) rides the same projection: an
+    export transition is something the operator can see about a result, so it
+    has to move the version the client reconciles against.
+    """
     conn.execute(
         tasks.update()
         .where(tasks.c.id == task_id)
@@ -722,7 +727,7 @@ def open_capture(
                 purged_by=None,
             )
         )
-        _bump_version(conn, task_id)
+        bump_results_version(conn, task_id)
         row = conn.execute(
             _metadata_select().where(task_results.c.id == result_id)
         ).one()
@@ -781,7 +786,7 @@ def finish_capture(
                 finished_at=now,
             )
         )
-        _bump_version(conn, row.task_id)
+        bump_results_version(conn, row.task_id)
         updated = conn.execute(
             _metadata_select().where(task_results.c.id == result_id)
         ).one()
@@ -810,7 +815,7 @@ def fail_capture(engine: Engine, result_id: str, error: str) -> TaskResult:
             .where(task_results.c.id == result_id)
             .values(state=STATE_FAILED, error=error, finished_at=now)
         )
-        _bump_version(conn, row.task_id)
+        bump_results_version(conn, row.task_id)
         updated = conn.execute(
             _metadata_select().where(task_results.c.id == result_id)
         ).one()
@@ -855,7 +860,7 @@ def accept_result(
             .where(task_results.c.id == result_id)
             .values(accepted_at=now, accepted_by="operator")
         )
-        _bump_version(conn, row.task_id)
+        bump_results_version(conn, row.task_id)
         updated = conn.execute(
             _metadata_select().where(task_results.c.id == result_id)
         ).one()
@@ -883,7 +888,7 @@ def mark_unavailable(engine: Engine, result_id: str, reason: str) -> TaskResult:
             .where(task_results.c.id == result_id)
             .values(unavailable_reason=reason)
         )
-        _bump_version(conn, row.task_id)
+        bump_results_version(conn, row.task_id)
         updated = conn.execute(
             _metadata_select().where(task_results.c.id == result_id)
         ).one()
@@ -907,13 +912,19 @@ def purge_result(
 
     A revision pinned as a launch input by any consumer task is refused
     outright, naming those consumers: retention is a dependency, not a
-    preference, and there is no force (ADR-0035).
+    preference, and there is no force (ADR-0035). A revision with an unfinished
+    checkout export is refused the same way, and named — but only until that
+    export settles (ADR-0036).
 
     This is logical removal. The row keeps identity, manifest, provenance, and
     both decisions; the bytes are deleted from the table. SQLite may reuse the
     freed pages later, and it makes no promise about backups or copies the
     operator already downloaded.
     """
+    from ompire_daemon.registry.result_exports import (
+        assert_result_exports_settled_on,
+    )
+
     now = _now_iso()
     with reserved_write(engine) as conn:
         row = conn.execute(
@@ -935,6 +946,11 @@ def purge_result(
         # refused, or it does not and the purge proceeds. There is no ordering
         # in which both win (ADR-0035).
         assert_result_unpinned_on(conn, result_id)
+        # An export that is still running, or whose effects nobody could
+        # classify, is reading these bytes or is unexplained. That protection
+        # is temporary and releases itself (ADR-0036): a completed export is a
+        # delivered copy, not a consumer reference.
+        assert_result_exports_settled_on(conn, result_id)
         current = conn.execute(
             select(tasks.c.results_version).where(tasks.c.id == row.task_id)
         ).first()
@@ -953,7 +969,7 @@ def purge_result(
             .where(task_results.c.id == result_id)
             .values(state=STATE_PURGED, purged_at=now, purged_by="operator")
         )
-        _bump_version(conn, row.task_id)
+        bump_results_version(conn, row.task_id)
         updated = conn.execute(
             _metadata_select().where(task_results.c.id == result_id)
         ).one()
@@ -1211,7 +1227,7 @@ def insert_references_on(
     )
     producers = sorted({producer for _id, producer, _m in references})
     for producer in producers:
-        _bump_version(conn, producer)
+        bump_results_version(conn, producer)
     return producers
 
 
@@ -1254,7 +1270,7 @@ def release_consumer_references_on(conn: Connection, consumer_task_id: int) -> l
     )
     producers = sorted({int(row.producer_task_id) for row in rows})
     for producer in producers:
-        _bump_version(conn, producer)
+        bump_results_version(conn, producer)
     return producers
 
 

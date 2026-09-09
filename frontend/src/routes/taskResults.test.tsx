@@ -8,6 +8,7 @@ import type {
   Task,
   TaskExecutionInputs,
   TaskResult,
+  TaskResultExport,
   TaskResultsProjection,
 } from "../types";
 
@@ -185,6 +186,7 @@ function makeResult(overrides: Partial<TaskResult> = {}): TaskResult {
     purged_at: null,
     purged_by: null,
     consumer_task_ids: [],
+    exports: [],
     ...overrides,
   };
 }
@@ -562,6 +564,434 @@ describe("Results panel", () => {
     expect(message).toContain("1 retained");
     expect(message).toContain("13 B");
     expect(message).toMatch(/You accepted this revision/);
+  });
+});
+
+describe("checkout export", () => {
+  const ACCEPTED = {
+    accepted_at: "2026-07-18T01:00:00Z",
+    files: [
+      {
+        path: "epics/demo/PLAN.md",
+        length: 13,
+        sha256: "a".repeat(64),
+        media_type: "text/markdown",
+      },
+      {
+        path: "epics/demo/SPEC.md",
+        length: 9,
+        sha256: "b".repeat(64),
+        media_type: "text/markdown",
+      },
+    ],
+    file_count: 2,
+  };
+
+  function previewBody(
+    overrides: Partial<{
+      files: unknown[];
+      omitted: string[];
+      blocked: boolean;
+      diff: string;
+    }> = {},
+  ) {
+    return {
+      preview: {
+        format: 1,
+        task_id: 1,
+        result_id: "res_aaaaaaaabbbbbbbb",
+        manifest_id: "manifest-1",
+        project_name: "maas",
+        checkout_path: "/home/op/proj/maas",
+        prefix: "",
+        selection: ["epics/demo/PLAN.md", "epics/demo/SPEC.md"],
+        omitted: overrides.omitted ?? [],
+        files: overrides.files ?? [
+          {
+            path: "epics/demo/PLAN.md",
+            destination: "epics/demo/PLAN.md",
+            length: 13,
+            sha256: "a".repeat(64),
+            media_type: "text/markdown",
+            classification: "create",
+            reason: null,
+            detail: null,
+            before: null,
+          },
+        ],
+      },
+      preview_token: "token-1",
+      blocked: overrides.blocked ?? false,
+      source: { "epics/demo/PLAN.md": "# Plan\n" },
+      diff: overrides.diff ?? "",
+      diff_truncated: false,
+    };
+  }
+
+  function makeExport(
+    overrides: Partial<TaskResultExport> = {},
+  ): TaskResultExport {
+    return {
+      id: "exp_11112222333344445555",
+      task_id: 1,
+      result_id: "res_aaaaaaaabbbbbbbb",
+      manifest_id: "manifest-1",
+      state: "completed",
+      error: null,
+      project_name: "maas",
+      checkout_path: "/home/op/proj/maas",
+      prefix: "",
+      selection: ["epics/demo/PLAN.md"],
+      actor: "operator",
+      confirmed_at: "2026-07-18T02:00:00Z",
+      started_at: "2026-07-18T02:00:01Z",
+      finished_at: "2026-07-18T02:00:02Z",
+      acknowledged_at: null,
+      acknowledged_by: null,
+      staging_error: null,
+      created_directories: [],
+      files: [
+        {
+          path: "epics/demo/PLAN.md",
+          destination: "epics/demo/PLAN.md",
+          classification: "create",
+          length: 13,
+          sha256: "a".repeat(64),
+          outcome: "created",
+          error: null,
+        },
+      ],
+      created_count: 1,
+      identical_count: 0,
+      unknown_count: 0,
+      incomplete_count: 0,
+      ...overrides,
+    } as TaskResultExport;
+  }
+
+  it("is offered only on an accepted, readable revision", async () => {
+    stubFetch();
+    await renderTaskDetail({
+      task_results: { "1": projection([makeResult()]) },
+    });
+
+    await screen.findByTestId("task-detail-results");
+    expect(screen.queryByTestId("export-panel")).toBeNull();
+  });
+
+  it("requires a preview before confirmation, and states why", async () => {
+    stubFetch();
+    await renderTaskDetail({
+      task_results: { "1": projection([makeResult(ACCEPTED)]) },
+    });
+
+    expect(await screen.findByTestId("export-confirm")).toBeDisabled();
+    expect(screen.getByTestId("export-needs-preview")).toHaveTextContent(
+      /approval names one exact set of destinations/i,
+    );
+  });
+
+  it("shows what would be created and warns about omitted link targets", async () => {
+    const { calls } = stubFetch({
+      "POST /exports/preview": {
+        body: previewBody({ omitted: ["epics/demo/SPEC.md"] }),
+      },
+    });
+    await renderTaskDetail({
+      task_results: { "1": projection([makeResult(ACCEPTED)]) },
+    });
+
+    await userEvent.click(await screen.findByTestId("export-select-epics/demo/SPEC.md"));
+    await userEvent.click(screen.getByTestId("export-preview-button"));
+
+    expect(await screen.findByTestId("export-preview")).toBeInTheDocument();
+    expect(screen.getByTestId("export-class-epics/demo/PLAN.md")).toHaveTextContent(
+      "Create",
+    );
+    expect(screen.getByTestId("export-omitted")).toHaveTextContent(
+      /will not resolve in your checkout/i,
+    );
+    const request = calls.find((call) => call.url.includes("/exports/preview"));
+    expect(request?.body).toMatchObject({
+      paths: ["epics/demo/PLAN.md"],
+      prefix: "",
+    });
+  });
+
+  it("blocks confirmation while a selected destination conflicts", async () => {
+    stubFetch({
+      "POST /exports/preview": {
+        body: previewBody({
+          blocked: true,
+          diff: "-old\n+new\n",
+          files: [
+            {
+              path: "epics/demo/PLAN.md",
+              destination: "epics/demo/PLAN.md",
+              length: 13,
+              sha256: "a".repeat(64),
+              media_type: "text/markdown",
+              classification: "conflict",
+              reason: "different-content",
+              detail:
+                "a different file already exists at this destination; export never replaces one",
+              before: { length: 4, sha256: "c".repeat(64), mode: 420 },
+            },
+          ],
+        }),
+      },
+    });
+    await renderTaskDetail({
+      task_results: { "1": projection([makeResult(ACCEPTED)]) },
+    });
+
+    await userEvent.click(await screen.findByTestId("export-preview-button"));
+
+    expect(await screen.findByTestId("export-blocked")).toHaveTextContent(
+      /never replaces an existing file, and there is no force/i,
+    );
+    expect(screen.getByTestId("export-confirm")).toBeDisabled();
+    // Agent- and operator-authored text alike is escaped source, never markup.
+    expect(screen.getByTestId("export-diff").tagName).toBe("PRE");
+  });
+
+  it("invalidates the preview when the selection or the prefix changes", async () => {
+    stubFetch({ "POST /exports/preview": { body: previewBody() } });
+    await renderTaskDetail({
+      task_results: { "1": projection([makeResult(ACCEPTED)]) },
+    });
+
+    await userEvent.click(await screen.findByTestId("export-preview-button"));
+    await screen.findByTestId("export-preview");
+
+    await userEvent.type(screen.getByTestId("export-prefix"), "handoffs");
+
+    expect(screen.queryByTestId("export-preview")).toBeNull();
+    expect(screen.getByTestId("export-confirm")).toBeDisabled();
+  });
+
+  it("drops a preview response the form has already moved past", async () => {
+    /* A slow answer for an earlier selection must never be shown as the
+     * approval for a different one — that is exactly how an operator would
+     * confirm destinations they never reviewed. */
+    const { mock } = stubFetch();
+    const passthrough = mock.getMockImplementation()!;
+    let resolve: ((value: never) => void) | undefined;
+    mock.mockImplementation(((
+      url: string,
+      init?: { method?: string; body?: string },
+    ) => {
+      if (url.includes("/exports/preview")) {
+        return new Promise((settle) => {
+          resolve = settle as (value: never) => void;
+        });
+      }
+      return passthrough(url, init);
+    }) as typeof passthrough);
+    await renderTaskDetail({
+      task_results: { "1": projection([makeResult(ACCEPTED)]) },
+    });
+
+    await userEvent.click(await screen.findByTestId("export-preview-button"));
+    await userEvent.type(screen.getByTestId("export-prefix"), "h");
+    await act(async () => {
+      resolve?.({
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: () => Promise.resolve(previewBody()),
+      } as never);
+    });
+
+    expect(screen.queryByTestId("export-preview")).toBeNull();
+  });
+
+  it("confirms with the reviewed token and a fresh request id", async () => {
+    const { calls } = stubFetch({
+      "POST /exports/preview": { body: previewBody() },
+      "POST /results/[^/]+/exports$": {
+        status: 202,
+        body: {
+          ...projection([makeResult({ ...ACCEPTED, exports: [makeExport()] })]),
+          limits: LIMITS,
+          export_id: "exp_11112222333344445555",
+        },
+      },
+    });
+    await renderTaskDetail({
+      task_results: { "1": projection([makeResult(ACCEPTED)]) },
+    });
+
+    await userEvent.click(await screen.findByTestId("export-preview-button"));
+    await screen.findByTestId("export-preview");
+    await userEvent.click(screen.getByTestId("export-confirm"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("export-history")).toBeInTheDocument(),
+    );
+    const confirmation = calls.find(
+      (call) => call.method === "POST" && /\/exports$/.test(call.url),
+    );
+    expect(confirmation?.body).toMatchObject({
+      preview_token: "token-1",
+      acknowledge_export: true,
+    });
+    expect((confirmation?.body as { request_id?: string })?.request_id).toBeTruthy();
+    expect(screen.getByTestId("export-state")).toHaveTextContent("Exported");
+  });
+
+  it("reports an unresolved export without claiming anything was delivered", async () => {
+    stubFetch();
+    await renderTaskDetail({
+      task_results: {
+        "1": projection([
+          makeResult({
+            ...ACCEPTED,
+            exports: [
+              makeExport({
+                state: "unresolved",
+                error: "this export did not finish",
+                created_count: 0,
+                unknown_count: 1,
+                files: [
+                  {
+                    path: "epics/demo/PLAN.md",
+                    destination: "epics/demo/PLAN.md",
+                    classification: "create",
+                    length: 13,
+                    sha256: "a".repeat(64),
+                    outcome: "unknown",
+                    error: "whether anything was installed cannot be established",
+                  },
+                ],
+              }),
+            ],
+          }),
+        ]),
+      },
+    });
+
+    expect(await screen.findByTestId("export-state")).toHaveTextContent(
+      "Outcome unknown",
+    );
+    expect(screen.getByTestId("export-outcomes")).toHaveTextContent("Unknown");
+    expect(screen.getByTestId("export-reconcile")).toBeInTheDocument();
+    expect(screen.getByTestId("export-acknowledge")).toBeInTheDocument();
+  });
+
+  it("finishes an incomplete export by re-previewing its own selection", async () => {
+    /* The recovery journey: nothing is retried and nothing is undone, so the
+     * way forward is a fresh review of the same selection against the checkout
+     * as it now stands. */
+    const { calls } = stubFetch({
+      "POST /exports/preview": {
+        body: previewBody({
+          files: [
+            {
+              path: "epics/demo/PLAN.md",
+              destination: "handoffs/epics/demo/PLAN.md",
+              length: 13,
+              sha256: "a".repeat(64),
+              media_type: "text/markdown",
+              classification: "identical",
+              reason: null,
+              detail: null,
+              before: { length: 13, sha256: "a".repeat(64), mode: 384 },
+            },
+          ],
+        }),
+      },
+    });
+    await renderTaskDetail({
+      task_results: {
+        "1": projection([
+          makeResult({
+            ...ACCEPTED,
+            exports: [
+              makeExport({
+                state: "incomplete",
+                prefix: "handoffs",
+                selection: ["epics/demo/PLAN.md"],
+                created_count: 0,
+                incomplete_count: 1,
+                files: [
+                  {
+                    path: "epics/demo/PLAN.md",
+                    destination: "handoffs/epics/demo/PLAN.md",
+                    classification: "create",
+                    length: 13,
+                    sha256: "a".repeat(64),
+                    outcome: "not-installed",
+                    error: "a file appeared at this destination",
+                  },
+                ],
+              }),
+            ],
+          }),
+        ]),
+      },
+    });
+
+    expect(await screen.findByTestId("export-incomplete-hint")).toHaveTextContent(
+      /Nothing was overwritten and nothing was undone/i,
+    );
+    await userEvent.click(screen.getByTestId("export-preview-remaining"));
+
+    expect(await screen.findByTestId("export-preview")).toBeInTheDocument();
+    // The export's own selection and prefix are what gets reviewed again.
+    const request = calls.find((call) => call.url.includes("/exports/preview"));
+    expect(request?.body).toMatchObject({
+      paths: ["epics/demo/PLAN.md"],
+      prefix: "handoffs",
+    });
+    expect(
+      (screen.getByTestId("export-prefix") as HTMLInputElement).value,
+    ).toBe("handoffs");
+    // A file already delivered is a no-op, not a second write.
+    expect(screen.getByTestId("export-plan")).toHaveTextContent(
+      "Already identical",
+    );
+  });
+
+  it("says an unfinished export blocks purge, and that the hold is temporary", async () => {
+    stubFetch();
+    await renderTaskDetail({
+      task_results: {
+        "1": projection([
+          makeResult({
+            ...ACCEPTED,
+            exports: [makeExport({ state: "unresolved" })],
+          }),
+        ]),
+      },
+    });
+
+    expect(await screen.findByTestId("results-export-blockers")).toHaveTextContent(
+      /that hold is temporary/i,
+    );
+    expect(screen.getByTestId("results-purge")).toBeDisabled();
+  });
+
+  it("keeps export history readable on a purged revision", async () => {
+    /* The revision's bytes are gone; what was delivered into the checkout is
+     * not, and neither is the record of delivering it. */
+    stubFetch();
+    await renderTaskDetail({
+      task_results: {
+        "1": projection([
+          makeResult({
+            state: "purged",
+            available: false,
+            accepted_at: "2026-07-18T01:00:00Z",
+            purged_at: "2026-07-18T03:00:00Z",
+            exports: [makeExport()],
+          }),
+        ]),
+      },
+    });
+
+    expect(await screen.findByTestId("export-history")).toBeInTheDocument();
+    expect(screen.queryByTestId("export-panel")).toBeNull();
   });
 });
 

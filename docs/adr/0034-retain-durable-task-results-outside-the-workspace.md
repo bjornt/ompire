@@ -8,6 +8,12 @@ gives a retained revision a reference-protected lifetime: a revision pinned by a
 consumer task cannot be purged, and the reference is released only by that
 consumer's own explicit task purge.
 
+Extended by [ADR-0036](0036-install-exported-result-files-without-replacing-them.md),
+which adds explicit create-only export of an accepted revision into the
+operator's project checkout, and a *temporary* hold on retained bytes and task
+history for the duration of one such operation — released once it settles,
+because the copies it delivered are ordinary checkout files.
+
 Advances the artifact-retention slice of
 [ADR-0016](0016-persist-authority-bearing-task-history-and-provenance.md);
 that ADR stays `Proposed`, because transcript retention and commit lineage

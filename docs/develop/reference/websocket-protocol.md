@@ -162,10 +162,20 @@ Published on the dashboard channel:
 | `stats`, `advisory` | Session telemetry and decorations |
 | `review_started`, `review_iteration`, `review_finished` | Review lifecycle |
 | `ship_updated` | A task's delivery projection changed; carries the whole versioned document |
-| `task_results_updated` | A task's durable results changed — a capture opened, finished or failed, a revision was accepted, found unavailable, or purged, or a consumer task pinned or released it as a launch input. Carries the whole versioned document for that task, metadata only, and is published only after the daemon committed the change. A client drops an older `version` and treats an equal one as already applied; `task_deleted` clears the task's results |
+| `task_results_updated` | A task's durable results changed — a capture opened, finished or failed, a revision was accepted, found unavailable, or purged, a consumer task pinned or released it as a launch input, or a checkout export was admitted, settled, reconciled, or acknowledged. Carries the whole versioned document for that task, metadata only, and is published only after the daemon committed the change. A client drops an older `version` and treats an equal one as already applied; `task_deleted` clears the task's results |
 | `gpg_status` | The signing-key probe result changes |
 | `gh_status` | A completed GitHub identity or target probe replaced the full safe `gh` projection |
 | `settings_changed` | Effective settings change |
+
+Checkout export rides `task_results_updated` as an `exports` list on the
+revision it delivered: state, destinations, per-file outcomes, and any created
+directories
+([ADR-0036](../../adr/0036-install-exported-result-files-without-replacing-them.md)).
+No retained file text, no destination content, and no conflict diff is ever in
+that document. Those are fetched for the one export or preview an operator asked
+for, over REST, `no-store` — a conflict diff can carry the contents of the
+operator's own checkout, and broadcasting it to every connected client would
+publish it far more widely than the file ever was.
 
 `project_setup_step` carries the project name, the step (`prepare`, `clone`,
 `fork-remote`, `finalize`), and a `status` of `started`, `ok`, or `failed`,

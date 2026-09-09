@@ -468,7 +468,10 @@ def purge_task(engine: Engine, task_id: int) -> tuple[list[str], list[int]]:
     Purge is the only operation that deletes durable history; cleanup
     deliberately retains the review and the delivery journal (ADR-0016), and
     result bytes are never destroyed here at all — an unpurged complete
-    revision refuses the whole purge and names itself (ADR-0034).
+    revision refuses the whole purge and names itself (ADR-0034). Terminal
+    checkout-export history goes with the rest of the record; the files those
+    exports delivered are ordinary files in the operator's checkout and are
+    never touched (ADR-0036).
 
     This is also the only thing that releases a *consumer's* references
     (ADR-0035), and it happens after every refusal above has passed, in the
@@ -476,6 +479,10 @@ def purge_task(engine: Engine, task_id: int) -> tuple[list[str], list[int]]:
     failed, or cleaned up keeps its inputs, so it keeps its protection of them.
     """
     from ompire_daemon.registry.model_profiles import reserved_write
+    from ompire_daemon.registry.result_exports import (
+        assert_task_exports_settled_on,
+        delete_task_exports,
+    )
     from ompire_daemon.registry.results import (
         assert_no_retained_results,
         delete_task_results,
@@ -502,8 +509,14 @@ def purge_task(engine: Engine, task_id: int) -> tuple[list[str], list[int]]:
         # it. They are purged explicitly or not at all; tombstones travel with
         # the rest of the history.
         assert_no_retained_results(conn, task_id)
+        # An unfinished checkout export is an unexplained external effect on a
+        # directory Ompire does not own (ADR-0036). Its record is the only
+        # thing that says what it was doing, so it is resolved or acknowledged
+        # before the task's history can be deleted.
+        assert_task_exports_settled_on(conn, task_id)
         storage_paths = delete_task_deliveries_on(conn, task_id)
         released_producers = release_consumer_references_on(conn, task_id)
+        delete_task_exports(conn, task_id)
         delete_task_results(conn, task_id)
         conn.execute(workflow_step_records.delete().where(workflow_step_records.c.task_id == task_id))
         conn.execute(task_sessions.delete().where(task_sessions.c.task_id == task_id))

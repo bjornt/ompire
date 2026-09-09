@@ -640,6 +640,98 @@ task_result_references = Table(
     Index("ix_task_result_references_result", "result_id"),
 )
 
+# One deliberate export of a retained revision into the operator's project
+# checkout. The journal, not the copies: the bytes stay in `task_result_files`,
+# and the files this created are ordinary checkout files afterwards.
+#
+# The approved preview document is persisted whole, because the approval *is*
+# that document — a confirmation is checked against a recomputed preview, and a
+# row that only remembered a token could not say what the operator agreed to.
+# It carries metadata and hashes only; no destination content and no diff text
+# is ever stored here.
+result_exports = Table(
+    "result_exports",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("task_id", Integer, ForeignKey("tasks.id"), nullable=False),
+    Column("result_id", String, ForeignKey("task_results.id"), nullable=False),
+    Column("manifest_id", String, nullable=False),
+    Column("request_id", String, nullable=False),
+    Column("selection_json", Text, nullable=False),
+    Column("selection_fingerprint", String, nullable=False),
+    Column("prefix", String, nullable=False),
+    Column("preview_token", String, nullable=False),
+    Column("preview_json", Text, nullable=False),
+    Column("project_name", String, nullable=False),
+    Column("checkout_path", String, nullable=False),
+    # The root's filesystem identity, as observed at admission. Serialization
+    # keys off this pair rather than the project name or the configured path,
+    # so two registrations aliasing one directory cannot export concurrently.
+    Column("root_device", Integer, nullable=False),
+    Column("root_inode", Integer, nullable=False),
+    Column("state", String, nullable=False),
+    Column("error", Text, nullable=True),
+    # Journalled *before* the directory is created, so recovery can recognize
+    # daemon-owned staging it is allowed to clean up and refuse anything else.
+    Column("staging_name", String, nullable=False),
+    Column("staging_device", Integer, nullable=True),
+    Column("staging_inode", Integer, nullable=True),
+    Column("staging_error", Text, nullable=True),
+    Column("created_directories_json", Text, nullable=True),
+    Column("actor", String, nullable=False),
+    Column("confirmed_at", String, nullable=False),
+    Column("started_at", String, nullable=True),
+    Column("finished_at", String, nullable=True),
+    # An operator closing an unresolved export. It records that the uncertainty
+    # was read and accepted; it never rewrites an unknown file outcome into a
+    # successful one.
+    Column("acknowledged_at", String, nullable=True),
+    Column("acknowledged_by", String, nullable=True),
+    Index("ix_result_exports_task", "task_id", "confirmed_at"),
+    Index("ix_result_exports_result", "result_id"),
+    Index(
+        "uq_result_exports_request", "task_id", "request_id", unique=True
+    ),
+    # The durable root reservation. A partial unique index rather than an
+    # in-memory lock: two aliases of one checkout, or a second daemon process,
+    # must not both be installing into it, and an unresolved export keeps the
+    # root reserved until it is reconciled or explicitly acknowledged.
+    Index(
+        "uq_result_exports_active_root",
+        "root_device",
+        "root_inode",
+        unique=True,
+        sqlite_where=text("state IN ('running', 'unresolved')"),
+    ),
+)
+
+# One approved destination, its intent, and what actually happened to it.
+#
+# `before_json` is the observation the approval was bound to; `observed_json` is
+# what was seen afterwards. Keeping both is what lets an interrupted export be
+# classified honestly instead of guessed at: matching bytes alone never
+# establish who wrote them.
+result_export_files = Table(
+    "result_export_files",
+    metadata,
+    Column(
+        "export_id", String, ForeignKey("result_exports.id"), primary_key=True
+    ),
+    Column("manifest_path", String, primary_key=True),
+    Column("seq", Integer, nullable=False),
+    Column("destination", String, nullable=False),
+    Column("classification", String, nullable=False),
+    Column("expected_length", Integer, nullable=False),
+    Column("expected_sha256", String, nullable=False),
+    Column("before_json", Text, nullable=True),
+    Column("staged_device", Integer, nullable=True),
+    Column("staged_inode", Integer, nullable=True),
+    Column("outcome", String, nullable=False),
+    Column("observed_json", Text, nullable=True),
+    Column("error", Text, nullable=True),
+    Index("ix_result_export_files_export", "export_id", "seq"),
+)
+
 # ADR-0013: UI-editable overrides are persisted as JSON-encoded scalar
 # values and layered over operator-owned config.toml.
 settings = Table(

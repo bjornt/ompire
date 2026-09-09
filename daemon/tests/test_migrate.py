@@ -52,7 +52,7 @@ def test_fresh_db_upgrades_to_head(tmp_path: Path) -> None:
         }
         task_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(tasks)"))}
         project_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
-    assert version == "0021"
+    assert version == "0022"
     assert "projects" in tables
     assert "tasks" in tables
     # Templates are retired (ADR-0026): the live table is gone and only inert
@@ -205,7 +205,7 @@ def test_reopen_at_head_is_noop(tmp_path: Path) -> None:
     with engine.connect() as conn:
         version = conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
         row = conn.execute(text("SELECT name FROM projects")).scalar_one()
-    assert version == "0021"
+    assert version == "0022"
     assert row == "demo"
 
 
@@ -1957,7 +1957,7 @@ def test_0020_adds_results_without_inventing_any(tmp_path: Path) -> None:
     with engine.connect() as conn:
         assert (
             conn.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "0021"
+            == "0022"
         )
         assert conn.execute(text("SELECT COUNT(*) FROM task_results")).scalar_one() == 0
         row = conn.execute(
@@ -2021,3 +2021,53 @@ def test_0021_leaves_a_task_with_no_pinned_inputs_null(tmp_path: Path) -> None:
             text("SELECT execution_inputs_json FROM tasks WHERE slug = 'unpinned'")
         ).scalar_one()
     assert raw is None
+
+
+def test_0022_adds_the_export_journal_without_inventing_history(
+    tmp_path: Path,
+) -> None:
+    """A result retained before checkout export existed has no export history.
+
+    That is the fact, not an unknown outcome to reconcile: nothing was ever
+    written into the operator's checkout on its behalf, and a backfilled row
+    would be a claim about files this daemon never touched.
+    """
+    db_path = tmp_path / "ompire.db"
+    _land_at_0014(db_path)
+    engine = make_engine(db_path)
+    with engine.begin() as conn:
+        _insert_project(conn, "legacy")
+        _insert_pinned_task(conn, "legacy", _v2_document())
+
+    upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
+
+    with engine.connect() as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            )
+        }
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND tbl_name = 'result_exports'"
+                )
+            )
+        }
+        exports = conn.execute(
+            text("SELECT count(*) FROM result_exports")
+        ).scalar_one()
+        files = conn.execute(
+            text("SELECT count(*) FROM result_export_files")
+        ).scalar_one()
+
+    assert {"result_exports", "result_export_files"} <= tables
+    # The durable root reservation, which is what stops two project
+    # registrations aliasing one directory from installing into it at once.
+    assert "uq_result_exports_active_root" in indexes
+    assert "uq_result_exports_request" in indexes
+    assert exports == 0
+    assert files == 0

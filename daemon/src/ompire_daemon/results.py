@@ -61,6 +61,11 @@ from ompire_daemon.delivery import (
 )
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import redact_github_text
+from ompire_daemon.registry.result_exports import (
+    ExportRecord,
+    export_payload,
+    exports_by_result,
+)
 from ompire_daemon.registry.results import (
     CAPTURE_DEADLINE_SECONDS,
     MAX_DIFF_BYTES,
@@ -501,7 +506,30 @@ def _extension_of(name: str) -> str:
 # --- The content boundary ---------------------------------------------------
 
 
-def _validate_content(display: str, data: bytes, token_values: tuple[str, ...]) -> str:
+def credential_token_values(config: Config) -> tuple[str, ...]:
+    """The literal secrets the recognizer must never let through.
+
+    Read on every use rather than held on a manager, so a rotated token is
+    recognized without a restart. Shared with checkout export (ADR-0036): the
+    same values have to be recognized in a *destination* file a preview would
+    otherwise display back to the operator.
+    """
+    try:
+        token = (config.data_dir / "token").read_text().strip() or None
+    except OSError:
+        token = None
+    return tuple(
+        value
+        for value in (
+            os.environ.get("GH_TOKEN"),
+            os.environ.get("GITHUB_TOKEN"),
+            token,
+        )
+        if value
+    )
+
+
+def validate_content(display: str, data: bytes, token_values: tuple[str, ...]) -> str:
     """Decode strictly and refuse recognizable credentials.
 
     Returns the decoded text purely so the caller does not decode twice; the
@@ -596,11 +624,12 @@ class ResultManager:
         """
         results = list_results(self._engine, task_id)
         consumers = consumers_by_result(self._engine)
+        exports = exports_by_result(self._engine)
         return {
             "task_id": task_id,
             "version": results_version(self._engine, task_id),
             "results": [
-                self.result_payload(result, consumers=consumers)
+                self.result_payload(result, consumers=consumers, exports=exports)
                 for result in results
             ],
         }
@@ -611,6 +640,7 @@ class ResultManager:
         grouped = list_tasks_with_results(self._engine)
         versions = {task.id: task for task in list_tasks(self._engine)}
         consumers = consumers_by_result(self._engine)
+        exports = exports_by_result(self._engine)
         payload: dict[int, dict[str, Any]] = {}
         for task_id, results in grouped.items():
             if task_id not in versions:
@@ -619,7 +649,7 @@ class ResultManager:
                 "task_id": task_id,
                 "version": results_version(self._engine, task_id),
                 "results": [
-                    self.result_payload(result, consumers=consumers)
+                    self.result_payload(result, consumers=consumers, exports=exports)
                     for result in results
                 ],
             }
@@ -639,6 +669,7 @@ class ResultManager:
         result: TaskResult,
         *,
         consumers: Mapping[str, list[int]] | None = None,
+        exports: Mapping[str, list[ExportRecord]] | None = None,
     ) -> dict[str, Any]:
         """The wire shape of one revision, shared by REST and the projection so
         a client cannot see two different shapes for the same row.
@@ -647,6 +678,11 @@ class ResultManager:
         that pinned this exact revision as an input, and therefore the reason a
         purge would be refused. Passed in rather than queried per row so a
         fleet projection stays one query.
+
+        `exports` is the checkout-export history (ADR-0036), metadata only. A
+        running or unresolved entry is a *temporary* purge blocker; a settled
+        one is history, because the copies it delivered are ordinary files in
+        the operator's checkout and outlive everything here.
         """
         try:
             files = [
@@ -691,6 +727,12 @@ class ResultManager:
                 (consumers if consumers is not None else consumers_by_result(self._engine))
                 .get(result.id, ())
             ),
+            "exports": [
+                export_payload(record)
+                for record in (
+                    exports if exports is not None else exports_by_result(self._engine)
+                ).get(result.id, ())
+            ],
         }
 
     # -- capture --
@@ -836,15 +878,7 @@ class ResultManager:
         import hashlib
 
         deadline = time.monotonic() + CAPTURE_DEADLINE_SECONDS
-        token_values = tuple(
-            value
-            for value in (
-                os.environ.get("GH_TOKEN"),
-                os.environ.get("GITHUB_TOKEN"),
-                self._daemon_token(),
-            )
-            if value
-        )
+        token_values = credential_token_values(self._config)
         captured: list[_CapturedFile] = []
         total = 0
         with _Walker(clone_path, deadline) as walker:
@@ -858,7 +892,7 @@ class ResultManager:
                             f"selection exceeds the {MAX_TOTAL_BYTES}-byte total "
                             "limit; select fewer or smaller files"
                         )
-                    _validate_content(display, data, token_values)
+                    validate_content(display, data, token_values)
                     captured.append(
                         _CapturedFile(
                             path=display,
@@ -870,19 +904,6 @@ class ResultManager:
             finally:
                 walker.close_collected()
         return captured
-
-    def _daemon_token(self) -> str | None:
-        """The daemon's own bearer token, read from its file.
-
-        Included in the credential recognizer so a task that echoed the token
-        into a planning file cannot have it retained in a downloadable bundle.
-        Read here rather than held on the manager so a rotated token is
-        recognized without a restart.
-        """
-        try:
-            return (self._config.data_dir / "token").read_text().strip() or None
-        except OSError:
-            return None
 
     async def _provenance(self, task: Task) -> dict[str, Any]:
         """What is actually known about who produced these files.

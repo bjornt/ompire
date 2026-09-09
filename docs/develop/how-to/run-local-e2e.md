@@ -73,7 +73,7 @@ the daemon, and `cleanup` runs last.
 | `merge-poll` | Pull-request state polling to a terminal state |
 | `advisories-stalls` | Stall detection and context advisories |
 | `crash-recovery` | Killing the daemon mid-work and recovering, including inside a delivery's push window |
-| `durable-results` | Capturing planning files with no commit, reviewing and accepting one revision, downloading it, a successor and its comparison, a refused capture, identical bytes after a daemon restart and after cleanup, and guarded purge |
+| `durable-results` | Capturing planning files with no commit, reviewing and accepting one revision, downloading it, a successor and its comparison, a refused capture, identical bytes after a daemon restart and after cleanup, guarded purge, and a create-only export into a disposable checkout with its conflict, identical-destination, and purge-blocker behavior |
 | `cleanup` | Workshop removal, clone deletion, archival |
 
 `scenarios/ws-watch` sits beside these but is **not** a runbook — it is the
@@ -288,6 +288,55 @@ a destination already occupied in the clone.
 Use the existing `durable-results`, `ship-retain`, and `ship-failures` scenarios
 for the non-browser evidence around this; never use the real developer checkout
 as a target.
+
+### Verify a checkout export
+
+Export writes into a directory Ompire does not own, so the point of the pass is
+watching it *not* do things. **Never point it at your own working checkout.**
+Register a throwaway project on a disposable clone and export into that; the
+`durable-results` scenario's harness state root already gives you one.
+
+Against a task with an accepted revision:
+
+1. On the accepted revision, open **Export to project checkout**. It names the
+   registered checkout and offers no way to type another directory.
+2. **Preview export** with everything selected and no prefix. Every destination
+   reads **Create**. Confirm nothing appeared in the checkout: preview creates
+   no file, no directory, and no staging directory.
+3. Confirm. Compare the bytes and checksums on disk with the accepted manifest,
+   and check `git status`, `git log`, and the index in that checkout — export
+   performs no Git action, so HEAD and the index must be untouched and the new
+   files must show as untracked.
+4. Deselect a file and export again with a prefix. The tree lands under the
+   prefix, individual filenames are unchanged, and the form warns that a
+   relative link into an omitted file will not resolve.
+5. Edit one exported file in the checkout by hand and preview the same selection
+   again. It must classify as a **Conflict** with a difference, and
+   **Confirm export** must be disabled. Deselect that file — the rest exports,
+   and the edited file is still exactly as you left it.
+6. Preview a selection whose destinations are all already identical. It is a
+   valid export that writes nothing, and the files' modification times and
+   permissions are unchanged afterwards.
+7. Preview, then create a file at one of the previewed destinations before
+   confirming. Confirmation must refuse as a stale preview with nothing written.
+8. Clean up the producing task and export again from the same revision. It still
+   works: export reads retained bytes, never a workspace.
+9. Try to purge the revision while an export is unresolved — refused, naming the
+   export. Close it as unresolved, then purge: the retained bytes go and the
+   exported copies stay exactly where they are.
+
+Interruption evidence is the part worth taking seriously, because it is the
+claim recovery rests on. Kill the daemon mid-install — drive it from the harness
+or attach a debugger to the daemon process, never through a test-only branch in
+shipped code — restart, and open the panel. The export must have settled to
+**Not fully installed** or **Outcome unknown** with per-file outcomes, no
+destination may have been written after the restart, and nothing may have been
+deleted. Then finish with a *new* preview of the remaining files: delivered ones
+read already identical, and anything you changed in between reads as a conflict.
+
+Interruptions worth including: a second tab exporting to the same checkout (the
+second is refused, naming the first), and repointing the project's checkout path
+while an export is unresolved (refused, while other project edits still work).
 
 ### When there is no browser
 
