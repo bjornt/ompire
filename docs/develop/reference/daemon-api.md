@@ -190,6 +190,16 @@ longer holds. Every one of them responds with the task's whole versioned result
 document, the same one the WebSocket publishes, so a response and its broadcast
 converge through one reducer.
 
+Format-4 workflow capture is a separate trusted entrypoint, not an extension
+of that REST command. The runner passes its current attempt, frozen producer
+binding, rendered paths, and literal allowlist to `ResultManager`; the manager
+reserves one result per `(task, capture attempt)` before it reads any bytes.
+The public request cannot claim that provenance or reserve an attempt key. A
+ready linked result is adopted on recovery; a still-capturing linked result is
+failed without a reread. A result-bound gate snapshots this exact result and
+rechecks its acceptance and payload on `resolve_gate`'s same write connection,
+so another revision, a purge, or a stale answer cannot advance it.
+
 Status codes are narrow on purpose: `422` for a request that was never well
 formed, `404` for an unknown task, revision, or file, `409` for a state or
 expectation that no longer holds, and `410` for a purged revision — a real,

@@ -48,16 +48,18 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         assert payload["projects"] == []
         assert payload["model_profiles"] == []
         # The library is what exists; the catalog is what a launch may select
-        # (ADR-0031). Both come from one read, so a fresh install shows the two
-        # packaged built-ins in both, each carrying its current revision.
+        # (ADR-0031). Both come from one read, so a fresh install shows the
+        # packaged workflows in both, each carrying its current revision.
         assert [w["name"] for w in payload["workflow_library"]] == [
             "bugfix",
+            "planning",
             "single-step",
         ]
         assert {w["origin"] for w in payload["workflow_library"]} == {"builtin"}
         assert all(w["available"] for w in payload["workflow_library"])
         assert [w["name"] for w in payload["workflow_catalog"]] == [
             "bugfix",
+            "planning",
             "single-step",
         ]
         assert payload["tasks"] == []
@@ -491,7 +493,7 @@ def test_a_mutation_during_snapshot_delivery_is_not_lost(
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         snapshot = ws.receive_json()["payload"]
         names = [e["name"] for e in snapshot["workflow_library"]]
-        assert names == ["bugfix", "custom", "single-step"]
+        assert names == ["bugfix", "custom", "planning", "single-step"]
 
         entry = next(e for e in snapshot["workflow_library"] if e["name"] == "custom")
         client.post(

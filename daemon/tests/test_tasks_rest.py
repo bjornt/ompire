@@ -370,7 +370,7 @@ def test_workflow_catalog_describes_every_declared_step(
     client: TestClient, auth_headers: dict
 ) -> None:
     catalog = {w["name"]: w for w in client.get("/api/workflows", headers=auth_headers).json()}
-    assert set(catalog) == {"bugfix", "single-step"}
+    assert set(catalog) == {"bugfix", "planning", "single-step"}
     bugfix = catalog["bugfix"]
     assert [step["name"] for step in bugfix["steps"]] == [
         "reproduce",

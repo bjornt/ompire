@@ -359,3 +359,46 @@ describe("format-3 flow reading", () => {
     expect(gate?.metadata.map((entry) => entry.field)).toEqual(["pr_title"]);
   });
 });
+
+describe("format 4 capture and result gates", () => {
+  it("keeps their explicit route and evidence bindings structural", () => {
+    const document = parseLossless(
+      JSON.stringify({
+        format: 4,
+        name: "planning",
+        sessions: ["planner"],
+        primary: "planner",
+        steps: [
+          { name: "propose", kind: "agent", session: "planner", outcome: null, prompt: { parts: [] } },
+          {
+            name: "capture",
+            kind: "capture",
+            evidence: { producer: { steps: ["propose"] } },
+            producer: "producer",
+            paths: [{ parts: [{ text: "changes/example/PLAN.md" }] }],
+            allowlist: ["changes"],
+            next: { step: "decide" },
+          },
+          {
+            name: "decide",
+            kind: "gate",
+            evidence: { captured: { steps: ["capture"] } },
+            result: { evidence: "captured" },
+            message: { parts: [] },
+            choices: [],
+          },
+        ],
+      }),
+    ) as DraftObject;
+
+    const renamed = renameEvidenceAlias(document, 2, "captured", "result");
+    expect((renamed.steps as DraftObject[])[2].result).toEqual({ evidence: "result" });
+    expect(referencesTo(document, "step", "decide").map((reference) => reference.location)).toContain(
+      "steps[1].next.step",
+    );
+    expect(readFlow(document).edges.find((edge) => edge.from === "capture")).toMatchObject({
+      kind: "captured",
+      to: { kind: "step", step: "decide" },
+    });
+  });
+});

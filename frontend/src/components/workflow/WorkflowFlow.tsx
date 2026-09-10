@@ -51,6 +51,7 @@ const EDGE_WORDS: Record<FlowEdge["kind"], string> = {
   // ordinary answer is how a diagram hides what a click would permit.
   authorize: "you authorize",
   delivered: "once published",
+  captured: "files retained",
   exhausted: "bound reached",
   skip: "skipped",
 };
@@ -421,6 +422,20 @@ export function WorkflowFlow({
                       </Row>
                     </>
                   )}
+                  {kind === "capture" && (
+                    <>
+                      <Row label="Retains">
+                        {asArray(step.paths).length === 0
+                          ? "no paths declared"
+                          : `${asArray(step.paths).length} declared path${asArray(step.paths).length === 1 ? "" : "s"} under ${asArray(step.allowlist)
+                              .map((root) => asString(root) ?? "?")
+                              .join(", ") || "no allowlist"}`}
+                      </Row>
+                      <Row label="Produced by">
+                        <code className="mono">{asString(step.producer) ?? "no evidence alias"}</code>
+                      </Row>
+                    </>
+                  )}
                   {evidence.length > 0 && (
                     <Row label="Reads">
                       <ul className="flowList">
@@ -457,6 +472,9 @@ export function WorkflowFlow({
                               {object?.feedback_required === true
                                 ? " · needs a reason from you"
                                 : ""}
+                              {object?.requires_result_acceptance === true
+                                ? " · requires accepted result"
+                                : ""}
                               {grant === "" ? (
                                 ""
                               ) : (
@@ -477,6 +495,14 @@ export function WorkflowFlow({
                         : ` · it suggests ${deliveryGate.metadata
                             .map((entry) => entry.field)
                             .join(", ")}`}
+                    </Row>
+                  )}
+                  {kind === "gate" && asObject(step.result) !== null && (
+                    <Row label="Retained result">
+                      This gate names the capture bound to{" "}
+                      <code className="mono">{asString(asObject(step.result)?.evidence) ?? "no evidence alias"}</code>.
+                      A choice marked “requires accepted result” checks that exact
+                      readable revision; accepting a different result does not satisfy it.
                     </Row>
                   )}
                   {deliveryAction !== null && (

@@ -55,6 +55,7 @@ from ompire_daemon.registry.results import (
     mark_unavailable,
     normalize_selection,
     open_capture,
+    open_workflow_capture,
     purge_result,
     read_all_files,
     read_result_on,
@@ -291,6 +292,39 @@ def test_failed_capture_is_never_a_predecessor(engine, task) -> None:
 
     assert second.predecessor_id is None
 
+
+
+def test_workflow_capture_reserves_its_attempt_and_preserves_provenance(
+    engine, task
+) -> None:
+    selection = normalize_selection(["epics/demo"])
+    first, created = open_workflow_capture(
+        engine,
+        task_id=task.id,
+        workflow_seq=7,
+        selection=selection,
+        provenance={
+            "producing_attempt": 6,
+            "producing_step": "propose",
+            "producing_session": "plan",
+        },
+    )
+    replayed, replay_created = open_workflow_capture(
+        engine,
+        task_id=task.id,
+        workflow_seq=7,
+        selection=selection,
+        provenance={"producing_attempt": 999},
+    )
+
+    assert created and not replay_created
+    assert replayed.id == first.id
+    assert first.workflow_seq == 7
+    assert first.workflow_provenance == {
+        "producing_attempt": 6,
+        "producing_step": "propose",
+        "producing_session": "plan",
+    }
 
 # --- Atomicity --------------------------------------------------------------
 

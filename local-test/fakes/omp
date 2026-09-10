@@ -294,14 +294,25 @@ def write_result(scenario: str, turn: int, message: str, params: dict) -> str | 
     else:
         chosen = names[0]
     required = dict(declared)[chosen]
+    artifacts = {
+        field: _artifact_value(field, declared_type, params)
+        for field, declared_type in required
+    }
+    if scenario == "plan-files":
+        # The packaged planning workflow's capture paths come from the
+        # declared outcome. Keep this fake's claim and workspace side effect
+        # coupled so the local scenario exercises capture, not an invented
+        # path failure.
+        plan_dir = params.get("plan-dir", PLAN_DIR_DEFAULT)
+        if "root" in artifacts:
+            artifacts["root"] = plan_dir
+        if "epic_root" in artifacts:
+            artifacts["epic_root"] = plan_dir
     document = {
         "version": 2,
         "result": chosen,
         "summary": f"fake omp {scenario} turn {turn}: {chosen}",
-        "artifacts": {
-            field: _artifact_value(field, declared_type, params)
-            for field, declared_type in required
-        },
+        "artifacts": artifacts,
     }
     path = Path.cwd() / OUTCOME_PATH
     path.parent.mkdir(parents=True, exist_ok=True)

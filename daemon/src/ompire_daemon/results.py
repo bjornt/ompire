@@ -99,6 +99,7 @@ from ompire_daemon.registry.results import (
     mark_unavailable,
     normalize_selection,
     open_capture,
+    open_workflow_capture,
     purge_result,
     read_all_files,
     read_file_bytes,
@@ -711,11 +712,14 @@ class ResultManager:
             "manifest_id": result.manifest_id,
             "content_id": result.content_id,
             "predecessor_id": result.predecessor_id,
+            "workflow_seq": result.workflow_seq,
+            "workflow_provenance": result.workflow_provenance,
             "selection": list(result.selection),
             "files": files,
             "file_count": len(files),
             "total_bytes": sum(entry["length"] for entry in files),
             "provenance": manifest.get("provenance"),
+            "input_results": manifest.get("input_results", []),
             "captured_at": manifest.get("captured_at") or result.started_at,
             "started_at": result.started_at,
             "finished_at": result.finished_at,
@@ -791,6 +795,40 @@ class ResultManager:
         job.add_done_callback(self._jobs.discard)
         return projection
 
+    async def capture_workflow(
+        self,
+        task: Task,
+        *,
+        workflow_seq: int,
+        paths: list[str],
+        allowlist: tuple[str, ...],
+        provenance: dict[str, Any],
+    ) -> TaskResult:
+        """Capture an attempt-owned declaration and return that exact result.
+
+        No REST request can enter here: the runner supplies its persisted
+        sequence and frozen producer binding. A retry of the same attempt
+        returns the operation already linked to it and never rereads the clone.
+        """
+        selection = normalize_selection(paths)
+        for path in selection:
+            if not any(path.startswith(root + "/") for root in allowlist):
+                raise InvalidSelectionError(
+                    path, "is outside this workflow capture's declared allowlist"
+                )
+        self._admit(task.id)
+        result, created = open_workflow_capture(
+            self._engine,
+            task_id=task.id,
+            workflow_seq=workflow_seq,
+            selection=selection,
+            provenance=provenance,
+        )
+        if created:
+            self.publish(task.id)
+            await self._run_capture(task, result.id, selection)
+        return get_result(self._engine, result.id)
+
     async def _run_capture(
         self, task: Task, result_id: str, selection: tuple[str, ...]
     ) -> None:
@@ -801,7 +839,10 @@ class ResultManager:
                 # task between admission and acquiring the guard.
                 self._admit(task.id)
                 captured = await self._read_bounded(Path(task.clone_path), selection)
-                provenance = await self._provenance(task)
+                result = get_result(self._engine, result_id)
+                provenance = await self._provenance(
+                    task, workflow=result.workflow_provenance
+                )
                 manifest = build_manifest(
                     result_id=result_id,
                     task_id=task.id,
@@ -816,11 +857,11 @@ class ResultManager:
                         )
                         for item in captured
                     ],
-                    predecessor_id=get_result(
-                        self._engine, result_id
-                    ).predecessor_id,
+                    predecessor_id=result.predecessor_id,
                     provenance=provenance,
                     captured_at=_now_iso(),
+                    capture_actor="workflow" if result.workflow_seq is not None else "operator",
+                    input_results=self._input_results(task),
                 )
                 finish_capture(
                     self._engine,
@@ -905,32 +946,37 @@ class ResultManager:
                 walker.close_collected()
         return captured
 
-    async def _provenance(self, task: Task) -> dict[str, Any]:
-        """What is actually known about who produced these files.
+    @staticmethod
+    def _input_results(task: Task) -> list[dict[str, Any]]:
+        inputs = task.execution_inputs
+        if inputs is None:
+            return []
+        return [
+            {
+                "producer_task_id": attachment.producer_task_id,
+                "result_id": attachment.result_id,
+                "manifest_id": attachment.manifest_id,
+            }
+            for attachment in inputs.result_attachments
+        ]
 
-        Every unknown is named as unknown. Manual capture is the operator's
-        action, so `capture_actor` is `operator` and the run's most recent step
-        is *not* relabeled as the producer: the current step is evidence that
-        something ran, never evidence that it wrote a particular file.
-
-        The Git values are labelled `capture_*` because that is what they are —
-        observations made at capture time, not the commit the task was spawned
-        from. `launch_base_branch` is the recorded intent and is preserved
-        separately; when it was never recorded, that is a classified gap rather
-        than today's project default quietly standing in for it.
-        """
+    async def _provenance(
+        self, task: Task, *, workflow: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Record capture-time observations without inferring authorship."""
         inputs = task.execution_inputs
         gaps: list[str] = []
         provenance: dict[str, Any] = {
             "capture_actor": "operator",
             "workflow_name": task.workflow_name,
             "workflow_revision": inputs.workflow_revision if inputs else None,
-            # Manual capture knows nothing about which attempt, session, or run
-            # authored each file, and recency is not evidence.
             "producing_run": "unknown",
             "producing_step": "unknown",
             "producing_session": "unknown",
         }
+        if workflow is not None:
+            provenance.update(workflow)
+            provenance["capture_actor"] = "workflow"
         if inputs is None:
             gaps.append("launch_inputs")
             provenance["launch_base_branch"] = None

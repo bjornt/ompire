@@ -202,8 +202,11 @@ sizes, media types, and SHA-256 checksums, plus its provenance.
 Provenance says what is actually known. A manual capture is attributed to the
 operator, and the producing run, step, and session read **unknown**: the run's
 most recent step is evidence that something executed, not evidence that it wrote
-these files. The commit shown is labelled as an observation made at capture
-time, distinct from the base branch recorded when the task was launched.
+these files. A workflow-owned capture instead names its producing step and the
+workflow attempt that retained the revision. The commit shown is labelled as an
+observation made at capture time, distinct from the base branch recorded when
+the task was launched. When the producer was launched with accepted result
+inputs, the panel links each exact input revision back to its producing task.
 Anything unrecorded is listed as a gap rather than guessed at.
 
 Selecting a file shows its retained text as escaped source. Markdown is not
@@ -224,6 +227,12 @@ purged or is unavailable, the panel names that instead of treating it as empty.
 **Accept this revision** records that the operator reviewed and is keeping
 exactly the displayed files. The label beside it states the scope: it does not
 approve code, answer a workflow question, or allow anything to be published.
+
+A workflow gate can name a retained revision without turning acceptance into
+publication authority. Its task card identifies the capture step and attempt
+and links to Results. A finish choice marked **requires accepted result** is
+refused until that exact readable revision is accepted; accepting a successor,
+predecessor, or another result does not satisfy it.
 
 Acceptance names the exact revision. A stale page — one showing a revision that
 has since been superseded, purged, or found damaged — is refused, and the

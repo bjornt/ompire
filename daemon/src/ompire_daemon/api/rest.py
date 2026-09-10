@@ -1150,7 +1150,7 @@ def export_workflow_revision_route(
 
 
 # The starter a new workflow opens on: the smallest thing that is a real
-# format-3 definition. One agent step that gets the operator's prompt, and an
+# format-4 definition. One agent step that gets the operator's prompt, and an
 # ending that says what finishing meant — because format 2 onwards does not
 # let a run stop by falling off the end of the list.
 #
@@ -1166,7 +1166,7 @@ STARTER_TEMPLATE = """\
 # This workflow publishes nothing. To publish, add a `review` step, a gate
 # whose `delivery` binds that review, and the `delivery` actions one of its
 # choices authorizes.
-format: 3
+format: 4
 name: {name}
 sessions: [main]
 primary: main

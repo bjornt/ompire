@@ -76,7 +76,7 @@ MEDIA_TYPES: dict[str, str] = {
 
 SUPPORTED_EXTENSIONS = tuple(sorted(MEDIA_TYPES))
 
-MANIFEST_FORMAT = 1
+MANIFEST_FORMAT = 2
 
 # Capture states. `capturing` is in flight, `failed` is a capture that produced
 # no bundle at all, `ready` is a complete retained revision, and `purged` is a
@@ -255,6 +255,8 @@ class TaskResult:
     manifest_id: str | None
     content_id: str | None
     predecessor_id: str | None
+    workflow_seq: int | None
+    workflow_provenance: dict[str, Any] | None
     started_at: str
     finished_at: str | None
     accepted_at: str | None
@@ -423,13 +425,14 @@ def build_manifest(
     predecessor_id: str | None,
     provenance: Mapping[str, Any],
     captured_at: str,
+    capture_actor: str = "operator",
+    input_results: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """The immutable description of exactly what was retained.
 
-    Versioned by `format` so a later shape can be recognized rather than
-    guessed at — and deliberately closed: there is no free-form metadata map an
-    agent could write into, because a manifest is Ompire's statement about what
-    it captured, not the task's statement about itself.
+    Version two adds immutable task-input references. Old manifests remain
+    readable as format one; no row is rewritten to claim linkage it never
+    recorded.
     """
     ordered = sorted(files, key=lambda entry: entry.path)
     return {
@@ -438,7 +441,7 @@ def build_manifest(
         "task_id": task_id,
         "project_name": project_name,
         "captured_at": captured_at,
-        "capture_actor": "operator",
+        "capture_actor": capture_actor,
         "selection": list(selection),
         "files": [
             {
@@ -453,6 +456,7 @@ def build_manifest(
         "total_bytes": sum(entry.length for entry in ordered),
         "predecessor_id": predecessor_id,
         "provenance": dict(provenance),
+        "input_results": [dict(item) for item in input_results],
     }
 
 
@@ -514,6 +518,12 @@ def _row_to_result(row) -> TaskResult:
         manifest_id=row.manifest_id,
         content_id=row.content_id,
         predecessor_id=row.predecessor_id,
+        workflow_seq=row.workflow_seq,
+        workflow_provenance=(
+            json.loads(row.workflow_provenance_json)
+            if row.workflow_provenance_json
+            else None
+        ),
         started_at=row.started_at,
         finished_at=row.finished_at,
         accepted_at=row.accepted_at,
@@ -536,6 +546,8 @@ _METADATA_COLUMNS = (
     task_results.c.manifest_id,
     task_results.c.content_id,
     task_results.c.predecessor_id,
+    task_results.c.workflow_seq,
+    task_results.c.workflow_provenance_json,
     task_results.c.started_at,
     task_results.c.finished_at,
     task_results.c.accepted_at,
@@ -666,31 +678,77 @@ def open_capture(
     request_id: str,
     selection: Sequence[str],
 ) -> tuple[TaskResult, bool]:
-    """Record a capture's identity before a single byte is read.
+    """Admit one operator capture under its caller-owned replay key."""
+    return _open_capture(
+        engine,
+        task_id=task_id,
+        request_id=request_id,
+        selection=selection,
+        workflow_seq=None,
+        workflow_provenance=None,
+    )
 
-    Returns `(result, created)`. `created` is False for a replay: the same
-    request id with the same selection answers with the original operation,
-    *including* its failure, because a lost response must not turn into a
-    second attempt that captures different bytes. A different selection under
-    that id is refused outright.
 
-    The predecessor is frozen here, at admission, as the most recent ready
-    revision. A capture that later fails never becomes anyone's predecessor,
-    and a revision that lands while this one is reading does not retarget it.
+def open_workflow_capture(
+    engine: Engine,
+    *,
+    task_id: int,
+    workflow_seq: int,
+    selection: Sequence[str],
+    provenance: Mapping[str, Any],
+) -> tuple[TaskResult, bool]:
+    """Admit a capture owned by one persisted workflow attempt.
+
+    This is intentionally not a variation of the public request-id API:
+    callers cannot claim the reserved workflow sequence or its provenance.
+    Re-driving the same attempt returns its original operation instead of
+    reading current workspace bytes.
     """
+    if workflow_seq < 1:
+        raise ValueError("workflow sequence must be positive")
+    return _open_capture(
+        engine,
+        task_id=task_id,
+        request_id=f"workflow:{workflow_seq}:{secrets.token_hex(16)}",
+        selection=selection,
+        workflow_seq=workflow_seq,
+        workflow_provenance=provenance,
+    )
+
+
+def _open_capture(
+    engine: Engine,
+    *,
+    task_id: int,
+    request_id: str,
+    selection: Sequence[str],
+    workflow_seq: int | None,
+    workflow_provenance: Mapping[str, Any] | None,
+) -> tuple[TaskResult, bool]:
     fingerprint = selection_fingerprint(selection)
     selection_json = json.dumps(list(selection), separators=(",", ":"))
     now = _now_iso()
     result_id = new_result_id()
     with reserved_write(engine) as conn:
-        existing = conn.execute(
-            _metadata_select()
-            .where(task_results.c.task_id == task_id)
-            .where(task_results.c.request_id == request_id)
-        ).first()
+        existing = (
+            conn.execute(
+                _metadata_select()
+                .where(task_results.c.task_id == task_id)
+                .where(task_results.c.workflow_seq == workflow_seq)
+            ).first()
+            if workflow_seq is not None
+            else conn.execute(
+                _metadata_select()
+                .where(task_results.c.task_id == task_id)
+                .where(task_results.c.request_id == request_id)
+            ).first()
+        )
         if existing is not None:
             if existing.selection_fingerprint != fingerprint:
-                raise SelectionMismatchError(request_id, existing.id)
+                raise SelectionMismatchError(
+                    f"workflow:{workflow_seq}" if workflow_seq is not None else request_id,
+                    existing.id,
+                )
             return _row_to_result(existing), False
         in_flight = conn.execute(
             select(task_results.c.id)
@@ -719,6 +777,12 @@ def open_capture(
                 manifest_id=None,
                 content_id=None,
                 predecessor_id=predecessor.id if predecessor is not None else None,
+                workflow_seq=workflow_seq,
+                workflow_provenance_json=(
+                    canonical_json(workflow_provenance)
+                    if workflow_provenance is not None
+                    else None
+                ),
                 started_at=now,
                 finished_at=None,
                 accepted_at=None,

@@ -54,6 +54,7 @@ relying on it.
 | [0034](0034-retain-durable-task-results-outside-the-workspace.md) | Retain durable task results outside the workspace | Accepted |
 | [0035](0035-refuse-to-publish-handoff-destinations.md) | Refuse to publish handoff destinations | Accepted |
 | [0036](0036-install-exported-result-files-without-replacing-them.md) | Install exported result files without replacing them | Accepted |
+| [0037](0037-capture-workflow-results-before-accepted-handoffs.md) | Capture workflow results before accepted handoffs | Accepted |
 
 ## Template
 

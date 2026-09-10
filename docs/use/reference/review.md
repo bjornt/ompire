@@ -22,6 +22,10 @@ written in the definition. A workflow that declares none is reviewed by the
 operator, exactly as before. Task detail says which of the two you are looking
 at.
 
+A retained planning result is not review evidence. **Accept this revision**
+keeps exact files, while review grades a publishable Git candidate; neither
+decision implies the other or grants delivery authority.
+
 ## Using review
 
 ### Operator interface

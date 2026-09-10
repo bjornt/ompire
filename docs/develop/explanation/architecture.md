@@ -109,12 +109,12 @@ lazily. One is declared primary, and task-scoped operations — review, ship —
 target it.
 
 A workflow definition is a **document**, not code: a bounded YAML subset
-declaring sequential `agent`, `command`, `decision`, `gate`, `review`, and
-`delivery` steps, with a content-derived revision as its identity. The document carries its own
-semantics version, so a change to what a retained document *means* is a new
-format rather than a silent reinterpretation; two versions execute side by
-side. Workflow state and step records are
-durable; in-memory runners re-drive them after a restart.
+declaring sequential `agent`, `command`, `decision`, `gate`, `review`,
+`delivery`, and format-4 `capture` steps, with a content-derived revision as
+its identity. The document carries its own semantics version, so a change to
+what a retained document *means* is a new format rather than a silent
+reinterpretation; two versions execute side by side. Workflow state and step
+records are durable; in-memory runners re-drive them after a restart.
 
 The definition and the engine are separate on purpose. `workflow_definitions.py`
 answers "what does this document mean" — data model, loader, canonical
@@ -151,6 +151,18 @@ decision a person already made to any crash in between.
 Human edges are ordinary routes: they pass through the same visit bounds, so a
 loop built out of answers is as finite as one built out of results, and no
 answer grants authority the definition did not declare.
+
+### Result capture is a workflow operation, not an agent claim
+
+A format-4 capture binds one declared producer attempt and renders its
+allowlisted paths from that attempt's frozen evidence. The trusted result
+service retains those bytes before the run can route to a result gate. The gate
+freezes the resulting revision identity and, in the same transaction that
+records its answer, can verify that this exact revision remains accepted and
+readable. Acceptance stays a separate retention decision: it neither advances
+the run nor grants review or publication authority. This preserves the
+workspace boundary while making a planning result durable and explainable
+([ADR-0037](../../adr/0037-capture-workflow-results-before-accepted-handoffs.md)).
 
 ### The workflow owns authority; the trusted services own the operations
 

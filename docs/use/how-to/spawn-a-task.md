@@ -137,6 +137,23 @@ When you later ship the code this task produced, the handoff files cannot ride
 along: Ompire refuses a delivery whose Git result carries one, and says which
 path is in the way. See [Ship flow](../reference/ship-flow.md#handoff-inputs).
 
+### Plan a change or epic
+
+Choose the packaged **planning** workflow when the deliverable is an epic or
+lightweight change proposal rather than application code. It researches and
+creates the declared `EPIC.md`, or `SPEC.md` and `PLAN.md`, then captures those
+exact files and waits. It declares no review, delivery, checkout export, or
+downstream launch step, so its preview states that it can publish nothing.
+
+Open the task's **Results** link from the waiting gate, inspect the captured
+revision, and select **Accept this revision**. Then choose **Finish with
+accepted result**. Acceptance keeps the bytes; the gate answer finishes this
+one procedure. Requesting changes requires feedback and creates a separately
+captured revision; **Stop without accepting** grants nothing. You may clean up
+the producer after either ending. To refine or implement the proposal later,
+use **Start task from this result** on an accepted readable revision and review
+the ordinary Spawn form before it starts a new isolated task.
+
 If the `inputs` step fails — a path turned out to be occupied, or the base moved
 under the launch — the task fails before any agent runs, and the failure names
 what stopped it. The clone is left as it is so you can look at it. Clean the
@@ -287,9 +304,8 @@ itself readable there.
 
 ## Workflows
 
-Two workflows ship as read-only examples, and both are available to every
+Three workflows ship as read-only examples, and all are available to every
 project:
-
 - `single-step` — one agent step. The agent works, you review, you ship.
 - `bugfix` — QA tries to reproduce, a coder diagnoses, QA tries again with
   those findings if the first attempt failed, then fix and verify. Routing is
@@ -298,6 +314,9 @@ project:
   declares rather than a bare Resume. Its five model consumers are `reproduce`,
   `diagnose`, `reproduce-informed`, `fix`, and `verify`. See
   [the bugfix workflow](../reference/bugfix-workflow.md).
+- `planning` — prepares one epic or change proposal, retains its declared
+  files, and waits for an independent result-acceptance decision before it can
+  end. It does not review or publish source code.
 
 You add your own in **Workflows** — see below.
 
@@ -316,7 +335,7 @@ not a new conversation and not a failure.
 
 Open **Workflows**. There is no daemon release and no restart in this loop.
 
-1. **Start from something.** *New workflow* opens a minimal format-3 example
+1. **Start from something.** *New workflow* opens a minimal format-4 example
    that publishes nothing;
    *Duplicate* copies a saved revision — including a packaged one — under a name
    you choose; *Import YAML…* reads a local file into the editor. You can also

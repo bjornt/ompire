@@ -29,6 +29,7 @@ MATRIX=(
 	ask-approval
 	workflow-decisions
 	review-comments
+	planning-handoff
 	ship-retain
 	ship-endings
 	ship-failures

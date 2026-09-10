@@ -145,7 +145,7 @@ def test_unsupported_format_is_refused_not_reinterpreted() -> None:
     # A version this interpreter does not implement is refused rather than
     # read under the newest rules it happens to know.
     with pytest.raises(UnsupportedWorkflowFormatError):
-        load(MINIMAL.replace("format: 1", "format: 4"))
+        load(MINIMAL.replace("format: 1", "format: 5"))
 
 
 @pytest.mark.parametrize(
@@ -1432,3 +1432,58 @@ def test_an_invalid_draft_is_still_a_draft() -> None:
     assert check_draft_data(half) is half
     with pytest.raises(WorkflowDocumentError):
         definition_from_document(half)
+
+
+def test_format_4_composes_declared_capture_and_result_gate() -> None:
+    revision = load(
+        """
+format: 4
+name: planning
+sessions: [plan]
+primary: plan
+steps:
+  - name: propose
+    kind: agent
+    session: plan
+    role: plan
+    outcome:
+      results:
+        proposed:
+          required: {root: string}
+    prompt:
+      parts: [{text: prepare a proposal}]
+  - name: capture
+    kind: capture
+    evidence:
+      producer:
+        steps: [propose]
+        required: true
+        with_outcome: true
+    producer: producer
+    paths:
+      - parts: [{text: changes/example/SPEC.md}]
+    allowlist: [changes]
+    next: {step: decide}
+  - name: decide
+    kind: gate
+    evidence:
+      captured:
+        steps: [capture]
+        required: true
+    result: {evidence: captured}
+    message:
+      parts: [{text: inspect the captured result}]
+    choices:
+      - id: finish
+        label: Finish with accepted result
+        requires_result_acceptance: true
+        next: {complete: true, result: accepted-result}
+      - id: stop
+        label: Stop without accepting
+        next: {complete: true, result: stopped}
+"""
+    )
+
+    assert revision.format == 4
+    assert revision.definition.step_named("capture").kind == "capture"
+    assert load_definition(export_yaml(revision)).revision == revision.revision

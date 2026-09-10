@@ -14,10 +14,10 @@ executes that exact revision for the rest of its life
 exact grammar is a contributor reference:
 [Workflow definitions](../../develop/reference/workflow-definitions.md).
 
-Two definitions ship with the daemon as read-only examples:
-[`single-step`](#the-single-step-workflow) and [`bugfix`](bugfix-workflow.md).
-You add your own in the [workflow library](#the-workflow-library) — no daemon
-release, and no restart.
+Three definitions ship with the daemon as read-only examples:
+`single-step`, [`bugfix`](bugfix-workflow.md), and `planning`. You add your own
+in the [workflow library](#the-workflow-library) — no daemon release, and no
+restart.
 
 A workflow also owns its ending. [Review](#review-steps) and each trusted
 publication effect — a local signed commit, a push, a pull request — are steps
@@ -31,32 +31,37 @@ A definition declares:
 
 | Part | Meaning |
 |---|---|
-| `format` | The document format *and* its interpretation: `1` or `2`. |
+| `format` | The document format and its interpretation: `1` through `4`. |
 | `name` | The library entry's name; a launch selects it. Permanent — renaming means creating a separate workflow |
 | `sessions` | Slug-format session names, declared up front, unique per task |
 | `primary` | Session targeted by task-scoped operations |
-| steps | Ordered, uniquely named, of six kinds. An `agent` step also declares the abstract model role it consumes. |
+| steps | Ordered, uniquely named, of seven kinds. An `agent` step also declares the abstract model role it consumes. |
 
 Steps fall through to the next declared step on success. A `decision` step
-routes explicitly, a `gate` step's chosen answer routes too, and a `delivery`
+routes explicitly, a `gate` step's chosen answer routes too, a `capture` step
+retains its declared files before following its explicit route, and a `delivery`
 step routes to the next action or to the ending its chain reaches.
 
-Three formats are installed and all execute. **Format 1** is frozen: a
+Four formats are installed and all execute. **Format 1** is frozen: a
 definition retained under it is always read under its original rules, so a task
 accepted years ago keeps meaning what it meant. **Format 2** adds declared
 results, recorded evidence, and gates with named choices, and removes the two
-places format 1 left meaning implicit. **Format 3** adds the ending: review and
-each trusted publication effect become steps, and an approving answer names the
-exact chain it permits. Both packaged workflows are format 3.
+places format 1 left meaning implicit. **Format 3** adds review and each trusted
+publication effect as steps; an approving answer names the exact chain it
+permits. **Format 4** adds a workflow-owned `capture` step and an optional gate
+binding to its exact retained revision. It does not add publication authority.
+The packaged planning workflow is format 4; the other packaged workflows are
+format 3.
 
-| | Format 1 | Format 2 | Format 3 |
-|---|---|---|---|
-| Agent result | `status: "success" \| "failed"` plus an untyped artifact bag | a [declared result](#declared-results-format-2-onwards) with required artifact fields | as format 2 |
-| Reading prior attempts | `latest`, re-scanned on every evaluation | [evidence bound once](#evidence-format-2-onwards) at attempt entry and recorded | as format 2 |
-| Gate | Resume, with an optional note | [named choices](#gate-steps) with declared destinations | plus answers that authorize publication |
-| Ending | falling off the last step | `{complete: true, result: <name>}` | as format 2 |
-| Review | an operator command beside the run | same | a [declared step](#review-steps) whose verdict routes |
-| Publishing | an operator command beside the run | same | [declared steps](#publication-steps) a person authorizes |
+| | Format 1 | Format 2 | Format 3 | Format 4 |
+|---|---|---|---|---|
+| Agent result | `status: "success" \| "failed"` plus an untyped artifact bag | a [declared result](#declared-results-format-2-onwards) with required artifact fields | as format 2 | as format 2 |
+| Reading prior attempts | `latest`, re-scanned on every evaluation | [evidence bound once](#evidence-format-2-onwards) at attempt entry and recorded | as format 2 | as format 2 |
+| Gate | Resume, with an optional note | [named choices](#gate-steps) with declared destinations | plus answers that authorize publication | optionally names a captured revision and can require its acceptance |
+| Capture | — | — | — | a declared, bounded result capture |
+| Ending | falling off the last step | `{complete: true, result: <name>}` | as format 2 | as format 2 |
+| Review | an operator command beside the run | same | a [declared step](#review-steps) whose verdict routes | as format 3 |
+| Publishing | an operator command beside the run | same | [declared steps](#publication-steps) a person authorizes | as format 3 |
 
 A newer definition cannot be offered as a continuation candidate for a task
 whose history was recorded under format 1: those results were written under a
@@ -135,21 +140,24 @@ rather than two documents. **Visual** is a list of step cards with an agents
 panel; **YAML** is the text. Switching between them is not a save and not a
 launch.
 
-The visual editor covers everything either format supports: named agents and
-which one the task opens on, each step's kind, assigned agent, abstract model
-role and run condition, instructions built from text and explicit references,
-required results and their artifact fields, evidence selectors with their
-sources, freshness anchor and optional flag, command arguments as separate
-rows, ordered decision cases, gate questions with their named answers, and
-visit bounds with the gate they reach when exhausted. Nothing supported is
-hidden behind the text editor.
+The visual editor covers every format it supports: named agents and which one
+the task opens on, each step's kind, assigned agent, abstract model role and run
+condition, instructions built from text and explicit references, required
+results and their artifact fields, evidence selectors with their sources,
+freshness anchor and optional flag, command arguments as separate rows, ordered
+decision cases, gate questions with named answers, retained-result prerequisites,
+capture producer and paths, and visit bounds with the gate they reach when
+exhausted. Nothing supported is hidden behind the text editor.
 
-Two things are deliberately not editable in either view. A workflow's **name**
-is the library entry's identity, so renaming means creating a separate entry.
-A workflow's **format** is the rules its document is read under, so an existing
-format-1 or format-2 workflow stays on its own format and keeps its own
-outcome, history, gate, and completion rules — including being unable to
-publish. New workflows are format 3.
+The planning workflow is a packaged, read-only format-4 procedure. It asks the
+planner to create one epic or change proposal, captures its exact proposal
+files, then stops at a gate. Inspect that revision in **Results** and accept it
+before selecting **Finish with accepted result**. Requesting changes returns to
+the planner with the recorded feedback; stopping grants no publication.
+
+New workflows begin as format 4, so Visual and YAML authoring can compose the
+same capture and result-gate flow. Duplicated and imported definitions preserve
+their declared format; a task's retained revision is never upgraded implicitly.
 
 What switching costs you:
 
@@ -614,7 +622,7 @@ published.
 
 ### Compatibility across formats
 
-All three formats execute, side by side, indefinitely. A task runs whatever its
+All four formats execute, side by side, indefinitely. A task runs whatever its
 pinned revision says, and nothing about a new format reaches it.
 
 - A retained format-1 or format-2 definition keeps its grammar, its canonical

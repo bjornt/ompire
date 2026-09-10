@@ -74,6 +74,7 @@ the daemon, and `cleanup` runs last.
 | `advisories-stalls` | Stall detection and context advisories |
 | `crash-recovery` | Killing the daemon mid-work and recovering, including inside a delivery's push window |
 | `durable-results` | Capturing planning files with no commit, reviewing and accepting one revision, downloading it, a successor and its comparison, a refused capture, identical bytes after a daemon restart and after cleanup, guarded purge, and a create-only export into a disposable checkout with its conflict, identical-destination, and purge-blocker behavior |
+| `planning-handoff` | Packaged planning capture, exact-result acceptance prerequisite, and no-publication completion |
 | `cleanup` | Workshop removal, clone deletion, archival |
 
 `scenarios/ws-watch` sits beside these but is **not** a runbook — it is the

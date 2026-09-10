@@ -95,7 +95,7 @@ export interface ModelProfile {
  * earlier can route past this step, so it may not execute. */
 export interface WorkflowStepDescriptor {
   name: string;
-  kind: "agent" | "command" | "decision" | "gate" | "review" | "delivery";
+  kind: "agent" | "command" | "decision" | "gate" | "review" | "delivery" | "capture";
   session: string | null;
   role: ModelRole | null;
   /** A declared route can pass this step by, or its own condition can hold
@@ -465,7 +465,7 @@ export interface SpawnStepPayload {
 /** Workflow run lifecycle (workflow-engine capability). */
 export type WorkflowRunStatus = "running" | "waiting" | "complete" | "failed";
 
-export type StepKind = "agent" | "command" | "decision" | "gate";
+export type StepKind = "agent" | "command" | "decision" | "gate" | "review" | "delivery" | "capture";
 
 /** Persisted step-record status: the event stream's `started` lands as
  * `running` on the record. */
@@ -522,6 +522,9 @@ export interface GateChoice {
    * generic Resume — it needs the content, target, and identity preview the
    * confirmation is checked against. */
   authorize?: { steps: string[] } | null;
+  /** Format 4: this answer observes independent acceptance of the exact
+   * retained revision named by the gate; it grants no authority. */
+  requires_result_acceptance?: boolean;
 }
 
 /** The operator's answer, once given. Recorded beside — never instead of —
@@ -544,6 +547,13 @@ export interface GateSnapshot {
   choices: GateChoice[];
   evidence: Record<string, EvidenceBinding | null>;
   decision?: GateDecision | null;
+  /** Frozen identity of the capture revision this gate names. */
+  result?: {
+    evidence: string;
+    capture: { step: string; seq: number };
+    result_id: string;
+    manifest_id: string;
+  };
 }
 
 /** One executed workflow step (workflow-engine capability), as persisted by
@@ -1232,11 +1242,20 @@ export interface TaskResult {
    * and keep separate identities and provenance. */
   content_id: string | null;
   predecessor_id: string | null;
+  /** The producing workflow attempt, when this was a workflow-owned capture. */
+  workflow_seq?: number | null;
+  workflow_provenance?: Record<string, unknown> | null;
   selection: string[];
   files: TaskResultFile[];
   file_count: number;
   total_bytes: number;
   provenance: TaskResultProvenance | null;
+  /** Exact result revisions the producing task was launched with. */
+  input_results?: {
+    producer_task_id: number;
+    result_id: string;
+    manifest_id: string;
+  }[];
   captured_at: string;
   started_at: string;
   finished_at: string | null;

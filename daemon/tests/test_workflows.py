@@ -29,9 +29,11 @@ from ompire_daemon import agent as agent_module
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
+from ompire_daemon.delivery import WorkspaceGuard
 from ompire_daemon.events import EventHub
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.registry.projects import create_project
+from ompire_daemon.registry.results import get_result, list_results
 from ompire_daemon.registry.sessions import get_session
 from ompire_daemon.registry.tasks import Task, create_task, get_task, task_payload
 from ompire_daemon.registry.workflow_library import (
@@ -47,6 +49,7 @@ from ompire_daemon.registry.workflows import (
     list_step_records,
     resolve_gate,
 )
+from ompire_daemon.results import ResultManager
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.taskdefinition import (
     TaskDefinitionUnavailableError,
@@ -495,7 +498,7 @@ def branch_workflow(engine: Engine, fake_workshop_cli: Path):
 
 
 def test_the_packaged_definitions_are_the_builtin_entries(engine: Engine) -> None:
-    assert [entry.name for entry in list_entries(engine)] == ["bugfix", "single-step"]
+    assert [entry.name for entry in list_entries(engine)] == ["bugfix", "planning", "single-step"]
     assert {entry.origin for entry in list_entries(engine)} == {"builtin"}
     with engine.connect() as conn:
         revision = resolve_current(conn, "single-step")
@@ -3713,3 +3716,225 @@ async def test_a_recorded_verdict_is_consumed_once_across_a_restart(
     assert iteration_for_step(engine, task.id, check.seq) is not None
     assert reviews._verdicts == []
     assert reviews.started == [2]
+
+
+async def test_capture_step_retains_the_declared_producer_output(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    revision = install_test_workflow(
+        engine,
+        """
+format: 4
+name: capture-flow
+sessions: [main]
+primary: main
+steps:
+  - name: prepare
+    kind: command
+    argv: ["true"]
+    idempotent: true
+  - name: capture
+    kind: capture
+    evidence:
+      producer:
+        steps: [prepare]
+        required: true
+        with_outcome: true
+    producer: producer
+    paths:
+      - parts: [{text: epics/example/PLAN.md}]
+    allowlist: [epics]
+    next: {step: decide}
+  - name: decide
+    kind: gate
+    evidence:
+      captured:
+        steps: [capture]
+        required: true
+    result: {evidence: captured}
+    message:
+      parts: [{text: inspect result}]
+    choices:
+      - id: finish
+        label: Finish with accepted result
+        requires_result_acceptance: true
+        next: {complete: true, result: accepted-result}
+      - id: stop
+        label: Stop
+        next: {complete: true, result: stopped}
+""",
+    )
+    runner, _supervisor, _tracker, hub, _scenario = rig
+    results = ResultManager(
+        runner._config, engine, hub, WorkspaceGuard()
+    )
+    runner.set_results(results)
+    task = _make_task(
+        engine, tmp_path, revision.definition.name, slug="capture-flow-task"
+    )
+    plan = Path(task.clone_path) / "epics" / "example" / "PLAN.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Plan\n")
+
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+
+    records = list_step_records(engine, task.id)
+    result = get_result(
+        engine,
+        records[1].outcome["artifacts"]["result_id"],
+    )
+    assert records[1].kind == "capture"
+    assert result.workflow_seq == records[1].seq
+    assert result.manifest["provenance"]["producing_attempt"] == records[0].seq
+    assert result.files[0].path == "epics/example/PLAN.md"
+    gate = records[2]
+    assert gate.outcome["result"] == {
+        "evidence": "captured",
+        "capture": {"step": "capture", "seq": records[1].seq},
+        "result_id": result.id,
+        "manifest_id": result.manifest_id,
+    }
+    await results.capture(
+        task.id, paths=["epics/example/PLAN.md"], request_id="manual-result"
+    )
+    await asyncio.gather(*list(results._jobs))
+    unrelated = next(
+        entry for entry in list_results(engine, task.id) if entry.request_id == "manual-result"
+    )
+    results.accept(unrelated, expected_manifest_id=unrelated.manifest_id)
+    with pytest.raises(WorkflowGateChoiceError, match="has not been accepted"):
+        answer(runner, engine, task, "finish")
+    results.accept(result, expected_manifest_id=result.manifest_id)
+    answer(runner, engine, task, "finish")
+    assert get_task(engine, task.id).workflow_result == "accepted-result"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "files"),
+    [
+        (
+            _result("epic-proposed", "epic ready", root="epics/example"),
+            {"epics/example/EPIC.md": "# Epic\n"},
+        ),
+        (
+            _result("change-proposed", "change ready", root="changes/example"),
+            {
+                "changes/example/SPEC.md": "# Spec\n",
+                "changes/example/PLAN.md": "# Plan\n",
+            },
+        ),
+        (
+            _result(
+                "epic-change-proposed",
+                "child ready",
+                root="epics/example/changes/child",
+                epic_root="epics/example",
+            ),
+            {
+                "epics/example/EPIC.md": "# Epic\n",
+                "epics/example/changes/child/SPEC.md": "# Spec\n",
+                "epics/example/changes/child/PLAN.md": "# Plan\n",
+            },
+        ),
+    ],
+)
+async def test_packaged_planning_captures_each_declared_proposal_bundle(
+    rig, engine, project, tmp_path: Path, outcome: str, files: dict[str, str]
+) -> None:
+    runner, supervisor, _tracker, hub, _scenario = rig
+    runner.set_results(
+        ResultManager(
+            runner._config, engine, hub, WorkspaceGuard()
+        )
+    )
+    task = _make_task(
+        engine,
+        tmp_path,
+        workflow="planning",
+        slug=f"planning-{json.loads(outcome)['result']}",
+    )
+    for relative_path, content in files.items():
+        path = Path(task.clone_path) / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor, task.id, "planner", Path(task.clone_path), outcome
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+
+    records = list_step_records(engine, task.id)
+    capture = records[-2]
+    result = get_result(engine, capture.outcome["artifacts"]["result_id"])
+    assert capture.step.startswith("capture-")
+    assert {entry.path for entry in result.files} == set(files)
+    assert records[-1].step == "result-gate"
+    assert records[-1].outcome["result"]["result_id"] == result.id
+
+
+async def test_packaged_planning_unable_result_routes_feedback_to_a_new_turn(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="planning", slug="planning-unable")
+    unable = _result("unable", "cannot proceed", reason="missing project context")
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor, task.id, "planner", Path(task.clone_path), unable
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+
+    assert list_step_records(engine, task.id)[-1].step == "unable-gate"
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor, task.id, "planner", Path(task.clone_path), unable, prompt_count=2
+        )
+    )
+    answer(runner, engine, task, "request-changes", "use the existing epic")
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+    retry = [r for r in list_step_records(engine, task.id) if r.step == "propose"][-1]
+    assert retry.evidence["bindings"]["feedback"]["step"] == "unable-gate"
+
+
+async def test_packaged_planning_stops_at_its_declared_revision_budget(
+    rig, engine, project, tmp_path: Path
+) -> None:
+    runner, supervisor, _tracker, _hub, _scenario = rig
+    task = _make_task(engine, tmp_path, workflow="planning", slug="planning-budget")
+    unable = _result("unable", "cannot proceed", reason="missing project context")
+    writer = asyncio.create_task(
+        _write_outcome_when_session_prompted(
+            supervisor, task.id, "planner", Path(task.clone_path), unable
+        )
+    )
+    _start(runner, engine, task)
+    await wait_for_run(engine, task.id, {"waiting"})
+    await writer
+
+    for prompt_count in (2, 3):
+        writer = asyncio.create_task(
+            _write_outcome_when_session_prompted(
+                supervisor,
+                task.id,
+                "planner",
+                Path(task.clone_path),
+                unable,
+                prompt_count=prompt_count,
+            )
+        )
+        answer(runner, engine, task, "request-changes", "try again")
+        await wait_for_run(engine, task.id, {"waiting"})
+        await writer
+    answer(runner, engine, task, "request-changes", "one more")
+    await wait_for_run(engine, task.id, {"waiting"})
+    exhausted = list_step_records(engine, task.id)[-1]
+    assert exhausted.step == "planning-exhausted"
+    assert [choice["id"] for choice in exhausted.outcome["choices"]] == ["stop"]

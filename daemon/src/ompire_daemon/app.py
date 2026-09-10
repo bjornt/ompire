@@ -335,10 +335,9 @@ def create_app(
         app.state.gh,
         app.state.workspace_guard,
     )
-    # Durable result capture (ADR-0034). It takes the same workspace guard as
-    # a HOST owner, so a capture and a review, a delivery, or a cleanup exclude
-    # each other; it is deliberately not wired into the workflow runner, since
-    # nothing about a captured result advances a run or authorizes a delivery.
+    # Durable result capture owns the descriptor-relative workspace read and
+    # retention transaction. Format-4 workflow steps can ask it to capture a
+    # declaration, but retained bytes and acceptance remain its boundary.
     app.state.results = ResultManager(
         config,
         app.state.engine,
@@ -362,6 +361,7 @@ def create_app(
     # dependency runs both ways — the managers admit against the run's
     # position, and the run asks the managers to act.
     app.state.workflow_runner.set_operations(app.state.reviews, app.state.ships)
+    app.state.workflow_runner.set_results(app.state.results)
     app.state.notifications = AttentionNotifier(
         app.state.events,
         bind=config.bind,

@@ -145,6 +145,11 @@ identity of the exact definition — which the `preview_token` covers, so an
 edited prompt or route invalidates the review even though the step list looks
 identical.
 
+For a format-4 planning workflow, the preview also identifies its declared
+capture steps and states that the procedure has no publication effects. Capture
+does not start a task or authorize delivery: it retains the workflow's
+declared files only after the producing attempt succeeds.
+
 Every row that consumes a model carries its own profile and role selectors,
 each with its own reset, and states separately whether its profile and its role
 are inherited or set here. A row with no binding gets no controls. Expanding a

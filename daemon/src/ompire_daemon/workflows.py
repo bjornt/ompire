@@ -83,6 +83,7 @@ from ompire_daemon.registry.workflow_library import (
 from ompire_daemon.registry.workflows import (
     GATE_SNAPSHOT_VERSION,
     MAX_FEEDBACK_BYTES,
+    PAUSE_CAPTURE_FAILED,
     PAUSE_CONDITION_UNRESOLVED,
     PAUSE_DELIVERY_BLOCKED,
     PAUSE_DELIVERY_CONTINUATION,
@@ -94,6 +95,7 @@ from ompire_daemon.registry.workflows import (
     PAUSE_WORKSPACE_UNAVAILABLE,
     RETRY_NOTE,
     DeliveryAuthorization,
+    ResultAcceptanceRequirement,
     StepRecord,
     WorkflowGateChoiceError,
     WorkflowWaitConflictError,
@@ -120,6 +122,7 @@ from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.workflow_definitions import (
     DELIVERY_METADATA_FIELDS,
     AgentStep,
+    CaptureStep,
     CommandStep,
     CompleteDestination,
     DecisionStep,
@@ -152,6 +155,7 @@ from ompire_daemon.workflow_definitions import (
 
 if TYPE_CHECKING:
     from ompire_daemon.registry.tasks import Task
+    from ompire_daemon.results import ResultManager
     from ompire_daemon.review import ReviewManager
     from ompire_daemon.ship import ShipManager
 
@@ -393,7 +397,7 @@ class WorkflowNotWaitingError(Exception):
 # would be reading a cache of something an operator can edit.
 
 BUILTIN_PACKAGE = "ompire_daemon.builtin_workflows"
-BUILTIN_NAMES = ("single-step", "bugfix")
+BUILTIN_NAMES = ("single-step", "bugfix", "planning")
 
 
 class PackagedWorkflowError(RuntimeError):
@@ -674,20 +678,19 @@ class WorkflowRunner:
         # wiring; a run whose definition declares neither never needs them.
         self._reviews: ReviewManager | None = None
         self._ships: ShipManager | None = None
+        self._results: ResultManager | None = None
 
     def set_guard(self, guard: WorkspaceGuard) -> None:
         self._guard = guard
 
     def set_operations(self, reviews: ReviewManager, ships: ShipManager) -> None:
-        """Bind the trusted services a format-3 run drives.
-
-        The runner decides *when* an operation is eligible and never how it is
-        performed: capture, signing, push, and forge writes stay behind these
-        managers, which apply their own content, credential, and target checks
-        to a runner exactly as they do to an operator.
-        """
+        """Bind the trusted review and delivery services."""
         self._reviews = reviews
         self._ships = ships
+
+    def set_results(self, results: ResultManager) -> None:
+        """Bind trusted capture without letting a definition perform it."""
+        self._results = results
 
     @contextlib.asynccontextmanager
     async def _admitted(self, step: Step, task_id: int) -> AsyncIterator[None]:
@@ -703,7 +706,9 @@ class WorkflowRunner:
         about to ask for — either refusing it or, worse, letting it run under
         the ownership kind that exists to say "an agent is writing".
         """
-        if self._guard is None or isinstance(step, (ReviewStep, DeliveryStep)):
+        if self._guard is None or isinstance(
+            step, (ReviewStep, DeliveryStep, CaptureStep)
+        ):
             yield
             return
         async with self._guard.hold(
@@ -856,6 +861,9 @@ class WorkflowRunner:
             raise WorkflowGateChoiceError(
                 f"feedback is longer than {MAX_FEEDBACK_BYTES} bytes", field="note"
             )
+        result_requirement = self._result_acceptance_requirement(
+            task.id, record.outcome or {}, choice_id
+        )
 
         successor: tuple[str, str, str | None, dict[str, Any] | None] | None = None
         terminal_result: str | None = None
@@ -896,6 +904,7 @@ class WorkflowRunner:
             successor=successor,
             terminal_result=terminal_result,
             authorization=authorization,
+            result_requirement=result_requirement,
         )
         answered = get_step_record(self._engine, task.id, expected_seq)
         self._publish_gate_step(
@@ -1672,6 +1681,80 @@ class WorkflowRunner:
 
     # --- step execution ----------------------------------------------------------
 
+    @staticmethod
+    def _gate_result_snapshot(
+        step: GateStep, ctx: EvaluationContext
+    ) -> dict[str, Any] | None:
+        """Extract the trusted capture identity a gate asks an operator about.
+
+        The capture's outcome was written by ResultManager, but a stored row
+        can still be damaged. A malformed identity stops before a question is
+        offered; it must never quietly fall back to a newer result.
+        """
+        if step.result is None:
+            return None
+        evidence = ctx.evidence.get(step.result.evidence)
+        if not isinstance(evidence, dict):
+            return None
+        outcome = evidence.get("outcome")
+        artifacts = outcome.get("artifacts") if isinstance(outcome, dict) else None
+        result_id = artifacts.get("result_id") if isinstance(artifacts, dict) else None
+        manifest_id = artifacts.get("manifest_id") if isinstance(artifacts, dict) else None
+        capture_seq = evidence.get("seq")
+        capture_step = evidence.get("step")
+        if (
+            not isinstance(result_id, str)
+            or not isinstance(manifest_id, str)
+            or not isinstance(capture_seq, int)
+            or capture_seq < 1
+            or not isinstance(capture_step, str)
+        ):
+            return None
+        return {
+            "evidence": step.result.evidence,
+            "capture": {"step": capture_step, "seq": capture_seq},
+            "result_id": result_id,
+            "manifest_id": manifest_id,
+        }
+
+    @staticmethod
+    def _result_acceptance_requirement(
+        task_id: int, snapshot: dict[str, Any], choice_id: str
+    ) -> ResultAcceptanceRequirement | None:
+        """Read one offered choice's frozen result prerequisite, if any."""
+        choice = next(
+            (
+                item
+                for item in snapshot.get("choices", [])
+                if isinstance(item, dict) and item.get("id") == choice_id
+            ),
+            None,
+        )
+        if not isinstance(choice, dict) or not choice.get(
+            "requires_result_acceptance"
+        ):
+            return None
+        result = snapshot.get("result")
+        capture = result.get("capture") if isinstance(result, dict) else None
+        result_id = result.get("result_id") if isinstance(result, dict) else None
+        manifest_id = result.get("manifest_id") if isinstance(result, dict) else None
+        capture_seq = capture.get("seq") if isinstance(capture, dict) else None
+        if (
+            not isinstance(result_id, str)
+            or not isinstance(manifest_id, str)
+            or not isinstance(capture_seq, int)
+            or capture_seq < 1
+        ):
+            raise WorkflowGateChoiceError(
+                "this result gate's frozen capture identity is unreadable"
+            )
+        return ResultAcceptanceRequirement(
+            task_id=task_id,
+            capture_seq=capture_seq,
+            result_id=result_id,
+            manifest_id=manifest_id,
+        )
+
     async def _run_step(
         self,
         attempt: _Attempt,
@@ -1687,6 +1770,8 @@ class WorkflowRunner:
             return await self._run_command_step(step, task)
         if isinstance(step, DecisionStep):
             return self._run_decision_step(step, ctx)
+        if isinstance(step, CaptureStep):
+            return await self._run_capture_step(attempt, step, ctx, task, inputs)
         if isinstance(step, ReviewStep):
             return await self._run_review_step(attempt, step, task)
         if isinstance(step, DeliveryStep):
@@ -1728,6 +1813,18 @@ class WorkflowRunner:
                         error=exc.reason,
                     )
                 )
+        gate_result = self._gate_result_snapshot(step, ctx)
+        if step.result is not None and gate_result is None:
+            return _StepResult(
+                pause=_Pause(
+                    reason=PAUSE_MISSING_EVIDENCE,
+                    message=(
+                        f"The result gate {step.name!r} has no readable capture "
+                        "identity. Retry the capture; no other result can stand in."
+                    ),
+                    error="capture outcome has no result_id and manifest_id",
+                )
+            )
         return _StepResult(
             gate_snapshot=build_gate_snapshot(
                 message=message,
@@ -1737,6 +1834,7 @@ class WorkflowRunner:
                         "label": choice.label,
                         "feedback_required": choice.feedback_required,
                         "next": destination_document(choice.next, 2),
+                        "requires_result_acceptance": choice.requires_result_acceptance,
                         **(
                             {
                                 "authorize": (
@@ -1753,6 +1851,7 @@ class WorkflowRunner:
                 ],
                 evidence=(attempt.record.evidence or {}).get("bindings", {}),
                 delivery=delivery,
+                result=gate_result,
             )
         )
 
@@ -2071,6 +2170,95 @@ class WorkflowRunner:
                 ),
                 error=note or "no outcome file written",
             )
+        )
+
+    async def _run_capture_step(
+        self,
+        attempt: _Attempt,
+        step: CaptureStep,
+        ctx: EvaluationContext,
+        task: Task,
+        inputs: TaskExecutionInputs,
+    ) -> _StepResult:
+        """Retain one declared selection through the result service."""
+        assert self._results is not None, "capture step without a result service"
+        try:
+            paths = [render_text(path, ctx) for path in step.paths]
+        except RenderError as exc:
+            return _StepResult(
+                pause=_Pause(
+                    reason=PAUSE_CAPTURE_FAILED,
+                    message=(
+                        f"The capture step {step.name!r} could not render its "
+                        f"declared paths: {exc.reason}. Correct the producer or retry."
+                    ),
+                    error=exc.reason,
+                )
+            )
+        binding = next(
+            (
+                item
+                for item in bindings_from_document(attempt.record.evidence)
+                if item.name == step.producer
+            ),
+            None,
+        )
+        if binding is None or binding.seq is None:
+            return _StepResult(
+                pause=_Pause(
+                    reason=PAUSE_CAPTURE_FAILED,
+                    message=(
+                        f"The capture step {step.name!r} has no recorded producer "
+                        "attempt. Retry only after its declared producer is available."
+                    ),
+                    error="capture producer evidence is missing",
+                )
+            )
+        producer = get_step_record(self._engine, task.id, binding.seq)
+        if producer is None:
+            return _StepResult(
+                pause=_Pause(
+                    reason=PAUSE_CAPTURE_FAILED,
+                    message="The recorded capture producer is unavailable; nothing was captured.",
+                    error="capture producer record is missing",
+                )
+            )
+        result = await self._results.capture_workflow(
+            task,
+            workflow_seq=attempt.record.seq,
+            paths=paths,
+            allowlist=step.allowlist,
+            provenance={
+                "workflow_name": task.workflow_name,
+                "workflow_revision": inputs.workflow_revision,
+                "capture_attempt": attempt.record.seq,
+                "producing_attempt": producer.seq,
+                "producing_step": producer.step,
+                "producing_session": producer.session,
+            },
+        )
+        if not result.available or result.manifest_id is None:
+            return _StepResult(
+                pause=_Pause(
+                    reason=PAUSE_CAPTURE_FAILED,
+                    message=(
+                        f"The capture step {step.name!r} did not retain its declared "
+                        f"files: {result.error or result.unavailable_reason or result.state}."
+                    ),
+                    error=result.error or result.unavailable_reason or result.state,
+                )
+            )
+        return _StepResult(
+            outcome={
+                "version": 2,
+                "result": "captured",
+                "summary": f"captured {len(result.files)} retained files",
+                "artifacts": {
+                    "result_id": result.id,
+                    "manifest_id": result.manifest_id,
+                },
+            },
+            destination=step.next,
         )
 
     # --- delivery (format 3) ----------------------------------------------------

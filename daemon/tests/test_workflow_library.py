@@ -84,13 +84,14 @@ def test_startup_installs_the_packaged_definitions_as_readonly_entries(
     engine: Engine,
 ) -> None:
     entries = {entry.name: entry for entry in list_entries(engine)}
-    assert set(entries) == {"bugfix", "single-step"}
+    assert set(entries) == {"bugfix", "planning", "single-step"}
     assert all(entry.origin == "builtin" for entry in entries.values())
     # A built-in carries no draft: its text is in the package, not the database.
     assert all(not entry.has_draft for entry in entries.values())
     assert all(entry.available for entry in entries.values())
     assert [d.name for d in launchable_descriptors(list(entries.values()))] == [
         "bugfix",
+        "planning",
         "single-step",
     ]
 

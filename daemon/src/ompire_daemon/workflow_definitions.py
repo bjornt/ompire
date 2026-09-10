@@ -76,8 +76,8 @@ from ompire_daemon.model_config import MODEL_ROLES
 # statement that the meaning of a document changed, not that a field was
 # added: a retained format-1 document keeps being read under format-1 rules
 # forever, and an unsupported version is refused rather than reinterpreted.
-FORMAT_VERSION = 3
-SUPPORTED_FORMATS = (1, 2, 3)
+FORMAT_VERSION = 4
+SUPPORTED_FORMATS = (1, 2, 3, 4)
 
 # Loader bounds. They protect the daemon from a hostile or accidental
 # document; every packaged built-in is orders of magnitude below them.
@@ -92,7 +92,7 @@ MAX_RENDERED_BYTES = 1024 * 1024
 # collide with the retired session name still present in legacy history.
 RESERVED_NAMES = ("judge",)
 
-STEP_KINDS = ("agent", "command", "decision", "gate", "review", "delivery")
+STEP_KINDS = ("agent", "command", "decision", "gate", "review", "delivery", "capture")
 
 # Which kinds each format admits. A kind is part of a format's meaning, not a
 # field a newer loader may quietly accept in an older document: a retained
@@ -101,7 +101,8 @@ STEP_KINDS = ("agent", "command", "decision", "gate", "review", "delivery")
 FORMAT_STEP_KINDS: dict[int, tuple[str, ...]] = {
     1: ("agent", "command", "decision", "gate"),
     2: ("agent", "command", "decision", "gate"),
-    3: STEP_KINDS,
+    3: STEP_KINDS[:-1],
+    4: STEP_KINDS,
 }
 
 # Format 3's trusted operations. Each names exactly one effect; there is no
@@ -131,6 +132,12 @@ MAX_RESULTS = 16
 MAX_REQUIRED_FIELDS = 32
 MAX_EVIDENCE = 16
 MAX_CHOICES = 8
+
+# A capture declaration is intentionally no larger than the existing bundle
+# bound. It cannot name a wider selection than the trusted result service can
+# retain, and every selected path is rendered once from frozen evidence.
+MAX_CAPTURE_PATHS = 128
+MAX_CAPTURE_ALLOWLISTS = 128
 
 # What a required artifact field may be declared as. `null` is absent from the
 # list on purpose: a required field whose accepted type is "nothing" would let
@@ -645,6 +652,17 @@ class GateDelivery:
 
 
 @dataclass(frozen=True)
+class GateResult:
+    """The exact captured result a gate asks a person to accept.
+
+    The binding names one of the gate's frozen evidence aliases. It never
+    accepts an agent-provided result id or whichever bundle happens to be newest.
+    """
+
+    evidence: str
+
+
+@dataclass(frozen=True)
 class DeliveryGrant:
     """The exact contiguous action chain one approving choice authorizes.
 
@@ -667,7 +685,9 @@ class GateChoice:
 
     `authorize` (format 3) is the only way a choice can grant privileged
     authority, and it grants exactly the chain it names — never "delivery" in
-    general, and never anything a later step could widen.
+    general, and never anything a later step could widen. Format 4's result
+    prerequisite observes an independent retained-result acceptance; it grants
+    neither publication authority nor acceptance itself.
     """
 
     id: str
@@ -675,6 +695,7 @@ class GateChoice:
     feedback_required: bool
     next: Destination
     authorize: DeliveryGrant | None = None
+    requires_result_acceptance: bool = False
 
 
 @dataclass(frozen=True)
@@ -729,6 +750,7 @@ class GateStep:
     choices: tuple[GateChoice, ...] = ()  # format 2; empty means fall-through
     evidence: tuple[EvidenceSelector, ...] = ()
     delivery: GateDelivery | None = None  # format 3: a delivery-capable gate
+    result: GateResult | None = None  # format 4: immutable capture under review
     kind: str = "gate"
 
     def choice_named(self, choice_id: str) -> GateChoice | None:
@@ -757,6 +779,21 @@ class ReviewStep:
     kind: str = "review"
 
 
+
+@dataclass(frozen=True)
+class CaptureStep:
+    """Capture declared, rendered paths through the trusted result boundary."""
+
+    name: str
+    producer: str
+    paths: tuple[TextDocument, ...]
+    allowlist: tuple[str, ...]
+    next: Destination
+    max_visits: int | None
+    on_exhausted: StepDestination | None
+    evidence: tuple[EvidenceSelector, ...] = ()
+    kind: str = "capture"
+
 @dataclass(frozen=True)
 class DeliveryStep:
     """One trusted publication effect, and nothing else.
@@ -784,7 +821,7 @@ class DeliveryStep:
     kind: str = "delivery"
 
 
-Step = AgentStep | CommandStep | DecisionStep | GateStep | ReviewStep | DeliveryStep
+Step = AgentStep | CommandStep | DecisionStep | GateStep | ReviewStep | DeliveryStep | CaptureStep
 
 
 @dataclass(frozen=True)
@@ -1333,6 +1370,23 @@ def _parse_evidence(data: Any, location: str) -> tuple[EvidenceSelector, ...]:
     return tuple(selectors)
 
 
+def _parse_capture_root(value: Any, location: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise WorkflowDocumentError(location, "must be a nonempty repository-relative path")
+    if value.startswith("/") or "\\" in value:
+        raise WorkflowDocumentError(location, "must be a slash-separated relative path")
+    components = value.split("/")
+    if any(component in ("", ".", "..") or component.startswith(".") for component in components):
+        raise WorkflowDocumentError(location, "must not contain empty, dot, or traversal components")
+    return value
+
+
+def _parse_gate_result(data: Any, location: str) -> GateResult:
+    data = _require_mapping(data, location)
+    _reject_unknown(data, ("evidence",), location)
+    return GateResult(evidence=_require_slug(data, "evidence", location))
+
+
 def _parse_gate_delivery(data: Any, location: str, version: int) -> GateDelivery:
     """A gate's binding to the review it is asking about (format 3)."""
     data = _require_mapping(data, location)
@@ -1407,6 +1461,7 @@ def _parse_choices(data: Any, location: str, version: int) -> tuple[GateChoice, 
                 "feedback_required",
                 "next",
                 *(("authorize",) if version >= 3 else ()),
+                *(("requires_result_acceptance",) if version >= 4 else ()),
             ),
             choice_location,
         )
@@ -1423,6 +1478,11 @@ def _parse_choices(data: Any, location: str, version: int) -> tuple[GateChoice, 
         if not isinstance(feedback_required, bool):
             raise WorkflowDocumentError(
                 f"{choice_location}.feedback_required", "must be a boolean"
+            )
+        requires_result_acceptance = item.get("requires_result_acceptance", False)
+        if not isinstance(requires_result_acceptance, bool):
+            raise WorkflowDocumentError(
+                f"{choice_location}.requires_result_acceptance", "must be a boolean"
             )
         if "next" not in item:
             raise WorkflowDocumentError(
@@ -1442,6 +1502,7 @@ def _parse_choices(data: Any, location: str, version: int) -> tuple[GateChoice, 
                     if raw_authorize is None
                     else _parse_grant(raw_authorize, f"{choice_location}.authorize")
                 ),
+                requires_result_acceptance=requires_result_acceptance,
             )
         )
     return tuple(choices)
@@ -1616,6 +1677,56 @@ def _parse_step(data: Any, location: str, version: int) -> Step:
             on_exhausted=on_exhausted,
             evidence=evidence,
         )
+    if kind == "capture":
+        _reject_unknown(
+            data, (*common, "producer", "paths", "allowlist", "next"), location
+        )
+        producer = _require_slug(data, "producer", location)
+        raw_paths = data.get("paths")
+        if not isinstance(raw_paths, list) or not raw_paths:
+            raise WorkflowDocumentError(
+                f"{location}.paths", "must be a nonempty ordered list of text documents"
+            )
+        if len(raw_paths) > MAX_CAPTURE_PATHS:
+            raise WorkflowDocumentError(
+                f"{location}.paths", f"more than {MAX_CAPTURE_PATHS} declared paths"
+            )
+        raw_allowlist = data.get("allowlist")
+        if not isinstance(raw_allowlist, list) or not raw_allowlist:
+            raise WorkflowDocumentError(
+                f"{location}.allowlist",
+                "must be a nonempty list of literal repository-relative roots",
+            )
+        if len(raw_allowlist) > MAX_CAPTURE_ALLOWLISTS:
+            raise WorkflowDocumentError(
+                f"{location}.allowlist",
+                f"more than {MAX_CAPTURE_ALLOWLISTS} declared roots",
+            )
+        allowlist = tuple(
+            _parse_capture_root(value, f"{location}.allowlist[{index}]")
+            for index, value in enumerate(raw_allowlist)
+        )
+        if len(set(allowlist)) != len(allowlist):
+            raise WorkflowDocumentError(
+                f"{location}.allowlist", "must not contain duplicate roots"
+            )
+        if "next" not in data:
+            raise WorkflowDocumentError(
+                location, "a capture step needs an explicit 'next' destination"
+            )
+        return CaptureStep(
+            name=name,
+            producer=producer,
+            paths=tuple(
+                _parse_text(value, f"{location}.paths[{index}]", version)
+                for index, value in enumerate(raw_paths)
+            ),
+            allowlist=allowlist,
+            next=_parse_destination(data["next"], f"{location}.next", version),
+            max_visits=max_visits,
+            on_exhausted=on_exhausted,
+            evidence=evidence,
+        )
     if kind == "delivery":
         # Deliberately not a common-fields step. A bound would mean repeating
         # a privileged write, and evidence would suggest the action decides
@@ -1667,12 +1778,14 @@ def _parse_step(data: Any, location: str, version: int) -> Step:
             "message",
             *(() if version == 1 else ("choices",)),
             *(("delivery",) if version >= 3 else ()),
+            *(("result",) if version >= 4 else ()),
         ),
         location,
     )
     if "message" not in data:
         raise WorkflowDocumentError(location, "a gate step needs a 'message'")
     raw_delivery = data.get("delivery")
+    raw_result = data.get("result")
     return GateStep(
         name=name,
         message=_parse_text(data["message"], f"{location}.message", version),
@@ -1689,6 +1802,11 @@ def _parse_step(data: Any, location: str, version: int) -> Step:
             if raw_delivery is None
             else _parse_gate_delivery(raw_delivery, f"{location}.delivery", version)
         ),
+        result=(
+            None
+            if raw_result is None
+            else _parse_gate_result(raw_result, f"{location}.result")
+        ),
     )
 
 
@@ -1704,6 +1822,7 @@ def definition_from_document(document: Mapping[str, Any]) -> WorkflowDefinition:
     raw_sessions = document.get("sessions")
     if not isinstance(raw_sessions, list) or not raw_sessions:
         raise WorkflowDocumentError("sessions", "must be a nonempty list of names")
+
     sessions: list[str] = []
     for index, item in enumerate(raw_sessions):
         if not isinstance(item, str) or not _SLUG_RE.match(item):
@@ -1858,12 +1977,88 @@ def _validate_references(definition: WorkflowDefinition) -> None:
                 )
                 check_destination(case.next, f"{location}.cases[{case_index}].next")
             check_destination(step.otherwise, f"{location}.otherwise")
+        elif isinstance(step, CaptureStep):
+            for path_index, path in enumerate(step.paths):
+                check_text(path, f"{location}.paths[{path_index}]", aliases)
+            capture_selector: EvidenceSelector | None = next(
+                (
+                    candidate
+                    for candidate in step.evidence
+                    if candidate.name == step.producer
+                ),
+                None,
+            )
+            if capture_selector is None:
+                raise WorkflowDocumentError(
+                    f"{location}.producer",
+                    f"names evidence {step.producer!r}, which this step does not declare",
+                )
+            if not capture_selector.required or not capture_selector.with_outcome:
+                raise WorkflowDocumentError(
+                    f"{location}.evidence.{capture_selector.name}",
+                    "a capture producer must be required and select outcome-bearing evidence",
+                )
+            for source in capture_selector.steps:
+                source_step = definition.step_named(source)
+                if not isinstance(source_step, (AgentStep, CommandStep)):
+                    raise WorkflowDocumentError(
+                        f"{location}.evidence.{capture_selector.name}.steps",
+                        f"{source!r} is not an agent or command step",
+                    )
+                if isinstance(source_step, AgentStep) and source_step.outcome is None:
+                    raise WorkflowDocumentError(
+                        f"{location}.evidence.{capture_selector.name}.steps",
+                        f"{source!r} does not declare an outcome",
+                    )
+            check_destination(step.next, f"{location}.next")
         elif isinstance(step, GateStep):
             check_text(step.message, f"{location}.message", aliases)
             for choice_index, choice in enumerate(step.choices):
                 check_destination(
                     choice.next, f"{location}.choices[{choice_index}].next"
                 )
+                if choice.requires_result_acceptance and step.result is None:
+                    raise WorkflowDocumentError(
+                        f"{location}.choices[{choice_index}].requires_result_acceptance",
+                        "requires a result-bound gate",
+                    )
+            if step.result is not None:
+                if step.delivery is not None:
+                    raise WorkflowDocumentError(
+                        f"{location}.result",
+                        "a gate cannot bind both a result and delivery",
+                    )
+                result_selector: EvidenceSelector | None = next(
+                    (
+                        candidate
+                        for candidate in step.evidence
+                        if candidate.name == step.result.evidence
+                    ),
+                    None,
+                )
+                if result_selector is None:
+                    raise WorkflowDocumentError(
+                        f"{location}.result.evidence",
+                        f"names evidence {step.result.evidence!r}, which this gate does not declare",
+                    )
+                if not result_selector.required:
+                    raise WorkflowDocumentError(
+                        f"{location}.evidence.{result_selector.name}.required",
+                        "a result gate's binding must be required",
+                    )
+                for source in result_selector.steps:
+                    if not isinstance(definition.step_named(source), CaptureStep):
+                        raise WorkflowDocumentError(
+                            f"{location}.evidence.{result_selector.name}.steps",
+                            f"{source!r} is not a capture step",
+                        )
+                if not any(
+                    not choice.requires_result_acceptance for choice in step.choices
+                ):
+                    raise WorkflowDocumentError(
+                        f"{location}.choices",
+                        "a result gate must offer a choice without acceptance",
+                    )
             if step.delivery is not None and step.delivery.metadata is not None:
                 for field in DELIVERY_METADATA_FIELDS:
                     text = getattr(step.delivery.metadata, field)
@@ -2384,36 +2579,25 @@ def _evidence_document(
 
 
 def destination_document(destination: Destination, version: int) -> dict[str, Any]:
-    """A destination in its persisted form.
-
-    Public because a gate snapshot records where each offered choice would
-    have gone. The record has to hold the route as it was offered, not a name
-    to look up in whatever the definition says later.
-    """
+    """The persisted route recorded in a gate snapshot."""
     return _destination_document(destination, version)
 
 
 def _step_document(step: Step, version: int) -> dict[str, Any]:
     if isinstance(step, DeliveryStep):
-        # Deliberately not a common-fields step: it has no bound, no
-        # exhaustion route, and no evidence, and writing those as explicit
-        # nulls would say it could have them.
-        delivery: dict[str, Any] = {
+        document: dict[str, Any] = {
             "name": step.name,
             "kind": step.kind,
             "action": step.action,
+            "approval": step.approval,
+            "next": _destination_document(step.next, version),
         }
-        # Only the field this action actually has. A `previous` on a commit or
-        # a `mode` on a push is not a defaulted field — it is not a field, and
-        # writing it as null would say the grammar has one.
         if step.action == "commit":
-            delivery["mode"] = step.mode
+            document["mode"] = step.mode
         else:
-            delivery["previous"] = step.previous
-        delivery["approval"] = step.approval
-        delivery["next"] = _destination_document(step.next, version)
-        return delivery
-    document: dict[str, Any] = {
+            document["previous"] = step.previous
+        return document
+    document = {
         "name": step.name,
         "kind": step.kind,
         "max_visits": step.max_visits,
@@ -2423,8 +2607,6 @@ def _step_document(step: Step, version: int) -> dict[str, Any]:
             else None
         ),
     }
-    # Format-1 canonical bytes are frozen: nothing format 2 added may appear
-    # in them, or every retained revision would change identity.
     if version >= 2:
         document["evidence"] = _evidence_document(step.evidence)
     if isinstance(step, AgentStep):
@@ -2453,8 +2635,15 @@ def _step_document(step: Step, version: int) -> dict[str, Any]:
             ],
             otherwise=_destination_document(step.otherwise, version),
         )
+    elif isinstance(step, CaptureStep):
+        document.update(
+            producer=step.producer,
+            paths=[_text_document(path) for path in step.paths],
+            allowlist=list(step.allowlist),
+            next=_destination_document(step.next, version),
+        )
     elif isinstance(step, ReviewStep):
-        pass  # the common fields are the whole step
+        pass
     else:
         document.update(message=_text_document(step.message))
         if version >= 2:
@@ -2469,11 +2658,24 @@ def _step_document(step: Step, version: int) -> dict[str, Any]:
                         if version >= 3
                         else {}
                     ),
+                    **(
+                        {
+                            "requires_result_acceptance": (
+                                choice.requires_result_acceptance
+                            )
+                        }
+                        if version >= 4
+                        else {}
+                    ),
                 }
                 for choice in step.choices
             ]
         if version >= 3:
             document["delivery"] = _gate_delivery_document(step.delivery)
+        if version >= 4:
+            document["result"] = (
+                None if step.result is None else {"evidence": step.result.evidence}
+            )
     return document
 
 
@@ -2734,6 +2936,11 @@ def _export_step(document: Mapping[str, Any], version: int) -> dict[str, Any]:
             for case in document["cases"]
         ]
         out["otherwise"] = dict(document["otherwise"])
+    elif kind == "capture":
+        out["producer"] = document["producer"]
+        out["paths"] = [_export_text(path) for path in document["paths"]]
+        out["allowlist"] = list(document["allowlist"])
+        out["next"] = dict(document["next"])
     elif kind == "review":
         pass  # nothing beyond the common fields
     else:
@@ -2741,6 +2948,8 @@ def _export_step(document: Mapping[str, Any], version: int) -> dict[str, Any]:
             out["choices"] = [_export_choice(choice) for choice in document["choices"]]
         if version >= 3 and document["delivery"] is not None:
             out["delivery"] = _export_gate_delivery(document["delivery"])
+        if version >= 4 and document["result"] is not None:
+            out["result"] = dict(document["result"])
         out["message"] = _export_text(document["message"])
     return out
 

@@ -118,6 +118,29 @@ async def test_capture_retains_exact_bytes_and_relative_paths(
     ).read_bytes()
 
 
+
+@pytest.mark.asyncio
+async def test_workflow_capture_keeps_attempt_provenance(manager, task, workspace) -> None:
+    result = await manager.capture_workflow(
+        task,
+        workflow_seq=7,
+        paths=["epics/demo/PLAN.md"],
+        allowlist=("epics",),
+        provenance={
+            "producing_attempt": 6,
+            "producing_step": "propose",
+            "producing_session": "plan",
+        },
+    )
+
+    assert result.state == STATE_READY
+    assert result.workflow_seq == 7
+    assert result.manifest["capture_actor"] == "workflow"
+    assert result.manifest["provenance"]["producing_attempt"] == 6
+    assert manager.read_bundle(result)["epics/demo/PLAN.md"] == (
+        workspace / "epics" / "demo" / "PLAN.md"
+    ).read_bytes()
+
 @pytest.mark.asyncio
 async def test_later_workspace_edits_do_not_mutate_a_capture(
     manager, task, workspace

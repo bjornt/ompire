@@ -261,6 +261,17 @@ function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowStat
           allows goes to that workflow&apos;s gate instead.
         </p>
       )}
+      {snapshot?.result && (
+        <p className="fieldHint" data-testid="gate-result-prerequisite">
+          This gate names retained revision{" "}
+          <code>{snapshot.result.result_id}</code> from{" "}
+          <code>{snapshot.result.capture.step}</code> attempt{" "}
+          {snapshot.result.capture.seq}.{" "}
+          <a href="#results">Inspect and accept that exact readable revision in Results</a>{" "}
+          before choosing an answer that requires it. Accepting another revision
+          does not satisfy this gate.
+        </p>
+      )}
       {choices.length > 0 && (
         <fieldset className="gateChoices" data-testid="gate-choices">
           <legend className="fieldHint">
@@ -288,6 +299,9 @@ function GateCard({ taskId, workflow }: { taskId: number; workflow: WorkflowStat
                 )}
                 {choice.feedback_required && (
                   <span className="gateChoiceRequired">needs a reason</span>
+                )}
+                {choice.requires_result_acceptance && (
+                  <span className="gateChoiceRequired">requires accepted result</span>
                 )}
                 {(choice.authorize?.steps ?? []).length > 0 && (
                   <span
@@ -807,6 +821,16 @@ export function TaskDetailView() {
   const taskForShipFlow = liveTask ?? detail;
   const showShipFlow = hasShipFlowHandoff(taskForShipFlow, review, ship);
 
+  // A no-publication procedure becomes result-first after it captures output:
+  // that exact immutable result, not a legacy code review, is now the next
+  // action. A delivery projection is absent until the task has delivery state;
+  // its absence therefore means no declared review or delivery can override a
+  // captured-result flow here.
+  const resultFirst =
+    workflow?.steps.some((record) => record.kind === "capture") === true &&
+    ship?.authority?.declares_review !== true &&
+    (ship?.authority?.declared_actions.length ?? 0) === 0;
+
   const workshop = workshopLabel(detail);
   const escapeHatch = [
     `cd ${detail.clone_path}`,
@@ -890,22 +914,29 @@ export function TaskDetailView() {
       </div>
 
       <TaskStatusStrip session={session} status={status} />
-      <ReviewPanel
-        taskId={taskId}
-        review={review}
-        primarySession={primarySession}
-        approvalBinding={approvalBindingFor(review, ship)}
-        showShipFlow={showShipFlow}
-        authority={ship?.authority}
-      />
-
-
-      <ResultsPanel
-        task={taskForShipFlow}
-        projection={taskResults[taskId]}
-        onProjection={(projection) => reconcileResults("task_results_updated", projection)}
-      />
-
+      {resultFirst ? (
+        <ResultsPanel
+          task={taskForShipFlow}
+          projection={taskResults[taskId]}
+          onProjection={(projection) => reconcileResults("task_results_updated", projection)}
+        />
+      ) : (
+        <>
+          <ReviewPanel
+            taskId={taskId}
+            review={review}
+            primarySession={primarySession}
+            approvalBinding={approvalBindingFor(review, ship)}
+            showShipFlow={showShipFlow}
+            authority={ship?.authority}
+          />
+          <ResultsPanel
+            task={taskForShipFlow}
+            projection={taskResults[taskId]}
+            onProjection={(projection) => reconcileResults("task_results_updated", projection)}
+          />
+        </>
+      )}
       <CleanupPanel task={taskForShipFlow} retained={retainedResults[taskId]} />
 
       {workflow !== null && workflow.status === "waiting" && (

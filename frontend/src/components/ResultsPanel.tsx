@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import {
   acceptTaskResult,
   captureTaskResult,
@@ -161,6 +161,12 @@ function Provenance({ result }: { result: TaskResult }) {
           attempt wrote each file, and the run's latest step is not evidence
           that it did. */}
       <dd>{provenance.producing_step}</dd>
+      {result.workflow_seq != null && (
+        <>
+          <dt>capture attempt</dt>
+          <dd>{result.workflow_seq}</dd>
+        </>
+      )}
       <dt>launch base</dt>
       <dd>{provenance.launch_base_branch ?? "not recorded"}</dd>
       <dt>commit at capture</dt>
@@ -174,6 +180,19 @@ function Provenance({ result }: { result: TaskResult }) {
         <>
           <dt>unknown</dt>
           <dd data-testid="results-provenance-gaps">{provenance.gaps.join(", ")}</dd>
+        </>
+      )}
+      {(result.input_results ?? []).length > 0 && (
+        <>
+          <dt>accepted inputs</dt>
+          <dd>
+            {(result.input_results ?? []).map((input) => (
+              <span key={input.result_id} className="resultsNote">
+                <Link to={`/tasks/${input.producer_task_id}`}>{input.result_id}</Link> from task{" "}
+                {input.producer_task_id}{" "}
+              </span>
+            ))}
+          </dd>
         </>
       )}
     </dl>
@@ -633,7 +652,7 @@ export function ResultsPanel({
   const archived = task.state === "archived";
 
   return (
-    <section className="panel resultsPanel" data-testid="task-detail-results">
+    <section id="results" className="panel resultsPanel" data-testid="task-detail-results">
       <h2 className="panelTitle">Results</h2>
       <p className="resultsHint">
         Files this task produced, kept outside its workspace. Capturing needs no

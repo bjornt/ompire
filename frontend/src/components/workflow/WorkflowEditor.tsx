@@ -87,6 +87,16 @@ function blankStep(kind: StepKindName, format: number | null, session: string): 
     // missing predecessor, so a fresh card cannot usefully be a push.
     return { name, kind, action: "commit", mode: "squash", approval: "", next: { step: "" } };
   }
+  if (kind === "capture") {
+    return {
+      name,
+      kind,
+      producer: "",
+      paths: [{ parts: [{ text: "" }] }],
+      allowlist: [""],
+      next: { step: "" },
+    };
+  }
   return {
     name,
     kind,
@@ -320,10 +330,11 @@ export function WorkflowEditor({
                   <SelectField
                     label="Kind"
                     value={kind}
-                    options={STEP_KINDS.filter(
-                      (option) =>
-                        (option !== "review" && option !== "delivery") ||
-                        (format ?? 0) >= 3,
+                    options={STEP_KINDS.filter((option) =>
+                      option === "capture"
+                        ? (format ?? 0) >= 4
+                        : (option !== "review" && option !== "delivery") ||
+                          (format ?? 0) >= 3,
                     ).map((option) => ({ value: option, label: option }))}
                     disabled={readOnly}
                     location={`steps[${index}].kind`}
@@ -345,7 +356,10 @@ export function WorkflowEditor({
                   />
 
                   <p className="hint" data-testid={`editor-fallthrough-${index}`}>
-                    {kind === "decision" || (kind === "gate" && format !== 1)
+                    {kind === "decision" ||
+                    kind === "capture" ||
+                    (kind === "gate" && format !== 1) ||
+                    kind === "delivery"
                       ? "This step routes explicitly; the order of the cards does not decide where it goes."
                       : next === null
                         ? "This is the last card. Finishing here falls off the end of the list."
@@ -795,6 +809,18 @@ function StepBody({
     );
   }
 
+  if (kind === "capture") {
+    return (
+      <CaptureEditor
+        step={step}
+        index={index}
+        grammar={grammar}
+        readOnly={readOnly}
+        onEdit={onEdit}
+      />
+    );
+  }
+
   if (kind === "review") {
     return (
       <p className="hint" data-testid={`editor-review-${index}`}>
@@ -838,6 +864,14 @@ function StepBody({
           onEdit={onEdit}
         />
       )}
+      {(format ?? 0) >= 4 && (
+        <ResultGateEditor
+          step={step}
+          index={index}
+          readOnly={readOnly}
+          onEdit={onEdit}
+        />
+      )}
       {(format ?? 0) >= 3 && (
         <DeliveryGateEditor
           step={step}
@@ -850,6 +884,150 @@ function StepBody({
     </>
   );
 }
+
+function CaptureEditor({
+  step,
+  index,
+  grammar,
+  readOnly,
+  onEdit,
+}: {
+  step: DraftObject;
+  index: number;
+  grammar: GrammarContext;
+  readOnly: boolean;
+  onEdit: (update: (step: DraftObject) => DraftObject) => void;
+}) {
+  const at = `steps[${index}]`;
+  const paths = asArray(step.paths);
+  const roots = asArray(step.allowlist);
+  const aliases = evidenceAliases(step);
+  const set = (key: string, value: DraftValue | undefined) =>
+    onEdit((current) => withKey(current, key, value));
+  return (
+    <fieldset className="editorSection" data-testid={`editor-capture-${index}`}>
+      <legend>Retain declared files</legend>
+      <p className="hint">
+        The daemon renders only these paths, refuses anything outside the literal
+        allowlist, and retains the whole selection or no result at all.
+      </p>
+      <SelectField
+        label="Producing evidence"
+        value={asString(step.producer) ?? ""}
+        options={aliases.map((alias) => ({ value: alias, label: alias }))}
+        disabled={readOnly}
+        location={`${at}.producer`}
+        testId={`editor-capture-producer-${index}`}
+        onChange={(next) => set("producer", next)}
+      />
+      {paths.map((path, pathIndex) => (
+        <TextDocumentField
+          key={pathIndex}
+          value={path}
+          location={`${at}.paths[${pathIndex}]`}
+          grammar={grammar}
+          label={`Path ${pathIndex + 1}`}
+          onChange={(next) => {
+            const updated = [...paths];
+            updated[pathIndex] = next;
+            set("paths", updated);
+          }}
+        />
+      ))}
+      <button
+        type="button"
+        className="ghostButton"
+        disabled={readOnly}
+        onClick={() => set("paths", [...paths, { parts: [{ text: "" }] }])}
+      >
+        Add retained path
+      </button>
+      {roots.map((root, rootIndex) => (
+        <TextField
+          key={rootIndex}
+          label={`Allowlist root ${rootIndex + 1}`}
+          value={asString(root) ?? ""}
+          disabled={readOnly}
+          location={`${at}.allowlist[${rootIndex}]`}
+          onChange={(next) => {
+            const updated = [...roots];
+            updated[rootIndex] = next;
+            set("allowlist", updated);
+          }}
+        />
+      ))}
+      <button
+        type="button"
+        className="ghostButton"
+        disabled={readOnly}
+        onClick={() => set("allowlist", [...roots, ""])}
+      >
+        Add allowlist root
+      </button>
+      <DestinationField
+        value={step.next}
+        location={`${at}.next`}
+        grammar={grammar}
+        label="Once files are retained, go to"
+        allowPause={false}
+        onChange={(next) => set("next", next)}
+      />
+    </fieldset>
+  );
+}
+
+function ResultGateEditor({
+  step,
+  index,
+  readOnly,
+  onEdit,
+}: {
+  step: DraftObject;
+  index: number;
+  readOnly: boolean;
+  onEdit: (update: (step: DraftObject) => DraftObject) => void;
+}) {
+  const result = asObject(step.result);
+  const aliases = evidenceAliases(step);
+  const set = (next: DraftObject | undefined) =>
+    onEdit((current) => withKey(current, "result", next));
+  return result === null ? (
+    <div className="editorSection" data-testid={`editor-result-gate-${index}`}>
+      <p className="hint">
+        This is an ordinary human gate. Bind a capture evidence alias to make
+        choices able to require acceptance of that exact retained revision.
+      </p>
+      <button
+        type="button"
+        className="ghostButton"
+        disabled={readOnly}
+        onClick={() => set({ evidence: aliases[0] ?? "" })}
+      >
+        Bind a retained result
+      </button>
+    </div>
+  ) : (
+    <fieldset className="editorSection" data-testid={`editor-result-gate-${index}`}>
+      <legend>Retained result prerequisite</legend>
+      <SelectField
+        label="Capture evidence"
+        value={asString(result.evidence) ?? ""}
+        options={aliases.map((alias) => ({ value: alias, label: alias }))}
+        disabled={readOnly}
+        location={`steps[${index}].result.evidence`}
+        onChange={(evidence) => set(withKey(result, "evidence", evidence))}
+      />
+      <p className="hint">
+        A choice marked “requires accepted result” will finish only after this
+        exact revision is accepted and still readable. It grants no publication.
+      </p>
+      <button type="button" className="ghostButton" disabled={readOnly} onClick={() => set(undefined)}>
+        Make this an ordinary gate
+      </button>
+    </fieldset>
+  );
+}
+
 
 function DeliveryEditor({
   step,
@@ -1322,6 +1500,22 @@ function ChoicesEditor({
                 allowPause={false}
                 onChange={(next) => replace(withKey(object, "next", next))}
               />
+              {(format ?? 0) >= 4 && (
+                <CheckField
+                  label="Requires accepted result"
+                  checked={object.requires_result_acceptance === true}
+                  disabled={readOnly}
+                  onChange={(next) =>
+                    replace(
+                      withKey(
+                        object,
+                        "requires_result_acceptance",
+                        next ? true : undefined,
+                      ),
+                    )
+                  }
+                />
+              )}
               {(format ?? 0) >= 3 && (
                 <GrantField
                   choice={object}

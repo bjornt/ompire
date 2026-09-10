@@ -39,6 +39,7 @@ export const STEP_KINDS = [
   "gate",
   "review",
   "delivery",
+  "capture",
 ] as const;
 export type StepKindName = (typeof STEP_KINDS)[number];
 
@@ -80,7 +81,7 @@ export const REQUIRED_TYPES = [
   "object",
 ] as const;
 export const VALUE_FORMATS = ["text", "json"] as const;
-export const MODEL_ROLES = ["default", "smol", "reasoning"] as const;
+export const MODEL_ROLES = ["default", "smol", "slow", "plan"] as const;
 
 // --- reading ------------------------------------------------------------------
 
@@ -615,6 +616,39 @@ function rewriteStep(step: DraftObject, index: number, rewrite: Rewrite, visit: 
       bound = withKey(bound, "metadata", rewritten);
     }
     next = withKey(next, "delivery", bound);
+  }
+  const result = asObject(step.result);
+  if (result !== null) {
+    next = withKey(
+      next,
+      "result",
+      withKey(
+        result,
+        "evidence",
+        rewriteName(
+          result.evidence,
+          "evidence",
+          context.rewrite.evidenceAlias,
+          `${location}.result.evidence`,
+          "is the retained result this gate asks about",
+          context,
+        ),
+      ),
+    );
+  }
+  if (step.producer !== undefined) {
+    next = withKey(
+      next,
+      "producer",
+      rewriteName(
+        step.producer,
+        "evidence",
+        context.rewrite.evidenceAlias,
+        `${location}.producer`,
+        "is the evidence that produced this capture",
+        context,
+      ),
+    );
   }
   // A delivery step's own references: the gate that can authorize it, the
   // action it consumes, and where the chain goes next.

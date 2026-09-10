@@ -1938,6 +1938,57 @@ describe("TaskDetailView", () => {
     expect(screen.getByTestId("task-detail-start-review")).toBeEnabled();
   });
 
+  it("makes a no-publication format-4 procedure result-first", async () => {
+    const task = makeTask({
+      workflow_name: "planning",
+      workflow_status: "waiting",
+      workflow_step: "result-gate",
+    });
+    stubDetailFetch({ ...task, workshop_status: "present" });
+    await renderAt("/tasks/1", {
+      projects: [project],
+      tasks: [task],
+      sessions: { "1": { main: { status: "idle", reason: "agent_end", since: "t0" } } },
+      workflows: {
+        "1": {
+          name: "planning",
+          status: "waiting",
+          step: "result-gate",
+          steps: [
+            {
+              task_id: 1,
+              seq: 2,
+              step: "capture-change",
+              kind: "capture",
+              session: null,
+              status: "ok",
+              outcome: null,
+              error: null,
+              pause: null,
+              evidence: null,
+              prompted_at: null,
+              started_at: "t0",
+              finished_at: "t0",
+            },
+          ],
+        },
+      },
+      ships: {
+        "1": {
+          delivery_id: null,
+          legacy_publication: false,
+          authority: {
+            format: 4,
+            declares_review: false,
+            declared_actions: [],
+          },
+        },
+      },
+    });
+    expect(await screen.findByTestId("task-detail-results")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-detail-review")).not.toBeInTheDocument();
+  });
+
   it("renders comment feedback live and restores re-review when the primary session idles", async () => {
     const task = makeTask();
     stubDetailFetch({ ...task, workshop_status: "present" });

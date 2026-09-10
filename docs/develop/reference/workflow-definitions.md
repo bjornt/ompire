@@ -52,7 +52,7 @@ steps:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `format` | yes | `1` or `2`. The grammar **and** its interpretation. |
+| `format` | yes | `1` through `4`. The grammar **and** its interpretation. |
 | `name` | yes | Slug: lowercase alphanumerics and single hyphens |
 | `sessions` | yes | Nonempty, unique, slug-format. `judge` is reserved. |
 | `primary` | yes | Must be a declared session. Explicit — never defaulted. |
@@ -63,23 +63,23 @@ duplicate step names, undeclared session references, and routes to steps that
 do not exist. Every refusal carries a location like
 `steps[2].prompt.parts[0].value` and a reason.
 
-### The three formats
+### The four formats
 
-All three are implemented and all three execute. An older format is **frozen**:
+All four are implemented and all four execute. An older format is **frozen**:
 a retained format-1 document is always read under format-1 rules, and its
-canonical bytes — and so its revision — are unchanged by anything format 2 or 3
+canonical bytes — and so its revision — are unchanged by anything later formats
 added. A field belonging to one format is refused in the others, so the
 vocabularies cannot be mixed by accident.
 
-| | Format 1 | Format 2 | Format 3 |
-|---|---|---|---|
-| Agent result | `expects_outcome: true\|false` | [`outcome`](#outcome-contracts-format-2), required, `null` or declared results | as format 2 |
-| Reading prior attempts | [`latest`](#value-expressions), evaluated on each read | [`evidence`](#evidence-selectors-format-2) selectors, resolved once at attempt entry | as format 2 |
-| Gate | `message` only | `message` plus [`choices`](#gate) | plus [`delivery`](#delivery-gates-format-3) and `authorize` on a choice |
-| Completion | `{complete: true}` | `{complete: true, result: <slug>}` | as format 2 |
-| Last step | may fall off the end | rejected at load time | as format 2 |
-| Step kinds | agent, command, decision, gate | same | plus [`review`](#review-format-3) and [`delivery`](#delivery-format-3) |
-| Can publish | no | no | only through a declared `delivery` step a person authorizes |
+| | Format 1 | Format 2 | Format 3 | Format 4 |
+|---|---|---|---|---|
+| Agent result | `expects_outcome: true\|false` | [`outcome`](#outcome-contracts-format-2), required, `null` or declared results | as format 2 | as format 2 |
+| Reading prior attempts | [`latest`](#value-expressions), evaluated on each read | [`evidence`](#evidence-selectors-format-2) selectors, resolved once at attempt entry | as format 2 | as format 2 |
+| Gate | `message` only | `message` plus [`choices`](#gate) | plus [`delivery`](#delivery-gates-format-3) and `authorize` on a choice | optional [`result` acceptance binding](#result-gates-format-4) |
+| Completion | `{complete: true}` | `{complete: true, result: <slug>}` | as format 2 | as format 2 |
+| Last step | may fall off the end | rejected at load time | as format 2 | as format 2 |
+| Step kinds | agent, command, decision, gate | same | plus [`review`](#review-format-3) and [`delivery`](#delivery-format-3) | plus [`capture`](#capture-format-4) |
+| Can publish | no | no | only through a declared `delivery` step a person authorizes | as format 3 |
 
 Format 2 has no `latest` and format 1 has no `evidence`: leaving both available
 would leave the unfrozen read path available, and the point of binding evidence
@@ -93,6 +93,11 @@ chain of effects it permits
 ([ADR-0033](../../adr/0033-scope-trusted-delivery-authority-to-the-workflow-run.md)).
 A format-1 or format-2 revision therefore cannot publish at all — there is no
 step that could, and nothing infers one from a workflow's name or its result.
+
+Format 4 reuses format 3's rules, adds no authority, and can retain a declared
+selection as a durable result. A capture's exact accepted revision can satisfy
+only a gate that binds that capture; accepting another result or merely
+answering the gate is insufficient.
 
 ## Steps
 
@@ -217,6 +222,7 @@ a restart re-runs an interrupted command, and the author has to say they know.
 | `message` | yes | A [text document](#text-documents) shown to the operator |
 | `choices` | format 2 onwards, yes | The answers this gate offers |
 | `delivery` | no (format 3) | Binds this gate to a review so its answers can [authorize publication](#delivery-gates-format-3) |
+| `result` | no (format 4) | Binds this gate to one capture evidence alias |
 
 ```yaml
 choices:
@@ -244,6 +250,50 @@ makes the decision replayable from the record and refusable when stale
 Choice destinations are **successors for graph validation**, so a loop built
 out of human answers needs a visit bound like any other. A gate with declared
 choices has no fall-through: its choices are its only edges.
+
+### Capture (format 4)
+
+```yaml
+- name: capture-proposal
+  kind: capture
+  evidence:
+    proposal: {steps: [propose], with_outcome: true}
+  producer: proposal
+  paths:
+    - parts: [{value: {op: get, value: {op: evidence, name: proposal}, keys: [outcome, artifacts, root]}, format: text}, {text: /SPEC.md}]
+  allowlist: [changes]
+  next: {step: accept-proposal}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `producer` | yes | This step's evidence alias naming the declared agent outcome that produced the files |
+| `paths` | yes | One or more text documents rendered into exact repository-relative paths |
+| `allowlist` | yes | Literal repository roots every rendered path must remain beneath |
+| `next` | yes | The successor after durable capture is ready |
+
+The runner renders paths from the frozen evidence already bound to this
+attempt, validates the whole selection against the allowlist, and asks the
+result service to retain exactly those bytes. A missing producer outcome, an
+unsafe or missing path, or a capture failure does not fall through: the attempt
+is recorded and routes only through its declared exhaustion or recovery path.
+
+### Result gates (format 4)
+
+```yaml
+result: {evidence: captured}
+choices:
+  - id: finish
+    label: Finish with accepted result
+    requires_result_acceptance: true
+    next: {complete: true, result: accepted-result}
+```
+
+`result.evidence` must name this gate's capture evidence alias. The gate
+snapshot freezes the capture result and manifest identities. A choice with
+`requires_result_acceptance: true` rechecks that exact revision is readable and
+accepted when the operator submits it. The flag grants no delivery authority;
+`authorize` remains format 3's separate publication mechanism.
 
 ### `review` (format 3)
 

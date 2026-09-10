@@ -616,6 +616,8 @@ run performs the chain its answer named and produces no new ones.
 | `manifest_id` | string, nullable | SHA-256 of that whole manifest — the revision binding |
 | `content_id` | string, nullable | SHA-256 over the sorted path/media/length/checksum entries only |
 | `predecessor_id` | string, nullable | The most recent `ready` revision at admission, frozen then |
+| `workflow_seq` | integer, nullable | The format-4 capture attempt that owns this result; NULL for manual capture |
+| `workflow_provenance_json` | text, nullable | Pinned workflow and declared producer-attempt context; never client supplied |
 | `started_at`, `finished_at` | string, nullable | ISO-8601 |
 | `accepted_at`, `accepted_by` | string, nullable | The operator's decision |
 | `purged_at`, `purged_by` | string, nullable | The tombstone |
@@ -635,6 +637,14 @@ Purely additive: no row is created for an existing task, and
 produced none, and reconstructing one from its outcome text, its clone, or its
 last workflow step would manufacture exactly the provenance this feature exists
 to keep honest.
+
+Migration `0023` adds nullable `workflow_seq` and
+`workflow_provenance_json`, with a partial unique index on
+`(task_id, workflow_seq)`. The capture attempt reserves its identity before the
+filesystem read, so recovery either adopts its complete ready result or records
+the interrupted operation as failed; it never reads changed workspace bytes
+under the same attempt. Existing and later manual captures keep both columns
+NULL rather than acquiring guessed workflow attribution.
 
 The file rows carry *only* bytes. Length, checksum and media type live in the
 manifest, which is hashed into `manifest_id`, so there is no second

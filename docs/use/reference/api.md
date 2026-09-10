@@ -325,6 +325,16 @@ revision as a launch input, and `exports` — the checkout exports of this exact
 revision. Content is never in the projection — it is fetched per selected
 revision.
 
+`POST /api/tasks/{id}/results` is the independent manual-capture command. A
+format-4 workflow capture never uses that route: its pinned definition supplies
+the producer attempt, rendered paths, and allowlist at the trusted runner
+boundary. Its result projection includes `workflow_seq`,
+`workflow_provenance`, and any exact `input_results`; clients cannot submit
+those provenance fields. A waiting result gate names the captured
+`result_id` and `manifest_id` in its workflow snapshot. Its
+`requires_result_acceptance` choice is refused until that same retained,
+readable revision was accepted; accepting it alone changes no workflow state.
+
 | Condition | Response |
 |---|---|
 | Malformed or ineligible selection, missing acknowledgement | `422` |

@@ -37,6 +37,10 @@ A local or push-only ending is a **successful delivery**, not a failed pull
 request. So is finishing without publishing: it is an ending an author declared
 and a person chose.
 
+The packaged planning workflow reaches the no-publication ending through its
+own result gate. It declares neither review nor delivery steps, so Results
+acceptance and completing that gate cannot make Ship flow available.
+
 **A completed ending does not grow.** The chain a person authorized is what
 runs, and once it is done there is nothing further to authorize — asking for a
 longer ending is refused, at the preview and at every action endpoint alike. If

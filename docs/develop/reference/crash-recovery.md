@@ -264,6 +264,14 @@ A capture cancelled before its supervising job ever ran never reaches its own
 interruption handler, so shutdown reconciles those the same way rather than
 leaving a row that looks in flight.
 
+For a workflow-owned capture, the persisted attempt link is the replay key.
+Recovery adopts only a ready result linked to that exact attempt. An unfinished
+or failed link pauses the capture attempt visibly; the operator may retry into
+a new bounded attempt, but startup never creates a successor capture from the
+current workspace. A result gate reconnects with its frozen result identity,
+and an accepted-result choice rechecks the retained bytes and acceptance before
+committing the answer.
+
 Committed results need no recovery at all. A `ready` revision, an acceptance,
 and a completed purge are durable facts; a lost response to any of them is
 recovered by reading the task's result history. Purge is either committed or

@@ -17,6 +17,11 @@ and read or download it after the task's workspace is cleaned up. Nothing is
 published, and no commit is needed. See
 [Task detail](reference/task-detail.md#results-panel).
 
+Planning is a complete task outcome too: choose the packaged **planning**
+workflow to prepare an epic or change proposal, inspect and accept its retained
+files, then finish without publishing. You can later start an isolated task
+from that exact accepted revision. See [Spawn a task](how-to/spawn-a-task.md#plan-a-change-or-epic).
+
 That is the daily loop of a workbench built from four parts — agent
 isolation, parallel task oversight, the workflow engine, and the refinement
 loop described in [`VISION.md`](../VISION.md). See

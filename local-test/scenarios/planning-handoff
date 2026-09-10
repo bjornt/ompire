@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# local-test/scenarios/planning-handoff — packaged planning workflow (format 4).
+#
+# Proves the workflow owns its proposal capture, freezes the result identity in
+# its gate, refuses an unaccepted revision, and finishes only after acceptance.
+
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+slug=$(unique_slug planning)
+tid=$(spawn_task "$slug" \
+  "Plan one standalone change. [[scenario:plan-files]]
+[[scenario-param:plan-dir=changes/local-e2e]]
+[[scenario-param:results=change-proposed]]" \
+  planning)
+
+waiting=$(wait_for "planning capture reaches its result gate" 180 workflow_gate "$tid")
+step=$(jq -r .step <<<"$waiting")
+[ "$step" = result-gate ] && ok "planning waits at its retained-result gate" ||
+  fail "planning result gate" "waiting at $step"
+
+result_id=$(jq -r '.outcome.result.result_id // empty' <<<"$waiting")
+manifest_id=$(jq -r '.outcome.result.manifest_id // empty' <<<"$waiting")
+[ -n "$result_id" ] && [ -n "$manifest_id" ] &&
+  ok "gate names captured revision $result_id" ||
+  fail "gate result identity" "result=$result_id manifest=$manifest_id"
+
+files=$(api_json GET "/api/tasks/$tid/results/$result_id" | jq -r '[.result.files[].path] | join(",")')
+  ok "workflow retained the declared proposal files" ||
+  fail "captured proposal files" "$files"
+
+# The gate is deliberately result-first: its finish choice cannot advance a
+# run merely because some other result was accepted or because it was clicked.
+seq=$(jq -r .seq <<<"$waiting")
+body=$(jq -n --argjson s "$seq" '{expected_seq: $s, choice_id: "finish"}')
+code=$(api_code POST "/api/tasks/$tid/workflow/resume" "$body")
+[ "$code" = 422 ] && ok "unaccepted result cannot finish planning" ||
+  fail "result acceptance prerequisite" "code $code: $API_BODY"
+
+api_json POST "/api/tasks/$tid/results/$result_id/accept" \
+  "$(jq -n --arg manifest "$manifest_id" '{expected_manifest_id: $manifest}')" >/dev/null
+[ "$API_CODE" = 200 ] && ok "accepted exact retained revision" ||
+  die "acceptance failed ($API_CODE): $API_BODY"
+answer_gate "$tid" finish
+ending=$(wait_for "planning completes after acceptance" 60 workflow_result "$tid")
+[ "$ending" = accepted-result ] && ok "planning completed with accepted result" ||
+  fail "planning completion" "$ending"
+

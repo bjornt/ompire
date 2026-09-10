@@ -577,6 +577,11 @@ task_results = Table(
     Column("manifest_id", String, nullable=True),
     Column("content_id", String, nullable=True),
     Column("predecessor_id", String, nullable=True),
+    # A workflow-owned capture is keyed to its producing attempt before the
+    # workspace read begins. NULL preserves the manual-capture history whose
+    # producer is honestly unknown.
+    Column("workflow_seq", Integer, nullable=True),
+    Column("workflow_provenance_json", Text, nullable=True),
     Column("started_at", String, nullable=False),
     Column("finished_at", String, nullable=True),
     Column("accepted_at", String, nullable=True),
@@ -589,6 +594,13 @@ task_results = Table(
         "task_id",
         "request_id",
         unique=True,
+    ),
+    Index(
+        "uq_task_results_workflow_seq",
+        "task_id",
+        "workflow_seq",
+        unique=True,
+        sqlite_where=text("workflow_seq IS NOT NULL"),
     ),
 )
 

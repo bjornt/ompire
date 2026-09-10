@@ -48,6 +48,10 @@ PAUSE_CONDITION_UNRESOLVED = "condition_unresolved"
 # open and recorded, and it stops here rather than prompting an agent with
 # a handoff its author said it must have.
 PAUSE_MISSING_EVIDENCE = "missing_evidence"
+# A workflow capture has no bytes to route on when it cannot retain the
+# declaration. The attempt stays retryable and names this rather than reading a
+# partial or current workspace selection as success.
+PAUSE_CAPTURE_FAILED = "capture_failed"
 # The task's workspace is owned by another daemon-managed writer — a review, a
 # delivery — or an unresolved privileged effect makes writing to it unsafe
 # (ADR-0032). The step is not started, its attempt keeps its own evidence, and
@@ -401,6 +405,42 @@ class DeliveryAuthorization:
     request_key: str
     input_fingerprint: str
 
+@dataclass(frozen=True)
+class ResultAcceptanceRequirement:
+    """One frozen capture revision an answer must re-check before it can finish.
+
+    Acceptance remains a separate result-service decision. This value merely
+    makes the choice observe that exact decision, on the same write reservation
+    that records the answer, so a purge cannot race between the check and the
+    workflow transition.
+    """
+
+    task_id: int
+    capture_seq: int
+    result_id: str
+    manifest_id: str
+
+    def verify_on(self, conn) -> None:
+        from ompire_daemon.registry.results import (
+            ResultNotAttachableError,
+            ResultNotFoundError,
+            StaleRevisionError,
+            verify_attachable_on,
+            verify_payload_on,
+        )
+
+        try:
+            result = verify_attachable_on(
+                conn, self.result_id, expected_manifest_id=self.manifest_id
+            )
+            if result.task_id != self.task_id or result.workflow_seq != self.capture_seq:
+                raise WorkflowGateChoiceError(
+                    "the retained result no longer belongs to this gate's capture attempt"
+                )
+            verify_payload_on(conn, result)
+        except (ResultNotAttachableError, ResultNotFoundError, StaleRevisionError) as exc:
+            raise WorkflowGateChoiceError(str(exc)) from exc
+
 
 def build_gate_snapshot(
     *,
@@ -408,6 +448,7 @@ def build_gate_snapshot(
     choices: list[dict[str, Any]],
     evidence: dict[str, Any],
     delivery: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The question, exactly as it was put to a person.
 
@@ -428,6 +469,8 @@ def build_gate_snapshot(
         # question: an operator reading it later must see what was proposed,
         # not only what was finally published.
         snapshot["delivery"] = delivery
+    if result is not None:
+        snapshot["result"] = result
     return snapshot
 
 
@@ -459,6 +502,7 @@ def resolve_gate(
     successor: tuple[str, str, str | None, dict[str, Any] | None] | None,
     terminal_result: str | None,
     authorization: DeliveryAuthorization | None = None,
+    result_requirement: ResultAcceptanceRequirement | None = None,
 ) -> tuple[StepRecord, Task]:
     """Record a human's answer and advance the run — in one transaction.
 
@@ -538,6 +582,8 @@ def resolve_gate(
             destination=choice.get("next", {}),
             decided_at=now,
         )
+        if result_requirement is not None:
+            result_requirement.verify_on(conn)
         if authorization is not None:
             # The grant lands here, on this connection, or not at all. A
             # decision committed without its authorization would leave a person

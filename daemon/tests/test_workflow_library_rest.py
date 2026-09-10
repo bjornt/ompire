@@ -62,10 +62,15 @@ def test_the_library_lists_what_exists_and_the_catalog_what_can_launch(
 ) -> None:
     assert create(client, headers, name="custom").status_code == 201
     library = client.get("/api/workflow-library", headers=headers).json()
-    assert [e["name"] for e in library] == ["bugfix", "custom", "single-step"]
+    assert [e["name"] for e in library] == [
+        "bugfix",
+        "custom",
+        "planning",
+        "single-step",
+    ]
     # `custom` is a draft, so it exists but cannot be selected.
     catalog = client.get("/api/workflows", headers=headers).json()
-    assert [w["name"] for w in catalog] == ["bugfix", "single-step"]
+    assert [w["name"] for w in catalog] == ["bugfix", "planning", "single-step"]
 
 
 def test_a_builtin_reads_as_its_packaged_text_and_cannot_be_edited(
@@ -95,7 +100,7 @@ def test_an_unknown_entry_is_a_404(client: TestClient, headers) -> None:
 def test_creating_without_a_source_opens_a_valid_starter(
     client: TestClient, headers
 ) -> None:
-    """The starter has to be a real format-2 definition, not a sketch: an
+    """The starter has to be a real format-4 definition, not a sketch: an
     operator's first Validate must succeed."""
     detail = create(client, headers, name="starter").json()
     assert detail["entry"]["current_revision"] is None
@@ -105,9 +110,9 @@ def test_creating_without_a_source_opens_a_valid_starter(
         json={"yaml": detail["draft_yaml"], "name": "starter"},
     )
     assert checked.status_code == 200
-    # The starter is format 3 and publishes nothing: review, an approval, and
+    # The starter is format 4 and publishes nothing: review, an approval, and
     # the actions it authorizes are all things an author adds deliberately.
-    assert checked.json()["format"] == 3
+    assert checked.json()["format"] == 4
     assert checked.json()["descriptor"]["actions"] == []
     assert [s["name"] for s in checked.json()["descriptor"]["steps"]] == [
         "work",
@@ -247,7 +252,12 @@ def test_a_saved_revision_becomes_the_launch_choice(client: TestClient, headers)
     saved = save_revision(client, headers, "custom", minimal()).json()
     assert saved["entry"]["available"] is True
     catalog = client.get("/api/workflows", headers=headers).json()
-    assert [w["name"] for w in catalog] == ["bugfix", "custom", "single-step"]
+    assert [w["name"] for w in catalog] == [
+        "bugfix",
+        "custom",
+        "planning",
+        "single-step",
+    ]
     # Saving started nothing.
     assert client.get("/api/tasks", headers=headers).json() == []
 
@@ -343,6 +353,7 @@ def test_archiving_removes_an_entry_from_launch_choices_only(
     assert archived["draft_yaml"] == minimal()
     assert [w["name"] for w in client.get("/api/workflows", headers=headers).json()] == [
         "bugfix",
+        "planning",
         "single-step",
     ]
     # Still listed in the library, and still readable.

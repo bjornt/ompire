@@ -154,6 +154,13 @@ delivery journal, every captured result, and every checkout export record. Its c
 result revisions are not
 ([ADR-0034](../../adr/0034-retain-durable-task-results-outside-the-workspace.md)).
 
+A workflow-owned capture is also durable task history. It records the exact
+capture attempt and its declared producing attempt before reading the workspace;
+a manually captured result remains explicitly operator-owned. A planning gate
+can require its particular retained revision to be accepted and readable before
+its run reaches an accepted-result ending. Acceptance itself never answers a
+gate, approves code, or grants publication authority.
+
 Purge is separate and deletes an archived task's registry row. Purging a task
 that is not archived is refused with `409`.
 

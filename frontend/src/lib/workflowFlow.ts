@@ -43,8 +43,10 @@ export type EdgeKind =
    * grants. Distinct from an ordinary choice because it is the only edge in
    * a definition that confers authority. */
   | "authorize"
-  /** A delivery step continuing once its effect is on record. */
+  /** A delivery step continues after its effect is on record. */
   | "delivered"
+  /** A capture completes and follows its declared route. */
+  | "captured"
   | "exhausted"
   | "skip";
 
@@ -174,6 +176,12 @@ export function readFlow(document: DraftObject): Flow {
       push({
         kind: "delivered",
         label: `once the ${asString(step.action) ?? "action"} is on record`,
+        to: targetFor(step.next, names),
+      });
+    } else if (kind === "capture") {
+      push({
+        kind: "captured",
+        label: "once its declared files are retained",
         to: targetFor(step.next, names),
       });
     } else {
@@ -450,8 +458,9 @@ const KNOWN_STEP_FIELDS: Record<string, readonly string[]> = {
   agent: ["name", "kind", "max_visits", "on_exhausted", "evidence", "session", "role", "prompt", "when", "expects_outcome", "outcome"],
   command: ["name", "kind", "max_visits", "on_exhausted", "evidence", "argv", "timeout", "idempotent"],
   decision: ["name", "kind", "max_visits", "on_exhausted", "evidence", "cases", "otherwise"],
-  gate: ["name", "kind", "max_visits", "on_exhausted", "evidence", "message", "choices", "delivery"],
+  gate: ["name", "kind", "max_visits", "on_exhausted", "evidence", "message", "choices", "delivery", "result"],
   review: ["name", "kind", "max_visits", "on_exhausted", "evidence"],
+  capture: ["name", "kind", "max_visits", "on_exhausted", "evidence", "producer", "paths", "allowlist", "next"],
   // Deliberately short: an action has no bound, no evidence, and no prompt.
   // Anything else on this card is a field the grammar does not have.
   delivery: ["name", "kind", "action", "mode", "approval", "previous", "next"],

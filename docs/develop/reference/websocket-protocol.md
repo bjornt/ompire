@@ -70,7 +70,7 @@ full current registry state:
 | `gh` | Current in-memory GitHub CLI identity plus canonical target eligibility map; no credential value or token fragment |
 | `reviews` | Per task, durable review status and iterations, each naming the candidate it graded, the workflow attempt that asked for it, and the reviewer's own report with the state of what was retained, plus the live reviewer's URL and port when one is running (`null` otherwise) |
 | `ships` | Per task, the durable delivery projection: `version`, disposition, ending and mode, candidate and review identity, draft, completed and remaining actions, concrete results, every action attempt and reconciliation decision, the delivery history, and an `authority` block saying what the run's own procedure currently permits |
-| `task_results` | Per task with any capture history, the durable result document (ADR-0034): `version` and every revision's state, availability, manifest and content identities, predecessor, selection, file list with lengths/media types/checksums, provenance, and acceptance and purge decisions. Metadata only — file text, comparisons and ZIPs are fetched for the one revision an operator selected, never broadcast |
+| `task_results` | Per task with any capture history, the durable result document (ADR-0034): `version` and every revision's state, availability, manifest and content identities, predecessor, selection, file list with lengths/media types/checksums, workflow attempt/provenance and supplied input-result context when known, and acceptance and purge decisions. Metadata only — file text, comparisons and ZIPs are fetched for the one revision an operator selected, never broadcast |
 | `retained_results` | Per task, the counts behind the Tasks index's Retained results section: total, retained, accepted, and retained bytes. Derived from the same rows as `task_results`, so the two cannot disagree |
 | attention | Current attention entries |
 
@@ -246,6 +246,11 @@ The gate snapshot is **sent rather than looked up**: a client renders the
 question that was actually asked instead of reconstructing choices from
 today's catalog for a definition that may have changed. The `ok` frame for an
 answered gate carries the same snapshot with its `decision` attached.
+
+A result-bound gate snapshot also carries its exact `result_id`, `manifest_id`,
+and capture attempt. A choice marked `requires_result_acceptance` stays
+available for rendering, but the daemon refuses it until that same readable
+revision is accepted; a later result projection cannot retarget the gate.
 
 A task whose pinned definition cannot be resolved still appears in the snapshot
 and still receives `task_updated`. It reports `workflow_ready: false` with a
