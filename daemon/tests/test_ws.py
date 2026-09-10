@@ -21,7 +21,6 @@ def _adoptable_checkouts(app) -> None:
         make_adoptable_checkout(app.state.config.checkout_root, name)
 
 
-
 def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) -> None:
     with client.websocket_connect(f"/api/ws?token={auth_token}") as ws:
         message = ws.receive_json()

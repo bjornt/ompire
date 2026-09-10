@@ -20,7 +20,6 @@ from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.delivery import WorkspaceGuard
 from ompire_daemon.events import EventHub
 from ompire_daemon.migrate import upgrade_head
-from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.results import (
     MAX_FILES,
     STATE_FAILED,
@@ -30,8 +29,9 @@ from ompire_daemon.registry.results import (
     get_result,
     list_results,
 )
-from ompire_daemon.registry.tasks import create_task, mark_archived
 from ompire_daemon.results import ResultManager
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import create_task, mark_archived
 from tests.conftest import make_execution_inputs
 
 
@@ -116,7 +116,6 @@ async def test_capture_retains_exact_bytes_and_relative_paths(
     assert contents["epics/demo/SPEC.md"] == (
         workspace / "epics" / "demo" / "SPEC.md"
     ).read_bytes()
-
 
 
 @pytest.mark.asyncio

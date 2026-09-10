@@ -41,17 +41,11 @@ from ompire_daemon.gh import (
     parse_github_target,
 )
 from ompire_daemon.gpg import GpgProbe, GpgSelection, GpgStatus, parse_candidates
-from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.reviews import clear_process_marker
 from ompire_daemon.registry.ships import (
     get_delivery,
     get_latest_delivery,
     list_deliveries,
-)
-from ompire_daemon.registry.tasks import (
-    create_task,
-    get_task,
-    mark_pr_url,
 )
 from ompire_daemon.registry.workflows import (
     WorkflowGateChoiceError,
@@ -73,6 +67,12 @@ from ompire_daemon.ship import (
     correlation_marker,
 )
 from ompire_daemon.taskdefinition import resolve_task_definition
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import (
+    create_task,
+    get_task,
+    mark_pr_url,
+)
 from ompire_daemon.workflows import WorkflowNotWaitingError, WorkflowRunner
 from tests.conftest import (
     install_delivery_workflow,
@@ -451,7 +451,6 @@ def _make_project_and_task(
     return project, task
 
 
-
 # --- shared delivery helpers ------------------------------------------------
 
 
@@ -477,8 +476,8 @@ def _repin_workflow(engine, task, workflow_name: str) -> None:
     Used to build the compatibility case: a task whose accepted procedure has
     no publication vocabulary at all.
     """
-    from ompire_daemon.execution_inputs import encode_execution_inputs
-    from ompire_daemon.registry.tasks import _update
+    from ompire_daemon.work.inputs import encode_execution_inputs
+    from ompire_daemon.work.tasks import _update
     from tests.conftest import install_plain_workflow
 
     if workflow_name == "plain":

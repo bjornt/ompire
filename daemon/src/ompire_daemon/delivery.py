@@ -51,7 +51,7 @@ from ompire_daemon.registry.ships import (
     SourceCommit,
     record_candidate,
 )
-from ompire_daemon.registry.tasks import Task
+from ompire_daemon.work.tasks import Task
 
 logger = logging.getLogger(__name__)
 

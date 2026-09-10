@@ -779,7 +779,6 @@ class ReviewStep:
     kind: str = "review"
 
 
-
 @dataclass(frozen=True)
 class CaptureStep:
     """Capture declared, rendered paths through the trusted result boundary."""
@@ -3615,7 +3614,6 @@ def validate_result_document(
         if expected == "string" and not value.strip():
             return None, f"artifact {field!r} must not be blank"
     return document, None
-
 
 
 # --- catalog description ------------------------------------------------------

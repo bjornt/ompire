@@ -81,7 +81,6 @@ _CONFIG_KEYS: dict[str, str] = {
 }
 
 
-
 def _validate(key: str, value: Any, config: Config) -> Any:
     """Return a normalized valid value or raise `SettingsValidationError`."""
     if key not in _DEFAULTS:

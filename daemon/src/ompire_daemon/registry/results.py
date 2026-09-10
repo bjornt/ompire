@@ -39,7 +39,7 @@ from ompire_daemon.db import (
     task_results,
     tasks,
 )
-from ompire_daemon.registry.model_profiles import reserved_write
+from ompire_daemon.platform.transactions import reserved_write
 
 # --- The fixed bounds -------------------------------------------------------
 #

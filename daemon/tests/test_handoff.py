@@ -17,14 +17,6 @@ from unittest import mock
 
 import pytest
 
-from ompire_daemon.execution_inputs import (
-    BASE_COMPARISON_DIFFERENT,
-    BASE_COMPARISON_MATCH,
-    BASE_COMPARISON_UNKNOWN,
-    HANDOFF_CLASSIFICATION,
-    AttachedFile,
-    ResultAttachment,
-)
 from ompire_daemon.handoff import (
     HandoffError,
     MaterializationError,
@@ -36,6 +28,14 @@ from ompire_daemon.handoff import (
     parse_batch_types,
     payload_key,
     plan_destinations,
+)
+from ompire_daemon.work.inputs import (
+    BASE_COMPARISON_DIFFERENT,
+    BASE_COMPARISON_MATCH,
+    BASE_COMPARISON_UNKNOWN,
+    HANDOFF_CLASSIFICATION,
+    AttachedFile,
+    ResultAttachment,
 )
 
 # The bodies each attachment was built from, so a payload map matches the

@@ -22,8 +22,8 @@ from typing import TYPE_CHECKING, Any
 from ompire_daemon import rpc
 from ompire_daemon.config import Config
 from ompire_daemon.events import Event, EventHub
-from ompire_daemon.execution_inputs import ModelPolicy, split_model_identifier
-from ompire_daemon.registry.model_profiles import RoleBinding
+from ompire_daemon.model_config import RoleBinding
+from ompire_daemon.work.inputs import ModelPolicy, split_model_identifier
 
 if TYPE_CHECKING:
     from ompire_daemon.sessions import SessionTracker

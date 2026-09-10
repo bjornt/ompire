@@ -163,8 +163,8 @@ def test_build_agent_argv_never_omits_the_policy() -> None:
 def test_role_flag_value_keeps_nested_model_ids_intact() -> None:
     """Only the *first* slash separates provider from model id, so a nested
     catalog path survives into the flag."""
-    from ompire_daemon.execution_inputs import split_model_identifier
-    from ompire_daemon.registry.model_profiles import RoleBinding
+    from ompire_daemon.model_config import RoleBinding
+    from ompire_daemon.work.inputs import split_model_identifier
 
     binding = RoleBinding(model="vendor/family/model-9", thinking="low")
     assert role_flag_value(binding) == "vendor/family/model-9:low"

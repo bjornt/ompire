@@ -47,7 +47,7 @@ projects = Table(
     Column("setup_error", Text, nullable=True),
     # Optional global model profile (ADR-0025). NULL means no default; the
     # named, non-cascading FK is schema metadata — the runtime guarantee is the
-    # write reservation in `registry/model_profiles.reserved_write`, because
+    # write reservation in `platform/transactions.reserved_write`, because
     # this connection does not enable `PRAGMA foreign_keys`.
     Column(
         "default_model_profile",

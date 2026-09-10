@@ -59,13 +59,7 @@ from ompire_daemon.delivery import (
     WorkspaceGuard,
 )
 from ompire_daemon.events import EventHub
-from ompire_daemon.execution_inputs import (
-    ConsumerBinding,
-    MissingConsumerBindingError,
-    ModelPolicy,
-    TaskExecutionInputs,
-)
-from ompire_daemon.projectfiles import mention_tokens, unresolved_mentions
+from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.registry.reviews import ReviewIterationRecord
 from ompire_daemon.registry.sessions import (
     build_applied_policy,
@@ -73,7 +67,6 @@ from ompire_daemon.registry.sessions import (
     record_applied_policy,
     record_session_spawned,
 )
-from ompire_daemon.registry.tasks import require_task_inputs, task_payload
 from ompire_daemon.registry.workflow_library import (
     BuiltinConflict,
     UnknownWorkflowNameError,
@@ -119,6 +112,14 @@ from ompire_daemon.registry.workflows import (
 )
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.sessions import SessionTracker
+from ompire_daemon.work.files import mention_tokens, unresolved_mentions
+from ompire_daemon.work.inputs import (
+    ConsumerBinding,
+    MissingConsumerBindingError,
+    ModelPolicy,
+    TaskExecutionInputs,
+)
+from ompire_daemon.work.tasks import require_task_inputs
 from ompire_daemon.workflow_definitions import (
     DELIVERY_METADATA_FIELDS,
     AgentStep,
@@ -154,10 +155,10 @@ from ompire_daemon.workflow_definitions import (
 )
 
 if TYPE_CHECKING:
-    from ompire_daemon.registry.tasks import Task
     from ompire_daemon.results import ResultManager
     from ompire_daemon.review import ReviewManager
     from ompire_daemon.ship import ShipManager
+    from ompire_daemon.work.tasks import Task
 
 logger = logging.getLogger(__name__)
 
@@ -753,7 +754,7 @@ class WorkflowRunner:
         must be refused rather than applied to whatever the run is waiting on
         now.
         """
-        from ompire_daemon.registry.tasks import get_task
+        from ompire_daemon.work.tasks import get_task
 
         task = get_task(self._engine, task_id)  # TaskNotFoundError → caller's 404
         record = latest_step_record(self._engine, task_id)
@@ -799,7 +800,7 @@ class WorkflowRunner:
         decide anything about it — it cannot, and it checks that the choice
         actually declares the chain before letting it through.
         """
-        from ompire_daemon.registry.tasks import get_task
+        from ompire_daemon.work.tasks import get_task
 
         definition = revision.definition
         # Read where the run *is*, not where the caller's copy says it was: a
@@ -1079,7 +1080,7 @@ class WorkflowRunner:
         recover: bool,
         attempt: _Attempt | None = None,
     ) -> None:
-        from ompire_daemon.registry.tasks import get_task
+        from ompire_daemon.work.tasks import get_task
 
         definition = revision.definition
         current: _Attempt | None
@@ -1470,7 +1471,7 @@ class WorkflowRunner:
                 # An uncertainty pause is re-armed exactly as persisted: no
                 # prompt, no automatic retry, no fresh evaluation. The
                 # operator's Retry is still the only thing that moves it.
-                from ompire_daemon.registry.tasks import get_task
+                from ompire_daemon.work.tasks import get_task
 
                 self._publish_task_updated(get_task(self._engine, task_id))
                 self._hub.publish(

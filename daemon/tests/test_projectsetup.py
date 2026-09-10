@@ -12,12 +12,12 @@ from fastapi.testclient import TestClient
 
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.projectsetup import ProjectSetupManager, clone_target
-from ompire_daemon.registry.projects import (
+from ompire_daemon.work.projects import (
     create_project,
     get_project,
     list_projects,
 )
+from ompire_daemon.work.setup import ProjectSetupManager, clone_target
 
 from .conftest import make_adoptable_checkout
 
@@ -144,7 +144,7 @@ async def test_failed_clone_can_be_retried_successfully(
     # Point it at a real upstream and retry, as the operator would after
     # fixing the URL.
     upstream = make_upstream(tmp_path)
-    from ompire_daemon.registry.projects import update_project
+    from ompire_daemon.work.projects import update_project
 
     update_project(
         app.state.engine,
@@ -333,7 +333,7 @@ def test_retry_endpoint_schedules_the_job_through_the_route(
     loop, and a sync route would run in FastAPI's threadpool where there is
     none. Calling the manager directly from an async test cannot catch that.
     """
-    from ompire_daemon.registry.projects import create_project
+    from ompire_daemon.work.projects import create_project
 
     root = app.state.config.checkout_root
     create_project(
@@ -408,7 +408,7 @@ async def test_setup_completion_and_retry_preserve_the_default_profile(
     """Setup only owns `setup_state`/`setup_error`. A clone that fails and is
     then retried must still come back with the profile the operator chose at
     registration."""
-    from ompire_daemon.registry.model_profiles import create_model_profile
+    from ompire_daemon.work.profiles import create_model_profile
 
     create_model_profile(
         app.state.engine,
@@ -439,7 +439,7 @@ async def test_setup_completion_and_retry_preserve_the_default_profile(
     assert failed.default_model_profile == "balanced"
 
     upstream = make_upstream(tmp_path)
-    from ompire_daemon.registry.projects import update_project
+    from ompire_daemon.work.projects import update_project
 
     update_project(
         app.state.engine,

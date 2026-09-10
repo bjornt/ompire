@@ -32,7 +32,7 @@ from datetime import UTC, datetime
 from sqlalchemy import Connection, Engine
 
 from ompire_daemon.db import workflow_library
-from ompire_daemon.registry.model_profiles import reserved_write
+from ompire_daemon.platform.transactions import reserved_write
 from ompire_daemon.registry.workflow_definitions import (
     RevisionSummary,
     WorkflowRevisionUnavailableError,

@@ -36,8 +36,8 @@ from sqlalchemy import Engine
 
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.projectcheckout import inspect_checkout, no_prompt_env
-from ompire_daemon.registry.projects import (
+from ompire_daemon.work.checkout import inspect_checkout, no_prompt_env
+from ompire_daemon.work.projects import (
     Project,
     ProjectNotFoundError,
     get_project,

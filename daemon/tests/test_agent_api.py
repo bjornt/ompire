@@ -10,8 +10,8 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from ompire_daemon.registry.projects import create_project
-from ompire_daemon.registry.tasks import create_task
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import create_task
 from tests.conftest import make_execution_inputs, spawn_task
 
 

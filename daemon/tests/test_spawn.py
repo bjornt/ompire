@@ -21,15 +21,15 @@ import pytest
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import Event, EventHub
-from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.sessions import get_session
-from ompire_daemon.registry.tasks import (
+from ompire_daemon.sessions import SessionTracker
+from ompire_daemon.spawn import Step, StepFailedError, _run_step, run_spawn_pipeline
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import (
     clone_path_for,
     create_task,
     get_task,
 )
-from ompire_daemon.sessions import SessionTracker
-from ompire_daemon.spawn import Step, StepFailedError, _run_step, run_spawn_pipeline
 from ompire_daemon.workflows import WorkflowRunner
 from tests.conftest import FAKE_WORKSHOP_SCRIPT, make_execution_inputs
 
@@ -44,7 +44,6 @@ def fake_my_workshop(tmp_path: Path):
         script.chmod(0o755)
         return str(script)
     return make
-
 
 
 def _failing_script(tmp_path: Path, body: str) -> str:

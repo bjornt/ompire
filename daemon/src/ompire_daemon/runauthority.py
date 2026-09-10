@@ -62,7 +62,7 @@ from ompire_daemon.workflow_definitions import (
 )
 
 if TYPE_CHECKING:
-    from ompire_daemon.registry.tasks import Task
+    from ompire_daemon.work.tasks import Task
 
 # How authority for a privileged operation was established.
 SOURCE_WORKFLOW_GATE = "workflow-gate"
@@ -219,7 +219,7 @@ def resolve_authority(engine: Engine, task: Task) -> RunAuthority:
     a question that has since been answered — and authority is a property of
     where the run *is*, never of how fresh someone's copy of it happens to be.
     """
-    from ompire_daemon.registry.tasks import TaskNotFoundError, get_task
+    from ompire_daemon.work.tasks import TaskNotFoundError, get_task
 
     try:
         task = get_task(engine, task.id)

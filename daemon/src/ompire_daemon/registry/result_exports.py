@@ -38,7 +38,7 @@ from ompire_daemon.db import (
     result_exports,
     tasks,
 )
-from ompire_daemon.registry.model_profiles import reserved_write
+from ompire_daemon.platform.transactions import reserved_write
 from ompire_daemon.registry.results import (
     ResultNotFoundError,
     StaleRevisionError,

@@ -28,7 +28,6 @@ from ompire_daemon.db import (
 from ompire_daemon.delivery import WorkspaceGuard
 from ompire_daemon.events import EventHub
 from ompire_daemon.migrate import upgrade_head
-from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.results import (
     RESERVED_MANIFEST_NAME,
     STATE_PURGED,
@@ -39,8 +38,9 @@ from ompire_daemon.registry.results import (
     list_results,
     results_version,
 )
-from ompire_daemon.registry.tasks import create_task
 from ompire_daemon.results import ResultManager, ResultUnavailableError
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import create_task
 from tests.conftest import make_execution_inputs
 
 

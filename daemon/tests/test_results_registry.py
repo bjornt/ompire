@@ -23,8 +23,7 @@ from ompire_daemon.db import (
     task_results,
 )
 from ompire_daemon.migrate import upgrade_head
-from ompire_daemon.registry.model_profiles import reserved_write
-from ompire_daemon.registry.projects import create_project
+from ompire_daemon.platform.transactions import reserved_write
 from ompire_daemon.registry.results import (
     STATE_FAILED,
     STATE_PURGED,
@@ -66,7 +65,8 @@ from ompire_daemon.registry.results import (
     verify_attachable_on,
     verify_payload_on,
 )
-from ompire_daemon.registry.tasks import (
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import (
     TaskNotArchivedError,
     create_task,
     mark_archived,
@@ -291,7 +291,6 @@ def test_failed_capture_is_never_a_predecessor(engine, task) -> None:
     second = _capture(engine, task, request_id="req-2")
 
     assert second.predecessor_id is None
-
 
 
 def test_workflow_capture_reserves_its_attempt_and_preserves_provenance(

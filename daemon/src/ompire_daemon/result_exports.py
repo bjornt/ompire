@@ -62,7 +62,6 @@ from sqlalchemy import Engine
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.handoff import RESERVED_ROOT_FILES
-from ompire_daemon.registry.projects import ProjectNotFoundError, get_project
 from ompire_daemon.registry.result_exports import (
     CLASS_CONFLICT,
     CLASS_CREATE,
@@ -106,12 +105,13 @@ from ompire_daemon.registry.results import (
     selection_fingerprint,
     validate_relative_path,
 )
-from ompire_daemon.registry.tasks import get_task
 from ompire_daemon.results import (
     ResultManager,
     credential_token_values,
     validate_content,
 )
+from ompire_daemon.work.projects import ProjectNotFoundError, get_project
+from ompire_daemon.work.tasks import get_task
 
 logger = logging.getLogger(__name__)
 

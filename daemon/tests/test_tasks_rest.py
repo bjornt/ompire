@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from ompire_daemon.app import create_app
 from ompire_daemon.config import Config
-from ompire_daemon.registry.tasks import (
+from ompire_daemon.work.tasks import (
     ClonePathOutsideRootError,
     clone_path_for,
     create_task,
@@ -1028,3 +1029,158 @@ def test_deleting_an_overridden_profile_after_acceptance_changes_nothing(
     assert work["profile_name"] == "thorough"
     assert work["profile_source"] == "step"
     assert work["roles"]["default"]["model"] == "vendor/default"
+
+
+# --- The launch application boundary -----------------------------------------
+# Direct, in-process exercise of `LaunchService` and the acceptance
+# transaction: the same admission the HTTP routes enforce, without
+# constructing a request.
+
+
+def test_edit_landing_during_acceptance_preflight_is_refused_by_the_reservation(
+    client: TestClient,
+    auth_headers: dict,
+    demo_project: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relevant project edit landing after the acceptance's first
+    resolution — inside the window between validation and the write
+    reservation — is caught by the reserved re-resolution, never trusted."""
+    from ompire_daemon.application import launch as launch_module
+    from ompire_daemon.work.projects import UNSUPPLIED, update_project
+
+    engine = client.app.state.engine
+    body = launch_body()
+    preview = client.post("/api/tasks/preview", headers=auth_headers, json=body).json()
+    real_validate = launch_module.validate_mentions
+
+    async def edit_then_validate(prompt: str, **kwargs):
+        # Runs between the first resolution and the reserved one: the exact
+        # window a concurrent project edit would land in.
+        update_project(
+            engine,
+            "demo",
+            title=demo_project["title"],
+            upstream_url=demo_project["upstream_url"],
+            fork_url=demo_project.get("fork_url"),
+            checkout_path=demo_project["checkout_path"],
+            fetch_remote=demo_project["fetch_remote"],
+            new_name=None,
+            default_model_profile=UNSUPPLIED,
+            base_branch="release",
+        )
+        return await real_validate(prompt, **kwargs)
+
+    monkeypatch.setattr(launch_module, "validate_mentions", edit_then_validate)
+    response = client.post(
+        "/api/tasks",
+        headers=auth_headers,
+        json={**body, "preview_token": preview["preview_token"]},
+    )
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["reason"] == "preview_changed"
+    assert detail["preview"]["workspace"]["base_branch"] == "release"
+    # No task, and no preparation was scheduled for one.
+    assert client.get("/api/tasks", headers=auth_headers).json() == []
+    assert not client.app.state.spawn_scheduler.jobs
+
+
+def test_reference_write_failure_rolls_back_task_and_schedules_nothing(
+    client: TestClient,
+    auth_headers: dict,
+    demo_project: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The task insert and its retained-input references are one transaction:
+    a failure while writing the references leaves no task behind and starts
+    no preparation job."""
+    from ompire_daemon.application import launch as launch_module
+    from ompire_daemon.work.tasks import list_tasks
+
+    engine = client.app.state.engine
+
+    def fail_references(*args, **kwargs):
+        raise RuntimeError("reference write failed")
+
+    monkeypatch.setattr(launch_module, "insert_references_on", fail_references)
+    with pytest.raises(RuntimeError, match="reference write failed"):
+        spawn_task(client, auth_headers, slug="rollback-check")
+    # The accepted task did not survive its own reference insertion.
+    assert list_tasks(engine) == []
+    assert client.get("/api/tasks", headers=auth_headers).json() == []
+    assert not client.app.state.spawn_scheduler.jobs
+
+
+async def test_direct_acceptance_enforces_the_same_admission_as_http(
+    client: TestClient,
+    auth_headers: dict,
+    demo_project: dict,
+) -> None:
+    """The typed in-process command refuses what the routes refuse — an
+    inadmissible selection, a stale review, an empty profile override — and
+    accepts exactly what the reviewed preview resolved."""
+    from ompire_daemon.application.launch import LaunchService
+    from ompire_daemon.work.launch import (
+        ConsumerOverride,
+        LaunchInputError,
+        LaunchRequest,
+        PreviewChangedError,
+    )
+    from ompire_daemon.work.tasks import list_tasks
+    from tests.conftest import install_plain_workflow
+
+    engine = client.app.state.engine
+    install_plain_workflow(engine)
+    service: LaunchService = client.app.state.launch_service
+
+    def request(**overrides) -> LaunchRequest:
+        base: dict = {
+            "project_name": "demo",
+            "workflow_name": "plain",
+            "slug": "direct-call",
+            "prompt": "do it directly",
+            "model_profile": None,
+            "profile_explicit": False,
+            "workspace_overrides": {},
+            "step_overrides": {},
+            "auxiliary_overrides": {},
+        }
+        base.update(overrides)
+        return LaunchRequest(**base)
+
+    # An unknown workflow is refused before anything is created.
+    with pytest.raises(LaunchInputError):
+        await service.preview(request(workflow_name="missing"))
+    assert list_tasks(engine) == []
+
+    # An empty profile name is refused for direct callers too, with the same
+    # field-level error the wire adapter produces.
+    with pytest.raises(LaunchInputError) as caught:
+        await service.preview(
+            request(step_overrides={"work": ConsumerOverride(model_profile="", role=None)})
+        )
+    assert caught.value.field == "step_overrides.work.model_profile"
+
+    # A reviewed preview accepted through the typed command records the same
+    # decision the HTTP path would, and schedules its preparation.
+    resolved = await service.preview(request())
+    task = await service.accept(request(), preview_token=resolved.fingerprint)
+    assert task.branch == "ompire/direct-call"
+    assert task.execution_inputs is not None
+    assert task.execution_inputs.workflow_binding is not None
+    assert task.execution_inputs.workflow_binding.revision == resolved.revision.revision
+
+    # Let the scheduled preparation finish on this test's loop before the
+    # client fixture's lifespan shutdown gathers the scheduler.
+    deadline = time.monotonic() + 20.0
+    while client.app.state.spawn_scheduler.jobs:
+        assert time.monotonic() < deadline, "scheduled preparation did not finish"
+        await asyncio.sleep(0.05)
+    settled = client.get(f"/api/tasks/{task.id}", headers=auth_headers).json()
+    assert settled["spawn_completed_at"] is not None or settled["state"] == "failed"
+
+    # A stale token is refused, not retried under today's resolution.
+    with pytest.raises(PreviewChangedError):
+        await service.accept(request(slug="direct-stale"), preview_token="stale")
+    assert [t.slug for t in list_tasks(engine)] == ["direct-call"]

@@ -66,6 +66,12 @@ full current registry state:
 | `sessions` | Per task, a per-session map of current status, plus the native model a live session reports |
 | workflow state | Per-task run status, current step, gate message, and any uncertainty pause |
 | `settings` | The effective settings map |
+
+Every `tasks` entry — in the snapshot, in `task_created`/`task_updated`
+deltas, and in REST task responses — is serialized by one canonical
+projection, `oversight/tasks.py:task_payload`, so a client cannot see two
+shapes for the same row. The wire behavior is unchanged; only the owner
+moved. Storage (`work/tasks.py`) does not depend on it.
 | `gpg` | Current signing status: `state`, `selected` key, `candidates`, `cache_ttl`, `detail`, `checked_at` — public identifiers only |
 | `gh` | Current in-memory GitHub CLI identity plus canonical target eligibility map; no credential value or token fragment |
 | `reviews` | Per task, durable review status and iterations, each naming the candidate it graded, the workflow attempt that asked for it, and the reviewer's own report with the state of what was retained, plus the live reviewer's URL and port when one is running (`null` otherwise) |

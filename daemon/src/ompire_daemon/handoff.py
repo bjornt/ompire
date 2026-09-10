@@ -39,18 +39,18 @@ import posixpath
 import stat
 from dataclasses import dataclass, field
 
-from ompire_daemon.execution_inputs import (
+from ompire_daemon.registry.results import (
+    MAX_FILES,
+    MAX_TOTAL_BYTES,
+    validate_relative_path,
+)
+from ompire_daemon.work.inputs import (
     BASE_COMPARISON_DIFFERENT,
     BASE_COMPARISON_MATCH,
     BASE_COMPARISON_UNKNOWN,
     AttachedFile,
     BaseComparison,
     ResultAttachment,
-)
-from ompire_daemon.registry.results import (
-    MAX_FILES,
-    MAX_TOTAL_BYTES,
-    validate_relative_path,
 )
 
 # At most this many bundles in one launch. The per-file and byte limits already

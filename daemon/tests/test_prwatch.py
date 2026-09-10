@@ -19,8 +19,8 @@ from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.prwatch import PrWatcher, _parse_pr_view
-from ompire_daemon.registry.projects import create_project
-from ompire_daemon.registry.tasks import (
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import (
     Task,
     create_task,
     get_task,

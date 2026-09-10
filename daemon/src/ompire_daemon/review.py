@@ -55,9 +55,9 @@ from ompire_daemon.registry.reviews import (
     open_review,
 )
 from ompire_daemon.registry.ships import CandidateRecord
-from ompire_daemon.registry.tasks import Task, require_task_inputs
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
 from ompire_daemon.spawn import Step, _run_step
+from ompire_daemon.work.tasks import Task, require_task_inputs
 
 if TYPE_CHECKING:
 
@@ -787,7 +787,7 @@ class ReviewManager:
             self._hub.unsubscribe(queue)
 
     def _task(self, task_id: int) -> Task | None:
-        from ompire_daemon.registry.tasks import get_task
+        from ompire_daemon.work.tasks import get_task
 
         try:
             return get_task(self._engine, task_id)
@@ -866,7 +866,6 @@ class ReviewManager:
             )
         )
         return "restored"
-
 
 
 def restore_reviews(engine: Engine) -> list[int]:

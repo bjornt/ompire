@@ -1300,8 +1300,8 @@ def test_a_migrated_task_decodes_and_executes_without_its_source_profile(
 
     upgrade_head(db_path, alembic_ini=REAL_ALEMBIC_INI)
 
-    from ompire_daemon.execution_inputs import ModelPolicy
-    from ompire_daemon.registry.tasks import get_task
+    from ompire_daemon.work.inputs import ModelPolicy
+    from ompire_daemon.work.tasks import get_task
 
     with engine.connect() as conn:
         task_id = conn.execute(

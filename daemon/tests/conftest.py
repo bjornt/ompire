@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from ompire_daemon.agent import build_agent_argv as REAL_BUILD_AGENT_ARGV
 from ompire_daemon.app import create_app
 from ompire_daemon.config import Config
-from ompire_daemon.registry.model_profiles import create_model_profile
+from ompire_daemon.work.profiles import create_model_profile
 
 FAKE_OMP = Path(__file__).parent / "fake_omp.py"
 
@@ -375,7 +375,7 @@ def make_result_attachment(*paths: str, result_id: str = "res_test", body: bytes
     there is no other legal one (ADR-0035)."""
     import hashlib
 
-    from ompire_daemon.execution_inputs import (
+    from ompire_daemon.work.inputs import (
         HANDOFF_CLASSIFICATION,
         AttachedFile,
         ResultAttachment,
@@ -440,7 +440,9 @@ def make_execution_inputs(
     *not* the library's current one, which is how coexistence across an edit
     is exercised.
     """
-    from ompire_daemon.execution_inputs import (
+    from ompire_daemon.model_config import RoleBinding
+    from ompire_daemon.registry.workflow_library import resolve_current
+    from ompire_daemon.work.inputs import (
         PROFILE_SOURCE_PROJECT,
         PROVENANCE_ACCEPTED,
         ROLE_SOURCE_WORKFLOW,
@@ -450,8 +452,6 @@ def make_execution_inputs(
         WorkflowBinding,
         WorkspaceInputs,
     )
-    from ompire_daemon.registry.model_profiles import RoleBinding
-    from ompire_daemon.registry.workflow_library import resolve_current
     from ompire_daemon.workflows import load_packaged_workflows
 
     if engine is not None and workflow_name == "plain" and revision is None:
@@ -535,8 +535,8 @@ def make_execution_inputs(
 def make_test_policy(**overrides):
     """The native model policy tests start agents with. Explicit everywhere:
     a supervisor start has no "no policy" case any more (ADR-0026)."""
-    from ompire_daemon.execution_inputs import ModelPolicy
-    from ompire_daemon.registry.model_profiles import RoleBinding
+    from ompire_daemon.model_config import RoleBinding
+    from ompire_daemon.work.inputs import ModelPolicy
 
     roles = {**TEST_ROLES, **overrides}
     return ModelPolicy.from_roles(
@@ -545,7 +545,6 @@ def make_test_policy(**overrides):
             for role, binding in roles.items()
         }
     )
-
 
 
 def fake_argv_builder(scenario: dict | str = "happy"):

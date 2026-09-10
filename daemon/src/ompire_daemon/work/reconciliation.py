@@ -56,7 +56,29 @@ from sqlalchemy import Connection, Engine
 from ompire_daemon.config import Config
 from ompire_daemon.db import launch_migration_evidence
 from ompire_daemon.db import projects as projects_table
-from ompire_daemon.execution_inputs import (
+from ompire_daemon.platform.transactions import reserved_write
+from ompire_daemon.registry.sessions import (
+    APPLIED_ORIGIN_MIGRATED,
+    build_applied_policy,
+    list_resumable_sessions,
+    record_applied_policy,
+)
+from ompire_daemon.registry.workflow_library import (
+    UnknownWorkflowNameError,
+    WorkflowNotLaunchableError,
+    resolve_current,
+)
+from ompire_daemon.registry.workflows import (
+    PAUSE_UNRESOLVED_DECISION,
+    build_pause,
+    list_step_records,
+    pause_step,
+)
+from ompire_daemon.taskdefinition import (
+    READINESS_NEEDS_WORKFLOW_CONFIRMATION,
+    workflow_readiness,
+)
+from ompire_daemon.work.inputs import (
     PROFILE_SOURCE_LEGACY,
     PROVENANCE_LEGACY_CONFIRMED,
     RETIRED_AUXILIARY_JUDGE,
@@ -71,8 +93,8 @@ from ompire_daemon.execution_inputs import (
     encode_execution_inputs,
     execution_inputs_payload,
 )
-from ompire_daemon.launch import LaunchInputError, _read_profile_roles
-from ompire_daemon.registry.launch import (
+from ompire_daemon.work.launch import LaunchInputError, _read_profile_roles
+from ompire_daemon.work.launch_evidence import (
     DECISION_JUDGE_MODEL,
     DECISION_LAUNCH_CONFIG,
     DECISION_NEW_DEFAULTS,
@@ -93,42 +115,20 @@ from ompire_daemon.registry.launch import (
     record_decision,
     record_evidence,
 )
-from ompire_daemon.registry.model_profiles import reserved_write
-from ompire_daemon.registry.projects import (
+from ompire_daemon.work.projects import (
     Project,
     ProjectNotFoundError,
     get_project,
     validate_branch_pattern,
     validate_workshop_additions,
 )
-from ompire_daemon.registry.sessions import (
-    APPLIED_ORIGIN_MIGRATED,
-    build_applied_policy,
-    list_resumable_sessions,
-    record_applied_policy,
-)
-from ompire_daemon.registry.tasks import (
+from ompire_daemon.work.tasks import (
     Task,
     TaskNotFoundError,
     get_task,
     list_unconfigured_tasks,
     pin_execution_inputs,
     pin_workflow_binding,
-)
-from ompire_daemon.registry.workflow_library import (
-    UnknownWorkflowNameError,
-    WorkflowNotLaunchableError,
-    resolve_current,
-)
-from ompire_daemon.registry.workflows import (
-    PAUSE_UNRESOLVED_DECISION,
-    build_pause,
-    list_step_records,
-    pause_step,
-)
-from ompire_daemon.taskdefinition import (
-    READINESS_NEEDS_WORKFLOW_CONFIRMATION,
-    workflow_readiness,
 )
 from ompire_daemon.workflow_definitions import (
     RESULT_ENVELOPE_VERSION,

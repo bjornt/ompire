@@ -38,7 +38,7 @@ from ompire_daemon.registry.workflow_definitions import (
 from ompire_daemon.workflow_definitions import WorkflowRevision
 
 if TYPE_CHECKING:
-    from ompire_daemon.registry.tasks import Task
+    from ompire_daemon.work.tasks import Task
 
 # The task has no accepted launch inputs at all (ADR-0026).
 READINESS_NEEDS_CONFIGURATION = "needs_configuration"

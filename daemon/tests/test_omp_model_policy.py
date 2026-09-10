@@ -36,8 +36,8 @@ from ompire_daemon.agent import (
 )
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.execution_inputs import ModelPolicy, split_model_identifier
-from ompire_daemon.registry.model_profiles import RoleBinding
+from ompire_daemon.model_config import RoleBinding
+from ompire_daemon.work.inputs import ModelPolicy, split_model_identifier
 
 pytestmark = pytest.mark.skipif(shutil.which("omp") is None, reason="real omp not on PATH")
 

@@ -6,7 +6,7 @@ runs from persisted state.
 Two phases, split because they have very different latency budgets:
 
 - `classify_startup_tasks` — the reconciliation matrix. DB-derivable fail
-  verdicts come from `registry.tasks.reconcile_startup`; the remaining
+  verdicts come from `work.tasks.reconcile_startup`; the remaining
   candidates (spawn-completed) get one `workshop_status` probe each to split
   `fail-missing-container` from recoverable. Fast, and must finish before the
   first WebSocket snapshot is served, so callers run it synchronously at
@@ -29,10 +29,7 @@ from sqlalchemy import Engine
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.execution_inputs import (
-    MissingConsumerBindingError,
-    ModelPolicy,
-)
+from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.registry.sessions import (
     APPLIED_ORIGIN_MIGRATED,
     AppliedPolicy,
@@ -41,17 +38,20 @@ from ompire_daemon.registry.sessions import (
     list_resumable_sessions,
     record_applied_policy,
 )
-from ompire_daemon.registry.tasks import (
-    Task,
-    mark_failed,
-    reconcile_startup,
-    task_payload,
-)
 from ompire_daemon.registry.workflows import list_step_records
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.taskdefinition import (
     TaskDefinitionUnavailableError,
     resolve_task_definition,
+)
+from ompire_daemon.work.inputs import (
+    MissingConsumerBindingError,
+    ModelPolicy,
+)
+from ompire_daemon.work.tasks import (
+    Task,
+    mark_failed,
+    reconcile_startup,
 )
 from ompire_daemon.workflows import WorkflowRunner
 from ompire_daemon.workshop import workshop_status

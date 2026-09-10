@@ -23,11 +23,6 @@ from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.delivery import WorkspaceGuard
 from ompire_daemon.events import EventHub
 from ompire_daemon.migrate import upgrade_head
-from ompire_daemon.registry.projects import (
-    DEFAULT_FETCH_REMOTE,
-    create_project,
-    update_project,
-)
 from ompire_daemon.registry.result_exports import (
     OUTCOME_CREATED,
     OUTCOME_IDENTICAL,
@@ -43,13 +38,18 @@ from ompire_daemon.registry.result_exports import (
     list_task_exports,
 )
 from ompire_daemon.registry.results import list_results, results_version
-from ompire_daemon.registry.tasks import (
+from ompire_daemon.result_exports import ExportError, ResultExportManager
+from ompire_daemon.results import ResultManager
+from ompire_daemon.work.projects import (
+    DEFAULT_FETCH_REMOTE,
+    create_project,
+    update_project,
+)
+from ompire_daemon.work.tasks import (
     create_task,
     mark_archived,
     purge_task,
 )
-from ompire_daemon.result_exports import ExportError, ResultExportManager
-from ompire_daemon.results import ResultManager
 from tests.conftest import make_execution_inputs
 
 PLAN = "# Plan\nfirst\n"

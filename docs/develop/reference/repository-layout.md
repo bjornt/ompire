@@ -16,6 +16,10 @@ docs/              documentation
   use/             operator documentation set
   develop/         contributor documentation set
   adr/             architecture decision records
+  VISION.md        long-term product direction
+epics/             lightweight epic and change proposals
+  <epic>/EPIC.md   outcome and child-change map
+  <epic>/changes/  child changes (SPEC.md + PLAN.md each)
 scripts/           QA, dogfooding, and local browser provisioning
 snap/              classic-confinement snap packaging
 design/handoff/    original design bundle and UI mockups
@@ -26,7 +30,7 @@ changes/           temporary change artifacts, deleted when finished
 
 | File | Purpose |
 |---|---|
-| `VISION.md` | Long-term product direction |
+| [`docs/VISION.md`](../../VISION.md) | Long-term product direction |
 | `AGENTS.md` | Short orientation for coding agents |
 | `Makefile` | Build, test, lint, typecheck, run |
 | `workshop.yaml` | Container definition, including the headless browser SDK |

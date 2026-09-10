@@ -13,14 +13,14 @@ import threading
 
 from fastapi.testclient import TestClient
 
-from ompire_daemon.registry.model_profiles import (
+from ompire_daemon.work.profiles import (
     ModelProfileReferencedError,
     UnknownModelProfileReferenceError,
     create_model_profile,
     delete_model_profile,
     get_model_profile,
 )
-from ompire_daemon.registry.projects import create_project, update_project
+from ompire_daemon.work.projects import create_project, update_project
 
 from .conftest import make_adoptable_checkout
 
@@ -392,7 +392,7 @@ def test_deletion_racing_an_assignment_cannot_orphan_a_default(app) -> None:
         assert isinstance(outcomes["delete"], ModelProfileReferencedError)
 
     # Whatever the interleaving, the committed state is consistent.
-    from ompire_daemon.registry.projects import get_project
+    from ompire_daemon.work.projects import get_project
 
     reference = get_project(engine, "alpha").default_model_profile
     if reference is not None:

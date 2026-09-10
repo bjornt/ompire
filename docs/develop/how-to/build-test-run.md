@@ -31,6 +31,29 @@ make test-frontend ARGS="--reporter=verbose"
 
 Both suites must pass before committing.
 
+### Architecture dependency checks
+
+`daemon/tests/test_architecture.py` runs as part of `make test-backend` —
+there is no separate command and no generated baseline. It statically parses
+every daemon module and fails the suite when an import crosses an enforced
+ownership boundary: platform/value modules importing product code, work
+modules importing transport or projections, application commands importing
+transport, work routers importing storage or execution managers, or any code
+importing a retired module path.
+
+Run it alone while iterating on a boundary:
+
+```sh
+make test-backend ARGS="tests/test_architecture.py"
+```
+
+When a violation is intentional migration debt, add it to the checked-in
+`EXCEPTIONS` table in that test — the importing module, the imported module
+and symbol, and the later change that owns removing it. An exception whose
+import disappears fails as *stale*, so paid-off debt cannot linger as
+permission for its return. The checker cannot establish SQL column ownership
+or runtime behavior; code review and the behavioral suites cover those.
+
 ## Lint
 
 ```sh

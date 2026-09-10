@@ -45,8 +45,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ompire_daemon.model_config import MODEL_ROLES
-from ompire_daemon.registry.model_profiles import RoleBinding
+from ompire_daemon.model_config import MODEL_ROLES, RoleBinding
 
 # Bumped when the stored shape changes in a way a reader must notice. A task
 # written by a newer daemon is refused rather than half-understood. Version 2

@@ -11,19 +11,11 @@ from sqlalchemy import Engine
 
 from ompire_daemon.db import make_engine
 from ompire_daemon.migrate import upgrade_head
-from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.sessions import (
     list_resumable_sessions,
     list_sessions,
     mark_session_id,
     record_session_spawned,
-)
-from ompire_daemon.registry.tasks import (
-    Task,
-    create_task,
-    get_task,
-    mark_spawn_completed,
-    reconcile_startup,
 )
 from ompire_daemon.registry.workflows import (
     append_step_record,
@@ -31,6 +23,14 @@ from ompire_daemon.registry.workflows import (
     list_step_records,
     mark_prompt_sent,
     set_run_status,
+)
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import (
+    Task,
+    create_task,
+    get_task,
+    mark_spawn_completed,
+    reconcile_startup,
 )
 
 
@@ -188,7 +188,7 @@ def test_reconcile_startup_returns_recoverable_candidate(
 def test_reconcile_startup_leaves_failed_and_archived_alone(
     engine: Engine, project, tmp_path: Path
 ) -> None:
-    from ompire_daemon.registry.tasks import mark_archived, mark_failed
+    from ompire_daemon.work.tasks import mark_archived, mark_failed
 
     already_failed = _make_task(engine, project, tmp_path, "already-failed")
     mark_failed(engine, already_failed.id, "some earlier failure")

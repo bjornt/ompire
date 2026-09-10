@@ -32,10 +32,9 @@ from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.delivery import WorkspaceGuard
 from ompire_daemon.events import EventHub
 from ompire_daemon.migrate import upgrade_head
-from ompire_daemon.registry.projects import create_project
+from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.registry.results import get_result, list_results
 from ompire_daemon.registry.sessions import get_session
-from ompire_daemon.registry.tasks import Task, create_task, get_task, task_payload
 from ompire_daemon.registry.workflow_library import (
     UnknownWorkflowNameError,
     WorkflowNotLaunchableError,
@@ -55,6 +54,8 @@ from ompire_daemon.taskdefinition import (
     TaskDefinitionUnavailableError,
     resolve_task_definition,
 )
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import Task, create_task, get_task
 from ompire_daemon.workflows import (
     COMPLETE,
     WorkflowNotWaitingError,
@@ -556,7 +557,11 @@ def test_a_missing_packaged_resource_stops_the_daemon(
 def test_launch_rejects_an_uninstalled_workflow(engine: Engine, project) -> None:
     """The library is the only source of valid workflow names, and a launch
     names one directly (ADR-0026, ADR-0031)."""
-    from ompire_daemon.launch import LaunchInputError, LaunchRequest, resolve_launch
+    from ompire_daemon.work.launch import (
+        LaunchInputError,
+        LaunchRequest,
+        resolve_launch,
+    )
 
     request = LaunchRequest(
         project_name="demo",
@@ -673,7 +678,8 @@ def test_a_task_whose_revision_is_unavailable_is_refused_not_substituted(
 
     # The task is still listed and still readable: one damaged row must not
     # take the dashboard with it.
-    from ompire_daemon.registry.tasks import list_tasks, task_payload
+    from ompire_daemon.oversight.tasks import task_payload
+    from ompire_daemon.work.tasks import list_tasks
 
     payload = task_payload(get_task(engine, task.id), engine=engine)
     assert payload["workflow_ready"] is False
@@ -1547,7 +1553,7 @@ def test_workflow_resume_endpoint_404_and_409(
         },
     )
     assert r.status_code == 201, r.text
-    from ompire_daemon.registry.tasks import create_task as _create
+    from ompire_daemon.work.tasks import create_task as _create
 
     task = _create(
         client.app.state.engine,
@@ -1583,7 +1589,6 @@ def test_a_choice_is_required_at_a_choice_gate_and_refused_anywhere_else(
     uncertainty pause and a format-1 gate refuse one, because answering with a
     choice would be answering a question nobody asked.
     """
-    from ompire_daemon.registry.tasks import create_task as _create
     from ompire_daemon.registry.workflows import (
         append_step_record,
         build_gate_snapshot,
@@ -1592,6 +1597,7 @@ def test_a_choice_is_required_at_a_choice_gate_and_refused_anywhere_else(
         pause_step,
         set_run_status,
     )
+    from ompire_daemon.work.tasks import create_task as _create
 
     from .conftest import make_adoptable_checkout
 
@@ -1737,7 +1743,6 @@ def test_answering_a_gate_over_rest_records_it_and_advances_once(
     client: TestClient, auth_headers: dict[str, str]
 ) -> None:
     """The accepted path, and its refusal on a second submit."""
-    from ompire_daemon.registry.tasks import create_task as _create
     from ompire_daemon.registry.workflows import (
         append_step_record,
         build_gate_snapshot,
@@ -1745,6 +1750,7 @@ def test_answering_a_gate_over_rest_records_it_and_advances_once(
         park_gate,
         set_run_status,
     )
+    from ompire_daemon.work.tasks import create_task as _create
 
     from .conftest import make_adoptable_checkout
 
@@ -2059,7 +2065,6 @@ def _feed(supervisor, task_id: int, clone: Path, plan: list[tuple[str, int, str]
             )
 
     return asyncio.create_task(drive())
-
 
 
 async def _wait_for_prompted(
@@ -2925,7 +2930,7 @@ def _make_task_policy_for_recovery(engine: Engine, task_id: int, session: str):
 
 
 def _role_bindings(roles: dict) -> dict:
-    from ompire_daemon.registry.model_profiles import RoleBinding
+    from ompire_daemon.model_config import RoleBinding
 
     return {
         role: RoleBinding(model=pair["model"], thinking=pair["thinking"])

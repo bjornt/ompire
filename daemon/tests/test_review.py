@@ -12,9 +12,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ompire_daemon.config import Config
-from ompire_daemon.execution_inputs import encode_execution_inputs
 from ompire_daemon.review import REVIEW_GIT_REF, ReviewManager
 from ompire_daemon.ship import ShipManager
+from ompire_daemon.work.inputs import encode_execution_inputs
 from tests.conftest import TEST_ROLES, make_execution_inputs, spawn_task
 
 
@@ -29,7 +29,7 @@ def _add_change(clone: Path, name: str = "worked.txt", text: str = "work\n") -> 
 
 def _create_demo_profile(client: TestClient) -> None:
     """The `demo` global model profile a launch inherits from the project."""
-    from ompire_daemon.registry.model_profiles import create_model_profile
+    from ompire_daemon.work.profiles import create_model_profile
 
     create_model_profile(client.app.state.engine, name="demo", roles=TEST_ROLES)
 
@@ -133,7 +133,7 @@ class TestCandidateReviewView:
         task clone's HEAD, index, and working tree are untouched throughout.
         """
         from ompire_daemon.delivery import capture_candidate, prepare_review_view
-        from ompire_daemon.registry.tasks import Task
+        from ompire_daemon.work.tasks import Task
 
         app = review_app
 
@@ -226,7 +226,7 @@ class TestCandidateReviewView:
     ) -> None:
         """An agent-writable clone must not choose what gets captured."""
         from ompire_daemon.delivery import UnsafeCloneConfigError, capture_candidate
-        from ompire_daemon.registry.tasks import Task
+        from ompire_daemon.work.tasks import Task
 
         app = review_app
 
@@ -545,7 +545,7 @@ class TestReviewManagerLifecycle:
         reviews._config = app.state.config
         reviews.start()
 
-        from ompire_daemon.registry.tasks import get_task
+        from ompire_daemon.work.tasks import get_task
 
         engine = app.state.engine
         seeded_inputs = encode_execution_inputs(
@@ -628,7 +628,7 @@ class TestReviewManagerLifecycle:
         reviews.start()
 
         from ompire_daemon.db import projects, tasks
-        from ompire_daemon.registry.tasks import get_task
+        from ompire_daemon.work.tasks import get_task
 
         engine = app.state.engine
         seeded_inputs = encode_execution_inputs(
@@ -707,7 +707,7 @@ class TestReviewManagerLifecycle:
         reviews.start()
 
         from ompire_daemon.db import projects, tasks
-        from ompire_daemon.registry.tasks import get_task
+        from ompire_daemon.work.tasks import get_task
 
         engine = app.state.engine
         seeded_inputs = encode_execution_inputs(
@@ -829,7 +829,7 @@ class TestReviewDurability:
         self, review_app, tmp_path: Path, git_checkout: Path
     ) -> None:
         from ompire_daemon.registry.reviews import get_review
-        from ompire_daemon.registry.tasks import get_task
+        from ompire_daemon.work.tasks import get_task
 
         app = review_app
         fake_llmvet = _write_fake_llmvet(tmp_path, "", 0)
@@ -876,7 +876,7 @@ class TestReviewDurability:
         self, review_app, tmp_path: Path, git_checkout: Path
     ) -> None:
         from ompire_daemon.registry.reviews import get_review
-        from ompire_daemon.registry.tasks import get_task
+        from ompire_daemon.work.tasks import get_task
 
         app = review_app
         reviews = app.state.reviews
@@ -1065,7 +1065,7 @@ class TestCleanupWithLiveReviewer:
         the review must be landed terminal here. A retained row left `open`
         with no process would show an archived task as still under review."""
         from ompire_daemon.registry.reviews import get_review
-        from ompire_daemon.registry.tasks import get_task
+        from ompire_daemon.work.tasks import get_task
 
         app = review_app
         slow = tmp_path / "slow-llmvet"

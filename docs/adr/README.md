@@ -55,6 +55,7 @@ relying on it.
 | [0035](0035-refuse-to-publish-handoff-destinations.md) | Refuse to publish handoff destinations | Accepted |
 | [0036](0036-install-exported-result-files-without-replacing-them.md) | Install exported result files without replacing them | Accepted |
 | [0037](0037-capture-workflow-results-before-accepted-handoffs.md) | Capture workflow results before accepted handoffs | Accepted |
+| [0038](0038-own-modules-and-compose-local-transactions.md) | Own modules and compose local transactions | Accepted |
 
 ## Template
 

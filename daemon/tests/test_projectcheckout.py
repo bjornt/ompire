@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from ompire_daemon.projectcheckout import (
+from ompire_daemon.work.checkout import (
     InvalidRemoteNameError,
     InvalidRepoUrlError,
     inspect_checkout,

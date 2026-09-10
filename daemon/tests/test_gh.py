@@ -16,8 +16,8 @@ from ompire_daemon.gh import (
     parse_github_target,
     redact_github_text,
 )
-from ompire_daemon.registry.projects import create_project
-from ompire_daemon.registry.tasks import Task, create_task
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import Task, create_task
 from tests.conftest import make_execution_inputs
 
 

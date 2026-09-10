@@ -12,7 +12,6 @@ from pathlib import Path
 import pytest
 from sqlalchemy import Engine
 
-from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.reviews import (
     append_iteration,
     clear_process_marker,
@@ -24,7 +23,8 @@ from ompire_daemon.registry.reviews import (
     open_review,
     set_status,
 )
-from ompire_daemon.registry.tasks import create_task, mark_archived, purge_task
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import create_task, mark_archived, purge_task
 from tests.conftest import make_execution_inputs
 
 

@@ -24,13 +24,13 @@ from sqlalchemy import Engine
 from ompire_daemon import workshopadditions
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.execution_inputs import TaskExecutionInputs
 from ompire_daemon.handoff import (
     HandoffError,
     MaterializationError,
     install_attachments,
     payload_key,
 )
+from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.registry.results import (
     DamagedManifestError,
     ResultNotAttachableError,
@@ -39,7 +39,12 @@ from ompire_daemon.registry.results import (
     verify_attachable_on,
     verify_payload_on,
 )
-from ompire_daemon.registry.tasks import (
+from ompire_daemon.taskdefinition import (
+    TaskDefinitionUnavailableError,
+    resolve_task_definition,
+)
+from ompire_daemon.work.inputs import TaskExecutionInputs
+from ompire_daemon.work.tasks import (
     Task,
     TaskConfigurationRequiredError,
     get_task,
@@ -47,11 +52,6 @@ from ompire_daemon.registry.tasks import (
     mark_spawn_completed,
     mark_workshop_launched,
     require_task_inputs,
-    task_payload,
-)
-from ompire_daemon.taskdefinition import (
-    TaskDefinitionUnavailableError,
-    resolve_task_definition,
 )
 from ompire_daemon.workflows import WorkflowRunner
 

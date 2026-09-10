@@ -8,6 +8,27 @@ automatically at startup.
 The rationale is in
 [ADR-0005](../../adr/0005-persist-local-state-with-sqlite-core-and-alembic.md).
 
+
+## Column ownership
+
+The schema is one database shared by every owner; the *writer* of each
+column is what ownership means today. No schema or migration change is
+pending on this split — it records who writes what, so a later extraction
+has a boundary to preserve:
+
+| Owner | What it writes |
+|---|---|
+| Work (`work/projects.py`, `work/profiles.py`, `work/tasks.py`, `work/reconciliation.py`) | `projects.*`; `model_profiles.*`; on `tasks`: identity (`id`, `project_name`, `slug`, `branch`, `clone_path`, `prompt`), `execution_inputs_json`, and lifecycle `state` |
+| Workspace lifecycle (`spawn.py`, `workshop.py` — not yet extracted) | `tasks.workshop_id`, `tasks.spawn_completed_at`, `tasks.error` on spawn failure |
+| Workflows (`workflows.py`, `registry/workflows.py` — not yet extracted) | the `tasks.workflow_*` run-state fields and the step-record tables |
+| Delivery (`ship.py`, `prwatch.py`, `registry/ships.py` — not yet extracted) | `tasks.pr_url`, `tasks.pr_state`, `tasks.pr_merged_at`, plus candidate/review/authorization/action history |
+| Sessions and artifacts (not yet extracted) | session identity and applied-policy rows; result, reference, and export records |
+
+The shared `tasks.updated_at` (and the error/timestamp columns) is
+attributed to whichever operation updates it; these denormalized fields do
+not have independent records yet. See the
+[daemon module map](daemon-modules.md#ownership-at-a-glance) for the
+
 ## `projects`
 
 | Column | Type | Notes |
@@ -71,7 +92,7 @@ The declaration is therefore schema metadata and defense for any connection
 that does enable it — it is not the runtime guarantee.
 
 The guarantee is a `BEGIN IMMEDIATE` write reservation
-(`registry.model_profiles.reserved_write`) shared by both sides of the race:
+(`platform/transactions.reserved_write`) shared by both sides of the race:
 project create/update takes it before checking that the referenced profile
 exists, and profile deletion takes it before scanning for referencing
 projects. Because `BEGIN IMMEDIATE` acquires SQLite's write lock up front, a
@@ -657,7 +678,7 @@ happened, even though the payload no longer matches it.
 
 ### Transaction boundaries
 
-Every mutation runs inside `registry/model_profiles.reserved_write` (`BEGIN
+Every mutation runs inside `platform/transactions.reserved_write` (`BEGIN
 IMMEDIATE`), and every one of them advances `tasks.results_version` in the same
 transaction, so an observable change and its version cannot separate.
 

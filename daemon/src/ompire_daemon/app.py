@@ -20,11 +20,12 @@ from typing import Any
 from fastapi import FastAPI
 from sqlalchemy import Engine
 
-from ompire_daemon import launchconfig, workshopadditions
+from ompire_daemon import workshopadditions
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.api.rest import router as api_router
 from ompire_daemon.api.ws import router as ws_router
+from ompire_daemon.application.launch import LaunchService, SpawnScheduler
 from ompire_daemon.auth import load_or_create_token
 from ompire_daemon.config import DEFAULT_CONFIG_PATH, Config
 from ompire_daemon.datadir import carry_forward_snap_state
@@ -35,17 +36,18 @@ from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import GpgProbe
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.notifications import AttentionNotifier
-from ompire_daemon.projectsetup import ProjectSetupManager
 from ompire_daemon.prwatch import PrWatcher
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
 from ompire_daemon.registry.settings import SettingsStore
-from ompire_daemon.registry.tasks import list_tasks
 from ompire_daemon.result_exports import ResultExportManager
 from ompire_daemon.results import ResultManager
 from ompire_daemon.review import ReviewManager, restore_reviews
 from ompire_daemon.sessions import SessionTracker
 from ompire_daemon.ship import ShipManager
 from ompire_daemon.static import DEFAULT_FRONTEND_DIST, mount_frontend
+from ompire_daemon.work import reconciliation
+from ompire_daemon.work.setup import ProjectSetupManager
+from ompire_daemon.work.tasks import list_tasks
 from ompire_daemon.workflows import WorkflowRunner, install_packaged_workflows
 
 logger = logging.getLogger(__name__)
@@ -107,11 +109,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         recovery_job.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await recovery_job
-        background_jobs = list(app.state.spawn_jobs)
-        for job in background_jobs:
-            job.cancel()
-        if background_jobs:
-            await asyncio.gather(*background_jobs, return_exceptions=True)
+        # Cancel accepted tasks' preparation jobs (and delivery jobs) after
+        # recovery is done with them; the scheduler owns the strong
+        # references and the completion removal.
+        await app.state.spawn_scheduler.shutdown()
         await notifier.stop()
         await advisories.stop()
         await prwatch.stop()
@@ -161,7 +162,7 @@ async def _prepare_startup(
     # Finish what migration 0013 could not: seed ordinary defaults for
     # projects that never had a template, and record any retired `judge_model`
     # as evidence to acknowledge (ADR-0026). Idempotent across restarts.
-    launchconfig.initialize(engine, config)
+    reconciliation.initialize(engine, config)
     # A crash mid-launch can leave a clone carrying staged Workshop additions
     # that are not the ones its repository owns. Undo that before any agent
     # can start in it.
@@ -290,7 +291,7 @@ def create_app(
     _chmod_db_private(db_path)
     app.state.auth_token = load_or_create_token(config.data_dir)
     app.state.events = EventHub()
-    app.state.spawn_jobs = set()
+    app.state.spawn_scheduler = SpawnScheduler()
     app.state.ws_connections = set()
     app.state.settings_store = SettingsStore(app.state.engine, config)
     effective_settings = app.state.settings_store.effective()
@@ -379,6 +380,17 @@ def create_app(
         config, app.state.engine, app.state.events, app.state.gh
     )
     app.state.advisories.register(app.state.sessions)
+    # The launch boundary: one transport-independent owner of preview and
+    # acceptance, with its post-commit collaborators injected rather than
+    # looked up from request state.
+    app.state.launch_service = LaunchService(
+        app.state.engine,
+        config,
+        events=app.state.events,
+        scheduler=app.state.spawn_scheduler,
+        workflow_runner=app.state.workflow_runner,
+        result_notifier=app.state.results.publish,
+    )
     # Bound to the app so the REST route does not have to reach into recovery
     # internals; the guard on eligibility lives in the route.
     app.state.continue_task = lambda task: _continue_task(app, task)

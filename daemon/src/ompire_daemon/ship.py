@@ -66,7 +66,6 @@ from ompire_daemon.delivery import (
     workspace_tree_id,
 )
 from ompire_daemon.events import EventHub
-from ompire_daemon.execution_inputs import TaskExecutionInputs
 from ompire_daemon.gh import (
     GitHubProbe,
     GitHubStatus,
@@ -74,6 +73,7 @@ from ompire_daemon.gh import (
     parse_github_owner,
 )
 from ompire_daemon.gpg import STATE_READY, gpg_signing_refusal
+from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.registry.reviews import get_review
 from ompire_daemon.registry.ships import (
     ENDING_ACTIONS,
@@ -106,14 +106,6 @@ from ompire_daemon.registry.ships import (
     set_disposition,
     task_version,
 )
-from ompire_daemon.registry.tasks import (
-    Task,
-    get_task,
-    list_tasks,
-    mark_pr_url,
-    require_task_inputs,
-    task_payload,
-)
 from ompire_daemon.registry.workflows import DeliveryAuthorization, latest_step_record
 from ompire_daemon.runauthority import (
     SOURCE_LEGACY_CONTINUATION,
@@ -123,6 +115,14 @@ from ompire_daemon.runauthority import (
     resolve_authority,
 )
 from ompire_daemon.sessions import wait_for_idle
+from ompire_daemon.work.inputs import TaskExecutionInputs
+from ompire_daemon.work.tasks import (
+    Task,
+    get_task,
+    list_tasks,
+    mark_pr_url,
+    require_task_inputs,
+)
 from ompire_daemon.workflow_definitions import DeliveryStep
 
 if TYPE_CHECKING:

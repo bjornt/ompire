@@ -1,5 +1,5 @@
 """Session registry: per-(task, session) rows against `task_sessions`. No ORM
-— Core only, mirroring the `registry/tasks.py` frozen-dataclass pattern.
+— Core only, mirroring the `work/tasks.py` frozen-dataclass pattern.
 
 A row appears when the workflow engine first spawns the session (lazy spawn);
 `omp_session_id` starts NULL and is filled by `mark_session_id` once the
@@ -27,7 +27,7 @@ from typing import Any
 from sqlalchemy import Engine
 
 from ompire_daemon.db import task_sessions
-from ompire_daemon.execution_inputs import ModelPolicy
+from ompire_daemon.work.inputs import ModelPolicy
 
 APPLIED_POLICY_VERSION = 1
 

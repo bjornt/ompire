@@ -151,3 +151,5 @@ nav:
           - 0034 Durable task results: adr/0034-retain-durable-task-results-outside-the-workspace.md
           - 0035 Non-publishable handoff destinations: adr/0035-refuse-to-publish-handoff-destinations.md
           - 0036 Create-only checkout export: adr/0036-install-exported-result-files-without-replacing-them.md
+          - 0037 Capture results before accepted handoffs: adr/0037-capture-workflow-results-before-accepted-handoffs.md
+          - 0038 Own modules, compose local transactions: adr/0038-own-modules-and-compose-local-transactions.md

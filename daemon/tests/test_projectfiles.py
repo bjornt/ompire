@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ompire_daemon.projectfiles import (
+from ompire_daemon.work.files import (
     MAX_LIMIT,
     CheckoutMissingError,
     CheckoutNotGitError,

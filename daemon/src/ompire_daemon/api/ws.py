@@ -20,15 +20,16 @@ from sqlalchemy import Engine
 from ompire_daemon.agent import EVENT_STREAM_END, AgentSupervisor
 from ompire_daemon.auth import check_ws_token
 from ompire_daemon.events import EventHub
-from ompire_daemon.registry.model_profiles import list_model_profiles
-from ompire_daemon.registry.projects import list_projects
+from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.registry.settings import SettingsStore
-from ompire_daemon.registry.tasks import list_tasks, task_payload
 from ompire_daemon.registry.workflow_library import (
     launchable_descriptors,
     list_entries,
 )
 from ompire_daemon.registry.workflows import list_step_records
+from ompire_daemon.work.profiles import list_model_profiles
+from ompire_daemon.work.projects import list_projects
+from ompire_daemon.work.tasks import list_tasks
 
 router = APIRouter()
 

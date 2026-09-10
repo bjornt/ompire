@@ -24,21 +24,13 @@ from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.app import create_app
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.execution_inputs import ModelPolicy
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
-from ompire_daemon.registry.model_profiles import create_model_profile
-from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.sessions import (
     build_applied_policy,
     get_session,
     mark_session_id,
     record_applied_policy,
     record_session_spawned,
-)
-from ompire_daemon.registry.tasks import (
-    create_task,
-    get_task,
-    mark_spawn_completed,
 )
 from ompire_daemon.registry.workflows import (
     append_step_record,
@@ -48,6 +40,14 @@ from ompire_daemon.registry.workflows import (
 )
 from ompire_daemon.review import REVIEW_GIT_REF
 from ompire_daemon.sessions import SessionTracker
+from ompire_daemon.work.inputs import ModelPolicy
+from ompire_daemon.work.profiles import create_model_profile
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import (
+    create_task,
+    get_task,
+    mark_spawn_completed,
+)
 from ompire_daemon.workflows import WorkflowRunner
 from tests.conftest import (
     TEST_ROLES,

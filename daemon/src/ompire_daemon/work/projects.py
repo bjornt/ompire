@@ -16,9 +16,9 @@ from pathlib import Path
 from sqlalchemy import Engine
 
 from ompire_daemon.db import projects, tasks
-from ompire_daemon.registry.model_profiles import (
+from ompire_daemon.platform.transactions import reserved_write
+from ompire_daemon.work.profiles import (
     require_profile_exists,
-    reserved_write,
 )
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")

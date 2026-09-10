@@ -298,7 +298,7 @@ resources used by a workflow, not the top-level unit of work.
 
 A versioned output with provenance: producing run and step, content or path,
 media type, checksum, and intended consumers. Artifacts include reproduction
-scripts, root-cause analyses, plans, OpenSpec changes, design handoffs, review
+scripts, root-cause analyses, plans, change documents, design handoffs, review
 reports, test evidence, patches, and release or pull-request text.
 
 Artifacts may pass between steps without entering Git. Export to the operator's
@@ -428,7 +428,7 @@ work.
 ### Exploratory work
 
 Exploration is a valid terminal outcome. A workflow may investigate, compare
-approaches, or create an OpenSpec/design handoff and then finish with no source
+approaches, or produce a design handoff and then finish with no source
 commit. The useful result is the artifact and its evidence, not a fabricated
 code change.
 
@@ -590,9 +590,12 @@ should nevertheless be small enough to admit another agent protocol later
 without reducing Ompire to a lowest-common-denominator terminal wrapper.
 
 Workflows should compose external tools through explicit inputs, outputs, exit
-semantics, and capability declarations. OpenSpec operations, automated review,
-design handoffs, test runners, and forge actions should be replaceable
-integrations rather than special behavior hidden inside agents.
+semantics, and capability declarations. Automated review, design-handoff
+tools, test runners, forge actions, and — where an operator chooses to keep
+using one — an external specification tool, should be replaceable integrations
+rather than special behavior hidden inside agents. Ompire's own maintained
+planning workflow is the lightweight SPEC/PLAN change flow, not any external
+specification CLI.
 
 Work-item providers share a small capability-aware interface for saved-query
 execution, revisioned reads, change observation, comments, links, assignment,

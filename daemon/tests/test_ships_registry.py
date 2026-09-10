@@ -16,7 +16,6 @@ import pytest
 
 from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.migrate import upgrade_head
-from ompire_daemon.registry.projects import create_project
 from ompire_daemon.registry.ships import (
     AuthorityBoundary,
     DeliveryConflictError,
@@ -45,7 +44,8 @@ from ompire_daemon.registry.ships import (
     resolve_action,
     task_version,
 )
-from ompire_daemon.registry.tasks import create_task, mark_archived
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import create_task, mark_archived
 from tests.conftest import make_execution_inputs
 
 
@@ -472,7 +472,7 @@ def test_purge_deletes_the_journal_and_names_the_storage_to_remove(
 ) -> None:
     """Cleanup retains all of this; only purge deletes it, and it has to say
     which candidate repositories are now unreferenced — nothing else knows."""
-    from ompire_daemon.registry.tasks import purge_task
+    from ompire_daemon.work.tasks import purge_task
 
     _candidate(engine, task)
     delivery = _authorize(engine, task, open_delivery(engine, task.id), ending="commit")

@@ -107,7 +107,7 @@ from ompire_daemon.registry.results import (
     results_version,
     retained_counts,
 )
-from ompire_daemon.registry.tasks import Task, get_task, list_tasks
+from ompire_daemon.work.tasks import Task, get_task, list_tasks
 
 logger = logging.getLogger(__name__)
 

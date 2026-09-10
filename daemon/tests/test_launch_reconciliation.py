@@ -85,7 +85,7 @@ def upgraded(daemon_config: Config, git_checkout: Path):
         _land_at_0012(effective)
         _seed(effective, git_checkout, templates)
         app = create_app(effective, frontend_dist=effective.data_dir / "no-dist")
-        from ompire_daemon.registry.model_profiles import create_model_profile
+        from ompire_daemon.work.profiles import create_model_profile
 
         create_model_profile(app.state.engine, name="chosen", roles=TEST_ROLES)
         # These tests launch to observe reconciliation, not to publish, so
@@ -423,7 +423,7 @@ def test_a_legacy_task_states_what_is_unknown_and_blocks_until_confirmed(
     _seed(daemon_config, git_checkout, [{"name": "t"}])
     task_id = _seed_legacy_task(daemon_config, git_checkout)
     app = create_app(daemon_config, frontend_dist=daemon_config.data_dir / "no-dist")
-    from ompire_daemon.registry.model_profiles import create_model_profile
+    from ompire_daemon.work.profiles import create_model_profile
 
     create_model_profile(app.state.engine, name="chosen", roles=TEST_ROLES)
     with TestClient(app) as client:
@@ -553,7 +553,7 @@ def test_a_stale_continuation_preview_changes_nothing(
     _seed(daemon_config, git_checkout, [{"name": "t"}])
     task_id = _seed_legacy_task(daemon_config, git_checkout)
     app = create_app(daemon_config, frontend_dist=daemon_config.data_dir / "no-dist")
-    from ompire_daemon.registry.model_profiles import create_model_profile
+    from ompire_daemon.work.profiles import create_model_profile
 
     create_model_profile(app.state.engine, name="chosen", roles=TEST_ROLES)
     with TestClient(app) as client:
@@ -814,7 +814,7 @@ def test_an_old_synthesized_escalation_gate_retries_the_decision(
     task_id = _seed_legacy_bugfix_at_a_synthesized_gate(daemon_config, git_checkout)
     app = create_app(daemon_config, frontend_dist=daemon_config.data_dir / "no-dist")
     _install_format_1_bugfix(app.state.engine)
-    from ompire_daemon.registry.model_profiles import create_model_profile
+    from ompire_daemon.work.profiles import create_model_profile
 
     create_model_profile(app.state.engine, name="chosen", roles=TEST_ROLES)
     with TestClient(app) as client:

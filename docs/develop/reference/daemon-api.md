@@ -15,6 +15,19 @@ Every state-changing operation is a REST endpoint under `/api/` with a
 Pydantic-validated JSON body. A body that fails validation returns `422` with
 field-level detail and changes nothing.
 
+HTTP is the only mutation *transport*, not where the work rules live. The
+work-related routes — projects, model profiles, task preview/creation, task
+configuration, and explicit Continue — are thin routers over the
+transport-independent command layer: `application/launch.py` owns preview and
+acceptance, `application/work.py` the project/profile/reconciliation
+commands, and `application/tasks.py` the task reads and Continue. A route
+converts its wire body into a typed request, calls one command, and maps the
+command's domain errors to status codes; the acceptance transaction,
+filesystem observation, and preparation-job supervision never see a request
+object. The remaining routes (workflow library and gates, review, delivery,
+results and exports, agent control, settings, cleanup and purge) still live
+in `api/rest.py` and migrate the same way as their owning changes proceed.
+
 The full endpoint inventory is in the [API
 reference](../../use/reference/api.md); the generated OpenAPI schema at
 `/openapi.json` is authoritative for request and response bodies. The model
@@ -76,7 +89,11 @@ Acceptance then resolves twice. The first resolution validates and is what the
 Git and file-mention work runs against; the authoritative one is taken again
 inside a `BEGIN IMMEDIATE` reservation, compared against the same token, and
 followed by the insert before the lock is released. Nothing is awaited,
-spawned, or published inside that reservation. A token that no longer matches
+spawned, or published inside that reservation. The whole sequence —
+observation, validation, the reserved transaction, and the post-commit
+scheduling — is owned by `LaunchService` in `application/launch.py`, with
+`SpawnScheduler` holding the preparation job's strong reference; the route
+maps `PreviewChangedError` to that `409` and nothing else. A token that no longer matches
 is a `409` carrying the current preview for review, and creates no task,
 workspace, or background job — the operator re-reviews rather than the daemon
 retrying under settings they never saw. What this pins is configuration and

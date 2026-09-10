@@ -36,7 +36,21 @@ from sqlalchemy import Connection
 from ompire_daemon.db import model_profiles as model_profiles_table
 from ompire_daemon.db import projects as projects_table
 from ompire_daemon.db import tasks as tasks_table
-from ompire_daemon.execution_inputs import (
+from ompire_daemon.handoff import HandoffError, plan_destinations
+from ompire_daemon.model_config import MODEL_ROLES, RoleBinding, validate_model_role
+from ompire_daemon.registry.results import (
+    ResultNotAttachableError,
+    ResultNotFoundError,
+    StaleRevisionError,
+    verify_attachable_on,
+    verify_payload_on,
+)
+from ompire_daemon.registry.workflow_library import (
+    UnknownWorkflowNameError,
+    WorkflowNotLaunchableError,
+    resolve_current,
+)
+from ompire_daemon.work.inputs import (
     AUXILIARY_CONSUMERS,
     HANDOFF_CLASSIFICATION,
     PROFILE_SOURCE_PROJECT,
@@ -55,26 +69,10 @@ from ompire_daemon.execution_inputs import (
     WorkflowBinding,
     WorkspaceInputs,
     decode_roles,
-    encode_binding,
 )
-from ompire_daemon.handoff import HandoffError, plan_destinations
-from ompire_daemon.model_config import MODEL_ROLES, validate_model_role
-from ompire_daemon.registry.model_profiles import RoleBinding
-from ompire_daemon.registry.projects import (
+from ompire_daemon.work.projects import (
     validate_branch_pattern,
     validate_workshop_additions,
-)
-from ompire_daemon.registry.results import (
-    ResultNotAttachableError,
-    ResultNotFoundError,
-    StaleRevisionError,
-    verify_attachable_on,
-    verify_payload_on,
-)
-from ompire_daemon.registry.workflow_library import (
-    UnknownWorkflowNameError,
-    WorkflowNotLaunchableError,
-    resolve_current,
 )
 from ompire_daemon.workflow_definitions import WorkflowRevision, describe
 
@@ -885,118 +883,3 @@ def resolve_launch(
     )
 
 
-def binding_payload(binding: ConsumerBinding) -> dict[str, Any]:
-    """One consumer's wire shape.
-
-    Byte-identical to what acceptance stores for that consumer, so the row
-    the operator reviewed and the row the run executes are comparable
-    without translation. The effective model and thinking level stay on the
-    preview row itself rather than being duplicated in here.
-    """
-    return encode_binding(binding)
-
-
-def resolution_payload(resolved: ResolvedLaunch) -> dict[str, Any]:
-    """The preview's wire shape."""
-    inputs = resolved.inputs
-    return {
-        "preview_token": resolved.fingerprint,
-        "project_name": inputs.project_name,
-        "workflow_name": inputs.workflow_name,
-        # The exact procedure being accepted, not just its name. The UI shows
-        # it beside the flow and offers the definition itself for reading.
-        "workflow_revision": resolved.revision.revision,
-        "workflow_format": resolved.revision.format,
-        "workflow_primary_session": resolved.revision.definition.primary,
-        "workflow_sessions": list(resolved.revision.definition.sessions),
-        "model_profile": inputs.model_profile_name,
-        "model_profile_source": inputs.model_profile_source,
-        "project_default_model_profile": resolved.project_default_profile,
-        "auxiliary_consumers": list(AUXILIARY_CONSUMERS),
-        # The task-wide profile's own map: what a row inheriting both
-        # dimensions resolves against.
-        "roles": {
-            role: {
-                "model": resolved.task_roles[role].model,
-                "thinking": resolved.task_roles[role].thinking,
-            }
-            for role in MODEL_ROLES
-        },
-        "workspace": {
-            "base_branch": inputs.workspace.base_branch,
-            "branch_pattern": inputs.workspace.branch_pattern,
-            "workshop_additions": inputs.workspace.workshop_additions,
-            "preamble": inputs.workspace.preamble,
-        },
-        "inherited_workspace": {
-            "base_branch": resolved.inherited_workspace.base_branch,
-            "branch_pattern": resolved.inherited_workspace.branch_pattern,
-            "workshop_additions": resolved.inherited_workspace.workshop_additions,
-            "preamble": resolved.inherited_workspace.preamble,
-        },
-        "workspace_overrides": list(inputs.workspace_overrides),
-        "branch": inputs.branch,
-        # The exact commit this launch was resolved against, null for an
-        # ordinary launch. Named so the operator reviews an identity, not "the
-        # tip of main, whenever the clone happens to run".
-        "source_commit": inputs.source_commit,
-        "needs_base_acknowledgement": resolved.needs_base_acknowledgement,
-        "acknowledged_base_difference": inputs.acknowledged_base_difference,
-        "result_attachments": [
-            {
-                "result_id": attachment.result_id,
-                "producer_task_id": attachment.producer_task_id,
-                "manifest_id": attachment.manifest_id,
-                "content_id": attachment.content_id,
-                "accepted_at": attachment.accepted_at,
-                "manifest_project_name": attachment.manifest_project_name,
-                # The fixed policy every destination carries. Rendered as a
-                # label, never as an editable control: there is no
-                # declassification.
-                "classification": attachment.classification,
-                "publishable": False,
-                "files": [
-                    {
-                        "path": entry.path,
-                        "length": entry.length,
-                        "sha256": entry.sha256,
-                        "media_type": entry.media_type,
-                    }
-                    for entry in attachment.files
-                ],
-                "destinations": list(attachment.destinations),
-                "provenance": attachment.provenance,
-            }
-            for attachment in inputs.result_attachments
-        ],
-        "base_comparisons": [
-            {
-                "result_id": comparison.result_id,
-                "state": comparison.state,
-                "target_commit": comparison.target_commit,
-                "producer_observation": comparison.producer_observation,
-                "changed_paths": list(comparison.changed_paths),
-                "truncated": comparison.truncated,
-                "detail": comparison.detail,
-            }
-            for comparison in inputs.base_comparisons
-        ],
-        "steps": [
-            {
-                "step": row.step,
-                "kind": row.kind,
-                "session": row.session,
-                "conditional": row.conditional,
-                "declared_role": row.declared_role,
-                # `None` for a command, decision, or gate: no binding, and no
-                # override controls.
-                "binding": binding_payload(row.binding) if row.binding else None,
-                # Kept flat as well, because every existing consumer of this
-                # payload reads the effective pair straight off the row.
-                "role": row.role,
-                "model": row.model,
-                "thinking": row.thinking,
-            }
-            for row in resolved.rows
-        ],
-    }

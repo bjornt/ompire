@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ompire_daemon.config import Config
-from ompire_daemon.registry.tasks import create_task, mark_archived
+from ompire_daemon.work.tasks import create_task, mark_archived
 
 from .conftest import make_adoptable_checkout, make_execution_inputs
 
@@ -375,7 +375,7 @@ def _register_unchecked(client: TestClient, checkout: str) -> None:
     registration; REST would (correctly) refuse to register one that was
     already broken.
     """
-    from ompire_daemon.registry.projects import create_project
+    from ompire_daemon.work.projects import create_project
 
     create_project(
         client.app.state.engine,
@@ -663,7 +663,7 @@ def test_checkout_inspect_explains_a_bad_path_without_erroring(
 def test_delete_is_refused_while_a_clone_is_running(
     client: TestClient, auth_headers: dict[str, str], app
 ) -> None:
-    from ompire_daemon.registry.projects import create_project
+    from ompire_daemon.work.projects import create_project
 
     create_project(
         app.state.engine,
@@ -686,7 +686,7 @@ def test_launch_refused_against_an_unready_project(
 ) -> None:
     """A checkout still being created has no usable clone source; refusing at
     resolution beats discovering it at the pipeline's first git command."""
-    from ompire_daemon.registry.projects import create_project
+    from ompire_daemon.work.projects import create_project
 
     create_project(
         app.state.engine,

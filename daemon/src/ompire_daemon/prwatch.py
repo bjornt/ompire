@@ -25,11 +25,11 @@ from sqlalchemy import Engine
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
-from ompire_daemon.registry.tasks import (
+from ompire_daemon.oversight.tasks import task_payload
+from ompire_daemon.work.tasks import (
     Task,
     list_pr_pollable_tasks,
     mark_pr_state,
-    task_payload,
 )
 
 logger = logging.getLogger(__name__)

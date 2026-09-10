@@ -250,6 +250,28 @@ Clients receive the library the way they receive every other registry: a
 snapshot plus one full-entry upsert per committed change, ordered by the edit
 version, with the launch catalog derived from the same payload.
 
+## One work boundary, enforced
+
+The records and rules of accepted work — projects, profiles, task identity,
+launch resolution, accepted inputs, reconciliation — live in one owned
+package (`work/`), with transport-independent commands above it
+(`application/`) and the one wire projection beside it (`oversight/`). A
+maintainer can exercise task launch in process: `LaunchService.preview` and
+`accept` take a typed request, run the same resolution rules the HTTP routes
+run, and return a task or a domain refusal — no FastAPI request is involved.
+`daemon/tests/test_architecture.py` enforces the import directions on every
+test run, so a new dependency cannot quietly undo the split.
+
+What this deliberately is *not*: the whole target architecture. Isolation,
+sessions, workflow semantics, delivery, artifacts, and oversight composition
+are still flat modules at their historical paths, and their existing edges
+into work-owned code remain as named exceptions in the checker, each
+assigned to the change that will remove it. The launch acceptance still
+shares one SQLite database and one local write reservation
+(`platform/transactions.py`) with every other owner — named module ownership
+without fragmenting the consistency boundary
+([ADR-0038](../../adr/0038-own-modules-and-compose-local-transactions.md)).
+
 ## A launch is resolved once and pinned to the task
 
 Starting a task is three choices — a workflow, a project, and a model profile

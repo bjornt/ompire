@@ -41,7 +41,7 @@ from ompire_daemon.db import (
     delivery_candidates,
     delivery_decisions,
 )
-from ompire_daemon.registry.model_profiles import reserved_write
+from ompire_daemon.platform.transactions import reserved_write
 
 # The three endings an operator can select. They name publishing effects, not
 # workflow results: a workflow's own ending vocabulary (ADR-0029) is separate

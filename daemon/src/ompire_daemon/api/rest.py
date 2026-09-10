@@ -25,12 +25,30 @@ from fastapi import (
     status,
 )
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import Engine
 
-from ompire_daemon import auth, launchconfig
+from ompire_daemon import auth
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
+from ompire_daemon.api.deps import (
+    _advisories,
+    _config,
+    _engine,
+    _events,
+    _exports,
+    _gh,
+    _gpg,
+    _guard,
+    _notifications,
+    _results,
+    _reviews,
+    _sessions,
+    _settings,
+    _ships,
+    _supervisor,
+)
+from ompire_daemon.api.work_models import TaskOut
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.datadir import audit_log_path_for
@@ -40,94 +58,13 @@ from ompire_daemon.delivery import (
     WorkspaceGuard,
 )
 from ompire_daemon.events import EventHub
-from ompire_daemon.execution_inputs import (
-    WORKSPACE_FIELDS,
-)
 from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import (
     FINGERPRINT_RE,
     GpgProbe,
 )
-from ompire_daemon.handoff import (
-    HandoffError,
-    observe_base_difference,
-    observe_target,
-)
-from ompire_daemon.launch import (
-    AttachmentSelection,
-    ConsumerOverride,
-    LaunchInputError,
-    LaunchRequest,
-    PreviewChangedError,
-    ProjectNotLaunchableError,
-    TargetEvidence,
-    resolution_payload,
-    resolve_launch,
-    resolve_target_context,
-)
 from ompire_daemon.notifications import AttentionNotifier
-from ompire_daemon.projectcheckout import (
-    InvalidRemoteNameError,
-    InvalidRepoUrlError,
-    inspect_checkout,
-    inspection_message,
-    validate_remote_name,
-    validate_repo_url,
-)
-from ompire_daemon.projectfiles import (
-    DEFAULT_LIMIT as FILE_SEARCH_DEFAULT_LIMIT,
-)
-from ompire_daemon.projectfiles import (
-    MAX_LIMIT as FILE_SEARCH_MAX_LIMIT,
-)
-from ompire_daemon.projectfiles import (
-    ProjectFilesError,
-    search_project_files,
-    validate_mentions,
-)
-from ompire_daemon.projectsetup import (
-    CLONE_FETCH_REMOTE,
-    DestinationExistsError,
-    ProjectSetupManager,
-    clone_target,
-)
-from ompire_daemon.registry.model_profiles import (
-    DuplicateModelProfileError,
-    InvalidModelProfileNameError,
-    InvalidRoleBindingError,
-    InvalidRoleSetError,
-    ModelProfile,
-    ModelProfileNotFoundError,
-    ModelProfileReferencedError,
-    UnknownModelProfileReferenceError,
-    create_model_profile,
-    delete_model_profile,
-    get_model_profile,
-    list_model_profiles,
-    reserved_write,
-    update_model_profile,
-    validate_profile_name,
-)
-from ompire_daemon.registry.projects import (
-    DEFAULT_BASE_BRANCH,
-    DEFAULT_FETCH_REMOTE,
-    DEFAULT_WORKSHOP_ADDITIONS,
-    UNSUPPLIED,
-    DuplicateProjectError,
-    InvalidBranchPatternError,
-    InvalidWorkshopAdditionsError,
-    Project,
-    ProjectHasReferencingTasksError,
-    ProjectNotFoundError,
-    ProjectNotReadyError,
-    ProjectSetupBusyError,
-    create_project,
-    delete_project,
-    get_project,
-    list_projects,
-    update_project,
-    validate_slug,
-)
+from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.registry.result_exports import (
     CheckoutBusyError,
     ExportNotFoundError,
@@ -144,7 +81,6 @@ from ompire_daemon.registry.results import (
     MAX_TOTAL_BYTES,
     SUPPORTED_EXTENSIONS,
     CaptureInProgressError,
-    DamagedManifestError,
     InvalidSelectionError,
     ResultNotAttachableError,
     ResultNotFoundError,
@@ -154,36 +90,15 @@ from ompire_daemon.registry.results import (
     ResultStateError,
     SelectionMismatchError,
     StaleRevisionError,
-    insert_references_on,
-    read_result_on,
     results_version,
 )
 from ompire_daemon.registry.settings import (
     SettingsStore,
     SettingsValidationError,
-    effective_checkout_root,
 )
 from ompire_daemon.registry.ships import (
     DeliveryConflictError,
     get_active_delivery,
-)
-from ompire_daemon.registry.tasks import (
-    ClonePathOutsideRootError,
-    DuplicateTaskError,
-    Task,
-    TaskConfigurationRequiredError,
-    TaskInputsAlreadyPinnedError,
-    TaskNotArchivedError,
-    TaskNotFoundError,
-    clone_path_for,
-    create_task,
-    get_task,
-    list_tasks,
-    mark_archived,
-    purge_task,
-    require_task_inputs,
-    task_payload,
-    validate_task_slug,
 )
 from ompire_daemon.registry.workflow_definitions import (
     WorkflowRevisionUnavailableError,
@@ -216,7 +131,6 @@ from ompire_daemon.registry.workflows import (
     WorkflowGateChoiceError,
     WorkflowWaitConflictError,
     latest_step_record,
-    list_step_records,
 )
 from ompire_daemon.result_exports import (
     ExportError,
@@ -249,10 +163,23 @@ from ompire_daemon.ship import (
     ShipManager,
     UnresolvedEffectError,
 )
-from ompire_daemon.spawn import run_spawn_pipeline
 from ompire_daemon.taskdefinition import (
     TaskDefinitionUnavailableError,
     resolve_task_definition,
+)
+from ompire_daemon.work.projects import (
+    Project,
+    ProjectNotReadyError,
+    get_project,
+)
+from ompire_daemon.work.tasks import (
+    Task,
+    TaskConfigurationRequiredError,
+    TaskNotArchivedError,
+    TaskNotFoundError,
+    get_task,
+    mark_archived,
+    purge_task,
 )
 from ompire_daemon.workflow_definitions import (
     GateStep,
@@ -274,166 +201,23 @@ from ompire_daemon.workflows import (
     WorkflowRunner,
     packaged_yaml,
 )
-from ompire_daemon.workshop import WorkshopRemoveError, remove_workshop, workshop_status
+from ompire_daemon.workshop import WorkshopRemoveError, remove_workshop
 
 # REST authentication boundary: ADR-0002
 # (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
 router = APIRouter(prefix="/api", dependencies=[Depends(require_bearer_token)])
 
+# The work routers are included once, here, so every route stays behind the
+# common bearer-authenticated `/api` boundary (ADR-0002).
+from ompire_daemon.api.profiles import router as profiles_router
+from ompire_daemon.api.projects import router as projects_router
+from ompire_daemon.api.tasks import router as tasks_router
 
-class ProjectCreate(BaseModel):
-    """`checkout_mode` defaults to `adopt`, which is what every registration
-    before ADR-0022 meant: the operator supplies (or derives) a checkout that
-    already exists. `clone` derives the destination from the effective
-    checkout root and refuses a `checkout_path` of its own."""
-
-    name: str
-    title: str
-    upstream_url: str
-    fork_url: str | None = None
-    checkout_path: str | None = None
-    checkout_mode: str = "adopt"
-    fetch_remote: str = DEFAULT_FETCH_REMOTE
-    # Optional global model profile (ADR-0025). Omitted or null means no
-    # default; nothing is inferred from credentials or the project name.
-    default_model_profile: str | None = None
-    # Workspace and prompt defaults a launch inherits (ADR-0026). The branch
-    # pattern defaults to the daemon's `default_branch_pattern` *setting* at
-    # registration time — a seed, not a value anything reads later.
-    base_branch: str = DEFAULT_BASE_BRANCH
-    branch_pattern: str | None = None
-    workshop_additions: str = DEFAULT_WORKSHOP_ADDITIONS
-    preamble: str = ""
-
-    @field_validator("name")
-    @classmethod
-    def _validate_name(cls, value: str) -> str:
-        validate_slug(value)
-        return value
-
-    @field_validator("checkout_mode")
-    @classmethod
-    def _validate_mode(cls, value: str) -> str:
-        if value not in ("adopt", "clone"):
-            raise ValueError("checkout_mode must be 'adopt' or 'clone'")
-        return value
+router.include_router(projects_router)
+router.include_router(profiles_router)
+router.include_router(tasks_router)
 
 
-class ProjectUpdate(BaseModel):
-    title: str
-    upstream_url: str
-    fork_url: str | None = None
-    checkout_path: str
-    fetch_remote: str = DEFAULT_FETCH_REMOTE
-    new_name: str | None = None
-    # Three-valued on update: absent from the body preserves the stored
-    # reference, explicit null clears it, a name selects that profile. The
-    # route reads `model_fields_set` to tell the first two apart, so a caller
-    # written before profiles existed cannot clear one by not mentioning it.
-    default_model_profile: str | None = None
-    # Same omission rule for the workspace defaults, but they are never null:
-    # an empty preamble is the value "no preamble".
-    base_branch: str | None = None
-    branch_pattern: str | None = None
-    workshop_additions: str | None = None
-    preamble: str | None = None
-
-    @field_validator("new_name")
-    @classmethod
-    def _validate_new_name(cls, value: str | None) -> str | None:
-        if value is not None:
-            validate_slug(value)
-        return value
-
-
-class CheckoutInspectIn(BaseModel):
-    checkout_path: str
-    fetch_remote: str = DEFAULT_FETCH_REMOTE
-
-
-class RemoteOut(BaseModel):
-    name: str
-    url: str
-
-
-class CheckoutInspectOut(BaseModel):
-    """What a read-only look at a candidate checkout found. Remote names and
-    URLs only — never file contents, and nothing is written to the path."""
-
-    ok: bool
-    reason: str
-    detail: str
-    remotes: list[RemoteOut]
-    suggested_upstream: str | None = None
-    suggested_fork: str | None = None
-
-
-class ProjectOut(BaseModel):
-    name: str
-    title: str
-    upstream_url: str
-    fork_url: str | None
-    checkout_path: str
-    checkout_mode: str
-    fetch_remote: str
-    setup_state: str
-    setup_error: str | None
-    default_model_profile: str | None
-    base_branch: str
-    branch_pattern: str
-    workshop_additions: str
-    preamble: str
-    # `reconciled` or `needs-reconciliation` — whether the carried-over
-    # template configuration still needs a decision (ADR-0026). Independent of
-    # `setup_state`, and reported alongside it so the UI can say which of the
-    # two is blocking a launch.
-    launch_config_state: str
-
-    model_config = {"from_attributes": True}
-
-
-def _engine(request: Request) -> Engine:
-    return request.app.state.engine
-
-
-def _config(request: Request) -> Config:
-    return request.app.state.config
-
-
-def _settings(request: Request) -> SettingsStore:
-    return request.app.state.settings_store
-
-
-def _events(request: Request) -> EventHub:
-    return request.app.state.events
-
-
-def _sessions(request: Request) -> SessionTracker:
-    return request.app.state.sessions
-
-
-def _advisories(request: Request) -> AdvisorySampler:
-    return request.app.state.advisories
-
-
-def _notifications(request: Request) -> AttentionNotifier:
-    return request.app.state.notifications
-
-
-def _reviews(request: Request) -> ReviewManager:
-    return request.app.state.reviews
-
-
-def _ships(request: Request) -> ShipManager:
-    return request.app.state.ships
-
-
-def _guard(request: Request) -> WorkspaceGuard:
-    return request.app.state.workspace_guard
-
-
-def _gpg(request: Request) -> GpgProbe:
-    return request.app.state.gpg
 
 
 def _assert_selectable_signing_key(value: Any, gpg: GpgProbe) -> None:
@@ -456,52 +240,6 @@ def _assert_selectable_signing_key(value: Any, gpg: GpgProbe) -> None:
             f"gpg_signing_key: {wanted} is not a usable signing key in the "
             "daemon's keyring",
         )
-
-
-def _gh(request: Request) -> GitHubProbe:
-    return request.app.state.gh
-
-
-def _supplied_workspace_defaults(body: ProjectUpdate) -> dict[str, Any]:
-    """Only the workspace defaults the caller actually mentioned. Everything
-    else stays `UNSUPPLIED`, so a client written before these fields existed
-    cannot blank them by omission — and an explicit null is refused rather
-    than read as a reset, because none of them has a meaningful empty value
-    except `preamble`, whose empty string is a real choice."""
-    supplied: dict[str, Any] = {}
-    for field in WORKSPACE_FIELDS:
-        if field not in body.model_fields_set:
-            continue
-        value = getattr(body, field)
-        if value is None:
-            if field == "preamble":
-                supplied[field] = ""
-                continue
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_CONTENT,
-                f"{field}: null is not a reset; omit the field to leave it unchanged",
-            )
-        supplied[field] = value
-    return supplied
-
-
-def _project_setup(request: Request) -> ProjectSetupManager:
-    return request.app.state.project_setup
-
-
-def _require_ready_project(engine: Engine, name: str) -> Project:
-    """Resolve a project that a task may actually use.
-
-    A project whose checkout is still being created, or whose creation failed,
-    has no usable clone source; letting a task start against it only defers
-    the failure to the spawn pipeline's first git command (ADR-0022).
-    """
-    try:
-        project = get_project(engine, name)
-    except ProjectNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    _refuse_unready(project)
-    return project
 
 
 def _refuse_unready(project: Project) -> None:
@@ -539,473 +277,8 @@ async def _close_all_ws(connections: set[WebSocket]) -> None:
 logger = logging.getLogger(__name__)
 
 
-@router.get("/projects", response_model=list[ProjectOut])
-def list_projects_route(engine: Engine = Depends(_engine)) -> list[Project]:
-    return list_projects(engine)
 
 
-def _validated_urls(body: ProjectCreate | ProjectUpdate) -> tuple[str, str | None]:
-    """Upstream and fork, refused before they can become `git` argv."""
-    try:
-        upstream = validate_repo_url("upstream_url", body.upstream_url)
-        fork = (
-            validate_repo_url("fork_url", body.fork_url)
-            if body.fork_url and body.fork_url.strip()
-            else None
-        )
-    except InvalidRepoUrlError as exc:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)
-        ) from exc
-    return upstream, fork
-
-
-def _validated_remote(name: str) -> str:
-    try:
-        return validate_remote_name(name)
-    except InvalidRemoteNameError as exc:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)
-        ) from exc
-
-
-async def _require_usable_checkout(
-    checkout_path: str, fetch_remote: str, timeout: int
-) -> None:
-    """Refuse an adopted checkout Ompire cannot clone a task workspace from.
-
-    Read-only: this only looks (ADR-0022).
-    """
-    inspection = await inspect_checkout(
-        checkout_path, fetch_remote=fetch_remote, timeout=timeout
-    )
-    if not inspection.ok:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            inspection_message(inspection, fetch_remote),
-        )
-
-
-@router.post("/projects/checkout-inspect", response_model=CheckoutInspectOut)
-async def inspect_checkout_route(
-    body: CheckoutInspectIn,
-    config: Config = Depends(_config),
-) -> CheckoutInspectOut:
-    """Look at a candidate checkout so the create form can prefill and explain.
-
-    Answers for an unregistered path, reads only remote names and URLs, and
-    writes nothing. A refusal is a successful response describing why, not an
-    error — the operator is still typing.
-    """
-    fetch_remote = _validated_remote(body.fetch_remote)
-    inspection = await inspect_checkout(
-        body.checkout_path,
-        fetch_remote=fetch_remote,
-        timeout=config.spawn_step_timeout,
-    )
-    return CheckoutInspectOut(
-        ok=inspection.ok,
-        reason=inspection.reason,
-        detail=inspection_message(inspection, fetch_remote),
-        remotes=[RemoteOut(name=r.name, url=r.url) for r in inspection.remotes],
-        suggested_upstream=inspection.suggested_upstream,
-        suggested_fork=inspection.suggested_fork,
-    )
-
-
-@router.post(
-    "/projects", response_model=ProjectOut, status_code=status.HTTP_201_CREATED
-)
-async def create_project_route(
-    body: ProjectCreate,
-    engine: Engine = Depends(_engine),
-    config: Config = Depends(_config),
-    events: EventHub = Depends(_events),
-    settings: SettingsStore = Depends(_settings),
-    setup: ProjectSetupManager = Depends(_project_setup),
-) -> Project:
-    """Register a project, adopting an existing checkout or creating one.
-
-    Adoption is answered here: validation is a handful of local git reads, so
-    the operator gets ready-or-why in the response. Clone mode returns a
-    `cloning` project immediately and continues in the background.
-    """
-    upstream_url, fork_url = _validated_urls(body)
-    if body.checkout_mode == "clone":
-        if body.checkout_path:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_CONTENT,
-                "checkout_path cannot be supplied in clone mode; the "
-                "destination is derived from the effective checkout root",
-            )
-        # Derived, never supplied — that is what bounds the one place Ompire
-        # creates a repository outside its task root (ADR-0022/0023).
-        target = clone_target(
-            effective_checkout_root(settings.effective()), body.name
-        )
-        if target.destination.exists():
-            raise HTTPException(
-                status.HTTP_409_CONFLICT, str(DestinationExistsError(target.destination))
-            )
-        checkout_path: str | None = str(target.destination)
-        fetch_remote = CLONE_FETCH_REMOTE
-        checkout_mode, setup_state = "cloned", "cloning"
-    else:
-        fetch_remote = _validated_remote(body.fetch_remote)
-        checkout_path = body.checkout_path or str(
-            effective_checkout_root(settings.effective()) / body.name
-        )
-        await _require_usable_checkout(
-            checkout_path, fetch_remote, config.spawn_step_timeout
-        )
-        checkout_mode, setup_state = "adopted", "ready"
-
-    try:
-        # Both modes converge here, so an unknown profile is refused before any
-        # row exists — and, in clone mode, before a clone job is scheduled.
-        project = create_project(
-            engine,
-            name=body.name,
-            title=body.title,
-            upstream_url=upstream_url,
-            fork_url=fork_url,
-            checkout_path=checkout_path,
-            default_checkout_root=config.checkout_root,
-            checkout_mode=checkout_mode,
-            fetch_remote=fetch_remote,
-            setup_state=setup_state,
-            default_model_profile=body.default_model_profile,
-            base_branch=body.base_branch,
-            branch_pattern=body.branch_pattern or config.default_branch_pattern,
-            workshop_additions=body.workshop_additions,
-            preamble=body.preamble,
-        )
-    except DuplicateProjectError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except (
-        UnknownModelProfileReferenceError,
-        InvalidBranchPatternError,
-        InvalidWorkshopAdditionsError,
-    ) as exc:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)
-        ) from exc
-    events.publish("project_created", asdict(project))
-    if project.setup_state == "cloning":
-        setup.start(project)
-    return project
-
-
-@router.post(
-    "/projects/{name}/setup/retry",
-    response_model=ProjectOut,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def retry_project_setup_route(
-    name: str,
-    setup: ProjectSetupManager = Depends(_project_setup),
-) -> Project:
-    # Must be async: `retry` schedules the clone job on the running loop, and
-    # a sync route would run in FastAPI's threadpool where there is none.
-    try:
-        return setup.retry(name)
-    except ProjectNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-
-
-@router.get("/projects/{name}", response_model=ProjectOut)
-def get_project_route(name: str, engine: Engine = Depends(_engine)) -> Project:
-    try:
-        return get_project(engine, name)
-    except ProjectNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-
-
-class ProjectFilesOut(BaseModel):
-    """Repository-relative path names only — never contents, sizes, or
-    absolute paths (add-spawn-file-mentions)."""
-
-    paths: list[str]
-    truncated: bool
-
-
-@router.get("/projects/{name}/files", response_model=ProjectFilesOut)
-async def search_project_files_route(
-    name: str,
-    q: str = "",
-    limit: int = FILE_SEARCH_DEFAULT_LIMIT,
-    engine: Engine = Depends(_engine),
-    config: Config = Depends(_config),
-) -> ProjectFilesOut:
-    """List the project's repository files for the Spawn view's `@` mentions.
-
-    A client-supplied `limit` cannot exceed the server's hard maximum. An
-    unusable checkout is a 409, never an empty success — "your checkout is
-    gone" and "no matches" must not read the same.
-    """
-    try:
-        project = get_project(engine, name)
-    except ProjectNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    try:
-        result = await search_project_files(
-            project.checkout_path,
-            query=q,
-            limit=min(max(limit, 1), FILE_SEARCH_MAX_LIMIT),
-            timeout=config.spawn_step_timeout,
-        )
-    except ProjectFilesError as exc:
-        # Missing checkout, not-a-repository, git failure, timeout: all state
-        # the operator has to fix, each carrying its own message.
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    return ProjectFilesOut(paths=result.paths, truncated=result.truncated)
-
-
-@router.put("/projects/{name}", response_model=ProjectOut)
-async def update_project_route(
-    name: str,
-    body: ProjectUpdate,
-    engine: Engine = Depends(_engine),
-    config: Config = Depends(_config),
-    events: EventHub = Depends(_events),
-) -> Project:
-    upstream_url, fork_url = _validated_urls(body)
-    fetch_remote = _validated_remote(body.fetch_remote)
-    try:
-        current = get_project(engine, name)
-    except ProjectNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    if current.setup_state == "cloning":
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, str(ProjectSetupBusyError(name))
-        )
-    # The checkout mode is fixed at registration: a cloned project's checkout
-    # is Ompire's own derived path, and repointing it would silently orphan
-    # what was created (ADR-0022).
-    if current.checkout_mode == "cloned" and body.checkout_path != current.checkout_path:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"project {name!r} uses a checkout Ompire created; its path cannot "
-            "be changed",
-        )
-    checkout_changed = (
-        body.checkout_path != current.checkout_path
-        or fetch_remote != current.fetch_remote
-    )
-    if current.setup_state == "ready" and checkout_changed:
-        await _require_usable_checkout(
-            body.checkout_path, fetch_remote, config.spawn_step_timeout
-        )
-    try:
-        project = update_project(
-            engine,
-            name,
-            title=body.title,
-            upstream_url=upstream_url,
-            fork_url=fork_url,
-            checkout_path=body.checkout_path,
-            fetch_remote=fetch_remote,
-            new_name=body.new_name,
-            # Absent from the body means "leave it alone"; the registry
-            # resolves that against the stored row inside its write
-            # transaction, not against the `current` read above.
-            default_model_profile=(
-                body.default_model_profile
-                if "default_model_profile" in body.model_fields_set
-                else UNSUPPLIED
-            ),
-            **_supplied_workspace_defaults(body),
-        )
-    except ProjectNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except DuplicateProjectError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except ProjectHasReferencingTasksError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except (
-        UnknownModelProfileReferenceError,
-        InvalidBranchPatternError,
-        InvalidWorkshopAdditionsError,
-    ) as exc:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)
-        ) from exc
-    renamed = body.new_name is not None and body.new_name != name
-    if renamed:
-        # Keyed-by-name consumers can't match a renamed payload via
-        # `project_updated`; the rename event carries the old key.
-        events.publish(
-            "project_renamed", {"old_name": name, "project": asdict(project)}
-        )
-    else:
-        events.publish("project_updated", asdict(project))
-    return project
-
-
-@router.delete("/projects/{name}")
-def delete_project_route(
-    name: str, engine: Engine = Depends(_engine), events: EventHub = Depends(_events)
-) -> dict[str, str]:
-    try:
-        delete_project(engine, name)
-    except ProjectNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except ProjectSetupBusyError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except ProjectHasReferencingTasksError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    events.publish("project_deleted", {"name": name})
-    return {"deleted": name}
-
-
-# --- Model profiles ---------------------------------------------------------
-# ADR-0025: global named model-role bindings. Configuration only in this
-# change — nothing here reaches spawn, agent argv, or a running session.
-
-
-class RoleBindingIn(BaseModel):
-    """One role's pair. Both fields are required and neither may be null: a
-    binding that cannot say which model and how much reasoning is not one."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    model: str
-    thinking: str
-
-
-class ModelProfileCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    name: str
-    roles: dict[str, RoleBindingIn]
-
-    @field_validator("name")
-    @classmethod
-    def _validate_name(cls, value: str) -> str:
-        validate_profile_name(value)
-        return value
-
-
-class ModelProfileUpdate(BaseModel):
-    """The name is the stable identifier, so an update replaces only the
-    bindings — and replaces all four of them together."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    roles: dict[str, RoleBindingIn]
-
-
-class RoleBindingOut(BaseModel):
-    model: str
-    thinking: str
-
-    model_config = {"from_attributes": True}
-
-
-class ModelProfileOut(BaseModel):
-    name: str
-    roles: dict[str, RoleBindingOut]
-    created_at: str
-    updated_at: str
-
-    model_config = {"from_attributes": True}
-
-
-def _model_profile_error(exc: Exception) -> HTTPException:
-    if isinstance(exc, ModelProfileNotFoundError):
-        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    if isinstance(exc, (DuplicateModelProfileError, ModelProfileReferencedError)):
-        return HTTPException(status.HTTP_409_CONFLICT, str(exc))
-    # Invalid names ride FastAPI's request validation via the field validator;
-    # role-set and binding refusals are registry-level 422s that name the role
-    # and field the operator has to fix.
-    return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
-
-
-def _profile_roles_payload(body: ModelProfileCreate | ModelProfileUpdate) -> dict[str, Any]:
-    return {role: binding.model_dump() for role, binding in body.roles.items()}
-
-
-def _profile_payload(profile: ModelProfile) -> dict[str, Any]:
-    """Event/response shape: the same nested role map the REST body uses."""
-    return asdict(profile)
-
-
-@router.get("/model-profiles", response_model=list[ModelProfileOut])
-def list_model_profiles_route(
-    engine: Engine = Depends(_engine),
-) -> list[ModelProfile]:
-    return list_model_profiles(engine)
-
-
-@router.post(
-    "/model-profiles",
-    response_model=ModelProfileOut,
-    status_code=status.HTTP_201_CREATED,
-)
-def create_model_profile_route(
-    body: ModelProfileCreate,
-    engine: Engine = Depends(_engine),
-    events: EventHub = Depends(_events),
-) -> ModelProfile:
-    try:
-        profile = create_model_profile(
-            engine, name=body.name, roles=_profile_roles_payload(body)
-        )
-    except (
-        DuplicateModelProfileError,
-        InvalidModelProfileNameError,
-        InvalidRoleBindingError,
-        InvalidRoleSetError,
-    ) as exc:
-        raise _model_profile_error(exc) from exc
-    events.publish("model_profile_created", _profile_payload(profile))
-    return profile
-
-
-@router.get("/model-profiles/{name}", response_model=ModelProfileOut)
-def get_model_profile_route(
-    name: str, engine: Engine = Depends(_engine)
-) -> ModelProfile:
-    try:
-        return get_model_profile(engine, name)
-    except ModelProfileNotFoundError as exc:
-        raise _model_profile_error(exc) from exc
-
-
-@router.put("/model-profiles/{name}", response_model=ModelProfileOut)
-def update_model_profile_route(
-    name: str,
-    body: ModelProfileUpdate,
-    engine: Engine = Depends(_engine),
-    events: EventHub = Depends(_events),
-) -> ModelProfile:
-    try:
-        profile = update_model_profile(
-            engine, name, roles=_profile_roles_payload(body)
-        )
-    except (
-        ModelProfileNotFoundError,
-        InvalidRoleBindingError,
-        InvalidRoleSetError,
-    ) as exc:
-        raise _model_profile_error(exc) from exc
-    events.publish("model_profile_updated", _profile_payload(profile))
-    return profile
-
-
-@router.delete("/model-profiles/{name}")
-def delete_model_profile_route(
-    name: str, engine: Engine = Depends(_engine), events: EventHub = Depends(_events)
-) -> dict[str, str]:
-    try:
-        delete_model_profile(engine, name)
-    except (ModelProfileNotFoundError, ModelProfileReferencedError) as exc:
-        raise _model_profile_error(exc) from exc
-    events.publish("model_profile_deleted", {"name": name})
-    return {"deleted": name}
 
 
 # --- The workflow library, its revisions, and authoring ------------------------
@@ -1757,697 +1030,8 @@ def _set_archived(
 # --- Task launch --------------------------------------------------------------
 
 
-class WorkspaceOverridesIn(BaseModel):
-    """Task-local overrides of the project's workspace defaults.
 
-    Each field is genuinely optional: leaving a key out inherits the project
-    value. An explicit empty `preamble` is an override to "no preamble", which
-    is why the route distinguishes omitted from present via `model_fields_set`
-    rather than treating empty as absent. The other three have no meaningful
-    null — a task cannot run with no base branch — so an explicit null is
-    refused instead of being read as a reset.
-    """
 
-    model_config = ConfigDict(extra="forbid")
-
-    base_branch: str | None = None
-    branch_pattern: str | None = None
-    workshop_additions: str | None = None
-    preamble: str | None = None
-
-
-class ConsumerOverrideIn(BaseModel):
-    """One model consumer's row-level selections (ADR-0027).
-
-    Each dimension is independently optional: omitted or null means inherit,
-    a value means the operator chose it. `extra="forbid"` keeps a typo like
-    `model` or `thinking` from being silently ignored — those are profile
-    settings, deliberately not a third override hierarchy.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    model_profile: str | None = None
-    role: str | None = None
-
-
-class ResultAttachmentIn(BaseModel):
-    """One selected revision.
-
-    All three fields together, because two of them alone would not identify an
-    immutable revision: the manifest id is what refuses a stale selection when
-    a successor capture has landed, and the producing task is what the refusal
-    can name.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    producer_task_id: int
-    result_id: str
-    expected_manifest_id: str
-
-
-class TaskCreate(BaseModel):
-    """The one supported creation contract (ADR-0026, ADR-0027).
-
-    `extra="forbid"` is load-bearing: `template_name`, and the old scalar
-    `model`/`thinking` spawn overrides, must be refused rather than ignored,
-    or a stale caller would silently get a launch it did not ask for.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    project_name: str
-    workflow_name: str
-    slug: str
-    prompt: str
-    # Omitted or null means "inherit the project default". A name selects that
-    # profile for this task and replaces the inheritance.
-    model_profile: str | None = None
-    workspace_overrides: WorkspaceOverridesIn | None = None
-    # Per-consumer overrides, keyed by declared agent step name. Absent means
-    # "everything inherits". `auxiliary_overrides` is kept only so a caller
-    # still naming the retired judge is refused with a field-level error
-    # rather than having its choice silently dropped (ADR-0028).
-    step_overrides: dict[str, ConsumerOverrideIn] = Field(default_factory=dict)
-    auxiliary_overrides: dict[str, ConsumerOverrideIn] = Field(default_factory=dict)
-    # Accepted result revisions to install before the first step runs
-    # (ADR-0035). Destinations are the manifest's own paths — deliberately not
-    # a caller-supplied mapping, so a request cannot choose where retained
-    # bytes land.
-    result_attachments: list[ResultAttachmentIn] = Field(default_factory=list)
-    # Explicit, and bound by the preview token to this exact attachment set and
-    # target commit: an acknowledgement cannot be carried over to a different
-    # selection or a base that moved.
-    acknowledge_result_base_difference: bool = False
-
-    @field_validator("slug")
-    @classmethod
-    def _validate_slug(cls, value: str) -> str:
-        validate_task_slug(value)
-        return value
-
-
-class TaskAccept(TaskCreate):
-    """Creation adds the reviewed resolution's token. It identifies *what was
-    reviewed*, not who is asking: it authorizes nothing, and a mismatch is a
-    409 asking for a fresh review rather than a permission error."""
-
-    preview_token: str
-
-
-def _launch_request(body: TaskCreate) -> LaunchRequest:
-    overrides: dict[str, str] = {}
-    supplied = body.workspace_overrides
-    if supplied is not None:
-        for field in WORKSPACE_FIELDS:
-            if field not in supplied.model_fields_set:
-                continue
-            value = getattr(supplied, field)
-            if value is None:
-                if field == "preamble":
-                    # A null preamble says the same thing as an empty one.
-                    overrides[field] = ""
-                    continue
-                raise HTTPException(
-                    status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    f"workspace_overrides.{field}: null is not a reset; omit the "
-                    "field to inherit the project default",
-                )
-            overrides[field] = value
-    return LaunchRequest(
-        project_name=body.project_name,
-        workflow_name=body.workflow_name,
-        slug=body.slug,
-        prompt=body.prompt,
-        model_profile=body.model_profile,
-        profile_explicit=(
-            "model_profile" in body.model_fields_set and body.model_profile is not None
-        ),
-        workspace_overrides=overrides,
-        result_attachments=tuple(
-            AttachmentSelection(
-                producer_task_id=entry.producer_task_id,
-                result_id=entry.result_id,
-                expected_manifest_id=entry.expected_manifest_id,
-            )
-            for entry in body.result_attachments
-        ),
-        acknowledge_result_base_difference=body.acknowledge_result_base_difference,
-        step_overrides=_consumer_overrides(body.step_overrides, "step_overrides"),
-        # Not normalized: an empty override for a consumer that no longer
-        # exists is still a caller believing it configures something, and it
-        # is refused with the field rather than dropped as a no-op.
-        auxiliary_overrides={
-            name: ConsumerOverride(
-                model_profile=entry.model_profile, role=entry.role
-            )
-            for name, entry in body.auxiliary_overrides.items()
-        },
-    )
-
-
-def _consumer_overrides(
-    supplied: Mapping[str, ConsumerOverrideIn], field: str
-) -> dict[str, ConsumerOverride]:
-    """Normalize the row override maps before anything resolves or
-    fingerprints them.
-
-    Null and omitted both mean inherit, and an entry that overrides nothing
-    is dropped entirely: `{"fix": {}}` and an absent `fix` are the same
-    launch, and letting them fingerprint differently would invalidate a
-    reviewed preview over a difference the operator cannot see. An empty
-    profile name is refused rather than read as a reset — a reset is
-    expressed by omitting the field.
-    """
-    normalized: dict[str, ConsumerOverride] = {}
-    for name, entry in supplied.items():
-        if entry.model_profile is not None and not entry.model_profile.strip():
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_CONTENT,
-                f"{field}.{name}.model_profile: a model profile name must not be "
-                "empty; omit the field to inherit",
-            )
-        override = ConsumerOverride(
-            model_profile=entry.model_profile, role=entry.role
-        )
-        if not override.is_empty():
-            normalized[name] = override
-    return normalized
-
-
-async def _target_evidence(
-    engine: Engine, config: Config, request: LaunchRequest
-) -> TargetEvidence | None:
-    """Read the target base for an attachment launch, outside any lock.
-
-    Returns None when nothing is attached, which is what keeps an ordinary
-    launch on exactly its previous path: no commit is resolved, no tree is
-    read, and nothing new can refuse it.
-
-    A revision that cannot be read here contributes no destinations. It is not
-    refused *here* — resolution owns that refusal, and it has to be the same
-    refusal in the preview and in the acceptance.
-    """
-    if not request.result_attachments:
-        return None
-    with engine.connect() as conn:
-        try:
-            checkout_path, base_branch = resolve_target_context(conn, request)
-        except (LaunchInputError, ProjectNotLaunchableError) as exc:
-            raise _launch_error(exc) from exc
-        observations: dict[str, str | None] = {}
-        destinations: set[str] = set()
-        for selection in request.result_attachments:
-            result = read_result_on(conn, selection.result_id)
-            if result is None or result.manifest is None:
-                continue
-            try:
-                paths = [entry.path for entry in result.files]
-            except DamagedManifestError:
-                continue
-            destinations.update(paths)
-            provenance = result.manifest.get("provenance") or {}
-            observations[selection.result_id] = provenance.get("capture_merge_base")
-
-    timeout = config.spawn_step_timeout
-    try:
-        observation = await observe_target(
-            checkout_path=checkout_path,
-            base_branch=base_branch,
-            destinations=tuple(sorted(destinations)),
-            timeout=timeout,
-        )
-        comparisons = {
-            result_id: await observe_base_difference(
-                result_id=result_id,
-                checkout_path=checkout_path,
-                target_commit=observation.commit,
-                producer_observation=producer_observation,
-                timeout=timeout,
-            )
-            for result_id, producer_observation in observations.items()
-        }
-    except HandoffError as exc:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, f"result_attachments: {exc.detail}"
-        ) from exc
-    return TargetEvidence(
-        commit=observation.commit,
-        conflicts=tuple(
-            (conflict.reason, conflict.detail, conflict.path)
-            for conflict in observation.conflicts
-        ),
-        comparisons=comparisons,
-    )
-
-
-def _preview_changed(resolved) -> HTTPException:
-    """409 with a machine-readable reason and the current resolution, so the
-    form can show the operator exactly what changed instead of retrying under
-    settings they never reviewed."""
-    exc = PreviewChangedError(resolved)
-    return HTTPException(
-        status.HTTP_409_CONFLICT,
-        {
-            "reason": exc.reason,
-            "message": str(exc),
-            "preview": resolution_payload(resolved) if resolved is not None else None,
-        },
-    )
-
-
-def _launch_error(exc: Exception) -> HTTPException:
-    if isinstance(exc, LaunchInputError):
-        return HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT, f"{exc.field}: {exc.detail}"
-        )
-    if isinstance(exc, ProjectNotLaunchableError):
-        return HTTPException(status.HTTP_409_CONFLICT, exc.detail)
-    return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
-
-
-@router.post("/tasks/preview")
-async def preview_task_route(
-    body: TaskCreate,
-    engine: Engine = Depends(_engine),
-    config: Config = Depends(_config),
-) -> dict[str, Any]:
-    """Resolve the operator's selections without creating anything.
-
-    Same rules, same module, and same output as acceptance — that identity is
-    what makes reviewing a preview worth anything.
-    """
-    request = _launch_request(body)
-    evidence = await _target_evidence(engine, config, request)
-    with engine.connect() as conn:
-        try:
-            resolved = resolve_launch(conn, request, evidence=evidence)
-        except (LaunchInputError, ProjectNotLaunchableError) as exc:
-            raise _launch_error(exc) from exc
-    return resolution_payload(resolved)
-
-
-class TaskOut(BaseModel):
-    id: int
-    project_name: str
-    execution_inputs: dict[str, Any] | None
-    needs_configuration: bool
-    slug: str
-    branch: str
-    clone_path: str
-    state: str
-    prompt: str
-    error: str | None
-    workshop_id: str | None
-    workflow_name: str
-    # The pinned definition (ADR-0028). `workflow_revision` is null only for a
-    # task that predates retained revisions; `workflow_primary_session` and
-    # `workflow_sessions` are null whenever the definition cannot be resolved,
-    # rather than a plausible-looking guess.
-    workflow_revision: str | None
-    workflow_revision_source: str | None
-    workflow_ready: bool
-    workflow_readiness_reason: str | None
-    workflow_readiness_detail: str | None
-    workflow_primary_session: str | None
-    workflow_sessions: list[str] | None
-    workflow_status: str | None
-    workflow_step: str | None
-    # The declared ending a finished format-2 run reached (ADR-0029). Null
-    # while it runs, and for every format-1 run: those have no name for their
-    # ending, and none is invented for them.
-    workflow_result: str | None
-    pr_url: str | None
-    pr_state: str | None
-    pr_merged_at: str | None
-    spawn_completed_at: str | None
-    created_at: str
-    updated_at: str
-
-    model_config = {"from_attributes": True}
-
-
-@router.get("/tasks", response_model=list[TaskOut])
-def list_tasks_route(engine: Engine = Depends(_engine)) -> list[dict[str, Any]]:
-    return [task_payload(task, engine=engine) for task in list_tasks(engine)]
-
-
-class TaskDetailOut(TaskOut):
-    # Derived on demand from the workshop CLI, never persisted (design D-3).
-    workshop_status: str | None
-    # The run's executed attempts, in order — the same records the snapshot
-    # replays, from the same projection. A gate's question and its answer, an
-    # attempt's frozen evidence, and an uncertainty pause all live here, so a
-    # reader that is not holding a socket open still sees the whole history
-    # rather than only the task row's summary.
-    workflow_steps: list[dict[str, Any]]
-
-
-@router.get("/tasks/{task_id}", response_model=TaskDetailOut)
-async def get_task_route(
-    task_id: int, engine: Engine = Depends(_engine)
-) -> TaskDetailOut:
-    try:
-        task = get_task(engine, task_id)
-    except TaskNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    derived_status = (
-        await workshop_status(task.clone_path) if task.workshop_id else None
-    )
-    return TaskDetailOut(
-        **task_payload(task, engine=engine),
-        workshop_status=derived_status,
-        workflow_steps=[asdict(record) for record in list_step_records(engine, task_id)],
-    )
-
-
-@router.post("/tasks", response_model=TaskOut, status_code=status.HTTP_202_ACCEPTED)
-async def spawn_task_route(
-    body: TaskAccept,
-    request: Request,
-    engine: Engine = Depends(_engine),
-    config: Config = Depends(_config),
-    events: EventHub = Depends(_events),
-) -> dict[str, Any]:
-    """Accept one reviewed launch.
-
-    The order is deliberate. Everything slow — git, mention validation, path
-    checks — runs first, against a resolution made outside any lock. Then the
-    same rules run again on a reserved connection, the reviewed token is
-    compared against what they now produce, and the task plus its pinned
-    inputs are inserted before the reservation is released. Nothing is
-    published or scheduled until that transaction has committed, so a refused
-    or stale submission leaves no task, workspace, agent, or background job.
-    """
-    launch_request = _launch_request(body)
-
-    # The Git reading, before anything is resolved and outside every lock. It
-    # is taken once and used by both resolutions below, so the accepted task is
-    # pinned to the same immutable commit the refusals were decided against.
-    evidence = await _target_evidence(engine, config, launch_request)
-
-    # First resolution: validation only. Its results are what the Git work
-    # below is done against; the authoritative one is taken again under the
-    # write reservation.
-    with engine.connect() as conn:
-        try:
-            resolved = resolve_launch(conn, launch_request, evidence=evidence)
-        except (LaunchInputError, ProjectNotLaunchableError) as exc:
-            raise _launch_error(exc) from exc
-    if resolved.fingerprint != body.preview_token:
-        raise _preview_changed(resolved)
-
-    # Mentions are validated before anything is created: Omp drops one it
-    # cannot resolve without a word (findings-omp-file-mentions.md), so a
-    # mention that will not survive into the clone must be refused here, not
-    # discovered after the workspace is built. Against the *accepted* base
-    # branch and checkout, not today's project defaults.
-    try:
-        rejections = await validate_mentions(
-            body.prompt,
-            checkout_path=resolved.inputs.checkout_path,
-            base_branch=resolved.inputs.workspace.base_branch,
-            timeout=config.spawn_step_timeout,
-            # An attached destination is a file the clone *will* contain by the
-            # time the agent runs, so a mention naming one resolves (ADR-0035).
-            # Everything else keeps its existing refusal: Omp drops a mention it
-            # cannot resolve without a word, so one that will not survive into
-            # the clone must be refused here, not discovered afterwards.
-            extra_paths=resolved.inputs.protected_destinations,
-        )
-    except ProjectFilesError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
-    if rejections:
-        detail = "; ".join(rejection.message() for rejection in rejections)
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            f"prompt file mention rejected — {detail}",
-        )
-
-    try:
-        clone_path = clone_path_for(
-            config.task_dir_root, resolved.inputs.project_name, body.slug
-        )
-    except ClonePathOutsideRootError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
-
-    # The consistency boundary. `BEGIN IMMEDIATE` up front means the re-read
-    # cannot go stale before the insert commits, and nothing awaited, spawned,
-    # or published happens inside it.
-    with reserved_write(engine) as conn:
-        try:
-            final = resolve_launch(conn, launch_request, evidence=evidence)
-        except (LaunchInputError, ProjectNotLaunchableError) as exc:
-            raise _launch_error(exc) from exc
-        if final.fingerprint != body.preview_token:
-            raise _preview_changed(final)
-        try:
-            task = create_task(
-                engine,
-                project_name=final.inputs.project_name,
-                slug=body.slug,
-                branch=final.inputs.branch,
-                clone_path=str(clone_path),
-                prompt=body.prompt,
-                execution_inputs=final.inputs,
-                workflow_name=final.inputs.workflow_name,
-                conn=conn,
-            )
-        except DuplicateTaskError as exc:
-            raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-        # Same transaction as the task and its pinned inputs (ADR-0035).
-        # Accepting the launch and reserving the bytes it depends on are one
-        # durable operation: a purge racing this either loses the reservation
-        # and is refused, or wins and leaves no consumer behind.
-        pinned_producers = insert_references_on(
-            conn,
-            consumer_task_id=task.id,
-            references=[
-                (
-                    attachment.result_id,
-                    attachment.producer_task_id,
-                    attachment.manifest_id,
-                )
-                for attachment in final.inputs.result_attachments
-            ],
-        )
-
-    # After the commit: a producer's reverse-dependency list moved, and a purge
-    # dialog open elsewhere has to converge without a refresh.
-    for producer_task_id in pinned_producers:
-        request.app.state.results.publish(producer_task_id)
-
-    payload = task_payload(task, engine=engine)
-    events.publish("task_created", payload)
-    job = asyncio.create_task(
-        run_spawn_pipeline(
-            engine,
-            events,
-            config,
-            task.id,
-            request.app.state.workflow_runner,
-        )
-    )
-    # Keep a reference so the job isn't garbage-collected mid-pipeline.
-    jobs: set[asyncio.Task] = request.app.state.spawn_jobs
-    jobs.add(job)
-    job.add_done_callback(jobs.discard)
-    return payload
-
-
-# --- Upgrade reconciliation ---------------------------------------------------
-# Two separate blockers with two separate flows: a project's carried-over
-# launch configuration, and a legacy task's missing continuation configuration.
-# Neither is ever resolved by guessing (ADR-0026).
-
-
-class ProjectReconciliationIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    # Names exactly the evidence the operator read. A decision made against a
-    # stale reading is refused rather than applied.
-    evidence_fingerprint: str
-    base_branch: str
-    branch_pattern: str
-    workshop_additions: str
-    preamble: str = ""
-    # Explicit either way: a name, or `null` meaning "this project has no
-    # default; a profile is selected at each launch".
-    default_model_profile: str | None = None
-    acknowledge_model_candidates: bool = False
-    acknowledge_judge_model: bool = False
-
-
-@router.get("/projects/{name}/launch-reconciliation")
-def get_project_reconciliation_route(
-    name: str, engine: Engine = Depends(_engine)
-) -> dict[str, Any]:
-    try:
-        return launchconfig.project_reconciliation(engine, name)
-    except ProjectNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-
-
-@router.post("/projects/{name}/launch-reconciliation", response_model=ProjectOut)
-def confirm_project_reconciliation_route(
-    name: str,
-    body: ProjectReconciliationIn,
-    engine: Engine = Depends(_engine),
-    events: EventHub = Depends(_events),
-) -> Project:
-    try:
-        project = launchconfig.confirm_project_reconciliation(
-            engine,
-            name,
-            launchconfig.ProjectDecision(
-                evidence_fingerprint=body.evidence_fingerprint,
-                base_branch=body.base_branch,
-                branch_pattern=body.branch_pattern,
-                workshop_additions=body.workshop_additions,
-                preamble=body.preamble,
-                default_model_profile=body.default_model_profile,
-                acknowledge_model_candidates=body.acknowledge_model_candidates,
-                acknowledge_judge_model=body.acknowledge_judge_model,
-            ),
-        )
-    except ProjectNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except launchconfig.ReconciliationConflictError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except (LaunchInputError, InvalidBranchPatternError, InvalidWorkshopAdditionsError) as exc:
-        raise _launch_error(exc) from exc
-    events.publish("project_updated", asdict(project))
-    return project
-
-
-class TaskContinuationIn(BaseModel):
-    """What the operator supplies to continue a task the upgrade left blocked.
-
-    Every field is optional at the schema level because two different gaps
-    share this route (ADR-0026, ADR-0028): a task that was never configured
-    needs all of them, while a task that merely predates retained workflow
-    definitions needs none — its model, branch, and preamble were reviewed
-    once and are not re-decided. Which are actually required is decided
-    against the task, and a missing one comes back as a field-level error.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    model_profile: str | None = None
-    base_branch: str | None = None
-    workshop_additions: str = DEFAULT_WORKSHOP_ADDITIONS
-    preamble: str = ""
-
-
-class TaskContinuationConfirmIn(TaskContinuationIn):
-    preview_token: str
-    # The operator says, in as many words, that the original model, thinking
-    # level, preamble, and overrides are unrecoverable. Confirmation pins what
-    # happens next; it never claims the past turns used these values.
-    acknowledge_unknown: bool = False
-    # And, separately, that the exact procedure this task already ran was
-    # never recorded. Two acknowledgements because they are two different
-    # things the daemon cannot recover, and a task can need only one of them.
-    acknowledge_workflow: bool = False
-
-
-def _continuation(body: TaskContinuationIn) -> launchconfig.TaskContinuation:
-    return launchconfig.TaskContinuation(
-        model_profile=body.model_profile,
-        base_branch=body.base_branch,
-        workshop_additions=body.workshop_additions,
-        preamble=body.preamble,
-    )
-
-
-@router.get("/tasks/{task_id}/configuration")
-def get_task_configuration_route(
-    task_id: int, engine: Engine = Depends(_engine)
-) -> dict[str, Any]:
-    try:
-        return launchconfig.task_configuration(engine, task_id)
-    except TaskNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-
-
-@router.post("/tasks/{task_id}/configuration/preview")
-def preview_task_configuration_route(
-    task_id: int,
-    body: TaskContinuationIn,
-    engine: Engine = Depends(_engine),
-) -> dict[str, Any]:
-    try:
-        return launchconfig.preview_task_configuration(
-            engine, task_id, _continuation(body)
-        )
-    except TaskNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except ProjectNotFoundError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
-    except launchconfig.ReconciliationConflictError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except (LaunchInputError, InvalidWorkshopAdditionsError) as exc:
-        raise _launch_error(exc) from exc
-
-
-@router.post("/tasks/{task_id}/configuration/confirm", response_model=TaskOut)
-def confirm_task_configuration_route(
-    task_id: int,
-    body: TaskContinuationConfirmIn,
-    engine: Engine = Depends(_engine),
-    events: EventHub = Depends(_events),
-) -> dict[str, Any]:
-    try:
-        task = launchconfig.confirm_task_configuration(
-            engine,
-            task_id,
-            _continuation(body),
-            preview_token=body.preview_token,
-            acknowledge_unknown=body.acknowledge_unknown,
-            acknowledge_workflow=body.acknowledge_workflow,
-        )
-    except TaskNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    except ProjectNotFoundError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
-    except (launchconfig.ReconciliationConflictError, TaskInputsAlreadyPinnedError) as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    except (LaunchInputError, InvalidWorkshopAdditionsError) as exc:
-        raise _launch_error(exc) from exc
-    payload = task_payload(task, engine=engine)
-    events.publish("task_updated", payload)
-    return payload
-
-
-@router.post("/tasks/{task_id}/continue", response_model=TaskOut)
-async def continue_task_route(
-    task_id: int,
-    request: Request,
-    engine: Engine = Depends(_engine),
-) -> dict[str, Any]:
-    """Resume a task whose run was left in place while it was unconfigured.
-
-    Deliberately explicit and deliberately narrow: only a run that was already
-    `running` or `waiting` is eligible. A failed or completed task is not
-    silently restarted, and review and ship remain their own actions.
-    """
-    try:
-        task = get_task(engine, task_id)
-    except TaskNotFoundError as exc:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-    try:
-        require_task_inputs(task)
-    except TaskConfigurationRequiredError as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    if task.workflow_status not in ("running", "waiting"):
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"task {task_id} workflow is {task.workflow_status or 'not running'}; "
-            "only an interrupted run can be continued",
-        )
-    await request.app.state.continue_task(task)
-    return task_payload(task, engine=engine)
 
 
 @router.post("/tasks/{task_id}/cleanup", response_model=TaskOut)
@@ -2544,10 +1128,6 @@ async def cleanup_task_route(
 # task in the path is part of the authorization, not decoration. Everything
 # here addresses *retained* bytes: no route in this section reads the task's
 # workspace, and none of them grants a workflow, review, or publication effect.
-
-
-def _results(request: Request) -> ResultManager:
-    return request.app.state.results
 
 
 class ResultCaptureIn(BaseModel):
@@ -2841,10 +1421,6 @@ def purge_task_result_route(
 # daemon.
 
 
-def _exports(request: Request) -> ResultExportManager:
-    return request.app.state.result_exports
-
-
 class ExportSelectionIn(BaseModel):
     """The subset of a revision to export, and where to put it.
 
@@ -3102,10 +1678,6 @@ def acknowledge_result_export_route(
 # D-4); stop stays as the manual kill switch, feeding the tracker's
 # operator-stop reason. Everything session-scoped is addressed
 # `/tasks/{id}/sessions/{name}/agent/*` (design D-1).
-
-
-def _supervisor(request: Request) -> AgentSupervisor:
-    return request.app.state.agents
 
 
 def _require_task(engine: Engine, task_id: int) -> Task:
@@ -3938,7 +2510,7 @@ async def commit_ship_route(
         # an approval, or a continuation of an interrupted action — moved the
         # run itself, and the run performs its own steps.
         ships.start_delivery(
-            task, delivery_id, body.request_id, request.app.state.spawn_jobs
+            task, delivery_id, body.request_id, request.app.state.spawn_scheduler.jobs
         )
     return projection
 
@@ -3995,7 +2567,7 @@ async def _continue_delivery(
         raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
 
     ships.start_delivery(
-        task, delivery_id, body.request_id, request.app.state.spawn_jobs
+        task, delivery_id, body.request_id, request.app.state.spawn_scheduler.jobs
     )
     return projection
 

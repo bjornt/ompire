@@ -1,6 +1,6 @@
 """Workflow run registry: step-record history against `workflow_step_records`
 plus the run-status mutators for the workflow columns on `tasks`. No ORM —
-Core only, mirroring the `registry/tasks.py` frozen-dataclass pattern.
+Core only, mirroring the `work/tasks.py` frozen-dataclass pattern.
 
 Architecture: ADR-0008
 (docs/adr/0008-model-tasks-as-workflows-over-named-sessions.md)
@@ -31,7 +31,7 @@ from sqlalchemy import Engine
 
 from ompire_daemon.db import tasks as tasks_table
 from ompire_daemon.db import workflow_step_records
-from ompire_daemon.registry.tasks import Task, _row_to_task, _update
+from ompire_daemon.work.tasks import Task, _row_to_task, _update
 
 WORKFLOW_STATUSES = ("running", "waiting", "complete", "failed")
 STEP_STATUSES = ("running", "waiting", "ok", "failed")
@@ -527,7 +527,7 @@ def resolve_gate(
     and `WorkflowGateChoiceError` when the answer names something this gate
     does not offer.
     """
-    from ompire_daemon.registry.model_profiles import reserved_write
+    from ompire_daemon.platform.transactions import reserved_write
 
     now = _now_iso()
     with reserved_write(engine) as conn:
@@ -731,7 +731,7 @@ def settle_delivery_step(
     it never dispatches a second effect to fill the gap, because the effect is
     already on record as having happened.
     """
-    from ompire_daemon.registry.model_profiles import reserved_write
+    from ompire_daemon.platform.transactions import reserved_write
     from ompire_daemon.registry.ships import complete_action_in
 
     now = _now_iso()
@@ -781,7 +781,7 @@ def resume_paused_attempt(
     still says the attempt was interrupted and continued rather than having
     run cleanly.
     """
-    from ompire_daemon.registry.model_profiles import reserved_write
+    from ompire_daemon.platform.transactions import reserved_write
 
     now = _now_iso()
     with reserved_write(engine) as conn:
@@ -843,7 +843,7 @@ def retry_paused_step(
     The original attempt is never edited into a success and never deleted:
     the pause, its evidence, and its error stay in the history.
     """
-    from ompire_daemon.registry.model_profiles import reserved_write
+    from ompire_daemon.platform.transactions import reserved_write
 
     now = _now_iso()
     with reserved_write(engine) as conn:
