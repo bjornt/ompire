@@ -39,6 +39,7 @@ from typing import Any
 
 from sqlalchemy import Connection, Engine
 
+from ompire_daemon.application.spawn import run_spawn_pipeline
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.handoff import observe_base_difference, observe_target
@@ -49,7 +50,6 @@ from ompire_daemon.registry.results import (
     insert_references_on,
     read_result_on,
 )
-from ompire_daemon.spawn import run_spawn_pipeline
 from ompire_daemon.work.files import validate_mentions
 from ompire_daemon.work.launch import (
     LaunchInputError,

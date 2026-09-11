@@ -13,9 +13,14 @@ agent's frame vocabulary can grow without breaking Ompire.
 
 ### Spawning
 
-The child is spawned as an asyncio subprocess with PIPE stdio, via
-`workshop exec` in the task's clone — argument list, never a shell — with a
-stream limit of at least 4 MiB.
+The child is started through the resource boundary's transport —
+`isolation.start_sandbox_process` wraps the native argv in `workshop exec`
+in the task's clone (argument list, never a shell) with PIPE stdio and a
+stream limit of at least 4 MiB. The agent owner builds the *native* argv —
+`omp --mode rpc-ui ...` with the accepted model flags — and adopts the
+started process for the ready handshake and supervision; which transport
+runs it is the resource boundary's decision, not the protocol's
+([ADR-0039](../../adr/0039-own-workspace-resources-behind-isolation.md)).
 
 The large stream limit matters: agent frames routinely exceed the default
 64 KiB line limit, and a truncated frame is an unrecoverable protocol error.

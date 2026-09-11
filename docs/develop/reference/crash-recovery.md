@@ -106,6 +106,18 @@ Recovery runs in the background. The daemon serves REST requests and WebSocket
 snapshots while it proceeds, bounded by `recovery_concurrency` — deliberately
 small, because each resume is a real container-side agent startup.
 
+The startup barrier itself is unchanged in order and reads the resource
+boundary through its public entry points: interrupted Workshop-additions
+staging is restored (`isolation.recover_pending` — the journal's format is
+unchanged, so records written before the package move restore identically)
+before any agent can start, delivery journals are reconciled before legacy
+parked-ref recovery, restored writer blocks are installed before task
+classification or resume, and session identity and applied policy are
+restored through their own owners before a run is re-driven. A restart during
+unfinished preparation still classifies the task as failed — including one
+interrupted while installing handoff inputs — without rebuilding or
+reinstalling anything, and no new automatic retry or replay exists.
+
 ### Startup reconciliation
 
 Every non-archived task that cannot be resumed becomes `failed` with a reason

@@ -19,11 +19,17 @@ from pathlib import Path
 import pytest
 
 from ompire_daemon.agent import AgentSupervisor
+from ompire_daemon.application.execution import SandboxCommandExecutor
+from ompire_daemon.application.spawn import run_spawn_pipeline
 from ompire_daemon.config import Config
 from ompire_daemon.events import Event, EventHub
+from ompire_daemon.platform.processes import (
+    ProcessStep,
+    ProcessStepError,
+    run_process_step,
+)
 from ompire_daemon.registry.sessions import get_session
 from ompire_daemon.sessions import SessionTracker
-from ompire_daemon.spawn import Step, StepFailedError, _run_step, run_spawn_pipeline
 from ompire_daemon.work.projects import create_project
 from ompire_daemon.work.tasks import (
     clone_path_for,
@@ -56,8 +62,8 @@ def _failing_script(tmp_path: Path, body: str) -> str:
 async def test_run_step_failure_detail_prefers_stderr(tmp_path: Path) -> None:
     """stderr is the primary diagnosis when a step fails."""
     script = _failing_script(tmp_path, "echo 'to stdout'\necho 'to stderr' >&2\nexit 3")
-    with pytest.raises(StepFailedError) as exc_info:
-        await _run_step(Step("step", [script], 10))
+    with pytest.raises(ProcessStepError) as exc_info:
+        await run_process_step(ProcessStep("step", [script], 10))
     assert exc_info.value.stderr.strip() == "to stderr"
 
 
@@ -65,22 +71,22 @@ async def test_run_step_failure_detail_falls_back_to_stdout(tmp_path: Path) -> N
     """A hook or wrapper that only writes stdout must not die silently
     (dogfooding: a ship commit failed with an empty diagnosis)."""
     script = _failing_script(tmp_path, "echo 'hook says no'\nexit 3")
-    with pytest.raises(StepFailedError) as exc_info:
-        await _run_step(Step("step", [script], 10))
+    with pytest.raises(ProcessStepError) as exc_info:
+        await run_process_step(ProcessStep("step", [script], 10))
     assert exc_info.value.stderr.strip() == "hook says no"
 
 
 async def test_run_step_failure_detail_reports_silent_exit_code(tmp_path: Path) -> None:
     script = _failing_script(tmp_path, "exit 3")
-    with pytest.raises(StepFailedError) as exc_info:
-        await _run_step(Step("step", [script], 10))
+    with pytest.raises(ProcessStepError) as exc_info:
+        await run_process_step(ProcessStep("step", [script], 10))
     assert exc_info.value.stderr.strip() == "exited with code 3"
 
 
 async def test_run_step_failure_detail_reports_signal_kill(tmp_path: Path) -> None:
     script = _failing_script(tmp_path, "kill -9 $$")
-    with pytest.raises(StepFailedError) as exc_info:
-        await _run_step(Step("step", [script], 10))
+    with pytest.raises(ProcessStepError) as exc_info:
+        await run_process_step(ProcessStep("step", [script], 10))
     assert exc_info.value.stderr.strip() == "killed by signal 9"
 
 @pytest.fixture
@@ -96,7 +102,7 @@ def pipeline(app):
 
     async def run(engine, task_id: int, run_config: Config | None = None):
         effective = run_config or config
-        runner = WorkflowRunner(engine, effective, hub, supervisor, tracker)
+        runner = WorkflowRunner(engine, effective, hub, supervisor, tracker, SandboxCommandExecutor())
         await run_spawn_pipeline(engine, hub, effective, task_id, runner)
 
     return run, hub, tracker, supervisor

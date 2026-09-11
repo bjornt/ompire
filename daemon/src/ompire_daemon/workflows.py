@@ -40,25 +40,23 @@ import contextlib
 import json
 import logging
 import math
-import os
-import signal
 import traceback
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, replace
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from sqlalchemy import Engine as SAEngine
 
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
-from ompire_daemon.delivery import (
+from ompire_daemon.events import EventHub
+from ompire_daemon.isolation import (
     WorkspaceBlockedError,
     WorkspaceBusyError,
     WorkspaceGuard,
 )
-from ompire_daemon.events import EventHub
 from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.registry.reviews import ReviewIterationRecord
 from ompire_daemon.registry.sessions import (
@@ -316,6 +314,43 @@ what is missing rather than repeating anything. The original instruction \
 follows."""
 
 _COMMAND_OUTPUT_TAIL = 8 * 1024
+
+
+@dataclass(frozen=True)
+class CommandOutcome:
+    """One completed sandbox command: its exit code and decoded output.
+
+    A nonzero exit is *data* — routing on it is a following decision step's
+    job — so it travels in the outcome, not in an exception.
+    """
+
+    exit_code: int
+    output: str
+
+
+class CommandExecutionError(Exception):
+    """A workflow command could not be executed at all: the sandbox transport
+    could not start it, or it exceeded its deadline. This is an
+    infrastructure failure, never a negative domain result."""
+
+
+class CommandExecutor(Protocol):
+    """The consumer-owned seam a run uses to execute one finite command.
+
+    The engine declares what it needs — a workspace path, a literal argv, a
+    deadline, and an output-tail bound — and application wiring supplies the
+    adapter to the owning resource boundary. The engine never constructs
+    container transport argv itself.
+    """
+
+    async def __call__(
+        self,
+        clone_path: str,
+        argv: list[str],
+        *,
+        timeout: float,
+        output_tail: int,
+    ) -> CommandOutcome: ...
 
 # A decision's recorded route when it finishes the run. Deliberately not
 # slug-format, so it can never collide with a declared step name, and
@@ -663,12 +698,18 @@ class WorkflowRunner:
         events: EventHub,
         supervisor: AgentSupervisor,
         tracker: SessionTracker,
+        command_executor: CommandExecutor,
     ) -> None:
         self._engine = engine
         self._config = config
         self._hub = events
         self._supervisor = supervisor
         self._tracker = tracker
+        # The one way a run executes a finite command: application wiring
+        # supplies the adapter to the resource boundary's sandbox execution.
+        # A required collaborator, not an optional port — there is no second
+        # default execution path.
+        self._command_executor = command_executor
         self._runs: dict[int, asyncio.Task] = {}
         # task_id → future completed with the operator's note on gate resume.
         self._gate_waits: dict[int, asyncio.Future[str | None]] = {}
@@ -2482,32 +2523,20 @@ class WorkflowRunner:
             self._hub.unsubscribe(queue)
 
     async def _run_command_step(self, step: CommandStep, task: Task) -> _StepResult:
-        argv = ["workshop", "exec", "-p", task.clone_path, "--", *step.argv]
         try:
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,
+            outcome = await self._command_executor(
+                task.clone_path,
+                list(step.argv),
+                timeout=step.timeout,
+                output_tail=_COMMAND_OUTPUT_TAIL,
             )
-        except OSError as exc:
-            raise _StepInfraFailure(f"cannot exec 'workshop': {exc}") from exc
-        try:
-            output_bytes, _ = await asyncio.wait_for(
-                process.communicate(), timeout=step.timeout
-            )
-        except (asyncio.CancelledError, TimeoutError) as exc:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            await process.communicate()
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            raise _StepInfraFailure(f"command timed out after {step.timeout}s") from None
-        tail = output_bytes[-_COMMAND_OUTPUT_TAIL:].decode("utf-8", errors="replace")
-        # A non-zero exit is outcome DATA (routing on it is a following
-        # decision step's job); only the inability to execute fails the run.
-        return _StepResult(outcome={"exit_code": process.returncode, "output": tail})
+        except CommandExecutionError as exc:
+            # Not started, or deadline exceeded — infrastructure failure.
+            # A completed nonzero exit is result data and never lands here.
+            raise _StepInfraFailure(str(exc)) from exc
+        return _StepResult(
+            outcome={"exit_code": outcome.exit_code, "output": outcome.output}
+        )
 
     # --- events ------------------------------------------------------------------
 

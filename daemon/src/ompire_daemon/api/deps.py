@@ -12,12 +12,13 @@ from sqlalchemy import Engine
 
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentSupervisor
+from ompire_daemon.application.cleanup import CleanupService
 from ompire_daemon.application.launch import LaunchService
 from ompire_daemon.config import Config
-from ompire_daemon.delivery import WorkspaceGuard
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import GpgProbe
+from ompire_daemon.isolation import WorkspaceGuard
 from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.registry.settings import SettingsStore
 from ompire_daemon.result_exports import ResultExportManager
@@ -94,3 +95,7 @@ def _supervisor(request: Request) -> AgentSupervisor:
 
 def _launch_service(request: Request) -> LaunchService:
     return request.app.state.launch_service
+
+
+def _cleanup_service(request: Request) -> CleanupService:
+    return request.app.state.cleanup_service

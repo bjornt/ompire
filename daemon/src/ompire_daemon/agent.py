@@ -22,6 +22,11 @@ from typing import TYPE_CHECKING, Any
 from ompire_daemon import rpc
 from ompire_daemon.config import Config
 from ompire_daemon.events import Event, EventHub
+from ompire_daemon.isolation import (
+    SandboxCommandError,
+    run_sandbox_command,
+    start_sandbox_process,
+)
 from ompire_daemon.model_config import RoleBinding
 from ompire_daemon.work.inputs import ModelPolicy, split_model_identifier
 
@@ -135,28 +140,30 @@ def role_flag_value(binding: RoleBinding) -> str:
 
 
 def build_agent_argv(
-    clone_path: str,
     *,
     policy: ModelPolicy,
     resume: str | None = None,
 ) -> list[str]:
-    """The spike's spawn recipe (design D-2): sessions ON (no `--no-session`),
-    no `-s` flag (nonexistent), and no environment-injection prefix
-    (ADR-0015). `resume` appends `--resume <session-id>`
-    (crash-recovery capability, design D-1/D-3) — a bare session id, not a
-    file path, confirmed against the omp source (see the
-    `omp-rpc-field-assumptions` memory note).
+    """The native argv for one omp child (design D-2): sessions ON (no
+    `--no-session`), no `-s` flag (nonexistent), and no
+    environment-injection prefix (ADR-0015). `resume` appends
+    `--resume <session-id>` (crash-recovery capability, design D-1/D-3) — a
+    bare session id, not a file path, confirmed against the omp source (see
+    the `omp-rpc-field-assumptions` memory note).
+
+    This is the argv *inside* the container: the workshop transport prefix
+    belongs to the resource boundary that starts the process, not to the
+    agent owner (ADR-0039).
 
     The model policy is not optional (ADR-0026). Every process — a fresh
-    session, a lazily spawned one, the judge, a resumed one — carries the
-    task's accepted active pair *and* all three auxiliary role pairs, each
-    with its own thinking level. There is no "unset means omp's default"
-    any more: inheriting the host's model settings is exactly what a global
-    profile exists to prevent. Flags and their one-argument
+    session, a lazily spawned one, a resumed one — carries the task's
+    accepted active pair *and* all three auxiliary role pairs, each with its
+    own thinking level. There is no "unset means omp's default" any more:
+    inheriting the host's model settings is exactly what a global profile
+    exists to prevent. Flags and their one-argument
     `provider/model-id:LEVEL` encoding verified against omp v18.1.10.
     """
     argv = [
-        "workshop", "exec", "-p", clone_path, "--",
         "omp", "--mode", "rpc-ui", "--no-title",
         "--model", policy.active.model,
         "--thinking", policy.active.thinking,
@@ -174,33 +181,31 @@ async def verify_ask_timeout(clone_path: str) -> None:
 
     The spike found `-s ask.timeout=0` doesn't exist and the default is
     already 0; this assertion catches a future omp changing that default,
-    which would leave agents blocked on interactive asks (design D-2).
+    which would leave agents blocked on interactive asks (design D-2). The
+    probe itself runs through the resource boundary's finite sandbox
+    execution; the argv, the zero-value interpretation, and the native error
+    translation stay here.
     """
     try:
-        process = await asyncio.create_subprocess_exec(
-            "workshop", "exec", "-p", clone_path, "--",
-            "omp", "config", "get", "ask.timeout",
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        result = await run_sandbox_command(
+            clone_path,
+            ["omp", "config", "get", "ask.timeout"],
+            timeout=_ASK_TIMEOUT_CHECK_TIMEOUT,
+            merge_stderr=False,
         )
-    except OSError as exc:
-        raise AgentStartError(f"cannot exec 'workshop': {exc}") from exc
-    try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            process.communicate(), timeout=_ASK_TIMEOUT_CHECK_TIMEOUT
-        )
-    except TimeoutError:
-        process.kill()
-        await process.wait()
+    except SandboxCommandError as exc:
+        if exc.timed_out:
+            raise AgentStartError(
+                f"'omp config get ask.timeout' timed out after "
+                f"{_ASK_TIMEOUT_CHECK_TIMEOUT}s"
+            ) from None
+        raise AgentStartError(str(exc)) from exc
+    if result.exit_code != 0:
         raise AgentStartError(
-            f"'omp config get ask.timeout' timed out after {_ASK_TIMEOUT_CHECK_TIMEOUT}s"
-        ) from None
-    stderr = stderr_bytes.decode("utf-8", errors="replace")
-    if process.returncode != 0:
-        raise AgentStartError("cannot read ask.timeout from the container's omp config", stderr)
+            "cannot read ask.timeout from the container's omp config", result.stderr
+        )
     # Tolerate both bare `0` and `ask.timeout = 0` output shapes.
-    tokens = stdout_bytes.decode("utf-8", errors="replace").strip().split()
+    tokens = result.output.strip().split()
     value = tokens[-1] if tokens else ""
     if value != "0":
         raise AgentStartError(
@@ -237,26 +242,20 @@ class AgentHandle:
     @classmethod
     async def start(
         cls,
-        argv: list[str],
+        process: asyncio.subprocess.Process,
         *,
         ready_timeout: float,
         ring_buffer_size: int,
     ) -> AgentHandle:
-        """Spawn and complete the ready handshake; on failure the child is
-        dead and the captured stderr rides on the raised AgentStartError.
+        """Adopt an already-started child and complete the ready handshake;
+        on failure the child is dead and the captured stderr rides on the
+        raised AgentStartError.
 
-        The launcher inherits the daemon's process environment and nothing
-        else (ADR-0015)."""
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                limit=rpc.STREAM_LIMIT,
-            )
-        except OSError as exc:
-            raise AgentStartError(f"cannot exec {argv[0]!r}: {exc}") from exc
+        The process is started by the resource boundary's transport, inside
+        the task's container (ADR-0039); the handle owns only the native
+        protocol from here — readiness, requests, events, and teardown. The
+        launcher inherits the daemon's process environment and nothing else
+        (ADR-0015)."""
         handle = cls(process, ring_buffer_size)
         await handle._await_ready(ready_timeout)
         return handle
@@ -798,15 +797,21 @@ class AgentSupervisor:
         if task_id not in self._ask_timeout_verified:
             await verify_ask_timeout(clone_path)
             self._ask_timeout_verified.add(task_id)
-        argv = build_agent_argv(clone_path, policy=policy, resume=resume)
+        argv = build_agent_argv(policy=policy, resume=resume)
         if self._tracker is not None and resume is None:
             # `starting` covers the spawn and ready handshake (design D-2). A
             # resumed start is already seeded `starting` with a recovery
             # reason by the caller (crash-recovery design D-4) — don't
             # clobber it with this generic one.
             self._tracker.agent_spawning(task_id, session)
+        try:
+            process = await start_sandbox_process(
+                clone_path, argv, stream_limit=rpc.STREAM_LIMIT
+            )
+        except OSError as exc:
+            raise AgentStartError(f"cannot exec 'workshop': {exc}") from exc
         handle = await AgentHandle.start(
-            argv,
+            process,
             ready_timeout=self._config.agent_ready_timeout,
             ring_buffer_size=self._config.agent_ring_buffer_size,
         )

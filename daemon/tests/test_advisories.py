@@ -16,7 +16,7 @@ from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.sessions import SessionTracker
-from tests.conftest import fake_argv_builder, make_test_policy
+from tests.conftest import fake_argv_builder, fake_sandbox_start, make_test_policy
 
 THROTTLE = 0.15
 
@@ -240,6 +240,7 @@ def tracked(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         agent_module, "build_agent_argv", fake_argv_builder("happy")
     )
+    monkeypatch.setattr(agent_module, "start_sandbox_process", fake_sandbox_start)
 
     async def no_preflight(clone_path: str) -> None:
         return None

@@ -17,8 +17,8 @@ import pytest
 
 from ompire_daemon.config import Config
 from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
-from ompire_daemon.delivery import WorkspaceGuard
 from ompire_daemon.events import EventHub
+from ompire_daemon.isolation import WorkspaceGuard
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.registry.results import (
     MAX_FILES,

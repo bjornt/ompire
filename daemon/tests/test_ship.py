@@ -20,12 +20,12 @@ from fastapi.testclient import TestClient
 
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.app import create_app
+from ompire_daemon.application.execution import SandboxCommandExecutor
 from ompire_daemon.config import Config
 from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
 from ompire_daemon.delivery import (
     DeliveryWorkspaceError,
     ProtectedPathError,
-    WorkspaceGuard,
     capture_candidate,
     compute_candidate_id,
 )
@@ -41,6 +41,7 @@ from ompire_daemon.gh import (
     parse_github_target,
 )
 from ompire_daemon.gpg import GpgProbe, GpgSelection, GpgStatus, parse_candidates
+from ompire_daemon.isolation import WorkspaceGuard
 from ompire_daemon.registry.reviews import clear_process_marker
 from ompire_daemon.registry.ships import (
     get_delivery,
@@ -560,7 +561,8 @@ class _StubRunner:
 
     def __init__(self, engine, config, hub, sessions) -> None:
         self._runner = WorkflowRunner(
-            engine, config, hub, AgentSupervisor(config, hub, sessions), sessions
+            engine, config, hub, AgentSupervisor(config, hub, sessions), sessions,
+            SandboxCommandExecutor(),
         )
 
     def answer_gate(self, task, revision, **kwargs):
@@ -2130,7 +2132,8 @@ async def test_the_run_performs_its_authorized_chain_and_ends_where_it_declared(
     await _approve_current(config, engine, task)
 
     live = WorkflowRunner(
-        engine, config, hub, AgentSupervisor(config, hub, sessions), sessions
+        engine, config, hub, AgentSupervisor(config, hub, sessions), sessions,
+        SandboxCommandExecutor(),
     )
     live.set_guard(ships._guard)
     live.set_operations(None, ships)
@@ -2305,7 +2308,8 @@ def _restored_sign(ships):
 def _live_runner(engine, config, hub, sessions, ships):
     """A real runner wired to the trusted services, as app startup wires it."""
     live = WorkflowRunner(
-        engine, config, hub, AgentSupervisor(config, hub, sessions), sessions
+        engine, config, hub, AgentSupervisor(config, hub, sessions), sessions,
+        SandboxCommandExecutor(),
     )
     live.set_guard(ships._guard)
     live.set_operations(None, ships)

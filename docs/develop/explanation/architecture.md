@@ -86,6 +86,11 @@ correct.
 Cleanup removes the container before deleting the clone, and refuses any path
 outside the configured task root.
 
+The clone, the container, and the command/process transports into it are one
+owned resource boundary (`isolation/`), separate from the application
+orchestration that decides when a task uses them
+([ADR-0039](../../adr/0039-own-workspace-resources-behind-isolation.md)).
+
 See [ADR-0006](../../adr/0006-give-every-task-a-separate-clone-and-workshop.md).
 
 ## Agents are supervised child processes
@@ -262,15 +267,57 @@ run, and return a task or a domain refusal — no FastAPI request is involved.
 `daemon/tests/test_architecture.py` enforces the import directions on every
 test run, so a new dependency cannot quietly undo the split.
 
-What this deliberately is *not*: the whole target architecture. Isolation,
-sessions, workflow semantics, delivery, artifacts, and oversight composition
-are still flat modules at their historical paths, and their existing edges
-into work-owned code remain as named exceptions in the checker, each
-assigned to the change that will remove it. The launch acceptance still
-shares one SQLite database and one local write reservation
-(`platform/transactions.py`) with every other owner — named module ownership
-without fragmenting the consistency boundary
-([ADR-0038](../../adr/0038-own-modules-and-compose-local-transactions.md)).
+## Workspace resources are owned, not embedded
+
+The disposable workspace — the confined clone and its container — has one
+owner, the `isolation` package, and it is a *resource* boundary rather than a
+task service. Its operations take resolved values (a frozen `WorkspaceSpec`
+carrying an opaque integer owner id, paths, an accepted source and branch,
+an optional pinned commit, an additions selection, supplied protected
+destinations, and the launcher argv and deadlines) and return observations,
+process handles, command results, or classified failures. Nothing inside it
+reads a task row, resolves a workflow, publishes an event, or starts a run:
+an arbitrary owner id with no task behind it can prepare a clone, launch and
+inspect a container, execute a command, and destroy the whole thing.
+
+Application orchestration decides *when accepted work uses those resources*.
+`application/spawn.py` is the preparation coordinator — it projects accepted
+inputs onto the spec, translates live resource progress into the task's
+events, installs retained handoff bytes between clone and container, records
+lifecycle observations through the work owner, and starts the pinned
+workflow only after every required operation succeeds. `application/cleanup.py`
+composes the existing admission rules and the shared cleanup hold around the
+guarded teardown. The workflow engine executes commands through a
+consumer-owned `CommandExecutor` contract that application wiring implements
+over the sandbox operation, so the engine routes on exit codes without ever
+constructing container argv; `agent.py` builds the native argv and adopts the
+process the boundary starts, keeping the protocol, readiness, and policy
+verification for itself.
+
+The same move gave two already-shared technical helpers a neutral home: the
+checked host-subprocess step runner (`platform/processes.py`) and the
+hardened Git invocation helpers (`platform/git.py`). They know argv,
+deadlines, and output capture — never which command is correct or what a
+failure means; their typed failures are classified by the calling owner.
+
+The writer guard moved with the resources, not with delivery policy: one
+`WorkspaceGuard`, shared by review, delivery, agent turns, captures, and
+cleanup, with host/agent ownership kinds and execution-context reentrancy.
+Delivery still decides why a workspace is blocked and when a block may clear,
+from its own durable evidence; the guard only holds the mechanical block.
+Inherited admission through the execution context is intentional convenience
+for the daemon's own nested calls — not a security claim, and no restraint on
+an agent's native escape hatch.
+
+What this deliberately is *not*: the whole target architecture. Sessions,
+workflow semantics, delivery, artifacts, and oversight composition are still
+flat modules at their historical paths, and their remaining edges into
+work-owned code stay as named exceptions in the checker, each assigned to
+the change that will remove it. Every owner still shares one SQLite database
+and one local write reservation (`platform/transactions.py`) — named module
+ownership without fragmenting the consistency boundary
+([ADR-0038](../../adr/0038-own-modules-and-compose-local-transactions.md),
+[ADR-0039](../../adr/0039-own-workspace-resources-behind-isolation.md)).
 
 ## A launch is resolved once and pinned to the task
 

@@ -14,17 +14,17 @@ from pathlib import Path
 
 import pytest
 
-from ompire_daemon import workshopadditions
+from ompire_daemon.application.spawn import run_spawn_pipeline
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
-from ompire_daemon.spawn import run_spawn_pipeline
-from ompire_daemon.work.projects import create_project
-from ompire_daemon.work.tasks import clone_path_for, create_task, get_task
-from ompire_daemon.workshopadditions import (
+from ompire_daemon.isolation import additions as workshopadditions
+from ompire_daemon.isolation.additions import (
     EMPTY_ADDITIONS,
     LOCAL_ADDITIONS_FILENAME,
     WorkshopAdditionsError,
 )
+from ompire_daemon.work.projects import create_project
+from ompire_daemon.work.tasks import clone_path_for, create_task, get_task
 from tests.conftest import make_execution_inputs
 
 

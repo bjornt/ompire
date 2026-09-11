@@ -5,14 +5,11 @@ Architecture: ADR-0004 (docs/adr/0004-use-rest-and-websocket-snapshot-deltas.md)
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import secrets
-import shutil
 from collections.abc import Mapping
 from dataclasses import asdict
 from importlib.metadata import version as package_version
-from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import (
@@ -33,6 +30,7 @@ from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentHandle, AgentSupervisor, NoLiveAgentError
 from ompire_daemon.api.deps import (
     _advisories,
+    _cleanup_service,
     _config,
     _engine,
     _events,
@@ -49,22 +47,26 @@ from ompire_daemon.api.deps import (
     _supervisor,
 )
 from ompire_daemon.api.work_models import TaskOut
+from ompire_daemon.application.cleanup import (
+    CleanupConflictError,
+    CleanupService,
+    WorkshopTeardownError,
+)
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.datadir import audit_log_path_for
-from ompire_daemon.delivery import (
-    WorkspaceBlockedError,
-    WorkspaceBusyError,
-    WorkspaceGuard,
-)
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import (
     FINGERPRINT_RE,
     GpgProbe,
 )
+from ompire_daemon.isolation import (
+    WorkspaceBlockedError,
+    WorkspaceBusyError,
+    WorkspaceGuard,
+)
 from ompire_daemon.notifications import AttentionNotifier
-from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.registry.result_exports import (
     CheckoutBusyError,
     ExportNotFoundError,
@@ -96,10 +98,7 @@ from ompire_daemon.registry.settings import (
     SettingsStore,
     SettingsValidationError,
 )
-from ompire_daemon.registry.ships import (
-    DeliveryConflictError,
-    get_active_delivery,
-)
+from ompire_daemon.registry.ships import DeliveryConflictError
 from ompire_daemon.registry.workflow_definitions import (
     WorkflowRevisionUnavailableError,
     get_revision,
@@ -178,7 +177,6 @@ from ompire_daemon.work.tasks import (
     TaskNotArchivedError,
     TaskNotFoundError,
     get_task,
-    mark_archived,
     purge_task,
 )
 from ompire_daemon.workflow_definitions import (
@@ -201,7 +199,6 @@ from ompire_daemon.workflows import (
     WorkflowRunner,
     packaged_yaml,
 )
-from ompire_daemon.workshop import WorkshopRemoveError, remove_workshop
 
 # REST authentication boundary: ADR-0002
 # (docs/adr/0002-run-as-local-daemon-with-stateless-web-ui.md)
@@ -1037,89 +1034,28 @@ def _set_archived(
 @router.post("/tasks/{task_id}/cleanup", response_model=TaskOut)
 async def cleanup_task_route(
     task_id: int,
-    engine: Engine = Depends(_engine),
-    config: Config = Depends(_config),
-    events: EventHub = Depends(_events),
-    sessions: SessionTracker = Depends(_sessions),
-    advisories: AdvisorySampler = Depends(_advisories),
-    reviews: ReviewManager = Depends(_reviews),
-    ships: ShipManager = Depends(_ships),
-    guard: WorkspaceGuard = Depends(_guard),
-    notifications: AttentionNotifier = Depends(_notifications),
+    cleanup: CleanupService = Depends(_cleanup_service),
 ) -> dict[str, Any]:
+    """Tear one task's workspace down and archive it.
+
+    Wire and error mapping only: the admission rules, guarded teardown, and
+    finalization live in the application cleanup service.
+
+    409 carries either a plain refusal message or the code-plus-message pair
+    a run-position refusal produces; 502 means the container could not be
+    torn down and the clone was retained.
+    """
     try:
-        task = get_task(engine, task_id)
+        return await cleanup.cleanup_task(task_id)
     except TaskNotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
-
-    active = get_active_delivery(engine, task_id)
-    if active is not None and active.disposition in ("authorized", "unresolved"):
+    except CleanupConflictError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, exc.detail) from exc
+    except WorkshopTeardownError as exc:
         raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"task {task_id} has a delivery that is still {active.disposition}; "
-            "finish or reconcile it before cleaning up",
-        )
-    # And refused while the run is at a decision or an action: destroying the
-    # workspace mid-publication would leave the effect on record with nothing
-    # to reconcile it against (ADR-0033).
-    _refuse_run_writer(engine, task_id)
-
-    clone_path = Path(task.clone_path).resolve()
-    task_root = config.task_dir_root.expanduser().resolve()
-    if task_root not in clone_path.parents:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            f"refusing to delete {clone_path}: outside task root {task_root}",
-        )
-
-    # Cleanup deletes the clone, so it is refused while another host operation
-    # owns the workspace and while a privileged effect's outcome is unknown
-    # (ADR-0032). Abandoning remaining agent work does not make an unresolved
-    # effect safe to destroy the evidence for; it has to be reconciled first.
-    #
-    # The hold is retained through teardown rather than only checked here: a
-    # result capture admitted between this check and the `rmtree` below would
-    # be reading files out of a clone that is being deleted (ADR-0034). A busy
-    # capture therefore refuses cleanup, and a started cleanup refuses a new
-    # capture.
-    try:
-        async with guard.cleanup_hold(task_id, "cleanup"):
-            # Tear down the container before deleting the clone under it
-            # (design D-4); an already-gone workshop is fine, any other failure
-            # aborts un-archived.
-            if task.workshop_id is not None:
-                try:
-                    await remove_workshop(
-                        str(clone_path), config.workshop_step_timeout
-                    )
-                except WorkshopRemoveError as exc:
-                    raise HTTPException(
-                        status.HTTP_502_BAD_GATEWAY,
-                        f"workshop remove failed; clone retained:\n{exc.stderr}",
-                    ) from exc
-
-            # Idempotent: a missing directory is already cleaned up.
-            await asyncio.to_thread(shutil.rmtree, clone_path, ignore_errors=True)
-
-            await reviews.cancel_and_drop(task_id)
-            await ships.cancel_and_drop(task_id)
-    except (WorkspaceBusyError, WorkspaceBlockedError) as exc:
-        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    # The delivery journal is deliberately retained across cleanup: a
-    # cleaned-up task keeps the record of what it published and under whose
-    # authorization. Retained results are retained too — cleanup destroys the
-    # workspace, never a captured result or its history (ADR-0034). Only the
-    # candidate staging repositories go, and only the ones no unresolved work
-    # still needs as evidence.
-    ships.release_candidate_storage(task_id)
-    guard.discard(task_id)
-    archived = mark_archived(engine, task_id)
-    sessions.discard(task_id)
-    advisories.clear_task(task_id)
-    notifications.clear_task(task_id)
-    payload = task_payload(archived, engine=engine)
-    events.publish("task_updated", payload)
-    return payload
+            status.HTTP_502_BAD_GATEWAY,
+            f"workshop remove failed; clone retained:\n{exc.stderr}",
+        ) from exc
 
 
 # --- Durable task results (ADR-0034) ----------------------------------------

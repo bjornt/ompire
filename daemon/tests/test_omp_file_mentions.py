@@ -133,8 +133,18 @@ async def _prompt_real_omp(
             "ANTHROPIC_BASE_URL", f"http://127.0.0.1:{server.port}"
         )
         monkeypatch.setenv("ANTHROPIC_API_KEY", "capture-server-not-a-real-key")
+        # A real-omp contract test may create its host-side process
+        # explicitly and adopt it; production always starts the process
+        # through the resource boundary's transport.
+        process = await asyncio.create_subprocess_exec(
+            *_argv(workdir),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=4 * 1024 * 1024,
+        )
         handle = await AgentHandle.start(
-            _argv(workdir), ready_timeout=90, ring_buffer_size=200
+            process, ready_timeout=90, ring_buffer_size=200
         )
         try:
             response = await asyncio.wait_for(handle.prompt(message), timeout=60)

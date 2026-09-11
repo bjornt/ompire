@@ -147,15 +147,25 @@ def supervisor(monkeypatch: pytest.MonkeyPatch, workdir: Path):
 
     real_build = agent_module.build_agent_argv
 
-    def build(clone: str, *, policy: ModelPolicy, resume: str | None = None) -> list[str]:
-        argv = real_build(clone, policy=policy, resume=resume)
-        omp_index = argv.index("omp")
-        return [*argv[omp_index:], "--cwd", clone, "--no-session"]
+    def build(*, policy: ModelPolicy, resume: str | None = None) -> list[str]:
+        return [*real_build(policy=policy, resume=resume), "--no-session"]
 
     async def no_preflight(clone_path: str) -> None:
         return None
 
+    async def start_on_host(clone_path, argv, *, stream_limit):
+        # The real transport wraps argv in the container prefix; this fake
+        # execs it host-side instead, with the workspace arriving as --cwd.
+        return await asyncio.create_subprocess_exec(
+            *argv, "--cwd", clone_path,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=stream_limit,
+        )
+
     monkeypatch.setattr(agent_module, "build_agent_argv", build)
+    monkeypatch.setattr(agent_module, "start_sandbox_process", start_on_host)
     monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
     return AgentSupervisor(
         Config(agent_ready_timeout=90, agent_ring_buffer_size=200), EventHub()
@@ -321,15 +331,28 @@ def recording_supervisor(monkeypatch: pytest.MonkeyPatch, workdir: Path, tmp_pat
     session_dir = tmp_path / "omp-sessions"
     session_dir.mkdir()
 
-    def build(clone: str, *, policy: ModelPolicy, resume: str | None = None) -> list[str]:
-        argv = real_build(clone, policy=policy, resume=resume)
-        omp_index = argv.index("omp")
-        return [*argv[omp_index:], "--cwd", clone, "--session-dir", str(session_dir)]
+    def build(*, policy: ModelPolicy, resume: str | None = None) -> list[str]:
+        return [
+            *real_build(policy=policy, resume=resume),
+            "--session-dir", str(session_dir),
+        ]
 
     async def no_preflight(clone_path: str) -> None:
         return None
 
+    async def start_on_host(clone_path, argv, *, stream_limit):
+        # The real transport wraps argv in the container prefix; this fake
+        # execs it host-side instead, with the workspace arriving as --cwd.
+        return await asyncio.create_subprocess_exec(
+            *argv, "--cwd", clone_path,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=stream_limit,
+        )
+
     monkeypatch.setattr(agent_module, "build_agent_argv", build)
+    monkeypatch.setattr(agent_module, "start_sandbox_process", start_on_host)
     monkeypatch.setattr(agent_module, "verify_ask_timeout", no_preflight)
     return AgentSupervisor(
         Config(agent_ready_timeout=90, agent_ring_buffer_size=200, shutdown_grace=15),
@@ -444,5 +467,5 @@ def test_a_role_flag_keeps_every_slash_after_the_provider() -> None:
     nested = RoleBinding(model="openrouter/vendor/model-9", thinking="medium")
     assert role_flag_value(nested) == "openrouter/vendor/model-9:medium"
     assert split_model_identifier(nested.model) == ("openrouter", "vendor/model-9")
-    argv = build_agent_argv("/clone", policy=_policy(smol=nested))
+    argv = build_agent_argv(policy=_policy(smol=nested))
     assert argv[argv.index("--smol") + 1] == "openrouter/vendor/model-9:medium"

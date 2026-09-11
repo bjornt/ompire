@@ -56,6 +56,7 @@ relying on it.
 | [0036](0036-install-exported-result-files-without-replacing-them.md) | Install exported result files without replacing them | Accepted |
 | [0037](0037-capture-workflow-results-before-accepted-handoffs.md) | Capture workflow results before accepted handoffs | Accepted |
 | [0038](0038-own-modules-and-compose-local-transactions.md) | Own modules and compose local transactions | Accepted |
+| [0039](0039-own-workspace-resources-behind-isolation.md) | Own workspace resources behind isolation | Accepted |
 
 ## Template
 

@@ -1,30 +1,26 @@
-"""Protected delivery candidates and the task-workspace ownership guard.
+"""Protected delivery candidates.
 
-Architecture: ADR-0032
-(docs/adr/0032-bind-trusted-delivery-to-retained-candidates.md)
+Architecture: ADR-0032, ADR-0039
+(docs/adr/0032-bind-trusted-delivery-to-retained-candidates.md,
+docs/adr/0039-own-workspace-resources-behind-isolation.md)
 
-Two mechanisms live here because review and publishing both need them and
-neither owns the other:
+The candidate: one resolution of *what would be published*: the pinned
+base branch, the base commit the delta is measured from, the HEAD it was
+captured at, the full publishable tree, and — for retain — the ordered source
+commits with their trees and messages. Its identity is a hash of that
+normalized data, so the same workspace captures to the same candidate and any
+change to what would be published captures to a different one. The objects are
+copied into an owner-private bare repository outside the workshop mount, so
+the task cannot rewrite or garbage-collect what a review graded and a
+signature covers.
 
-- **The candidate.** One resolution of *what would be published*: the pinned
-  base branch, the base commit the delta is measured from, the HEAD it was
-  captured at, the full publishable tree, and — for retain — the ordered source
-  commits with their trees and messages. Its identity is a hash of that
-  normalized data, so the same workspace captures to the same candidate and any
-  change to what would be published captures to a different one. The objects are
-  copied into an owner-private bare repository outside the workshop mount, so
-  the task cannot rewrite or garbage-collect what a review graded and a
-  signature covers.
-- **The guard.** A task-scoped exclusion so review, drafting, delivery, agent
-  turns, workflow steps, and cleanup cannot run over each other's workspace.
-  It is mechanical safety only: it says who may write, not what a workflow is
-  allowed to publish. Workflow-declared capability and gate authorization are a
-  separate, later concern that will admit at this same boundary.
-
-Everything here runs Git with the clone's own hooks disabled and refuses a clone
-that configures content filters. The per-task clone is agent-writable, so any
-Git operation the daemon runs in it could otherwise execute task-authored code
-on the host as the operator (ADR-0011).
+Everything here runs Git with the clone's own hooks disabled and refuses a
+clone that configures content filters. The per-task clone is agent-writable,
+so any Git operation the daemon runs in it could otherwise execute task-
+authored code on the host as the operator (ADR-0011). The workspace writer
+guard and the hardened Git primitives this module used to carry live behind
+the isolation and platform boundaries now; candidate identity, protected-path
+policy, and clone-safety refusal stay here.
 """
 
 from __future__ import annotations
@@ -37,8 +33,7 @@ import logging
 import os
 import shutil
 import tempfile
-from collections.abc import AsyncIterator, Iterator, Sequence
-from contextvars import ContextVar
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -46,6 +41,8 @@ from typing import Any
 from sqlalchemy import Engine
 
 from ompire_daemon.config import Config
+from ompire_daemon.isolation import ExcludeUpdateError, ensure_git_excludes
+from ompire_daemon.platform.git import git_out, run_git, safe_git
 from ompire_daemon.registry.ships import (
     CandidateRecord,
     SourceCommit,
@@ -63,14 +60,11 @@ def _ensure_excludes(clone_path: str, protected: Sequence[str] = ()) -> None:
     delivery path writes exactly the same entries the spawn pipeline did. It
     improves what `git add --all` picks up; it proves nothing, and the tree
     checks below never trust it (ADR-0035).
-
-    Imported lazily: the spawn pipeline reaches the workflow runner, which
-    admits through this module's guard, and a module-level import would close
-    that circle.
     """
-    from ompire_daemon.spawn import _ensure_git_excludes
-
-    _ensure_git_excludes(clone_path, "delivery-exclude", protected=protected)
+    try:
+        ensure_git_excludes(clone_path, "delivery-exclude", protected=protected)
+    except ExcludeUpdateError as exc:
+        raise DeliveryWorkspaceError(str(exc)) from exc
 
 # Where candidate staging repositories live: under the daemon's own data
 # directory, never inside the task clone or the workshop mount.
@@ -126,284 +120,6 @@ class EmptyCandidateError(DeliveryWorkspaceError):
     """The task has nothing to deliver against its base."""
 
 
-class WorkspaceBusyError(Exception):
-    """Another daemon-managed writer owns this task's workspace."""
-
-    def __init__(self, task_id: int, owner: str) -> None:
-        super().__init__(
-            f"task {task_id} workspace is in use by {owner}; wait for it to finish"
-        )
-        self.task_id = task_id
-        self.owner = owner
-
-
-class WorkspaceBlockedError(Exception):
-    """An unresolved privileged effect blocks work on this task."""
-
-    def __init__(self, task_id: int, reason: str) -> None:
-        super().__init__(
-            f"task {task_id} has an unresolved delivery effect: {reason}"
-        )
-        self.task_id = task_id
-        self.reason = reason
-
-
-# --- ownership guard -------------------------------------------------------
-
-_current_hold: ContextVar[tuple[int, str] | None] = ContextVar(
-    "ompire_workspace_hold", default=None
-)
-
-
-class WorkspaceGuard:
-    """Task-scoped exclusion over daemon-managed workspace writers.
-
-    A holder declares a kind, because two different questions get asked of this
-    guard. `host` covers Ompire's own host-side operations on the workspace —
-    review, drafting, delivery — which exclude everything, including each other.
-    `agent` covers the task's own work: a workflow step driving its agent. Agent
-    work blocks a host operation from *starting*, but it does not stop the
-    operator from steering the very agent it is running, or from abandoning the
-    task; those are interactions with the writer that already holds it, not a
-    second writer.
-
-    Reentrancy is by execution context, not by an explicit token argument: a
-    holder's nested daemon calls — an authorized draft prompting the agent, a
-    review handing comments back — inherit the hold and pass their own
-    admission check, while an unrelated caller does not. `asyncio` copies the
-    context into every task it spawns, so a background job started under a hold
-    stays inside it.
-
-    The guard never interrupts an existing writer. It refuses the new one.
-    """
-
-    HOST = "host"
-    AGENT = "agent"
-
-    def __init__(self) -> None:
-        self._owners: dict[int, tuple[str, str]] = {}
-        self._blocked: dict[int, str] = {}
-
-    def owner(self, task_id: int) -> str | None:
-        held = self._owners.get(task_id)
-        return held[0] if held is not None else None
-
-    def owner_kind(self, task_id: int) -> str | None:
-        held = self._owners.get(task_id)
-        return held[1] if held is not None else None
-
-    def blocked_reason(self, task_id: int) -> str | None:
-        return self._blocked.get(task_id)
-
-    def block(self, task_id: int, reason: str) -> None:
-        """Mark a task unsafe to write until an operator decision resolves it.
-
-        Set from startup reconciliation and whenever an effect's outcome cannot
-        be established. Deliberately independent of `hold`: the daemon that
-        launched the effect may be long gone.
-        """
-        self._blocked[task_id] = reason
-
-    def unblock(self, task_id: int) -> None:
-        self._blocked.pop(task_id, None)
-
-    def discard(self, task_id: int) -> None:
-        self._owners.pop(task_id, None)
-        self._blocked.pop(task_id, None)
-
-    def held_by_current_context(self, task_id: int) -> bool:
-        hold = _current_hold.get()
-        return hold is not None and hold[0] == task_id
-
-    def _assert_unblocked(self, task_id: int) -> None:
-        blocked = self._blocked.get(task_id)
-        if blocked is not None:
-            raise WorkspaceBlockedError(task_id, blocked)
-
-    def assert_available(self, task_id: int, *, allow_blocked: bool = False) -> None:
-        """Refuse a new writer while any writer owns the workspace, or while an
-        unresolved effect makes writing unsafe."""
-        if not allow_blocked:
-            self._assert_unblocked(task_id)
-        held = self._owners.get(task_id)
-        if held is not None and not self.held_by_current_context(task_id):
-            raise WorkspaceBusyError(task_id, held[0])
-
-    def assert_host_free(self, task_id: int) -> None:
-        """Refuse only against a host-side operation and an unresolved effect.
-
-        What operator agent interaction and cleanup ask: steering the agent a
-        workflow step is already running is not a second writer, but doing
-        either while a review is reading the workspace, or while a privileged
-        effect's outcome is unknown, is.
-        """
-        self._assert_unblocked(task_id)
-        held = self._owners.get(task_id)
-        if (
-            held is not None
-            and held[1] == self.HOST
-            and not self.held_by_current_context(task_id)
-        ):
-            raise WorkspaceBusyError(task_id, held[0])
-
-    def acquire(
-        self,
-        task_id: int,
-        owner: str,
-        *,
-        kind: str = HOST,
-        allow_blocked: bool = False,
-    ) -> None:
-        """Take ownership for work that outlives the calling coroutine — a
-        supervised reviewer process, above all. `release` is the caller's
-        obligation."""
-        self.assert_available(task_id, allow_blocked=allow_blocked)
-        self._owners[task_id] = (owner, kind)
-
-    def release(self, task_id: int, owner: str) -> None:
-        held = self._owners.get(task_id)
-        if held is not None and held[0] == owner:
-            self._owners.pop(task_id, None)
-
-    @contextlib.asynccontextmanager
-    async def hold(
-        self,
-        task_id: int,
-        owner: str,
-        *,
-        kind: str = HOST,
-        allow_blocked: bool = False,
-    ) -> AsyncIterator[None]:
-        """Own the task's workspace for the duration of the block."""
-        if self.held_by_current_context(task_id):
-            # Nested call inside an admitted holder: it is already the owner.
-            yield
-            return
-        self.acquire(task_id, owner, kind=kind, allow_blocked=allow_blocked)
-        token = _current_hold.set((task_id, owner))
-        try:
-            yield
-        finally:
-            _current_hold.reset(token)
-            self.release(task_id, owner)
-
-    @contextlib.asynccontextmanager
-    async def cleanup_hold(self, task_id: int, owner: str) -> AsyncIterator[None]:
-        """Own the workspace for the whole of cleanup, agent work included.
-
-        Cleanup is the one operation that legitimately abandons the task's own
-        agent: it tears the container down and deletes the clone. So it admits
-        on `assert_host_free` — refusing another host operation and an
-        unresolved effect, exactly as before — and then *takes* ownership for
-        the duration, displacing any agent hold.
-
-        The reservation is what is new. `assert_host_free` alone left the
-        workspace unowned across cleanup's awaits, so a capture admitted during
-        the container teardown would have been reading files while the clone
-        was being deleted underneath it (ADR-0034). Holding through teardown
-        makes the two mutually exclusive in both orders: a busy capture refuses
-        cleanup, and a started cleanup refuses a new capture.
-
-        Ownership is released on failure as well as success — an aborted
-        cleanup must not leave the task permanently unwritable.
-        """
-        self.assert_host_free(task_id)
-        self._owners[task_id] = (owner, self.HOST)
-        token = _current_hold.set((task_id, owner))
-        try:
-            yield
-        finally:
-            _current_hold.reset(token)
-            self.release(task_id, owner)
-
-    @contextlib.contextmanager
-    def released(self, task_id: int, owner: str) -> Iterator[None]:
-        """Temporarily give ownership back while `owner` still holds it.
-
-        Used before handing review comments to the agent: the reviewer is done
-        with the workspace, and the agent's turn has to be admitted on its own
-        merits rather than inheriting — or deadlocking against — the reviewer's
-        hold. Ownership is restored afterwards only if nothing else took it.
-        """
-        current = self._owners.get(task_id)
-        held = current is not None and current[0] == owner
-        if held:
-            self._owners.pop(task_id, None)
-        token = _current_hold.set(None)
-        try:
-            yield
-        finally:
-            _current_hold.reset(token)
-            if held and task_id not in self._owners:
-                assert current is not None
-                self._owners[task_id] = current
-
-
-# --- git plumbing ----------------------------------------------------------
-
-
-def safe_git(clone_path: str | Path, *args: str) -> list[str]:
-    """A `git` argv that cannot execute anything the clone configures.
-
-    `core.hooksPath` is pointed at a directory that does not exist, so no
-    task-authored hook runs on the host during capture, signing, or push.
-    """
-    return [
-        "git",
-        "-C",
-        str(clone_path),
-        "-c",
-        "core.hooksPath=/nonexistent/ompire-no-hooks",
-        *args,
-    ]
-
-
-async def run_git(
-    argv: list[str],
-    *,
-    cwd: str | Path,
-    timeout: int,
-    step: str,
-    env: dict[str, str] | None = None,
-    check: bool = True,
-) -> tuple[str, str, int]:
-    """Run one Git command and return `(stdout, stderr, returncode)`."""
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(cwd),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, **(env or {})},
-        )
-    except OSError as exc:
-        raise DeliveryWorkspaceError(f"{step}: cannot exec {argv[0]!r}: {exc}") from exc
-    try:
-        out_bytes, err_bytes = await asyncio.wait_for(
-            process.communicate(), timeout=timeout
-        )
-    except TimeoutError as exc:
-        process.kill()
-        await process.wait()
-        raise DeliveryWorkspaceError(f"{step}: timed out after {timeout}s") from exc
-    stdout = out_bytes.decode("utf-8", errors="replace")
-    stderr = err_bytes.decode("utf-8", errors="replace")
-    code = process.returncode or 0
-    if check and code != 0:
-        raise DeliveryWorkspaceError(
-            f"{step} failed: {stderr.strip() or stdout.strip() or f'exit {code}'}"
-        )
-    return stdout, stderr, code
-
-
-async def git_out(
-    clone_path: str | Path, args: list[str], *, timeout: int, step: str
-) -> str:
-    stdout, _stderr, _code = await run_git(
-        safe_git(clone_path, *args), cwd=clone_path, timeout=timeout, step=step
-    )
-    return stdout
 
 
 # --- clone safety ----------------------------------------------------------

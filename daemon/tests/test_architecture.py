@@ -68,9 +68,7 @@ OWNER_BY_PREFIX: dict[str, str] = {
     f"{MODULE}.results": "artifacts",
     f"{MODULE}.result_exports": "artifacts",
     f"{MODULE}.handoff": "artifacts",
-    f"{MODULE}.spawn": "isolation",
-    f"{MODULE}.workshop": "isolation",
-    f"{MODULE}.workshopadditions": "isolation",
+    f"{MODULE}.isolation": "isolation",
     f"{MODULE}.events": "core",
     f"{MODULE}.notifications": "oversight-flat",
     f"{MODULE}.advisories": "oversight-flat",
@@ -204,7 +202,15 @@ def iter_production_modules() -> list[tuple[str, Path]]:
 WORK_MODULES_PREFIX = f"{MODULE}.work"
 APPLICATION_PREFIX = f"{MODULE}.application"
 OVERSIGHT_PREFIX = f"{MODULE}.oversight"
-PLATFORM_VALUES_MODULES = (f"{MODULE}.platform.transactions", f"{MODULE}.model_config")
+ISOLATION_PREFIX = f"{MODULE}.isolation"
+PLATFORM_PREFIX = f"{MODULE}.platform"
+# Purity applies to the whole technical foundation, not one module: every
+# platform module (and the shared model vocabulary) stays product-free.
+PLATFORM_VALUES_MODULES = (
+    *(f"{MODULE}.platform", f"{MODULE}.platform.transactions",
+      f"{MODULE}.platform.processes", f"{MODULE}.platform.git"),
+    f"{MODULE}.model_config",
+)
 WORK_ROUTERS = (
     f"{MODULE}.api.projects",
     f"{MODULE}.api.profiles",
@@ -224,7 +230,6 @@ ROUTER_FORBIDDEN_TARGETS = frozenset(
         f"{MODULE}.agent",
         f"{MODULE}.rpc",
         f"{MODULE}.sessions",
-        f"{MODULE}.spawn",
         f"{MODULE}.review",
         f"{MODULE}.ship",
         f"{MODULE}.delivery",
@@ -245,7 +250,39 @@ ROUTER_FORBIDDEN_TARGETS = frozenset(
 )
 
 PROTECTED_OWNERS = frozenset(
-    {"platform", "model-values", "work", "application", "oversight", "api"}
+    {"platform", "model-values", "isolation", "work", "application", "oversight", "api"}
+)
+
+# The resource boundary's declared public surface. Cross-owner consumers
+# import exactly these names, from the package — never an isolation submodule
+# or a private symbol.
+ISOLATION_PUBLIC_SURFACE = frozenset(
+    {
+        "ExcludeUpdateError",
+        "GIT_EXCLUDE_OMPIRE_ENTRY",
+        "PhaseProgress",
+        "SandboxCommandError",
+        "SandboxCommandResult",
+        "WorkshopRemoveError",
+        "WorkspaceBlockedError",
+        "WorkspaceBusyError",
+        "WorkspaceDeletionRefused",
+        "WorkspaceGuard",
+        "WorkspaceOperationError",
+        "WorkspaceRef",
+        "WorkspaceSpec",
+        "destroy_workspace",
+        "ensure_git_excludes",
+        "exclude_pattern_for",
+        "launch_workshop",
+        "prepare_clone",
+        "recover_pending",
+        "remove_workshop",
+        "run_sandbox_command",
+        "start_sandbox_process",
+        "verify_pinned_source",
+        "workshop_status",
+    }
 )
 
 # Checked-in migration exceptions: (importer, imported module, symbol) ->
@@ -262,16 +299,6 @@ EXCEPTIONS: dict[tuple[str, str, str], str] = {
         f"{MODULE}.work.tasks",
         "_update",
     ): "separate-workflow-semantics-and-effect-coordination",
-    (
-        f"{MODULE}.delivery",
-        f"{MODULE}.spawn",
-        "_ensure_git_excludes",
-    ): "isolate-workspace-lifecycle-and-execution",
-    (
-        f"{MODULE}.review",
-        f"{MODULE}.spawn",
-        "_run_step",
-    ): "encapsulate-trusted-review-and-publication",
 }
 
 # Retired module paths: no source, test, tool, or harness root may import
@@ -288,6 +315,9 @@ RETIRED_MODULES = frozenset(
         f"{MODULE}.projectcheckout",
         f"{MODULE}.projectsetup",
         f"{MODULE}.projectfiles",
+        f"{MODULE}.spawn",
+        f"{MODULE}.workshop",
+        f"{MODULE}.workshopadditions",
     }
 )
 RETIRED_FILES = {
@@ -301,7 +331,32 @@ RETIRED_FILES = {
     PACKAGE_ROOT / "registry" / "projects.py",
     PACKAGE_ROOT / "registry" / "tasks.py",
     PACKAGE_ROOT / "registry" / "launch.py",
+    PACKAGE_ROOT / "spawn.py",
+    PACKAGE_ROOT / "workshop.py",
+    PACKAGE_ROOT / "workshopadditions.py",
 }
+
+# Symbols whose canonical home moved off a module that still exists: importing
+# them from the old owner is a retired path too, not a re-export.
+RETIRED_QUALIFIED_SYMBOLS = {
+    f"{MODULE}.delivery": frozenset(
+        {
+            "WorkspaceGuard",
+            "WorkspaceBusyError",
+            "WorkspaceBlockedError",
+            "safe_git",
+            "run_git",
+            "git_out",
+        }
+    ),
+}
+
+# Direct submodule imports are for the package's own wiring; cross-owner
+# consumers get the declared surface only.
+ISOLATION_SUBMODULES = frozenset(
+    f"{ISOLATION_PREFIX}.{name}"
+    for name in ("additions", "excludes", "guard", "workshop", "workspace")
+)
 
 
 def check_tree(modules: list[tuple[str, Path]]) -> list[str]:
@@ -339,6 +394,48 @@ def check_tree(modules: list[tuple[str, Path]]) -> list[str]:
                     violations.append(
                         f"{located}: model_config must not depend on SQLAlchemy"
                     )
+
+            # --- isolation purity: the resource boundary stays resource-only -
+            if _within(module, ISOLATION_PREFIX):
+                if target.startswith(f"{MODULE}.") and owner_of(target) not in (
+                    "isolation",
+                    "platform",
+                ):
+                    violations.append(
+                        f"{located}: isolation module {module} imports product "
+                        f"code {target} — the resource boundary must stay "
+                        "usable without any product owner"
+                    )
+                if target in ("fastapi", "starlette", "pydantic"):
+                    violations.append(
+                        f"{located}: isolation module {module} imports {target}"
+                    )
+
+            # --- isolation public surface -----------------------------------
+            if owner != "isolation" and target.startswith(f"{MODULE}."):
+                if target in ISOLATION_SUBMODULES:
+                    violations.append(
+                        f"{located}: {module} imports isolation submodule "
+                        f"{target} directly — import the declared surface "
+                        f"from {ISOLATION_PREFIX}"
+                    )
+                elif (
+                    target == ISOLATION_PREFIX
+                    and edge.symbol is not None
+                    and edge.symbol not in ISOLATION_PUBLIC_SURFACE
+                ):
+                    violations.append(
+                        f"{located}: {module} imports {target}.{edge.symbol} — "
+                        "not part of the declared isolation public surface"
+                    )
+
+            # --- retired qualified symbols ----------------------------------
+            retired_symbols = RETIRED_QUALIFIED_SYMBOLS.get(target)
+            if retired_symbols and edge.symbol in retired_symbols:
+                violations.append(
+                    f"{located}: {target}.{edge.symbol} moved off {target} — "
+                    "import it from its canonical owner"
+                )
 
             # --- work persistence/values: no transport, commands, or
             # projection ---------------------------------------------------
@@ -478,6 +575,13 @@ def test_no_retired_module_imports_anywhere() -> None:
                     problems.append(
                         f"{path}:{edge.line}: imports retired module "
                         f"{edge.imported}"
+                    )
+                retired = RETIRED_QUALIFIED_SYMBOLS.get(edge.imported)
+                if retired and edge.symbol in retired:
+                    problems.append(
+                        f"{path}:{edge.line}: imports {edge.imported}."
+                        f"{edge.symbol} from its retired location — use the "
+                        "canonical owner"
                     )
     assert not problems, "\n".join(problems)
 
@@ -681,3 +785,94 @@ def test_collect_imports_resolves_relative_forms() -> None:
     imported = {e.imported for e in edges}
     assert f"{MODULE}.api.rest" in imported
     assert f"{MODULE}.work.tasks" in imported
+
+
+def test_checker_rejects_product_import_in_any_platform_module(tmp_path: Path) -> None:
+    # Purity is a property of the whole technical foundation, not of the one
+    # module that happened to exist first.
+    for platform_module in ("platform.git", "platform.processes"):
+        modules = [
+            _synthetic(
+                tmp_path,
+                f"{MODULE}.{platform_module}",
+                f"from {MODULE}.work.tasks import Task\n",
+            )
+        ]
+        violations = check_tree(modules)
+        assert any("platform/value modules stay pure" in v for v in violations)
+
+
+def test_checker_rejects_product_import_in_isolation(tmp_path: Path) -> None:
+    # The resource boundary must be exercisable with no product owner loaded:
+    # a workflow, delivery, or transport import back into it is the coupling
+    # this change exists to remove.
+    for product in ("workflows", "delivery", "work.tasks", "api.rest", "rpc"):
+        modules = [
+            _synthetic(
+                tmp_path,
+                f"{MODULE}.isolation.workspace",
+                f"from {MODULE}.{product} import Something\n",
+            )
+        ]
+        violations = check_tree(modules)
+        assert any("resource boundary must stay usable" in v for v in violations)
+
+
+def test_checker_rejects_isolation_submodule_import_across_owners(tmp_path: Path) -> None:
+    modules = [
+        _synthetic(
+            tmp_path,
+            f"{MODULE}.ship",
+            f"from {MODULE}.isolation.guard import WorkspaceGuard\n",
+        )
+    ]
+    violations = check_tree(modules)
+    assert any("imports isolation submodule" in v for v in violations)
+
+
+def test_checker_rejects_undeclared_isolation_surface_symbol(tmp_path: Path) -> None:
+    modules = [
+        _synthetic(
+            tmp_path,
+            f"{MODULE}.ship",
+            f"from {MODULE}.isolation import _staging_dir\n",
+        )
+    ]
+    violations = check_tree(modules)
+    assert any("not part of the declared isolation public surface" in v for v in violations)
+
+
+def test_checker_rejects_retired_qualified_guard_import(tmp_path: Path) -> None:
+    # The guard's canonical home moved to isolation; delivery must not grow a
+    # re-export, and no caller may keep importing it from the old owner.
+    modules = [
+        _synthetic(
+            tmp_path,
+            f"{MODULE}.review",
+            f"from {MODULE}.delivery import WorkspaceGuard\n",
+        )
+    ]
+    violations = check_tree(modules)
+    assert any("moved off" in v for v in violations)
+
+
+def test_checker_allows_public_isolation_import_across_owners(tmp_path: Path) -> None:
+    modules = [
+        _synthetic(
+            tmp_path,
+            f"{MODULE}.ship",
+            f"from {MODULE}.isolation import WorkspaceGuard\n",
+        )
+    ]
+    assert check_tree(modules) == []
+
+
+def test_checker_allows_intra_isolation_submodule_import(tmp_path: Path) -> None:
+    modules = [
+        _synthetic(
+            tmp_path,
+            f"{MODULE}.isolation.workspace",
+            f"from {MODULE}.isolation.additions import stage\n",
+        )
+    ]
+    assert check_tree(modules) == []

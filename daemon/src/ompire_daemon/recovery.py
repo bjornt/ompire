@@ -29,6 +29,7 @@ from sqlalchemy import Engine
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
+from ompire_daemon.isolation import workshop_status
 from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.registry.sessions import (
     APPLIED_ORIGIN_MIGRATED,
@@ -54,7 +55,6 @@ from ompire_daemon.work.tasks import (
     reconcile_startup,
 )
 from ompire_daemon.workflows import WorkflowRunner
-from ompire_daemon.workshop import workshop_status
 
 logger = logging.getLogger(__name__)
 

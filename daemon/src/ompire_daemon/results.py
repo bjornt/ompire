@@ -52,15 +52,14 @@ from typing import Any, Self
 from sqlalchemy import Engine
 
 from ompire_daemon.config import Config
-from ompire_daemon.delivery import (
+from ompire_daemon.events import EventHub
+from ompire_daemon.gh import redact_github_text
+from ompire_daemon.isolation import (
     WorkspaceBlockedError,
     WorkspaceBusyError,
     WorkspaceGuard,
-    run_git,
-    safe_git,
 )
-from ompire_daemon.events import EventHub
-from ompire_daemon.gh import redact_github_text
+from ompire_daemon.platform.git import run_git, safe_git
 from ompire_daemon.registry.result_exports import (
     ExportRecord,
     export_payload,

@@ -3,6 +3,15 @@
 ```text
 daemon/            FastAPI control plane (Python 3.12)
   src/ompire_daemon/
+    platform/      technical foundation: the write reservation, checked
+                   host-subprocess steps, hardened Git invocation
+    isolation/     workspace resources: clone preparation, Workshop
+                   lifecycle and additions, sandbox execution, the guard
+    work/          accepted work: projects, profiles, tasks, launch inputs
+    application/   transport-independent commands: launch, preparation,
+                   cleanup, command-execution wiring
+    oversight/     the one task wire projection
+    api/           REST and WebSocket transport
   alembic/         schema migrations
   tests/           pytest suite
 frontend/          React + TypeScript presentation layer
@@ -25,6 +34,12 @@ snap/              classic-confinement snap packaging
 design/handoff/    original design bundle and UI mockups
 changes/           temporary change artifacts, deleted when finished
 ```
+
+The daemon's extracted packages are the enforced ownership boundary — see
+[the daemon module map](daemon-modules.md) for what each owns and
+[ADR-0039](../../adr/0039-own-workspace-resources-behind-isolation.md) for
+the resource-owner decision. The remaining flat modules are still assigned
+owners there, pending their own extraction changes.
 
 ## Root files
 

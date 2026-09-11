@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass, field
 
 from sqlalchemy import Engine
 
+from ompire_daemon.isolation import workshop_status
 from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.registry.workflows import list_step_records
 from ompire_daemon.work.tasks import (
@@ -24,7 +25,6 @@ from ompire_daemon.work.tasks import (
     list_tasks,
     require_task_inputs,
 )
-from ompire_daemon.workshop import workshop_status
 
 
 class ContinueIneligibleError(Exception):

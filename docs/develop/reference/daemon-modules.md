@@ -5,15 +5,16 @@ All paths are under `daemon/src/ompire_daemon/`.
 ## Ownership at a glance
 
 The daemon is one process with explicit module ownership rather than strict
-layer isolation. Four packages draw the first hard boundary, and
+layer isolation. Five packages draw the first hard boundary, and
 `daemon/tests/test_architecture.py` enforces it on every pytest run (see
 [Build, test, and run](../how-to/build-test-run.md#architecture-dependency-checks)):
 
 | Package | Owns | May not import |
 |---|---|---|
-| `platform/` | The shared SQLite write reservation | Any product code |
+| `platform/` | The shared SQLite write reservation, the checked host-subprocess step runner, and the hardened Git invocation helpers | Any product code |
+| `isolation/` | The disposable workspace as a resource: confined clone preparation, pinned-source verification, Workshop status/launch/removal, additions staging, one Git-exclusion mechanism, finite sandbox command execution, piped container-process transport, and the workspace writer guard | Any product code — no work registry, workflow, delivery, artifacts, HTTP transport, or native agent RPC |
 | `work/` | Projects, profiles, tasks, launch resolution, accepted inputs, and their reconciliation — the records and rules of accepted work | Transport, application commands, task projections |
-| `application/` | Transport-independent commands: `LaunchService` (preview/accept), work configuration, task reads and explicit Continue | Transport of any kind |
+| `application/` | Transport-independent commands: `LaunchService` (preview/accept), accepted-task preparation, coordinated cleanup, workflow command execution wiring, work configuration, task reads and explicit Continue | Transport of any kind |
 | `oversight/` | The one wire shape of a task row and of a reviewed launch resolution | — |
 
 `model_config.py` carries the same guarantee in file form: the shared
@@ -22,21 +23,31 @@ its validation) imports no product code at all.
 
 Everything else is still flat modules at their historical paths, listed below
 under the owner a later change will formalize. The map is honest about what
-is extracted and what is not: `work` does not contain isolation, sessions,
-workflow semantics, delivery, or artifacts yet, and their existing edges into
-work-owned modules are named as migration exceptions in the checker, each
-assigned to the change that will remove it.
+is extracted and what is not: `isolation` is a real resource boundary that
+takes resolved values and an opaque owner id, but `work` does not contain
+sessions, workflow semantics, delivery, or artifacts yet, and their existing
+edges into work-owned modules are named as migration exceptions in the
+checker, each assigned to the change that will remove it.
+
+The resource boundary's contract, in one line each: `prepare_clone`,
+`verify_pinned_source`, `launch_workshop`, and `destroy_workspace` operate on
+a frozen `WorkspaceSpec` and return observations or classified failures;
+`run_sandbox_command` and `start_sandbox_process` are the only container
+transports; `WorkspaceGuard` is the one writer-exclusion mechanism
+([ADR-0039](../../adr/0039-own-workspace-resources-behind-isolation.md)).
+Cross-owner consumers import the package's declared surface — never its
+submodules — and the checker rejects anything else.
 
 ## Entry and wiring
 
-| Module | Responsibility |
-|---|---|
 | `__main__.py` | `ompire-daemon` entry point. Loads config, builds the app, runs uvicorn. |
-| `app.py` | Application construction and lifespan. Owns the shared state every route depends on, and constructs the `LaunchService` and `SpawnScheduler` with explicit collaborators. |
+| `app.py` | Application construction and lifespan. Owns the shared state every route depends on, and constructs the `LaunchService`, `SpawnScheduler`, `CleanupService`, and `WorkflowRunner` (with its command-execution adapter) using explicit collaborators. |
 | `config.py` | `config.toml` loading, validation, and defaults. Fails startup on an unknown or invalid key. |
 | `auth.py` | Bearer token generation, the REST dependency, and the WebSocket check. |
 | `static.py` | Serving the built frontend, including SPA deep-link fallback. |
 | `platform/transactions.py` | `reserved_write`: the one SQLite write reservation (`BEGIN IMMEDIATE`, commit or roll back) that every check-then-write mutation in the daemon admits through. Platform code — the standard library and SQLAlchemy only. |
+| `platform/processes.py` | The checked host-subprocess step runner: literal argv, deadline, captured streams, and a typed failure whose diagnosis is the command's own output (stderr first, stdout fallback, bare exit status last). Neutral step/error values; command selection and interpretation stay with the calling owner. |
+| `platform/git.py` | `safe_git`/`run_git`/`git_out`: hardened host-side Git invocation with hooks disabled, a deadline, and a neutral `GitCommandError`. Callers own command selection, authorization, and failure classification. |
 
 ## API surface
 
@@ -64,7 +75,10 @@ acceptance algorithm itself never sees a request.
 
 | Module | Responsibility |
 |---|---|
-| `application/launch.py` | `LaunchService.preview/accept` and `SpawnScheduler` (strong job references, completion removal, lifespan cancellation — shared by spawn pipelines and delivery jobs). |
+| `application/launch.py` | `LaunchService.preview/accept` and `SpawnScheduler` (strong job references, completion removal, lifespan cancellation — shared by preparation jobs and delivery jobs). |
+| `application/spawn.py` | The accepted-task preparation coordinator: projects accepted inputs onto a `WorkspaceSpec`, translates live resource progress into task events, installs retained handoff inputs between clone and container, records lifecycle observations through the work owner, and starts the pinned workflow only after preparation succeeds. `read_attachment_bytes` lives here — it reads result records under a connection. |
+| `application/cleanup.py` | `CleanupService`: admission (active delivery, run-position refusal), the shared cleanup hold, guarded resource teardown through isolation, and the existing owner finalization, archival, and projection. Destroys resources, never retained results or journals. |
+| `application/execution.py` | The workflow command-execution adapter: implements the engine's consumer-owned `CommandExecutor` contract over isolation's sandbox execution, translating resource failures into the engine's one execution error. |
 | `application/work.py` | Project registration/update/removal with checkout admission, setup retry, profile commands, and reconciliation confirmation — each with its committed-change event. |
 | `application/tasks.py` | Task list/detail composition (workshop status, attempt history) and the guarded explicit Continue. |
 | `work/launch.py` | Launch resolution: one set of rules shared by preview, acceptance, and legacy confirmation. Pure with respect to the world outside the database, so it can run inside a write reservation. |
@@ -107,22 +121,23 @@ owners have not moved yet — but never transport, commands, or projections.
 
 | Module | Responsibility |
 |---|---|
-| `spawn.py` | The spawn pipeline: fetch, clone, branch, `inputs` for a launch with handoff inputs, workshop. Resolves nothing — every value comes off the task's accepted inputs. |
-| `handoff.py` | Handoff inputs: the destination and bounds rules an attached result revision must satisfy, the read-only Git observation a launch is reviewed against, and the no-follow exclusive materialization that installs reviewed bytes into a recipient's clone. Shared by launch resolution and the spawn pipeline so the two cannot disagree. See [ADR-0035](../../adr/0035-refuse-to-publish-handoff-destinations.md) |
-| `workshopadditions.py` | The bounded staging that makes the accepted Workshop additions source the one the launcher actually applies, with restoration and crash recovery. |
-| `workshop.py` | Container existence checks and teardown. Status is derived on demand, never persisted. |
-| `agent.py` | Agent child process lifecycle and event fan-out. |
+| `isolation/workspace.py` | The workspace as a resource: `WorkspaceSpec`/`WorkspaceRef`, confined clone preparation (destination refusal, fetch, hardlink clone, exclusions, branch), pinned-source verification, Workshop launch with additions staged around the launcher, and confined container-first destruction. Every failure is one classified `WorkspaceOperationError` naming its phase. |
+| `isolation/workshop.py` | The Workshop CLI adapter (on-demand status, idempotent removal) plus the two container transports: `run_sandbox_command` (finite, deadline-bounded, process-group teardown, nonzero-exit-as-data) and `start_sandbox_process` (piped long-lived process for a protocol-owning caller). |
+| `isolation/additions.py` | The bounded staging that makes the accepted Workshop additions source the one the launcher actually applies, with restoration and crash recovery. The staging journal's filenames, layout, and integer owner field are unchanged. |
+| `isolation/excludes.py` | One literal Git-exclusion mechanism for daemon-owned paths and supplied protected destinations. Convenience only — never proof that content is safe to publish (ADR-0035). |
+| `isolation/guard.py` | `WorkspaceGuard` with `WorkspaceBusyError`/`WorkspaceBlockedError`: the one task-scoped exclusion over daemon-managed workspace writers, with host/agent kinds, execution-context reentrancy, and cleanup reservation. Durable policy still decides *why* a workspace is blocked; the guard only holds the mechanical block. |
+| `application/spawn.py` | The preparation coordinator behind the pipeline (see the application table above). |
+| `handoff.py` | Handoff inputs: the destination and bounds rules an attached result revision must satisfy, the read-only Git observation a launch is reviewed against, and the no-follow exclusive materialization that installs reviewed bytes into a recipient's clone. Shared by launch resolution and preparation so the two cannot disagree. See [ADR-0035](../../adr/0035-refuse-to-publish-handoff-destinations.md) |
+| `agent.py` | Agent child process lifecycle and event fan-out. Builds the native argv (no container prefix — the resource boundary starts the process) and owns readiness, policy verification, and graceful supervision. |
 | `rpc.py` | Stdio NDJSON transport. Correlates requests by ID while push events interleave. |
 | `sessions.py` | The per-session status state machine. Every transition goes through one guarded method. |
-| `workflows.py` | The packaged built-ins and the engine that carries a definition out: step execution, routing, uncertainty pauses, gates, and restart recovery. What a *name* currently means is not here — it lives in the library. |
+| `workflows.py` | The packaged built-ins and the engine that carries a definition out: step execution, routing, uncertainty pauses, gates, and restart recovery. Executes commands only through its injected `CommandExecutor`; constructs no tool argv. What a *name* currently means is not here — it lives in the library. |
 | `taskdefinition.py` | The one resolver from a task to *its* pinned definition, and the classified readiness a task reports when that cannot be resolved. Every runtime consumer goes through here. |
 | `recovery.py` | Startup recovery for sessions and interrupted operations. |
 
 ## Review and publishing
 
-| Module | Responsibility |
-|---|---|
-| `delivery.py` | The protected candidate — capture, identity, its owner-private object store, and the isolated review view — plus the task-workspace ownership guard every daemon-managed writer is admitted through. |
+| `delivery.py` | The protected candidate — capture, identity, its owner-private object store, and the isolated review view — plus clone-safety refusal. The writer guard and hardened Git helpers it used to carry live behind the isolation and platform boundaries. |
 | `review.py` | Host-side review: candidate capture, the llmvet subprocess over an isolated view, and startup interruption handling. The record lives in `registry/reviews.py`. |
 | `ship.py` | Draft, plus three independently admitted trusted operations — signed commit, push, pull request — a coordinator that runs only the authorized prefix, and operation-specific reconciliation. The journal lives in `registry/ships.py`. |
 | `gpg.py` | Signing-key enumeration, selection (override → config → git → auto), and non-prompting agent classification: `ready`, `locked`, `ambiguous`, `no_key`, `missing`, `agent_unavailable`, `error`, `unknown`. |
@@ -142,15 +157,18 @@ owners have not moved yet — but never transport, commands, or projections.
 
 To follow one launch: `api/tasks.py` → `application/launch.py` →
 `work/launch.py` → the acceptance transaction in `platform/transactions.py` →
-`spawn.py`.
+`application/spawn.py` → `isolation/workspace.py`.
 
-To follow one task end to end: `spawn.py` → `agent.py` → `rpc.py` →
-`sessions.py` → `workflows.py` → `delivery.py` → `review.py` → `ship.py`.
+To follow one task end to end: `application/spawn.py` → `isolation/` →
+`agent.py` → `rpc.py` → `sessions.py` → `workflows.py` (commands through
+`application/execution.py`) → `delivery.py` → `review.py` → `ship.py`, and
+its end through `application/cleanup.py`.
 
 For a task that ends in a retained result rather than a publication, the path is
-`spawn.py` → `agent.py` → `results.py`, and then either `handoff.py` (into
-another task's clone) or `result_exports.py` (into the operator's checkout).
-Nothing in `review.py` or `ship.py` is involved on any of those paths.
+`application/spawn.py` → `agent.py` → `results.py`, and then either
+`handoff.py` (into another task's clone) or `result_exports.py` (into the
+operator's checkout). Nothing in `review.py` or `ship.py` is involved on any
+of those paths.
 
 To understand how clients see any of it: `oversight/tasks.py` → `events.py`
 → `api/ws.py`.

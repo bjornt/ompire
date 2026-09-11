@@ -555,15 +555,39 @@ def fake_argv_builder(scenario: dict | str = "happy"):
     unless it matches the accepted policy (ADR-0026), so a fake argv that
     dropped the flags would fail every session start for reasons that have
     nothing to do with what the test is about.
+
+    The returned argv is host-side: it starts at the fake omp binary, with no
+    workshop transport prefix, so the test must also install
+    `fake_sandbox_start` as the supervisor's process starter.
     """
     from tests.test_rpc import fake_omp_argv
 
-    def build(clone, *, policy, resume=None):
+    def build(*, policy, resume=None):
         name = scenario["name"] if isinstance(scenario, dict) else scenario
-        real = REAL_BUILD_AGENT_ARGV(clone, policy=policy, resume=resume)
+        real = REAL_BUILD_AGENT_ARGV(policy=policy, resume=resume)
         return fake_omp_argv(name, *real[real.index("--no-title") + 1 :])
 
     return build
+
+
+async def fake_sandbox_start(clone_path, argv, *, stream_limit):
+    """A `start_sandbox_process` replacement that runs the caller's argv on
+    the host, with the same pipes and stream limit the real transport uses.
+
+    Paired with `fake_argv_builder`: the fake argv already names an
+    executable, so it must not be wrapped in the workshop transport prefix.
+    The production path has no such bypass — only tests adopt a process they
+    built themselves.
+    """
+    import asyncio
+
+    return await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=stream_limit,
+    )
 
 
 # --- format-3 delivery fixtures -----------------------------------------------

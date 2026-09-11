@@ -39,12 +39,14 @@ from sqlalchemy import Engine
 from ompire_daemon.config import Config
 from ompire_daemon.delivery import (
     DeliveryWorkspaceError,
-    WorkspaceGuard,
     capture_candidate,
     prepare_review_view,
     remove_review_view,
 )
 from ompire_daemon.events import EventHub
+from ompire_daemon.isolation import WorkspaceGuard
+from ompire_daemon.platform.git import GitCommandError
+from ompire_daemon.platform.processes import ProcessStep, run_process_step
 from ompire_daemon.registry.reviews import (
     ReviewIterationRecord,
     append_iteration,
@@ -56,7 +58,6 @@ from ompire_daemon.registry.reviews import (
 )
 from ompire_daemon.registry.ships import CandidateRecord
 from ompire_daemon.rpc import AgentGoneError, RequestFailedError
-from ompire_daemon.spawn import Step, _run_step
 from ompire_daemon.work.tasks import Task, require_task_inputs
 
 if TYPE_CHECKING:
@@ -377,9 +378,10 @@ class ReviewManager:
             )
             view = await prepare_review_view(self._config, task_id, candidate)
             port = await self._allocate_port()
-        except DeliveryWorkspaceError as exc:
-            # A capture refusal is a review refusal, and says which content
-            # problem stopped it rather than failing as an opaque 500.
+        except (DeliveryWorkspaceError, GitCommandError) as exc:
+            # A capture refusal — a content problem or a technical Git
+            # failure while reading the workspace — is a review refusal that
+            # says what stopped it, not an opaque 500.
             self._guard.release(task_id, "review")
             raise ReviewContentError(str(exc)) from exc
         except Exception:
@@ -829,8 +831,8 @@ class ReviewManager:
         except ReviewError:
             return "absent"
         try:
-            await _run_step(
-                Step(
+            await run_process_step(
+                ProcessStep(
                     "review-startup-restore",
                     ["git", "-C", clone_path, "reset", "--mixed", REVIEW_GIT_REF],
                     timeout,
@@ -858,8 +860,8 @@ class ReviewManager:
                 clone_path,
             )
             return "unsafe"
-        await _run_step(
-            Step(
+        await run_process_step(
+            ProcessStep(
                 "review-startup-delete-ref",
                 ["git", "-C", clone_path, "update-ref", "-d", REVIEW_GIT_REF],
                 timeout,

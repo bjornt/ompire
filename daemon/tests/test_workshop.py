@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from ompire_daemon.workshop import WorkshopRemoveError, remove_workshop, workshop_status
+from ompire_daemon.isolation import (
+    WorkshopRemoveError,
+    remove_workshop,
+    workshop_status,
+)
 
 
 @pytest.fixture

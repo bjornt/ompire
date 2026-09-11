@@ -24,7 +24,7 @@ from ompire_daemon.config import Config
 from ompire_daemon.events import Event, EventHub
 from ompire_daemon.rpc import AgentGoneError
 from ompire_daemon.sessions import SessionTracker
-from tests.conftest import fake_argv_builder, make_test_policy
+from tests.conftest import fake_argv_builder, fake_sandbox_start, make_test_policy
 from tests.test_rpc import fake_omp_argv
 
 
@@ -33,10 +33,17 @@ async def start_fake(scenario: str = "happy", **kwargs) -> AgentHandle:
     kwargs.setdefault("ring_buffer_size", 100)
     # Started with the real native flags so the fake reports the policy back
     # through `get_state`, the way the daemon's handshake expects.
-    argv = build_agent_argv("/clone", policy=make_test_policy())
-    return await AgentHandle.start(
-        fake_omp_argv(scenario, *argv[argv.index("--no-title") + 1 :]), **kwargs
+    argv = build_agent_argv(policy=make_test_policy())
+    # A contract test may build its own host-side process before adopting it;
+    # production always starts the process through the resource boundary.
+    process = await asyncio.create_subprocess_exec(
+        *fake_omp_argv(scenario, *argv[argv.index("--no-title") + 1 :]),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=4 * 1024 * 1024,
     )
+    return await AgentHandle.start(process, **kwargs)
 
 
 async def drain_until(queue: asyncio.Queue, event_type: str, timeout: float = 5.0) -> list:
@@ -118,11 +125,8 @@ async def test_ring_buffer_replays_in_order_and_caps_size() -> None:
 
 
 def test_build_agent_argv_recipe() -> None:
-    argv = build_agent_argv("/clones/t1", policy=make_test_policy())
-    assert argv[:9] == [
-        "workshop", "exec", "-p", "/clones/t1", "--",
-        "omp", "--mode", "rpc-ui", "--no-title",
-    ]
+    argv = build_agent_argv(policy=make_test_policy())
+    assert argv[:5] == ["omp", "--mode", "rpc-ui", "--no-title", "--model"]
     # No environment-injection prefix (ADR-0015).
     assert "env" not in argv
     # Sessions stay ON and the nonexistent -s flag is never used (design D-2).
@@ -131,12 +135,12 @@ def test_build_agent_argv_recipe() -> None:
 
 
 def test_build_agent_argv_resume_appends_flag() -> None:
-    argv = build_agent_argv("/clones/t1", policy=make_test_policy(), resume="sess-abc")
+    argv = build_agent_argv(policy=make_test_policy(), resume="sess-abc")
     assert argv[-2:] == ["--resume", "sess-abc"]
 
 
 def test_build_agent_argv_no_resume_by_default() -> None:
-    argv = build_agent_argv("/clones/t1", policy=make_test_policy())
+    argv = build_agent_argv(policy=make_test_policy())
     assert "--resume" not in argv
 
 
@@ -144,7 +148,7 @@ def test_build_agent_argv_carries_every_role_pair() -> None:
     """All four roles reach the child, each with its own thinking level
     (ADR-0026). Flags and the `provider/model-id:LEVEL` encoding verified
     against omp v18.1.10."""
-    argv = build_agent_argv("/clones/t1", policy=make_test_policy())
+    argv = build_agent_argv(policy=make_test_policy())
     assert argv[argv.index("--model") + 1] == "testing/main-model"
     assert argv[argv.index("--thinking") + 1] == "medium"
     assert argv[argv.index("--smol") + 1] == "testing/smol-model:low"
@@ -155,7 +159,7 @@ def test_build_agent_argv_carries_every_role_pair() -> None:
 def test_build_agent_argv_never_omits_the_policy() -> None:
     """There is no "unset means omp's default" case: inheriting the host's
     model settings is what a profile exists to prevent."""
-    argv = build_agent_argv("/clones/t1", policy=make_test_policy())
+    argv = build_agent_argv(policy=make_test_policy())
     for flag in ("--model", "--thinking", "--smol", "--slow", "--plan"):
         assert flag in argv
 
@@ -248,6 +252,7 @@ def supervisor(monkeypatch: pytest.MonkeyPatch):
         "build_agent_argv",
         fake_argv_builder(scenario),
     )
+    monkeypatch.setattr(agent_module, "start_sandbox_process", fake_sandbox_start)
 
     async def no_preflight(clone_path: str) -> None:
         return None
@@ -301,11 +306,12 @@ async def test_supervisor_resume_appends_resume_flag(monkeypatch) -> None:
 
     build = fake_argv_builder("happy")
 
-    def fake_build(clone, *, policy, resume=None):
+    def fake_build(*, policy, resume=None):
         captured["resume"] = resume
-        return build(clone, policy=policy, resume=resume)
+        return build(policy=policy, resume=resume)
 
     monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
+    monkeypatch.setattr(agent_module, "start_sandbox_process", fake_sandbox_start)
 
     async def no_preflight(clone_path: str) -> None:
         return None
@@ -327,11 +333,12 @@ async def test_supervisor_threads_the_whole_policy(monkeypatch) -> None:
     captured = {}
     build = fake_argv_builder("happy")
 
-    def fake_build(clone, *, policy, resume=None):
+    def fake_build(*, policy, resume=None):
         captured["policy"] = policy
-        return build(clone, policy=policy, resume=resume)
+        return build(policy=policy, resume=resume)
 
     monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
+    monkeypatch.setattr(agent_module, "start_sandbox_process", fake_sandbox_start)
 
     async def no_preflight(clone_path: str) -> None:
         return None
@@ -356,6 +363,7 @@ def tracked_supervisor(monkeypatch: pytest.MonkeyPatch):
         "build_agent_argv",
         fake_argv_builder(scenario),
     )
+    monkeypatch.setattr(agent_module, "start_sandbox_process", fake_sandbox_start)
 
     async def no_preflight(clone_path: str) -> None:
         return None
@@ -432,11 +440,12 @@ def handoff(monkeypatch: pytest.MonkeyPatch):
     build = fake_argv_builder(scenario)
     resumes: list[str | None] = []
 
-    def fake_build(clone, *, policy, resume=None):
+    def fake_build(*, policy, resume=None):
         resumes.append(resume)
-        return build(clone, policy=policy, resume=resume)
+        return build(policy=policy, resume=resume)
 
     monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
+    monkeypatch.setattr(agent_module, "start_sandbox_process", fake_sandbox_start)
 
     async def no_preflight(clone_path: str) -> None:
         return None

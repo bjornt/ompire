@@ -36,16 +36,24 @@ Both suites must pass before committing.
 `daemon/tests/test_architecture.py` runs as part of `make test-backend` —
 there is no separate command and no generated baseline. It statically parses
 every daemon module and fails the suite when an import crosses an enforced
-ownership boundary: platform/value modules importing product code, work
-modules importing transport or projections, application commands importing
-transport, work routers importing storage or execution managers, or any code
-importing a retired module path.
+ownership boundary: platform modules importing product code, isolation
+importing anything but the platform foundation and itself, cross-owner
+imports of an isolation submodule or of a symbol outside its declared public
+surface, work modules importing transport or projections, application
+commands importing transport, work routers importing storage or execution
+managers, or any code importing a retired module path or a symbol from its
+retired location (for example the workspace guard or the Git helpers, whose
+canonical home is now `isolation` and `platform/git`).
 
 Run it alone while iterating on a boundary:
 
 ```sh
 make test-backend ARGS="tests/test_architecture.py"
 ```
+
+The checker also carries synthetic self-tests that prove each rule rejects
+what it claims to reject, so a policy regression fails visibly rather than
+silently allowing everything.
 
 When a violation is intentional migration debt, add it to the checked-in
 `EXCEPTIONS` table in that test — the importing module, the imported module

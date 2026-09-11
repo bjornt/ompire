@@ -25,8 +25,8 @@ from ompire_daemon.db import (
     make_engine,
     task_result_files,
 )
-from ompire_daemon.delivery import WorkspaceGuard
 from ompire_daemon.events import EventHub
+from ompire_daemon.isolation import WorkspaceGuard
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.registry.results import (
     RESERVED_MANIFEST_NAME,

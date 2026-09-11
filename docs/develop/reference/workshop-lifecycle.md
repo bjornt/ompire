@@ -7,6 +7,14 @@ removed during cleanup. The container is what makes an agent's actions
 recoverable: it is disposable, and nothing in it is shared with another task
 or with the operator's checkout.
 
+The container and the clone under it are owned by the resource boundary
+(`isolation/`): `launch_workshop` and `remove_workshop` take resolved values
+and an opaque owner id, so a workspace can be prepared, launched, inspected,
+and destroyed with no task row behind it. `application/spawn.py` and
+`application/cleanup.py` decide when a task's accepted work uses those
+operations
+([ADR-0039](../../adr/0039-own-workspace-resources-behind-isolation.md)).
+
 ## States and behavior
 
 ### Launch
@@ -15,6 +23,10 @@ The workshop step runs after the branch step succeeds. The configured
 my-workshop command is invoked as a subprocess with an argument list — never
 through a shell — with the clone directory as working directory, bounded by
 `workshop_step_timeout`.
+
+The invocation and the lock-file contract belong to `isolation.launch_workshop`;
+the preparation coordinator emits the step events and records the identity on
+the task only after the launcher leaves a non-empty lock.
 
 That timeout is deliberately much larger than the git-step timeout, because
 launching a container includes SDK installation.
@@ -63,13 +75,14 @@ with a short timeout, whenever the answer is needed — task detail, cleanup.
 A status check never writes to the registry, and a tool failure degrades to
 `unknown` rather than failing the request that asked.
 
-This is the right trade for a fact that can change without the daemon's
-involvement: a persisted status would be authoritative-looking and wrong.
-
 ### Removal
 
 Cleanup of a task with a recorded workshop identity runs `workshop remove` in
-the clone **before** deleting the clone directory.
+the clone **before** deleting the clone directory. The teardown is
+`isolation.destroy_workspace`: it independently validates that the resolved
+clone is strictly below the configured task root — the root itself and
+anything outside it cannot be deleted, with no task lookup involved — then
+removes the container, then the clone.
 
 An already-removed container is treated as success, so cleanup is idempotent.
 
@@ -107,3 +120,14 @@ exists as `failed`, since the workspace can no longer be resumed.
 The workshop identity is a task field, populated after a successful launch and
 null before it. Container status is not a registry field and appears only in
 responses that derive it on demand.
+
+The resource entry points, all on the declared `isolation` public surface:
+`launch_workshop` (stages additions around the launcher, reports the source
+disclosure, returns the identity), `workshop_status`, `remove_workshop`,
+`destroy_workspace` (confined, container-first teardown), and
+`recover_pending` (startup restoration of interrupted additions staging —
+the journal's filenames, backup layout, and integer owner field are
+unchanged, so records written before the package move are restored the same
+way). The additions source/note disclosure is reported to the coordinator
+before the launcher runs and published as the `workshop_additions` event,
+not as a pipeline step.

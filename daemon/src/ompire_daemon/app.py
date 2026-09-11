@@ -20,20 +20,21 @@ from typing import Any
 from fastapi import FastAPI
 from sqlalchemy import Engine
 
-from ompire_daemon import workshopadditions
 from ompire_daemon.advisories import AdvisorySampler
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.api.rest import router as api_router
 from ompire_daemon.api.ws import router as ws_router
+from ompire_daemon.application.cleanup import CleanupService
+from ompire_daemon.application.execution import SandboxCommandExecutor
 from ompire_daemon.application.launch import LaunchService, SpawnScheduler
 from ompire_daemon.auth import load_or_create_token
 from ompire_daemon.config import DEFAULT_CONFIG_PATH, Config
 from ompire_daemon.datadir import carry_forward_snap_state
 from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
-from ompire_daemon.delivery import WorkspaceGuard
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import GpgProbe
+from ompire_daemon.isolation import WorkspaceGuard, recover_pending
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.notifications import AttentionNotifier
 from ompire_daemon.prwatch import PrWatcher
@@ -51,8 +52,6 @@ from ompire_daemon.work.tasks import list_tasks
 from ompire_daemon.workflows import WorkflowRunner, install_packaged_workflows
 
 logger = logging.getLogger(__name__)
-
-
 def _chmod_db_private(db_path: Path) -> None:
     """Restrict the database directory and files to the owner only."""
     try:
@@ -166,7 +165,7 @@ async def _prepare_startup(
     # A crash mid-launch can leave a clone carrying staged Workshop additions
     # that are not the ones its repository owns. Undo that before any agent
     # can start in it.
-    workshopadditions.recover_pending(config.data_dir)
+    recover_pending(config.data_dir)
     # A project left `cloning` by a stopped daemon is resolved from the
     # filesystem before any client can see the project list, so a card can
     # never sit pending forever (ADR-0022).
@@ -307,8 +306,8 @@ def create_app(
         app.state.events,
         app.state.agents,
         app.state.sessions,
+        SandboxCommandExecutor(),
     )
-    # One task-scoped exclusion shared by review, drafting, delivery, agent
     # turns, workflow steps and cleanup (ADR-0032). It is created before the
     # managers that admit against it.
     app.state.workspace_guard = WorkspaceGuard()
@@ -380,6 +379,20 @@ def create_app(
         config, app.state.engine, app.state.events, app.state.gh
     )
     app.state.advisories.register(app.state.sessions)
+    # The cleanup boundary: admission, guarded teardown, and finalization
+    # composed over the owners above, so the REST route maps errors instead
+    # of owning the algorithm.
+    app.state.cleanup_service = CleanupService(
+        app.state.engine,
+        config,
+        app.state.events,
+        sessions=app.state.sessions,
+        advisories=app.state.advisories,
+        reviews=app.state.reviews,
+        ships=app.state.ships,
+        guard=app.state.workspace_guard,
+        notifications=app.state.notifications,
+    )
     # The launch boundary: one transport-independent owner of preview and
     # acceptance, with its post-commit collaborators injected rather than
     # looked up from request state.

@@ -19,7 +19,7 @@ has a boundary to preserve:
 | Owner | What it writes |
 |---|---|
 | Work (`work/projects.py`, `work/profiles.py`, `work/tasks.py`, `work/reconciliation.py`) | `projects.*`; `model_profiles.*`; on `tasks`: identity (`id`, `project_name`, `slug`, `branch`, `clone_path`, `prompt`), `execution_inputs_json`, and lifecycle `state` |
-| Workspace lifecycle (`spawn.py`, `workshop.py` — not yet extracted) | `tasks.workshop_id`, `tasks.spawn_completed_at`, `tasks.error` on spawn failure |
+| Workspace lifecycle (preparation writes through `application/spawn.py` over `isolation/` resources) | `tasks.workshop_id`, `tasks.spawn_completed_at`, `tasks.error` on spawn failure |
 | Workflows (`workflows.py`, `registry/workflows.py` — not yet extracted) | the `tasks.workflow_*` run-state fields and the step-record tables |
 | Delivery (`ship.py`, `prwatch.py`, `registry/ships.py` — not yet extracted) | `tasks.pr_url`, `tasks.pr_state`, `tasks.pr_merged_at`, plus candidate/review/authorization/action history |
 | Sessions and artifacts (not yet extracted) | session identity and applied-policy rows; result, reference, and export records |

@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 from ompire_daemon import agent as agent_module
 from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.app import create_app
+from ompire_daemon.application.execution import SandboxCommandExecutor
 from ompire_daemon.config import Config
 from ompire_daemon.events import EventHub
 from ompire_daemon.recovery import classify_startup_tasks, run_recovery
@@ -52,6 +53,7 @@ from ompire_daemon.workflows import WorkflowRunner
 from tests.conftest import (
     TEST_ROLES,
     fake_argv_builder,
+    fake_sandbox_start,
     make_execution_inputs,
     spawn_task,
 )
@@ -192,12 +194,13 @@ async def test_run_recovery_resumes_with_resume_argv_and_no_reprompt(
 
     build = fake_argv_builder("happy")
 
-    def fake_build(clone, *, policy, resume=None):
+    def fake_build(*, policy, resume=None):
         captured_resume["value"] = resume
         captured_resume["policy"] = policy
-        return build(clone, policy=policy, resume=resume)
+        return build(policy=policy, resume=resume)
 
     monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
+    monkeypatch.setattr(agent_module, "start_sandbox_process", fake_sandbox_start)
 
     async def no_preflight(clone_path: str) -> None:
         return None
@@ -209,7 +212,7 @@ async def test_run_recovery_resumes_with_resume_argv_and_no_reprompt(
     config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100)
     supervisor = AgentSupervisor(config, hub, tracker)
     tracker.recovering(task.id, "main")
-    runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
+    runner = WorkflowRunner(engine, config, hub, supervisor, tracker, SandboxCommandExecutor())
 
     await run_recovery(engine, hub, config, supervisor, tracker, runner, [task])
 
@@ -241,6 +244,7 @@ async def test_run_recovery_failure_marks_task_and_session_failed(
         "build_agent_argv",
         fake_argv_builder("crash"),
     )
+    monkeypatch.setattr(agent_module, "start_sandbox_process", fake_sandbox_start)
 
     async def no_preflight(clone_path: str) -> None:
         return None
@@ -253,7 +257,7 @@ async def test_run_recovery_failure_marks_task_and_session_failed(
     config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100)
     supervisor = AgentSupervisor(config, hub, tracker)
     tracker.recovering(task.id, "main")
-    runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
+    runner = WorkflowRunner(engine, config, hub, supervisor, tracker, SandboxCommandExecutor())
 
     await run_recovery(engine, hub, config, supervisor, tracker, runner, [task])
 
@@ -286,6 +290,7 @@ async def test_run_recovery_legacy_complete_run_is_not_redriven(
     fake_build = fake_argv_builder("happy")
 
     monkeypatch.setattr(agent_module, "build_agent_argv", fake_build)
+    monkeypatch.setattr(agent_module, "start_sandbox_process", fake_sandbox_start)
 
     async def no_preflight(clone_path: str) -> None:
         return None
@@ -297,7 +302,7 @@ async def test_run_recovery_legacy_complete_run_is_not_redriven(
     config = Config(agent_ready_timeout=5, agent_ring_buffer_size=100)
     supervisor = AgentSupervisor(config, hub, tracker)
     tracker.recovering(task.id, "main")
-    runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
+    runner = WorkflowRunner(engine, config, hub, supervisor, tracker, SandboxCommandExecutor())
 
     await run_recovery(engine, hub, config, supervisor, tracker, runner, [task])
 

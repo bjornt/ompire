@@ -27,10 +27,11 @@ from sqlalchemy import Engine
 
 from ompire_daemon import agent as agent_module
 from ompire_daemon.agent import AgentSupervisor
+from ompire_daemon.application.execution import SandboxCommandExecutor
 from ompire_daemon.config import Config
 from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
-from ompire_daemon.delivery import WorkspaceGuard
 from ompire_daemon.events import EventHub
+from ompire_daemon.isolation import WorkspaceGuard
 from ompire_daemon.migrate import upgrade_head
 from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.registry.results import get_result, list_results
@@ -64,6 +65,7 @@ from ompire_daemon.workflows import (
 from tests.conftest import (
     TEST_ROLES,
     fake_argv_builder,
+    fake_sandbox_start,
     install_plain_workflow,
     install_test_workflow,
     make_execution_inputs,
@@ -210,6 +212,7 @@ async def rig(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     `scenario` lets a test switch the fake omp behavior before the run."""
     scenario = {"name": "happy"}
     monkeypatch.setattr(agent_module, "build_agent_argv", fake_argv_builder(scenario))
+    monkeypatch.setattr(agent_module, "start_sandbox_process", fake_sandbox_start)
 
     async def no_preflight(clone_path: str) -> None:
         return None
@@ -225,7 +228,7 @@ async def rig(engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         spawn_step_timeout=10,
     )
     supervisor = AgentSupervisor(config, hub, tracker)
-    runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
+    runner = WorkflowRunner(engine, config, hub, supervisor, tracker, SandboxCommandExecutor())
     # A format-3 run reaches a `review` step, which the trusted service owns.
     # The stub is unbounded and approves by default, so a test about routing
     # says only what it means to say; one about verdicts sets them explicitly.
@@ -250,7 +253,7 @@ def _restart_rig(engine: Engine, tmp_path: Path):
         spawn_step_timeout=10,
     )
     supervisor = AgentSupervisor(config, hub, tracker)
-    runner = WorkflowRunner(engine, config, hub, supervisor, tracker)
+    runner = WorkflowRunner(engine, config, hub, supervisor, tracker, SandboxCommandExecutor())
     runner.set_operations(_StubReviews(engine, [], default={"outcome": "approved"}), None)
     return runner, supervisor, tracker, hub
 

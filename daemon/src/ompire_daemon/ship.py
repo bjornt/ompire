@@ -50,18 +50,12 @@ from ompire_daemon.delivery import (
     DeliveryWorkspaceError,
     EmptyCandidateError,
     ProtectedPathError,
-    WorkspaceBlockedError,
-    WorkspaceBusyError,
-    WorkspaceGuard,
     assert_range_unprotected,
     assert_tree_unprotected,
     candidate_identity,
     capture_candidate,
-    git_out,
     protected_destinations,
     remove_candidate_storage,
-    run_git,
-    safe_git,
     store_has_objects,
     workspace_tree_id,
 )
@@ -73,7 +67,13 @@ from ompire_daemon.gh import (
     parse_github_owner,
 )
 from ompire_daemon.gpg import STATE_READY, gpg_signing_refusal
+from ompire_daemon.isolation import (
+    WorkspaceBlockedError,
+    WorkspaceBusyError,
+    WorkspaceGuard,
+)
 from ompire_daemon.oversight.tasks import task_payload
+from ompire_daemon.platform.git import GitCommandError, git_out, run_git, safe_git
 from ompire_daemon.registry.reviews import get_review
 from ompire_daemon.registry.ships import (
     ENDING_ACTIONS,
@@ -1248,7 +1248,7 @@ class ShipManager:
             info["current_candidate_id"] = None
             info["stale"] = None
             return None, info, blockers
-        except DeliveryWorkspaceError as exc:
+        except (DeliveryWorkspaceError, GitCommandError) as exc:
             blockers.append(
                 Blocker(
                     "candidate-unavailable",
@@ -1384,7 +1384,7 @@ class ShipManager:
             )
         except ProtectedPathError as exc:
             return str(exc)
-        except DeliveryWorkspaceError as exc:
+        except (DeliveryWorkspaceError, GitCommandError) as exc:
             return (
                 "Ompire could not check what this delivery would publish for "
                 f"handoff inputs, so it will not publish it: {exc}"
@@ -1420,7 +1420,7 @@ class ShipManager:
                 )
             except ProtectedPathError as exc:
                 return [Blocker("retain-protected-paths", str(exc))]
-            except DeliveryWorkspaceError as exc:
+            except (DeliveryWorkspaceError, GitCommandError) as exc:
                 return [
                     Blocker(
                         "retain-protected-unreadable",
@@ -1980,7 +1980,7 @@ class ShipManager:
             installed, install_note = await self._install_signed(
                 task, store, tip, candidate, signed_ref, timeout
             )
-        except DeliveryWorkspaceError as exc:
+        except (DeliveryWorkspaceError, GitCommandError) as exc:
             # Signing either produced nothing or left evidence under the
             # action's own ref. `_sign` records what it produced before each
             # step, so classification is a lookup, not a guess.
@@ -2032,7 +2032,7 @@ class ShipManager:
                 base_branch=candidate.base_branch,
                 fetch=False,
             )
-        except DeliveryWorkspaceError as exc:
+        except (DeliveryWorkspaceError, GitCommandError) as exc:
             logger.warning(
                 "could not re-capture candidate %s for task %d: %s",
                 candidate.candidate_id,
@@ -2337,7 +2337,7 @@ class ShipManager:
         # workspace having moved.
         try:
             tree_now: str | None = await workspace_tree_id(self._config, task)
-        except DeliveryWorkspaceError:
+        except (DeliveryWorkspaceError, GitCommandError):
             tree_now = None
         await run_git(
             safe_git(clone, "reset", "--mixed", "--quiet", tip),
@@ -3222,7 +3222,7 @@ class ShipManager:
                 # restart mid-delivery cannot resume under a weaker one.
                 protected_destinations(task),
             )
-        except DeliveryWorkspaceError as exc:
+        except (DeliveryWorkspaceError, GitCommandError) as exc:
             return {
                 "state": "partial",
                 "reference": tip,
@@ -3242,7 +3242,7 @@ class ShipManager:
                 )
             ).strip()
             installed = current == tip
-        except DeliveryWorkspaceError:
+        except (DeliveryWorkspaceError, GitCommandError):
             current = None
         return {
             "state": "completed",
