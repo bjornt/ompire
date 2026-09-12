@@ -1118,7 +1118,7 @@ def _result_error(exc: Exception) -> HTTPException:
     it, not a missing resource.
     """
     if isinstance(exc, InvalidSelectionError):
-        return HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+        return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc))
     if isinstance(exc, ResultNotFoundError):
         return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
     if isinstance(exc, ResultPurgedError):
@@ -1333,7 +1333,7 @@ def purge_task_result_route(
     result = _require_result(results, task_id, result_id)
     if not body.acknowledge_purge:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             "purging a result deletes its retained files permanently; confirm "
             "the purge explicitly",
         )
@@ -1413,7 +1413,7 @@ def _export_error(exc: Exception) -> HTTPException:
             "reserved-destination",
             "destination-collision",
         ):
-            return HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, exc.detail)
+            return HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, exc.detail)
         return HTTPException(status.HTTP_409_CONFLICT, exc.detail)
     if isinstance(exc, ExportNotFoundError):
         return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
@@ -1488,7 +1488,7 @@ async def start_result_export_route(
     _require_task(engine, task_id)
     if not body.acknowledge_export:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             "exporting writes files into your project checkout; confirm the "
             "reviewed preview explicitly",
         )
@@ -1598,7 +1598,7 @@ def acknowledge_result_export_route(
         )
     if not body.acknowledge_unknown_outcome:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             "this export has effects nobody could classify; acknowledge that "
             "explicitly to close it",
         )
@@ -1976,7 +1976,7 @@ async def _answer_with_delivery(
     ships: ShipManager = request.app.state.ships
     if not body.preview_token or not body.request_id:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             {
                 "field": "preview_token",
                 "detail": (
@@ -2046,13 +2046,13 @@ async def resume_workflow_route(
     )
     if body.choice_id is not None and not offers_choices:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             "this task is not waiting at a gate with declared choices; "
             "a retry or a format-1 resume takes no 'choice_id'",
         )
     if offers_choices and body.choice_id is None:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             "this gate asks a question with named choices; 'choice_id' names "
             "the one being answered",
         )
@@ -2094,7 +2094,7 @@ async def resume_workflow_route(
         # does not accept, so name the field rather than telling them to
         # reload.
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             {"field": exc.field, "detail": exc.detail},
         ) from exc
     except WorkflowWaitConflictError as exc:
@@ -2375,7 +2375,7 @@ async def preview_ship_route(
     except DeliveryBlockedError as exc:
         raise _delivery_conflict(exc) from exc
     except PreviewMismatchError as exc:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
     except TaskConfigurationRequiredError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     return resolved.payload()
@@ -2429,7 +2429,7 @@ async def commit_ship_route(
         raise _delivery_conflict(exc) from exc
     except WorkflowGateChoiceError as exc:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             {"field": exc.field, "detail": exc.detail},
         ) from exc
     except (WorkflowWaitConflictError, WorkflowNotWaitingError) as exc:
@@ -2548,7 +2548,7 @@ async def reconcile_ship_route(
     task = _require_task(engine, task_id)
     if body.decision not in ("recheck", "adopt", "retry", "abandon"):
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             {"field": "decision", "detail": f"unknown decision {body.decision!r}"},
         )
     try:

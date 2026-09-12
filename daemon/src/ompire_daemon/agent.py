@@ -441,6 +441,18 @@ class AgentHandle:
                 pass
         await self.kill()
 
+    def kill_now(self) -> None:
+        """Signal death without waiting for the flush.
+
+        For teardown that has lost the ability to await anything — the ASGI
+        lifespan is cancelled hard under a test client, and a cancelled
+        `shutdown` must still stop every child before the event loop goes
+        away. The exit watcher reaps the death on the loop's remaining
+        turns; `kill` is the awaiting counterpart."""
+        if self._process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self._process.kill()
+
     async def wait_exited(self) -> int:
         """Block until the child has exited and both pipes are flushed."""
         return await asyncio.shield(self._exited)
@@ -479,17 +491,40 @@ class AgentHandle:
         await self._conn.wait_closed()
         with contextlib.suppress(Exception):
             await self._stderr_task
+        self._release_pipes()
         for queue in self._subscribers:
             queue.put_nowait(EVENT_STREAM_END)
         self._exited.set_result(code)
 
+    def _release_pipes(self) -> None:
+        """Close the child's stdin deterministically once it is dead.
+
+        asyncio closes a dead child's read pipes at EOF, but the stdin
+        write pipe stays open and keeps the subprocess transport alive
+        until the handle's reference cycles (conn -> event callback ->
+        handle) are garbage-collected — arbitrarily late, possibly after
+        the event loop is gone, where the transport's `__del__` then trips
+        over the closed loop. Closing it here makes teardown immediate
+        and complete."""
+        stdin = self._process.stdin
+        if stdin is not None and not stdin.is_closing():
+            stdin.close()
+
     async def _await_ready(self, timeout: float) -> None:
         futures: set[asyncio.Future[Any]] = {self._conn.ready, self._exited}
-        done, _ = await asyncio.wait(
-            futures,
-            timeout=timeout,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        try:
+            done, _ = await asyncio.wait(
+                futures,
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            # A start cancelled from outside (daemon shutdown cancels the
+            # recovery job, a run is torn down) must not leave the child
+            # running with pipes on a loop that is about to close.
+            await self._abandon_ready()
+            await self.kill()
+            raise
         ready = self._conn.ready
         if ready in done and not ready.cancelled() and ready.exception() is None:
             return
@@ -502,18 +537,22 @@ class AgentHandle:
             ready_failed or self._exited in done or self._process.returncode is not None
         )
         await self.kill()
-        # Consume/cancel the ready future so its AgentGoneError is never
-        # reported as an unretrieved exception.
-        if ready.done():
-            if not ready.cancelled():
-                ready.exception()
-        else:
-            ready.cancel()
+        await self._abandon_ready()
         stderr = "\n".join(self._stderr_capture)
         if child_died_first:
             code = self._exited.result()  # kill() waited for the exit flush
             raise AgentStartError(f"agent exited before ready (exit code {code})", stderr)
         raise AgentStartError(f"no ready frame within {timeout}s", stderr)
+
+    async def _abandon_ready(self) -> None:
+        """Consume/cancel the ready future so its AgentGoneError is never
+        reported as an unretrieved exception."""
+        ready = self._conn.ready
+        if ready.done():
+            if not ready.cancelled():
+                ready.exception()
+        else:
+            ready.cancel()
 
 
 class AgentSupervisor:
@@ -837,6 +876,14 @@ class AgentSupervisor:
             raise ModelConfigurationError(
                 "omp did not answer the model configuration handshake"
             ) from exc
+        except BaseException:
+            # A start abandoned from outside — daemon shutdown cancels the
+            # recovery job and workflow teardown cancels runs — must not
+            # leave the child running with pipes on a loop that is about to
+            # close. The handle is only registered once this method returns,
+            # so `shutdown` cannot see it yet; this is its cleanup.
+            await handle.kill()
+            raise
         handle.policy = policy
         if commit is not None:
             try:
@@ -896,10 +943,20 @@ class AgentSupervisor:
         tasks stay `created` and are recovered on the next startup."""
         self._shutting_down = True
         handles = list(self._handles.values())
-        await asyncio.gather(
-            *(handle.terminate(self._config.shutdown_grace) for handle in handles),
-            return_exceptions=True,
-        )
+        try:
+            await asyncio.gather(
+                *(handle.terminate(self._config.shutdown_grace) for handle in handles),
+                return_exceptions=True,
+            )
+        except asyncio.CancelledError:
+            # Teardown that lost the ability to await (a test client cancels
+            # the ASGI lifespan scope outright): every child still has to be
+            # signalled dead before the loop disappears, or its transport is
+            # reaped after close. `kill_now` is synchronous; the exit
+            # watchers reap on the loop's remaining turns.
+            for handle in handles:
+                handle.kill_now()
+            raise
 
     async def _watch(self, task_id: int, session: str, handle: AgentHandle) -> None:
         code = await handle.wait_exited()

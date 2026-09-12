@@ -208,7 +208,14 @@ def client(app) -> TestClient:
     # jobs started by request handlers (the spawn pipeline) keep running.
     with TestClient(app) as test_client:
         yield test_client
-
+        # TestClient tears the lifespan down by cancelling its scope, which
+        # can abandon an agent mid-`terminate` and leave its subprocess
+        # transport to be garbage-collected after the portal loop is gone —
+        # the source of PytestUnraisableException noise. Reap the agents
+        # while that loop is still alive; the lifespan shutdown that runs
+        # right afterwards is idempotent.
+        if test_client.portal is not None:
+            test_client.portal.call(test_client.app.state.agents.shutdown)
 
 @pytest.fixture
 def auth_headers(auth_token: str) -> dict[str, str]:

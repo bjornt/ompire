@@ -1180,6 +1180,13 @@ async def test_direct_acceptance_enforces_the_same_admission_as_http(
     settled = client.get(f"/api/tasks/{task.id}", headers=auth_headers).json()
     assert settled["spawn_completed_at"] is not None or settled["state"] == "failed"
 
+    # The typed accept scheduled its preparation job on this test's loop, so
+    # the agent handle and its futures live here — the app's own loop (the
+    # test client's portal) cannot await them across loops. Stop the child
+    # from the loop that owns it; the fixture's shutdown then finds nothing
+    # left to reap.
+    await client.app.state.agents.shutdown()
+
     # A stale token is refused, not retried under today's resolution.
     with pytest.raises(PreviewChangedError):
         await service.accept(request(slug="direct-stale"), preview_token="stale")

@@ -648,6 +648,7 @@ async def test_a_replacement_without_a_resume_identity_is_refused(handoff, monke
     # the live child is touched.
     assert sup.get(1, "main") is handle
     assert resumes == [None]
+    await sup.stop(1, "main")
 
 
 async def test_a_prompting_caller_waits_for_a_handoff_rather_than_racing_it(
