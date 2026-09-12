@@ -9,25 +9,21 @@ sdks:
   # Provides `pptr-node` and PUPPETEER_EXECUTABLE_PATH — see
   # docs/develop/reference/local-testing.md#browser
   - name: puppeteer-chrome
+# Actions delegate to the project Makefile so they stay in sync with it.
+# Positional arguments are forwarded through the Makefile's ARGS variable:
+#   <action> -k test_ship  →  make test-backend ARGS="-k test_ship"
 actions:
   test-backend: |
-    cd /project/daemon
-    uv run pytest "$@"
+    cd /project && make test-backend ARGS="$*"
   test-frontend: |
-    cd /project/frontend
-    pnpm test "$@"
+    cd /project && make test-frontend ARGS="$*"
   lint-backend: |
-    cd /project/daemon
-    uvx ruff check src tests "$@"
+    cd /project && make lint-backend ARGS="$*"
   lint-frontend: |
-    cd /project/frontend
-    pnpm lint "$@"
+    cd /project && make lint-frontend ARGS="$*"
   typecheck-backend: |
-    cd /project/daemon
-    uv run --with mypy mypy src "$@"
+    cd /project && make typecheck-backend ARGS="$*"
   typecheck-frontend: |
-    cd /project/frontend
-    pnpm exec tsc -b "$@"
+    cd /project && make typecheck-frontend ARGS="$*"
   docs: |
-    cd /project
-    NO_MKDOCS_2_WARNING=1 uvx --with mkdocs-material mkdocs build --strict "$@"
+    cd /project && make docs ARGS="$*"
