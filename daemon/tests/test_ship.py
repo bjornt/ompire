@@ -2324,7 +2324,34 @@ async def _settle(engine, task_id, statuses, timeout=30.0):
         if task.workflow_status in statuses:
             return task
         await asyncio.sleep(0.02)
-    return get_task(engine, task_id)
+    raise AssertionError(
+        f"task {task_id} never reached {sorted(statuses)} within "
+        f"{timeout}s; last status {get_task(engine, task_id).workflow_status!r}"
+    )
+
+
+async def _wait_delivery_phase(engine, task_id: int, phase: str, timeout: float = 5.0):
+    """Wait until the task's latest delivery holds a commit action in `phase`.
+
+    The crash simulations cannot wait on workflow status: a run whose
+    daemon died mid-effect legitimately stays `running`, which is what
+    recovery exists to resolve. The write-ahead action row is the
+    deterministic landmark — `executing` once the journal has committed
+    that the effect is launched, `succeeded` once its result has landed.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        record = get_latest_delivery(engine, task_id)
+        if record is not None and any(
+            a.kind == "commit" and a.phase == phase for a in record.actions
+        ):
+            return record
+        await asyncio.sleep(0.02)
+    raise AssertionError(
+        f"delivery for task {task_id} never reached a commit action "
+        f"in phase {phase!r}"
+    )
 
 
 async def test_a_restart_adopts_a_completed_effect_instead_of_repeating_it(
@@ -2363,7 +2390,7 @@ async def test_a_restart_adopts_a_completed_effect_instead_of_repeating_it(
             request_id="r1",
         )
         await ships.confirm(task, preview, runner=live)
-        await _settle(engine, task.id, {"complete", "failed", "waiting"})
+        await _wait_delivery_phase(engine, task.id, "succeeded")
     finally:
         await live.shutdown()
 
@@ -2424,7 +2451,7 @@ async def test_an_interrupted_action_waits_for_an_explicit_continuation(
             request_id="r1",
         )
         await ships.confirm(task, preview, runner=live)
-        await _settle(engine, task.id, {"complete", "failed", "waiting"})
+        await _wait_delivery_phase(engine, task.id, "executing")
     finally:
         await live.shutdown()
 
