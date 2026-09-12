@@ -29,6 +29,10 @@ make test-backend ARGS="-k test_ship"
 make test-frontend ARGS="--reporter=verbose"
 ```
 
+Backend tests run in parallel across CPU cores (`pytest-xdist`). To
+serialize them — for example when debugging a timing-sensitive test —
+run `make test-backend ARGS="-n 0"`.
+
 Both suites must pass before committing.
 
 ### Architecture dependency checks

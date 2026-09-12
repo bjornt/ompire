@@ -36,8 +36,8 @@ run: ## Run the daemon (serves frontend/dist at /)
 
 test: test-backend test-frontend ## Run all tests
 
-test-backend: ## Run backend tests
-	cd daemon && uv run pytest $(ARGS)
+test-backend: ## Run backend tests (parallel; ARGS="-n 0" serializes)
+	cd daemon && uv run pytest -n auto $(ARGS)
 
 test-frontend: ## Run frontend tests
 	cd frontend && pnpm test $(ARGS)
