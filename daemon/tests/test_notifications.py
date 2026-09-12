@@ -13,7 +13,7 @@ import pytest
 from ompire_daemon.events import EventHub
 from ompire_daemon.notifications import AttentionNotifier, tier_for
 
-RENOTIFY = 0.15
+RENOTIFY = 0.05
 
 
 def test_tier_map() -> None:
@@ -510,7 +510,7 @@ async def test_cross_session_worst_tier_wins(fake_notify_send) -> None:
             "status_changed",
             {"task_id": 1, "session": "main", "from": "waiting-input", "to": "stalled", "reason": "no frames for 300s"},
         )
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(RENOTIFY * 0.5)
         assert len(calls_log.read_text().splitlines()) == 2
         assert notifier.snapshot()[1]["status"] == "failed"
 

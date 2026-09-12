@@ -14,12 +14,12 @@ from ompire_daemon.events import EventHub
 from ompire_daemon.sessions import SessionTracker
 from tests.conftest import fake_argv_builder, fake_sandbox_start, make_test_policy
 
-DEBOUNCE = 0.2
+DEBOUNCE = 0.05
 # Deliberately much larger than DEBOUNCE/the sleeps unrelated tests use, so
 # the stall watchdog never fires incidentally in tests that don't exercise it
 # (e.g. a queued-message re-check sleeping past DEBOUNCE*3).
 STALL_THRESHOLD = 30.0
-FAST_STALL_THRESHOLD = 0.2
+FAST_STALL_THRESHOLD = 0.05
 
 
 @pytest.fixture

@@ -18,7 +18,7 @@ from ompire_daemon.events import EventHub
 from ompire_daemon.sessions import SessionTracker
 from tests.conftest import fake_argv_builder, fake_sandbox_start, make_test_policy
 
-THROTTLE = 0.15
+THROTTLE = 0.05
 
 
 class FakeHandle:
