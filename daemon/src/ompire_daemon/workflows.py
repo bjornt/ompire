@@ -43,6 +43,7 @@ import math
 import traceback
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -435,6 +436,13 @@ class WorkflowNotWaitingError(Exception):
 BUILTIN_PACKAGE = "ompire_daemon.builtin_workflows"
 BUILTIN_NAMES = ("single-step", "bugfix", "planning")
 
+# Parsing the packaged definitions is the dominant cost of app startup
+# after the schema migration, and the packaged bytes are immutable for
+# the life of the process. Keyed on the text itself, so a swapped-in
+# resource re-parses instead of reading a stale entry; bounded because
+# the package ships three names.
+_parse_packaged_definition = lru_cache(maxsize=16)(load_definition)
+
 
 class PackagedWorkflowError(RuntimeError):
     """A definition shipped with the daemon is not loadable. Fails startup."""
@@ -457,7 +465,7 @@ def load_packaged_workflows() -> dict[str, WorkflowRevision]:
                 f"packaged workflow {name!r} is missing from the installed package"
             ) from exc
         try:
-            revision = load_definition(text)
+            revision = _parse_packaged_definition(text)
         except WorkflowDocumentError as exc:
             raise PackagedWorkflowError(
                 f"packaged workflow {name!r} is invalid: {exc}"
