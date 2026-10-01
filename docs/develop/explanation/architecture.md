@@ -113,18 +113,29 @@ resources a workflow uses, addressed as `(task_id, session_name)` and spawned
 lazily. One is declared primary, and task-scoped operations — review, ship —
 target it.
 
-A workflow definition is a **document**, not code: a bounded YAML subset
-declaring sequential `agent`, `command`, `decision`, `gate`, `review`,
-`delivery`, and format-4 `capture` steps, with a content-derived revision as
-its identity. The document carries its own semantics version, so a change to
-what a retained document *means* is a new format rather than a silent
-reinterpretation; two versions execute side by side. Workflow state and step
-records are durable; in-memory runners re-drive them after a restart.
+A workflow definition is a **document**, not code: a bounded YAML subset with
+content-derived revisions and explicit semantics versions. Its ordinary
+execution steps are `agent`, `command`, `decision`, `gate`, `review`, `delivery`,
+and `capture`. Format 5 composes globally shared definitions over format-4
+execution rules and retains meaningful phases for presentation. Old formats
+keep their original meaning and execute beside newer ones.
 
-The definition and the engine are separate on purpose. `workflow_definitions.py`
-answers "what does this document mean" — data model, loader, canonical
-identity, bounded evaluator — and imports nothing from the registry or the task
-model. `workflows.py` answers "how is that carried out".
+`workflow_definitions.py` owns the ordinary grammar, canonical identity, and
+bounded evaluator. `workflow_composition.py` resolves source invocations,
+checks structural parameters, and validates the resulting ordinary procedure.
+Neither imports the registry or task model. The global library is packaged
+YAML under `builtin_workflow_steps/`, available to custom workflows through the
+same authoring API. Only prospective validation and executable saves consult
+it; retained procedures contain their complete dependency snapshots and source
+composition. Recovery and export never depend on the deployed library.
+
+The executable expansion and phase membership are pinned together. The UI can
+present Reproduce → Diagnose → Fix → Verify → Review → Decide → Publish without
+making routing decisions or losing the exact underlying attempts. Shared
+declarations add no authority: expanded grants still pass the existing review
+and delivery checks. `workflows.py` owns execution and restart re-driving from
+durable run and step records. See
+[ADR-0040](../../adr/0040-resolve-shared-workflow-steps-before-retention.md).
 
 The engine consumes no model of its own. When the evidence a step or a route
 needs is missing or unreadable, the run stops at that attempt with the reason

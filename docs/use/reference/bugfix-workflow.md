@@ -21,7 +21,7 @@ named alternatives.
 
 ## Definition
 
-A packaged YAML document in workflow **format 3**
+A packaged compositional YAML document in workflow **format 5**
 (`daemon/src/ompire_daemon/builtin_workflows/bugfix.yaml`). Each task pins the
 revision it was accepted under, so the routes below describe *your task's*
 `bugfix` — a later release that edits this definition does not change a run
@@ -30,6 +30,17 @@ already in flight. See
 
 Sessions `["reproducer", "coder"]`, primary `coder` — so review, ship, and
 task-scoped agent operations target the coder.
+
+The default overview shows **Reproduce → Diagnose → Fix → Verify → Review →
+Decide → Publish**. Expand a phase for its exact routing and execution steps.
+Review routing, approval questions, and signed delivery chains reference the
+global shared-step library; this workflow supplies its evidence, correction
+destinations, questions, choices, and named endings. The reproduced and
+unreproduced approvals remain distinct. Those bindings and shared snapshots
+are frozen in the task's revision; editing a global definition cannot change
+this task's procedure.
+
+The table below lists the expanded engine steps, not the compact overview:
 
 | # | Step | Kind | Session |
 |---|---|---|---|

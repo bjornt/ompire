@@ -1,7 +1,7 @@
-# The planning workflow (format 4) retains proposal files instead of treating an
+# The planning workflow (format 5) retains proposal files instead of treating an
 # agent summary as the result. It has no review, delivery, or export step: no
 # answer to this workflow grants publication authority.
-format: 4
+format: 5
 name: planning
 sessions: [planner]
 primary: planner
@@ -242,3 +242,27 @@ steps:
       - id: stop
         label: Stop without accepting
         next: {complete: true, result: stopped-without-acceptance}
+
+stages:
+- name: propose
+  label: Propose
+  description: Research and draft one epic or change proposal; request missing information or stop at the attempt
+    budget.
+  steps:
+  - propose
+  - route-proposal
+  - unable-gate
+  - planning-exhausted
+- name: retain
+  label: Retain proposal
+  description: Capture the exact declared proposal files as an immutable result outside the workspace.
+  steps:
+  - capture-epic
+  - capture-change
+  - capture-epic-change
+- name: decide
+  label: Decide
+  description: Inspect and accept the retained revision, request changes, or stop without acceptance; no choice
+    publishes code.
+  steps:
+  - result-gate

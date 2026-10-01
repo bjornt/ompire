@@ -1,10 +1,11 @@
-"""The declarative workflow document: formats 1 and 2.
+"""The declarative workflow document: frozen formats 1 through 5.
 
 A workflow definition is *data*. It is authored as a bounded YAML subset,
 normalized into one canonical JSON document, and identified by the SHA-256 of
-those canonical bytes. Nothing in here imports a task, opens a connection,
-touches the filesystem, or executes anything: this module answers "what does
-this document mean", and `workflows.py` answers "how is that carried out".
+those canonical bytes. Nothing in here imports a task, opens a connection, or
+executes anything: this module answers "what does this document mean", and
+`workflows.py` answers "how is that carried out". Format-5 prospective source
+loading resolves packaged YAML declarations; retained loading uses frozen bytes.
 
 Three properties are load-bearing, and each one is a rule below rather than a
 convention:
@@ -76,8 +77,8 @@ from ompire_daemon.model_config import MODEL_ROLES
 # statement that the meaning of a document changed, not that a field was
 # added: a retained format-1 document keeps being read under format-1 rules
 # forever, and an unsupported version is refused rather than reinterpreted.
-FORMAT_VERSION = 4
-SUPPORTED_FORMATS = (1, 2, 3, 4)
+FORMAT_VERSION = 5
+SUPPORTED_FORMATS = (1, 2, 3, 4, 5)
 
 # Loader bounds. They protect the daemon from a hostile or accidental
 # document; every packaged built-in is orders of magnitude below them.
@@ -103,6 +104,7 @@ FORMAT_STEP_KINDS: dict[int, tuple[str, ...]] = {
     2: ("agent", "command", "decision", "gate"),
     3: STEP_KINDS[:-1],
     4: STEP_KINDS,
+    5: STEP_KINDS,
 }
 
 # Format 3's trusted operations. Each names exactly one effect; there is no
@@ -830,6 +832,8 @@ class WorkflowDefinition:
     sessions: tuple[str, ...]
     primary: str
     steps: tuple[Step, ...]
+    # Immutable normalized source metadata; runtime steps remain ordinary steps.
+    composition: str | None = None
 
     def step_named(self, name: str) -> Step | None:
         for step in self.steps:
@@ -1809,8 +1813,19 @@ def _parse_step(data: Any, location: str, version: int) -> Step:
     )
 
 
-def definition_from_document(document: Mapping[str, Any]) -> WorkflowDefinition:
-    """Validate one already-parsed document into an immutable definition."""
+def definition_from_document(
+    document: Mapping[str, Any], *, resolve_catalog: bool = True
+) -> WorkflowDefinition:
+    """Validate source prospectively; canonical composition is always frozen."""
+    if document.get("format") == 5:
+        from ompire_daemon.workflow_composition import composition_definition
+
+        return composition_definition(document, resolve_catalog=resolve_catalog)
+    return _primitive_definition_from_document(document)
+
+
+def _primitive_definition_from_document(document: Mapping[str, Any]) -> WorkflowDefinition:
+    """The unchanged ordinary step grammar and reference/authority validation."""
     _reject_unknown(document, ("format", "name", "sessions", "primary", "steps"), "")
     if "format" not in document:
         raise WorkflowDocumentError("format", "missing required field 'format'")
@@ -2680,7 +2695,7 @@ def _step_document(step: Step, version: int) -> dict[str, Any]:
 
 def canonical_document(definition: WorkflowDefinition) -> dict[str, Any]:
     """The normalized document: every default explicit, nothing implied."""
-    return {
+    document = {
         "format": definition.format,
         "name": definition.name,
         "sessions": list(definition.sessions),
@@ -2689,6 +2704,9 @@ def canonical_document(definition: WorkflowDefinition) -> dict[str, Any]:
             _step_document(step, definition.format) for step in definition.steps
         ],
     }
+    if definition.format == 5 and definition.composition is not None:
+        document["composition"] = json.loads(definition.composition)
+    return document
 
 
 def canonical_bytes(definition: WorkflowDefinition) -> bytes:
@@ -2725,7 +2743,9 @@ def load_definition(text: str) -> WorkflowRevision:
 
 def load_canonical_document(document: Mapping[str, Any]) -> WorkflowDefinition:
     """Re-validate a retained canonical document before executing it."""
-    return definition_from_document(document)
+    if document.get("format") == 5 and "composition" not in document:
+        raise WorkflowDocumentError("composition", "retained format 5 requires frozen composition")
+    return definition_from_document(document, resolve_catalog=False)
 
 
 # --- YAML emission (ADR-0031) -------------------------------------------------
@@ -2989,6 +3009,19 @@ def export_document(document: Mapping[str, Any]) -> dict[str, Any]:
     and `evidence: {}` on every step is one an operator cannot read.
     """
     version = document["format"]
+    if version == 5:
+        # Verify first: conversion/export must not disguise corrupted retained bytes.
+        verified = canonical_document(load_canonical_document(document))
+        composition = verified["composition"]
+        return {
+            "format": version,
+            "name": verified["name"],
+            "sessions": verified["sessions"],
+            "primary": verified["primary"],
+            "steps": composition["steps"],
+            "definitions": composition["definitions"],
+            "stages": composition["stages"],
+        }
     return {
         "format": version,
         "name": document["name"],

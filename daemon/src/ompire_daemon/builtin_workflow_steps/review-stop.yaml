@@ -1,0 +1,36 @@
+name: review-stop
+label: Review unavailable
+description: Stops without publication when independent review cannot approve or its visit bound is spent.
+parameters:
+  gate_name:
+    type: string
+    default: review-exhausted
+  review_name:
+    type: string
+    default: review
+  message:
+    type: object
+  label:
+    type: string
+    default: Stop without publishing
+  result:
+    type: string
+steps:
+- name:
+    param: gate_name
+  kind: gate
+  evidence:
+    verdict:
+      steps:
+      - param: review_name
+      required: false
+  message:
+    param: message
+  choices:
+  - id: stop
+    label:
+      param: label
+    next:
+      complete: true
+      result:
+        param: result

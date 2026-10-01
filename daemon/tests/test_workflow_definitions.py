@@ -145,7 +145,7 @@ def test_unsupported_format_is_refused_not_reinterpreted() -> None:
     # A version this interpreter does not implement is refused rather than
     # read under the newest rules it happens to know.
     with pytest.raises(UnsupportedWorkflowFormatError):
-        load(MINIMAL.replace("format: 1", "format: 5"))
+        load(MINIMAL.replace("format: 1", "format: 6"))
 
 
 @pytest.mark.parametrize(

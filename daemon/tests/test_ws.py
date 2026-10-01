@@ -203,7 +203,6 @@ def test_workflow_catalog_rides_the_snapshot_with_no_change_event(
         # so a client can tell "the same workflow" from "the same name"
         # (ADR-0028).
         assert catalog["single-step"]["revision"].startswith("sha256:")
-        assert catalog["single-step"]["format"] == 3
 
 
 def test_reconnect_gets_fresh_snapshot(

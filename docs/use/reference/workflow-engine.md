@@ -2,9 +2,9 @@
 
 ## Overview
 
-A workflow is an ordered sequence of steps executed over a task's named
-sessions. It is what turns "run an agent" into "run this procedure, collect
-this evidence, and stop for a human when the evidence is missing".
+A workflow is a procedure executed over a task's named sessions. Its overview
+shows meaningful phases; expanding a phase reveals the execution steps,
+instructions, evidence, routes, and recorded attempts underneath it.
 
 A workflow definition is a **document**, not code. It is a bounded YAML
 subset, normalized into one canonical form and identified by the SHA-256 of
@@ -31,27 +31,27 @@ A definition declares:
 
 | Part | Meaning |
 |---|---|
-| `format` | The document format and its interpretation: `1` through `4`. |
+| `format` | The document format and its interpretation: `1` through `5`. |
 | `name` | The library entry's name; a launch selects it. Permanent — renaming means creating a separate workflow |
 | `sessions` | Slug-format session names, declared up front, unique per task |
 | `primary` | Session targeted by task-scoped operations |
-| steps | Ordered, uniquely named, of seven kinds. An `agent` step also declares the abstract model role it consumes. |
+| steps | Ordered ordinary steps or format-5 shared-step invocations. An `agent` step also declares the abstract model role it consumes. |
+| phases | Format-5 `stages` group execution steps under readable labels and descriptions; they do not change execution order. |
 
 Steps fall through to the next declared step on success. A `decision` step
 routes explicitly, a `gate` step's chosen answer routes too, a `capture` step
 retains its declared files before following its explicit route, and a `delivery`
 step routes to the next action or to the ending its chain reaches.
 
-Four formats are installed and all execute. **Format 1** is frozen: a
-definition retained under it is always read under its original rules, so a task
-accepted years ago keeps meaning what it meant. **Format 2** adds declared
-results, recorded evidence, and gates with named choices, and removes the two
-places format 1 left meaning implicit. **Format 3** adds review and each trusted
-publication effect as steps; an approving answer names the exact chain it
-permits. **Format 4** adds a workflow-owned `capture` step and an optional gate
-binding to its exact retained revision. It does not add publication authority.
-The packaged planning workflow is format 4; the other packaged workflows are
-format 3.
+Five formats are installed and all execute. **Format 1** is frozen: a retained
+definition always keeps its original rules. **Format 2** adds declared results,
+recorded evidence, and gates with named choices. **Format 3** adds review and
+each trusted publication effect as steps; an approving answer names the exact
+chain it permits. **Format 4** adds workflow-owned result capture and exact
+retained-result acceptance. **Format 5** composes shared definitions and retains
+meaningful phases over those same format-4 execution rules. All three packaged
+workflows use format 5; their execution steps and publication policies remain
+explicit.
 
 | | Format 1 | Format 2 | Format 3 | Format 4 |
 |---|---|---|---|---|
@@ -63,6 +63,9 @@ format 3.
 | Review | an operator command beside the run | same | a [declared step](#review-steps) whose verdict routes | as format 3 |
 | Publishing | an operator command beside the run | same | [declared steps](#publication-steps) a person authorizes | as format 3 |
 
+Format 5 inherits every format-4 row above. Composition adds no new runtime
+operation or publication permission.
+
 A newer definition cannot be offered as a continuation candidate for a task
 whose history was recorded under format 1: those results were written under a
 different contract and cannot be reinterpreted. See
@@ -70,11 +73,11 @@ different contract and cannot be reinterpreted. See
 
 ### What a revision pins, and what it does not
 
-The revision covers everything that decides what a run *does*: every prompt and
-gate message, every route, every command and timeout, the declared sessions and
-which one is primary, the outcome contracts, and the visit bounds. Change any
-of them and the revision changes. YAML comments and the order of mapping keys
-do not change it; the exact text of a prompt and the order of a sequence do.
+The revision covers the procedure: every prompt and gate message, route,
+command and timeout, declared session, primary session, outcome contract, and
+visit bound. In format 5 it also covers the shared-definition snapshots,
+bindings, and phase labels, descriptions, and membership. YAML comments and
+mapping-key order do not change it; text and sequence order do.
 
 It does **not** pin model responses, binaries, credentials, tool versions, or
 the contents of your working tree. It pins the procedure, not the world.
@@ -103,6 +106,43 @@ Packaged definitions are validated at **daemon startup**. A malformed built-in
 prevents the daemon from serving rather than failing a task later. Your own
 drafts are never parsed at startup, so a half-finished one cannot keep the
 daemon from starting.
+
+## Phases and globally shared steps
+
+The default reader is a compact phase overview. `single-step` shows **Work →
+Review → Decide → Publish**; `bugfix` shows **Reproduce → Diagnose → Fix → Verify
+→ Review → Decide → Publish**; `planning` shows **Propose → Retain proposal →
+Decide**. These are possible phases, not a promise that every one will run.
+
+Each phase shows short possible destinations and any declared publication
+effects. **Possible declared routes** opens the exact conditions and choices;
+**Exact steps and recorded attempts** opens the underlying procedure. On task
+detail, the current engine step identifies its phase, and the attempt count
+comes only from recorded history. Neither a visit nor a finished attempt means
+every branch in that phase succeeded.
+
+Format-5 workflows can reference a global read-only library rather than copy
+shared behavior. The packaged definitions are `review-and-route`, `approval`,
+`review-stop`, `signed-commit`, `signed-push`, and `signed-pr`. Both packaged and
+custom workflows can use them. An invocation supplies workflow-specific
+bindings: evidence, questions, positive review routes, correction destinations,
+engine step names, and named endings. The compiler still validates the complete
+expanded procedure, including every grant and loop bound.
+
+An executable save freezes all used definitions and their content revisions.
+Reading, recovering, and exporting that saved revision never consults the
+current shared library. An exported workflow includes its frozen definitions
+and imports to the same revision. Removing an embedded snapshot with **Use
+current global definition for future saves** is an explicit draft edit affecting
+all invocations of that definition in the draft; saved revisions and tasks stay
+unchanged. The next executable save resolves the global definition again.
+
+An unavailable catalog leaves embedded references usable. An unresolved global
+name, missing or wrongly typed binding, damaged snapshot, invalid expansion, or
+incorrect phase membership refuses validation/save with its location. A failed
+save never displaces the existing executable revision. Adding or modifying the
+global library itself is a daemon-package change, not an operator CRUD action.
+
 
 ## The workflow library
 
@@ -149,15 +189,21 @@ decision cases, gate questions with named answers, retained-result prerequisites
 capture producer and paths, and visit bounds with the gate they reach when
 exhausted. Nothing supported is hidden behind the text editor.
 
-The planning workflow is a packaged, read-only format-4 procedure. It asks the
+Format-5 invocation cards edit the reference and its typed bindings, not a copy
+of the expansion. Object and array bindings use JSON fields that preserve
+incomplete input as draft data until repaired. **Phases** edits readable labels,
+descriptions, and engine-step membership. Frozen revisions stay visible, and
+adopting the current global definition requires an explicit action.
+
+The planning workflow is a packaged, read-only format-5 procedure. It asks the
 planner to create one epic or change proposal, captures its exact proposal
 files, then stops at a gate. Inspect that revision in **Results** and accept it
 before selecting **Finish with accepted result**. Requesting changes returns to
 the planner with the recorded feedback; stopping grants no publication.
 
-New workflows begin as format 4, so Visual and YAML authoring can compose the
-same capture and result-gate flow. Duplicated and imported definitions preserve
-their declared format; a task's retained revision is never upgraded implicitly.
+New workflows begin as format 5. Visual and YAML can reference shared steps and
+compose capture/result-gate flows. Duplicated and imported definitions preserve
+their format and frozen dependencies; retained revisions are never upgraded.
 
 What switching costs you:
 
@@ -210,7 +256,7 @@ will succeed. A failed executable save leaves the last one exactly where it was.
 
 Four ways in, all of which produce a draft and nothing else:
 
-- **New workflow** opens a minimal format-3 example with one agent step and a
+- **New workflow** opens a minimal format-5 example with one agent step and a
   named ending, which you can then build out in either editor. It publishes
   nothing: review, an approval, and the actions it authorizes are things you
   add deliberately.
@@ -240,6 +286,10 @@ Re-importing an unchanged export under the same name is the same procedure and
 reuses the same revision. Importing it under a *different* name is a different
 document, so it gets its own revision. An import whose name collides is refused
 — pick another name, or edit the existing entry.
+When importing into a new entry under another name, change the document's
+top-level `name` to match that entry before saving it executable. A mismatch
+is refused and leaves the imported draft intact. Shared definition names and
+their frozen revisions do not need to change.
 
 ### Archive and restore
 
@@ -295,10 +345,11 @@ committed.
 
 ### Run execution
 
-After the spawn pipeline completes the workspace, the workflow the task was
-accepted with executes as a single sequential run — one step at a time, in
-declaration order, with `decision` routes as the only jumps. At most one step
-runs at a time per task.
+After spawn prepares the workspace, the pinned procedure executes as one
+sequential run: at most one execution step runs per task. Ordinary work steps
+advance in declaration order; decisions, gate answers, captures, and delivery
+steps follow their declared routes. Phases describe this procedure, not a second
+execution order.
 
 Persisted per task: the workflow name and its pinned revision, the run status
 (`running`, `waiting`, `complete`, `failed`), the current step name, and one
@@ -756,6 +807,11 @@ Task detail shows the procedure the task accepted, laid over what actually
 happened. It is addressed by the task's **retained revision**, never by its
 workflow name: editing or archiving the entry in the library changes neither
 this flow nor anything the run recorded.
+
+The compact phase overview is open by default. Expand a phase to inspect every
+attempt at its member steps, including later exception gates grouped under the
+phase they explain. Grouping never changes the step order or hides rejected
+attempts from history.
 
 Declaration and attempt are kept apart, because conflating them is how a run
 gets read as more successful than it was.

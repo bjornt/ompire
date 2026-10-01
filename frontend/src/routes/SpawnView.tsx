@@ -1070,6 +1070,7 @@ export function SpawnView() {
                       Revision{" "}
                       <WorkflowRevision
                         revision={preview.workflow_revision}
+                        defaultOpen
                         summaryLabel="read the whole procedure this launch would accept"
                       />
                     </div>

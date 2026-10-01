@@ -1,0 +1,34 @@
+name: approval
+label: Decide
+description: A human chooses an explicit ending or correction route against the reviewed candidate; only named publication
+  answers grant authority.
+parameters:
+  approval_name:
+    type: string
+    default: approve
+  review_alias:
+    type: string
+    default: verdict
+  evidence:
+    type: object
+  message:
+    type: object
+  choices:
+    type: array
+  metadata:
+    type: object
+steps:
+- name:
+    param: approval_name
+  kind: gate
+  evidence:
+    param: evidence
+  delivery:
+    review:
+      param: review_alias
+    metadata:
+      param: metadata
+  message:
+    param: message
+  choices:
+    param: choices

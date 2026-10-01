@@ -54,6 +54,8 @@ OWNER_BY_PREFIX: dict[str, str] = {
     f"{MODULE}.workflows": "workflows",
     f"{MODULE}.workflow_definitions": "workflows",
     f"{MODULE}.builtin_workflows": "workflows",
+    f"{MODULE}.builtin_workflow_steps": "workflows",
+    f"{MODULE}.workflow_composition": "workflows",
     f"{MODULE}.taskdefinition": "workflows",
     f"{MODULE}.runauthority": "workflows",
     f"{MODULE}.agent": "sessions",

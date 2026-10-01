@@ -756,7 +756,7 @@ def test_a_newer_candidate_cannot_claim_format_1_history(
 ) -> None:
     """The format boundary, enforced where a continuation is offered.
 
-    The packaged `bugfix` is format 3: it reads results by declared name, and
+    The packaged `bugfix` reads results by declared name, and
     it does not declare the steps this task actually ran. Its history recorded
     generic success/failed outcomes that the new contract has no way to
     express. Offering it as a continuation would point a different procedure
@@ -774,13 +774,11 @@ def test_a_newer_candidate_cannot_claim_format_1_history(
         ).json()
         candidate = configuration["workflow_candidate"]
 
-    assert candidate["format"] == 3
     assert candidate["compatible"] is False
     problems = " ".join(candidate["problems"])
     # Both halves are named: the results cannot be reinterpreted, and the
     # steps are not even declared.
     assert "older success/failed envelope" in problems
-    assert "workflow format 3" in problems
     assert "'triage'" in problems
     # The history itself is untouched and still readable.
     from ompire_daemon.registry.workflows import list_step_records

@@ -1860,7 +1860,6 @@ def test_a_retained_revision_is_readable_and_a_damaged_one_is_classified(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["name"] == "bugfix"
-    assert body["format"] == 3
     assert body["primary_session"] == "coder"
     assert body["definition"]["steps"][0]["name"] == "reproduce"
 

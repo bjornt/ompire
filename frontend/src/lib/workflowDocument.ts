@@ -120,6 +120,41 @@ export function documentFormat(document: DraftObject): number | null {
   return null;
 }
 
+/** Canonical execution documents keep editable declarations in composition. */
+export function workflowSource(document: DraftObject): DraftObject {
+  const composition = asObject(document.composition);
+  if (documentFormat(document) !== 5 || composition === null) return document;
+  const source = withKey(document, "composition", undefined);
+  return {
+    ...source,
+    steps: composition.steps,
+    definitions: composition.definitions,
+    stages: composition.stages,
+  };
+}
+
+export function isInvocation(step: DraftObject): boolean {
+  return typeof step.use === "string";
+}
+
+/** Engine identities explicitly declared by source cards, without compiling. */
+export function sourceEngineNames(document: DraftObject, definitions: DraftObject = {}): string[] {
+  return stepObjects(document).flatMap((step) => {
+    if (!isInvocation(step)) return typeof step.name === "string" ? [step.name] : [];
+    const use = asString(step.use) ?? "";
+    const definition = asObject(asObject(document.definitions)?.[use]) ?? asObject(definitions[use]);
+    return asArray(definition?.steps).flatMap((entry) => {
+      const name = asObject(entry)?.name;
+      if (typeof name === "string") return [name];
+      const parameter = asString(asObject(name)?.param);
+      if (parameter === null) return [];
+      const bindings = asObject(step.bindings);
+      const bound = bindings?.[parameter] !== undefined ? bindings[parameter] : asObject(asObject(definition?.parameters)?.[parameter])?.default;
+      return typeof bound === "string" ? [bound] : [];
+    });
+  });
+}
+
 /** The steps as objects. A non-object entry in an invalid draft is kept in
  * the document but has no card of its own; the validation summary names it. */
 export function stepObjects(document: DraftObject): DraftObject[] {
@@ -470,10 +505,121 @@ function rewriteEvidence(
   return next;
 }
 
+/** Bindings are JSON data, but can contain the ordinary structural grammar.
+ * Never inspect prose or literal payloads, nor replace arbitrary strings. */
+function rewriteBinding(node: DraftValue, location: string, context: Context): DraftValue {
+  if (Array.isArray(node)) {
+    return node.map((entry, index) => rewriteBinding(entry, `${location}[${index}]`, context));
+  }
+  const object = asObject(node);
+  if (object === null || object.op === "literal" || "text" in object) return node;
+  if (typeof object.op === "string") {
+    return rewritePredicate(rewriteValue(object, location, context), location, context);
+  }
+  // Only an actual destination node gives a bare `step` string meaning.
+  if (typeof object.step === "string" && Object.keys(object).every((key) => key === "step")) {
+    return rewriteDestination(object, location, context, "is a bound route");
+  }
+  let next = object;
+  if ("steps" in object && ("after" in object || "with_outcome" in object || "required" in object)) {
+    next = withKey(next, "steps", asArray(object.steps).map((entry, index) => rewriteName(entry, "step", context.rewrite.step, `${location}.steps[${index}]`, "selects a bound evidence source", context)));
+    if (object.after !== undefined && object.after !== null) next = withKey(next, "after", rewriteName(object.after, "step", context.rewrite.step, `${location}.after`, "anchors bound evidence freshness", context));
+  }
+  for (const [key, value] of Object.entries(next)) {
+    if (key === "steps" || key === "after") continue;
+    if (key === "authorize") {
+      const grant = asObject(value);
+      if (grant !== null) {
+        next = withKey(next, key, withKey(grant, "steps", asArray(grant.steps).map((entry, index) =>
+          rewriteName(entry, "step", context.rewrite.step, `${location}.authorize.steps[${index}]`, "is an action this answer authorizes", context),
+        )));
+        continue;
+      }
+    }
+    if (key === "approval" || key === "previous") {
+      next = withKey(next, key, rewriteName(value, "step", context.rewrite.step, `${location}.${key}`, "names a bound execution step", context));
+    } else {
+      next = withKey(next, key, rewriteBinding(value, `${location}.${key}`, context));
+    }
+  }
+  return next;
+}
+
+/** Read reference positions from the selected template, with provenance back
+ * to binding JSON. This is not a compiled or persisted execution document. */
+function rewriteTemplateBindings(step: DraftObject, index: number, definition: DraftObject, rewrite: Rewrite, visit: Visit): DraftObject {
+  const bindings = asObject(step.bindings) ?? {};
+  let rewritten = bindings;
+  const provenance = new Map<string, (string | number)[]>();
+  const resolve = (node: DraftValue, location: string, bindingPath?: (string | number)[]): DraftValue => {
+    if (bindingPath !== undefined) provenance.set(location, bindingPath);
+    if (Array.isArray(node)) {
+      const next: DraftValue[] = [];
+      for (const [at, entry] of node.entries()) {
+        const spread = asObject(entry);
+        if (bindingPath === undefined && spread !== null && Object.keys(spread).length === 1 && typeof spread.spread === "string") {
+          const value = bindings[spread.spread] !== undefined ? bindings[spread.spread] : asObject(asObject(definition.parameters)?.[spread.spread])?.default;
+          if (Array.isArray(value)) {
+            for (const [bindingIndex, item] of value.entries()) next.push(resolve(item, `${location}[${next.length}]`, [spread.spread, bindingIndex]));
+            continue;
+          }
+        }
+        next.push(resolve(entry, `${location}[${next.length}]`, bindingPath === undefined ? undefined : [...bindingPath, at]));
+      }
+      return next;
+    }
+    const object = asObject(node);
+    if (object === null) return node;
+    if (bindingPath === undefined && Object.keys(object).length === 1 && typeof object.param === "string") {
+      const value = bindings[object.param] !== undefined ? bindings[object.param] : asObject(asObject(definition.parameters)?.[object.param])?.default;
+      if (value !== undefined) return resolve(value, location, [object.param]);
+      return object;
+    }
+    const next: DraftObject = {};
+    for (const [key, value] of Object.entries(object)) next[key] = resolve(value, `${location}.${key}`, bindingPath === undefined ? undefined : [...bindingPath, key]);
+    return next;
+  };
+  const replace = (node: DraftValue, path: (string | number)[], value: string): DraftValue => {
+    if (path.length === 0) return value;
+    const [key, ...rest] = path;
+    if (Array.isArray(node) && typeof key === "number") return node.map((entry, at) => at === key ? replace(entry, rest, value) : entry);
+    const object = asObject(node);
+    return object === null || typeof key !== "string" ? node : withKey(object, key, replace(object[key], rest, value));
+  };
+  asArray(definition.steps).forEach((entry, templateIndex) => {
+    const template = asObject(resolve(entry, `steps[${templateIndex}]`));
+    if (template === null) return;
+    rewriteStep(template, templateIndex, {}, (reference) => {
+      const path = provenance.get(reference.location);
+      if (path === undefined) return;
+      const location = `steps[${index}].bindings.${path.map((key, at) => typeof key === "number" ? `[${key}]` : `${at === 0 ? "" : "."}${key}`).join("")}`;
+      visit({ ...reference, location, stepIndex: index });
+      const map = reference.kind === "step" ? rewrite.step : reference.kind === "session" ? rewrite.session : rewrite.evidenceAlias;
+      if (map !== undefined && map(reference.name) !== reference.name) {
+        const parameter = path[0];
+        if (typeof parameter === "string" && rewritten[parameter] === undefined) {
+          const fallback = asObject(asObject(definition.parameters)?.[parameter])?.default;
+          if (fallback === undefined) return;
+          rewritten = withKey(rewritten, parameter, fallback);
+        }
+        rewritten = replace(rewritten, path, map(reference.name)) as DraftObject;
+      }
+    });
+  });
+  return step.bindings === undefined && Object.keys(rewritten).length === 0 ? step : withKey(step, "bindings", rewritten);
+}
+
 function rewriteStep(step: DraftObject, index: number, rewrite: Rewrite, visit: Visit): DraftObject {
   const context: Context = { rewrite, visit, stepIndex: index };
   const location = `steps[${index}]`;
   let next = step;
+  if (isInvocation(step)) {
+    const bindings = asObject(step.bindings);
+    if (bindings === null) return step;
+    const rewritten: DraftObject = {};
+    for (const [name, value] of Object.entries(bindings)) rewritten[name] = rewriteBinding(value, `${location}.bindings.${name}`, context);
+    return withKey(step, "bindings", rewritten);
+  }
   if (step.session !== undefined) {
     next = withKey(
       next,
@@ -699,6 +845,7 @@ function rewriteDocument(
   document: DraftObject,
   rewrite: Rewrite,
   visit: Visit = () => {},
+  definitions: DraftObject = {},
 ): DraftObject {
   let next = document;
   if (rewrite.session !== undefined) {
@@ -713,12 +860,29 @@ function rewriteDocument(
     const primary = asString(document.primary);
     if (primary !== null) next = withKey(next, "primary", rewrite.session(primary));
   }
-  return withSteps(
+  next = withSteps(
     next,
-    asArray(next.steps).map((step, index) =>
-      isDraftObject(step) ? rewriteStep(step, index, rewrite, visit) : step,
-    ),
+    asArray(next.steps).map((step, index) => {
+      if (!isDraftObject(step)) return step;
+      if (isInvocation(step)) {
+        const use = asString(step.use) ?? "";
+        const definition = asObject(asObject(document.definitions)?.[use]) ?? asObject(definitions[use]);
+        if (definition !== null) return rewriteTemplateBindings(step, index, definition, rewrite, visit);
+      }
+      return rewriteStep(step, index, rewrite, visit);
+    }),
   );
+  if (next.stages !== undefined) {
+    next = withKey(next, "stages", asArray(next.stages).map((entry, stageIndex) => {
+      const stage = asObject(entry);
+      if (stage === null) return entry;
+      const context: Context = { rewrite, visit, stepIndex: -1 };
+      return withKey(stage, "steps", asArray(stage.steps).map((name, index) =>
+        rewriteName(name, "step", rewrite.step, `stages[${stageIndex}].steps[${index}]`, "belongs to this phase", context),
+      ));
+    }));
+  }
+  return next;
 }
 
 /** Every structural reference to a name, with where it is and what it does.
@@ -730,12 +894,18 @@ export function referencesTo(
   document: DraftObject,
   kind: Reference["kind"],
   name: string,
+  definitions: DraftObject = {},
 ): Reference[] {
   const found: Reference[] = [];
   rewriteDocument(document, {}, (reference) => {
-    if (reference.kind === kind && reference.name === name) found.push(reference);
-  });
+    if (reference.kind === kind && reference.name === name && !found.some((entry) => entry.location === reference.location)) found.push(reference);
+  }, definitions);
   return found;
+}
+
+/** Update references to an engine identity, without renaming a local invocation. */
+export function renameEngineReferences(document: DraftObject, from: string, to: string, definitions: DraftObject = {}): DraftObject {
+  return rewriteDocument(document, { step: (name) => name === from ? to : name }, undefined, definitions);
 }
 
 /** Rename a step everywhere the grammar puts a step name.
@@ -747,15 +917,17 @@ export function renameStep(
   document: DraftObject,
   from: string,
   to: string,
+  definitions: DraftObject = {},
 ): { document: DraftObject; error: string | null } {
+  const invocation = stepObjects(document).some((step) => step.name === from && isInvocation(step));
   const occurrences = stepNames(document).filter((name) => name === from).length;
-  if (occurrences > 1) {
+  if (occurrences > 1 || (!invocation && sourceEngineNames(document, definitions).filter((name) => name === from).length > 1)) {
     return {
       document,
       error: `Two steps are called “${from}”. Give them distinct names before renaming, so the references can be moved to the right one.`,
     };
   }
-  const renamed = rewriteDocument(document, { step: (name) => (name === from ? to : name) });
+  const renamed = invocation ? document : renameEngineReferences(document, from, to, definitions);
   return {
     document: withSteps(
       renamed,

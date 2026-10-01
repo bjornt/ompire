@@ -1,7 +1,7 @@
 # Workflow definitions
 
-The exact format-1 document contract: what a definition may say, what changes
-its revision, and how the interpreter reads it.
+The bounded workflow document contract: formats 1–5, shared-step composition,
+content identity, and interpreter rules.
 
 For what revisions *mean* operationally — pinning, coexistence, uncertainty
 pauses, legacy continuation — see the operator reference,
@@ -25,6 +25,12 @@ Operator definitions arrive over the authoring API and are retained by an
 executable save. They are the same grammar read by the same loader; nothing
 about a definition is different because a person wrote it rather than the
 package.
+
+Shared definitions are global YAML resources under
+`daemon/src/ompire_daemon/builtin_workflow_steps/`. They are readable through
+`GET /api/workflow-steps` as `{definitions: {name: snapshot}}`; they are not a
+second operator-owned registry. `workflow_composition.py` owns their validation
+and expansion, with no registry or task dependency.
 
 `workflow_definitions.py` owns the data model, the loader, canonicalization,
 YAML emission, and the evaluator. It imports nothing from the registry, the
@@ -52,23 +58,24 @@ steps:
 
 | Field | Required | Meaning |
 |---|---|---|
-| `format` | yes | `1` through `4`. The grammar **and** its interpretation. |
+| `format` | yes | `1` through `5`. The grammar **and** its interpretation. |
 | `name` | yes | Slug: lowercase alphanumerics and single hyphens |
 | `sessions` | yes | Nonempty, unique, slug-format. `judge` is reserved. |
 | `primary` | yes | Must be a declared session. Explicit — never defaulted. |
-| `steps` | yes | Nonempty, ordered, uniquely named. `judge` is reserved. |
+| `steps` | yes | Nonempty, ordered, uniquely named; format 5 also accepts shared invocations. `judge` is reserved. |
 
 Unknown fields are refused, not ignored, everywhere in the document. So are
 duplicate step names, undeclared session references, and routes to steps that
 do not exist. Every refusal carries a location like
 `steps[2].prompt.parts[0].value` and a reason.
 
-### The four formats
+### The five formats
 
-All four are implemented and all four execute. An older format is **frozen**:
-a retained format-1 document is always read under format-1 rules, and its
-canonical bytes — and so its revision — are unchanged by anything later formats
-added. A field belonging to one format is refused in the others, so the
+All five execute. An older format is **frozen**: its canonical bytes and
+interpretation are unaffected by newer vocabulary. Format-5 primitives inherit
+format-4 rules; composition is resolved and validated before execution. The
+table below describes the underlying formats 1–4.
+A field belonging to one format is refused in the others, so the
 vocabularies cannot be mixed by accident.
 
 | | Format 1 | Format 2 | Format 3 | Format 4 |
@@ -98,6 +105,94 @@ Format 4 reuses format 3's rules, adds no authority, and can retain a declared
 selection as a durable result. A capture's exact accepted revision can satisfy
 only a gate that binds that capture; accepting another result or merely
 answering the gate is insufficient.
+
+## Shared invocations and phases (format 5)
+
+Format 5 accepts ordinary steps and shared invocations in the same ordered
+`steps` sequence. Optional top-level `definitions` embeds verified snapshots;
+optional `stages` declares readable phases. `composition` is reserved for the
+canonical retained form, not combined with source `definitions` or `stages`.
+
+```yaml
+format: 5
+name: review-only
+sessions: [main]
+primary: main
+steps:
+  - name: review
+    kind: review
+  - name: finish
+    use: review-stop
+    bindings:
+      gate_name: finish
+      review_name: review
+      message:
+        parts: [{text: "Inspect the review and stop without publishing."}]
+      result: reviewed-unpublished
+```
+
+An invocation has exactly `name`, `use`, and `bindings`. Its local source name
+identifies the invocation, not necessarily an engine step; templates receive
+engine identities through explicit string parameters. Unknown names, unknown
+bindings, missing required parameters, or wrong types carry source locations.
+
+### Shared definition snapshots
+
+Each snapshot has `name`, nonblank `label`, `description`, `parameters`, `steps`,
+and `revision`. Parameters map names to `{type, default?}`; types are `boolean`,
+`integer`, `number`, `string`, `array`, or `object`. Booleans are not numbers.
+An omitted default makes the parameter required. Defaults and bindings are
+bounded JSON data. At most 32 parameters and 256 ordinary template steps are
+allowed, and a workflow retains at most 64 used definitions.
+
+An exact `{param: parameter_name}` node substitutes one bound data value. An
+exact `{spread: parameter_name}` node is allowed only as an array element and
+splices an array parameter. Substituted values are not visited as templates
+again. Keys and substrings are never interpolated, templates cannot invoke
+other templates, and kinds remain ordinary literal step kinds. The existing
+step-count, nesting, node-count, and 1 MiB bounds apply to source, expansion,
+and retained composition; no template bypasses ordinary graph or authority
+validation.
+
+The shared revision is `sha256:` plus the SHA-256 of sorted-key, compact UTF-8
+JSON for the normalized snapshot without its `revision` field. Packaged YAML
+may omit `revision`; catalog loading computes it. Embedded snapshots must
+provide a matching digest. Embedded definitions override the current catalog.
+
+Prospective validation/save consults the catalog only for referenced definitions
+not embedded in the source. Canonical retained decoding requires every used
+snapshot and never reads that catalog. Unused embedded source definitions are
+not retained; canonical snapshots must match the set actually used.
+
+### Phase declarations
+
+`stages` is an ordered sequence of `{name, label, description, steps}`. Names are
+unique, non-reserved slugs; labels are nonblank. Members are engine step names,
+not invocation IDs. Every engine step must belong to exactly one phase, members
+follow declaration order within a phase, and phases follow their first member's
+declaration order. A later exhaustion gate may belong to an earlier phase:
+grouping is explanation, never execution ordering.
+
+Without explicit stages, compilation derives one per source declaration using
+its invocation label/description and expanded IDs, or the ordinary step's name
+and kind. These derived phases are frozen just like authored ones.
+
+### Canonical retention and export
+
+The canonical format-5 document stores normalized ordinary execution `steps`
+plus `composition: {steps, definitions, stages}`. Composition `steps` retains
+source invocations with normalized default bindings and canonical ordinary
+source steps. All used snapshot bytes and phase descriptions participate in the
+workflow revision. The runtime model exposes only expanded ordinary steps to
+execution; immutable composition metadata exists for authoring and inspection.
+
+Retained reads verify the stored content identity and snapshot digests, rebuild
+the expansion from frozen source, and require it to match the retained execution
+steps. Export emits source steps, embedded definitions, and stages and verifies
+that importing the result produces the same workflow revision. No installed
+shared definition is needed for that roundtrip. Formats 1–4 retain their
+original canonicalization.
+
 
 ## Steps
 
@@ -742,9 +837,10 @@ exact source token until somebody edits it, and an integer past 2^53 is never
 narrowed to JavaScript's safe range.
 
 **Neither direction converts a format.** An unsupported `format` is reported as
-unsupported in `validation`; it is never read under the newest rules. Both
-supported formats round-trip under their own rules, and a format-1 document
-stays format 1.
+unsupported in `validation`; it is never read under the newest rules.
+Every supported format round-trips under its own rules; a format-1 document
+stays format 1. Canonical format-5 input is converted to self-contained editable
+source, preserving references rather than presenting an expanded copy.
 
 `daemon/tests/test_workflow_definitions.py` covers the bounds and the scalar
 round trips; `test_workflow_library_rest.py` covers the route's refusals and
@@ -796,6 +892,9 @@ not an authoring one — an operator adds a workflow through the library instead
    built-in stops the daemon.
 2. Its revision changes, so new launches pin the new one and existing tasks
    keep theirs. No migration is needed — that is the point.
+   For a shared definition, edit its resource in `builtin_workflow_steps/`.
+   New executable saves that resolve it from the catalog freeze the new bytes;
+   existing workflow revisions and embedded exports keep their old snapshots.
 3. If you changed what an existing *retained* document means rather than
    writing a new document, you need a new format version instead. Retained
    documents must keep being read under the rules they were written for.

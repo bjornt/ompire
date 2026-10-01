@@ -54,6 +54,11 @@ marked *conditional*. It is a list of what the run *may* do, not a promise
 about the path it will take. Every model consumer is one of these rows; nothing
 runs a model outside them.
 
+The pinned procedure opens as a compact phase overview, with possible
+destinations and publication effects. Expand a phase for exact routes and
+execution details. Per-agent model selectors remain attached to their engine
+step names, not to the phase headings.
+
 It also states **what this workflow could publish**: which privileged effects
 it declares and which decision would have to authorize each — or that it
 publishes nothing, which is worth knowing before you launch rather than after.
@@ -306,7 +311,7 @@ itself readable there.
 
 Three workflows ship as read-only examples, and all are available to every
 project:
-- `single-step` — one agent step. The agent works, you review, you ship.
+- `single-step` — Work → Review → Decide → Publish, using one agent conversation.
 - `bugfix` — QA tries to reproduce, a coder diagnoses, QA tries again with
   those findings if the first attempt failed, then fix and verify. Routing is
   decided by explicit rules over declared results; where the evidence does not
@@ -335,17 +340,25 @@ not a new conversation and not a failure.
 
 Open **Workflows**. There is no daemon release and no restart in this loop.
 
-1. **Start from something.** *New workflow* opens a minimal format-4 example
+1. **Start from something.** *New workflow* opens a minimal format-5 example
    that publishes nothing;
    *Duplicate* copies a saved revision — including a packaged one — under a name
    you choose; *Import YAML…* reads a local file into the editor. You can also
    paste. The name is permanent and cannot collide with a built-in or with an
    archived name.
+   If an imported document still declares its old name, edit its top-level
+   `name` in YAML to match the new entry before saving it executable. Its
+   shared references and embedded snapshots remain unchanged.
 2. **Edit it.** *Visual* gives you an agents panel and a list of step cards;
    *YAML* gives you the text. They are two views of one draft, and switching
    between them is neither a save nor a launch. Save a draft whenever you like:
    drafts take any text, valid or not, and survive a refresh and a daemon
    restart. Saving one never changes what the workflow would launch.
+   **Add a shared step** selects a globally defined review, approval, or signed
+   delivery operation without copying its execution steps. Set its local
+   invocation name and typed bindings. Object and array bindings use JSON
+   fields; incomplete input can be saved as a draft but not made executable.
+   **Phases** sets readable labels, descriptions, and engine-step membership.
 3. **Validate.** You get either the revision identity and a readable reading of
    the definition, or the location and reason of the problem. In the visual
    editor the reason also appears at the field it is about, with a link that
@@ -355,6 +368,10 @@ Open **Workflows**. There is no daemon release and no restart in this loop.
 4. **Save an executable revision.** This validates the text again, retains it,
    and makes it what a new launch of this name pins. Until you do, the entry is
    *draft only* and cannot be launched at all. Saving starts nothing.
+   Shared definitions are frozen with this revision. Duplicated or imported
+   workflows keep embedded snapshots; **Use current global definition for
+   future saves** explicitly removes one snapshot from the draft so the next
+   executable save can resolve it again. It never updates a saved task.
 5. **Launch it.** *Launch in Spawn* carries the workflow into the ordinary
    Spawn form; you still choose the project and the profile and review the
    resolution before submitting. The preview shows the exact revision you are
@@ -363,8 +380,8 @@ Open **Workflows**. There is no daemon release and no restart in this loop.
 
 ### Building one without writing YAML
 
-Everything either format supports has a form control, so you never have to open
-the text editor to write a branching workflow.
+Every supported workflow format has visual controls. Format-5 shared-step
+bindings use typed fields, including JSON editors for structured data.
 
 - **Agents** names the conversations. A step assigned to an agent that ran
   earlier continues *that* conversation, which is how QA verifies a fix in the
@@ -391,6 +408,10 @@ the text editor to write a branching workflow.
 - **Publication** is one card per effect: a local signed commit, a push, a pull
   request. Each names the approval that can permit it and the action whose
   result it consumes.
+- **Shared invocations** keep the global definition reference and its bindings.
+  A workflow supplies its own evidence, routing, choices, and endings while
+  the shared template supplies the operation. Global definitions are packaged
+  read-only resources available to both built-in and custom workflows.
 
 ### Ending a workflow with a publication
 
@@ -407,6 +428,11 @@ A workflow publishes nothing until you say how. Four cards:
    another answer that publishes nothing.
 4. The **delivery** cards themselves, in that order, the last of which ends the
    run at a named result.
+
+In format 5, reuse **approval** and the appropriate **signed-commit**,
+**signed-push**, or **signed-pr** definition instead of repeating ordinary
+declarations. The approving choice must still name the exact expanded action
+chain, and the completed workflow still passes all authority and loop checks.
 
 The editor and the daemon check the shape for you: an answer must go straight
 to the first action it grants, every action must name the same approval and its
@@ -425,9 +451,9 @@ Two things are the same in both views and editable in neither. The workflow's
 **name** is the entry's identity — renaming means creating a separate workflow
 — and its **format** is the rules it is read under, so an existing format-1 or
 format-2 workflow keeps being read under its own format rather than being
-upgraded. That includes not being able to publish: review and delivery steps
-exist only in format 3, so to publish from an older workflow, duplicate it into
-a new one and add them.
+upgraded. Formats 1 and 2 cannot publish: review and delivery exist only in
+format 3 onwards. Start a new format-5 workflow to declare shared review,
+approval, and delivery rather than silently upgrading an older procedure.
 
 Once you change something visually, saving rewrites the document: its layout is
 normalized and YAML comments are dropped. What it means does not change.

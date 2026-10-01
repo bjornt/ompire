@@ -1,0 +1,29 @@
+name: signed-commit
+label: Local signed commit
+description: Trusted publication effects linked to one exact approving answer. No effect is permitted without its
+  declared grant.
+parameters:
+  approval_step:
+    type: string
+    default: approve
+  mode:
+    type: string
+    default: squash
+  result:
+    type: string
+  commit_step:
+    type: string
+    default: commit
+steps:
+- name:
+    param: commit_step
+  kind: delivery
+  action: commit
+  mode:
+    param: mode
+  approval:
+    param: approval_step
+  next:
+    complete: true
+    result:
+      param: result

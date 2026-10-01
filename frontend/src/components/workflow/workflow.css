@@ -13,18 +13,45 @@
   gap: 0.6rem;
 }
 
-.flowLayout {
+.flowPhases {
+  list-style: none;
+  margin: 0;
+  padding: 0;
   display: flex;
-  align-items: flex-start;
-  gap: 1rem;
+  flex-direction: column;
+  gap: 0.75rem;
 }
 
-.flowOverview {
-  position: sticky;
-  top: 0.5rem;
-  flex: 0 0 auto;
-  overflow: auto;
-  max-height: 70vh;
+.flowPhase {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.75rem;
+  min-width: 0;
+}
+
+.flowPhase.current {
+  border: 2px solid var(--accent);
+}
+
+.flowCurrent {
+  color: var(--accent);
+}
+
+.flowPhaseDescription {
+  white-space: pre-wrap;
+  margin: 0.35rem 0;
+}
+
+.flowPhaseRoutes, .flowRecorded, .flowInternals, .flowRouteDetails {
+  margin-top: 0.6rem;
+}
+
+.flowInternals > summary, .flowRouting > summary, .flowRouteDetails > summary {
+  cursor: pointer;
+}
+
+.flowInternals > .flowCards {
+  margin-top: 0.6rem;
 }
 
 .flowCards {
@@ -39,14 +66,8 @@
 }
 
 @media (max-width: 900px) {
-  .flowLayout {
-    flex-direction: column;
-  }
-  .flowOverview {
-    position: static;
-    max-height: none;
-    width: 100%;
-    order: 2;
+  .flowPhase {
+    padding: 0.5rem;
   }
   .flowCards {
     order: 1;

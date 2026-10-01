@@ -89,6 +89,20 @@ export interface ModelProfile {
   updated_at: string;
 }
 
+/** Read-only shared templates. Their JSON bytes use the workflow lossless codec. */
+export interface SharedWorkflowDefinition extends DraftObject {
+  name: string;
+  label: string;
+  description: string;
+  revision: string;
+  parameters: DraftObject;
+  steps: DraftObject[];
+}
+
+export interface WorkflowStepCatalog {
+  definitions: Record<string, SharedWorkflowDefinition>;
+}
+
 /** One declared step of a workflow, as the daemon describes it (ADR-0026).
  * `role` is set only for agent steps — a command, decision, or gate has no
  * model and is never shown with one. `conditional` says a decision declared

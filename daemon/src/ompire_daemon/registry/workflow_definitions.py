@@ -17,6 +17,7 @@ ADR-0028 (docs/adr/0028-retain-declarative-workflow-revisions.md)
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -99,6 +100,23 @@ def _decode(revision: str, format_version: int, raw: str) -> WorkflowRevision:
         raise WorkflowRevisionUnavailableError(
             revision, UNAVAILABLE_INTEGRITY, f"stored document is not JSON: {exc}"
         ) from exc
+    if format_version == 5:
+        # A composed revision pins both source and expansion. Verify its stored
+        # content before structural validation can classify tampering as invalid.
+        try:
+            content = json.dumps(
+                document, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise WorkflowRevisionUnavailableError(
+                revision, UNAVAILABLE_INTEGRITY, "stored document is not bounded JSON"
+            ) from exc
+        if "sha256:" + hashlib.sha256(content).hexdigest() != revision:
+            raise WorkflowRevisionUnavailableError(
+                revision, UNAVAILABLE_INTEGRITY,
+                "stored document does not match its content identity",
+            )
     try:
         definition = load_canonical_document(document)
     except WorkflowDocumentError as exc:

@@ -294,7 +294,6 @@ async function openProcedure() {
   await screen.findByTestId("task-metadata");
   const panel = await screen.findByTestId("pinned-procedure");
   const user = userEvent.setup();
-  await user.click(within(panel).getByText(/read the pinned procedure/));
   await within(panel).findByTestId("workflow-revision-flow");
   return { panel, user };
 }
@@ -353,6 +352,8 @@ describe("the pinned procedure", () => {
   it("links a consumed reference to the exact attempt that produced it", async () => {
     stubFetch();
     const { panel, user } = await openProcedure();
+    const phase = within(panel).getByTestId("flow-phase-verify");
+    await user.click(within(phase).getByText(/Exact steps and recorded attempts/));
     const link = within(panel).getByTestId("evidence-source-3-fix");
     expect(link.textContent).toContain("fix attempt 2");
     await user.click(link);
@@ -385,6 +386,34 @@ describe("the pinned procedure", () => {
     expect(within(panel).getByTestId("flow-step-reproduce").textContent).toContain(
       "not on the record",
     );
+  });
+
+  it("shows pinned phases and current progress without predicting alternative visits", async () => {
+    stubFetch({
+      ...PINNED_DEFINITION,
+      format: 5,
+      composition: {
+        steps: [], definitions: {},
+        stages: [
+          { name: "work", label: "Prepare", description: "Produce the fix", steps: ["reproduce", "fix"] },
+          { name: "verification", label: "Verify", description: "Check the evidence", steps: ["verify"] },
+          { name: "stop", label: "Stop", description: "Possible bounded ending", steps: ["give-up"] },
+        ],
+      },
+    });
+    const { panel, user } = await openProcedure();
+    const verification = within(panel).getByTestId("flow-phase-verification");
+    expect(verification.getAttribute("aria-current")).toBe("step");
+    expect(within(verification).getByTestId("flow-phase-attempts").textContent).toContain("2 attempts");
+    expect(within(panel).getByTestId("flow-phase-stop").hasAttribute("aria-current")).toBe(false);
+    expect(within(within(panel).getByTestId("flow-phase-stop")).getByTestId("flow-phase-attempts").textContent).toContain("0 attempts");
+    const internals = within(verification).getByTestId("flow-step-verify").closest("details")!;
+    expect(internals.open).toBe(false);
+    await user.click(within(verification).getByText(/Exact steps and recorded attempts/));
+    expect(internals.open).toBe(true);
+    expect(within(verification).getByTestId("attempt-verify-3").textContent).toContain("rejected");
+    await user.click(within(verification).getByTestId("evidence-source-3-fix"));
+    expect(within(panel).getByTestId("flow-step-fix").closest("details")!.open).toBe(true);
   });
 
   it("shows the declared routes without claiming which one a run took", async () => {

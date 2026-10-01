@@ -1,4 +1,4 @@
-# The simplest complete workflow (format 3): one session does the work, an
+# The simplest complete workflow (format 5): one session does the work, an
 # independent reviewer reads what it would publish, and a person decides what
 # happens to it.
 #
@@ -7,18 +7,13 @@
 #     └── comments ──┘                        ├─ a pushed branch
 #                                             └─ a pull request
 #
-# Two things are deliberately different from the pre-format-3 version.
-#
-# The correction loop is *declared*. Review comments used to be pushed
-# straight into the agent's conversation by the daemon, which meant the loop
-# was invisible in the flow, unbounded, and impossible to route around. Here it
-# is an ordinary edge back to `work`, carrying the reviewer's own report, and
-# the three-visit bound on `work` is what ends it.
+# Review, approval, and signed delivery reference the global shared-step library.
+# The correction loop remains explicit and bounded by work's three-visit limit.
 #
 # And publishing is a step. Finishing the work authorizes nothing; the gate
 # asks, and each approving answer grants exactly the chain it names. Choosing
 # to finish without publishing is a real, named ending — not a failure.
-format: 3
+format: 5
 name: single-step
 sessions: [main]
 primary: main
@@ -106,163 +101,162 @@ steps:
             operator reviews and edits them before anything is published, and nothing
             you write here authorizes publishing.
 
-  # 2. Independent review of exactly what would be published. Bounded for the
-  #    whole run: three reviews, and no answer anywhere refills them.
   - name: review
-    kind: review
-    max_visits: 3
-    on_exhausted: {step: review-exhausted}
-    evidence:
-      work: {steps: [work]}
-
-  # 3. Where the verdict goes. Comments with a complete report go back to the
-  #    worker; anything else stops for a person, because "the reviewer could
-  #    not finish" is not an opinion about the code.
-  - name: route-review
-    kind: decision
-    evidence:
-      verdict: {steps: [review]}
-    cases:
+    use: review-and-route
+    bindings:
+      review_evidence:
+        work:
+          steps:
+          - work
+      route_evidence:
+        verdict:
+          steps:
+          - review
+      approved_cases:
       - when:
           op: eq
           left:
             op: get
-            value: {op: evidence, name: verdict}
-            keys: [outcome, result]
-          right: {op: literal, value: "approved"}
-        next: {step: approve}
-      - when:
-          op: all
-          of:
-            - op: eq
-              left:
-                op: get
-                value: {op: evidence, name: verdict}
-                keys: [outcome, result]
-              right: {op: literal, value: "comments"}
-            # Only a complete report may drive an automatic correction. A
-            # truncated or missing one is handed to a person instead of to an
-            # agent that would treat a fragment as the whole opinion.
-            - op: eq
-              left:
-                op: get
-                value: {op: evidence, name: verdict}
-                keys: [outcome, findings_state]
-              right: {op: literal, value: "complete"}
-        next: {step: work}
-    otherwise: {step: review-exhausted}
-
-  # 4. The decision. Every answer is explicit, none is preselected, and each
-  #    approving one names exactly the actions it permits.
+            value:
+              op: evidence
+              name: verdict
+            keys:
+            - outcome
+            - result
+          right:
+            op: literal
+            value: approved
+        next:
+          step: approve
+      correction_step: work
   - name: approve
-    kind: gate
-    evidence:
-      verdict: {steps: [review]}
-      work: {steps: [work]}
-    delivery:
-      review: verdict
-      metadata:
-        message:
-          parts:
-            - value:
-                op: get
-                value: {op: evidence, name: work}
-                keys: [outcome, artifacts, commit_message]
-              format: text
-        pr_title:
-          parts:
-            - value:
-                op: get
-                value: {op: evidence, name: work}
-                keys: [outcome, artifacts, pr_title]
-              format: text
-        pr_body:
-          parts:
-            - value:
-                op: get
-                value: {op: evidence, name: work}
-                keys: [outcome, artifacts, pr_body]
-              format: text
-    message:
-      separator: ""
-      parts:
-        - text: "The reviewer approved this change.\n\nWhat was done:\n"
+    use: approval
+    bindings:
+      approval_name: approve
+      evidence:
+        verdict:
+          steps:
+          - review
+        work:
+          steps:
+          - work
+      message:
+        separator: ''
+        parts:
+        - text: |
+            The reviewer approved this change.
+
+            What was done:
         - value:
             op: get
-            value: {op: evidence, name: work}
-            keys: [outcome, artifacts, summary_text]
+            value:
+              op: evidence
+              name: work
+            keys:
+            - outcome
+            - artifacts
+            - summary_text
           format: text
-        - text: |-
+        - text: |2-
 
 
             Choose what happens to it. Finishing here is a complete, useful ending:
             the work stays on the branch and nothing is published. The other answers
             each authorize exactly the actions they name, against the content that
             was just reviewed, and nothing further.
-    choices:
+      metadata:
+        message:
+          parts:
+          - value:
+              op: get
+              value:
+                op: evidence
+                name: work
+              keys:
+              - outcome
+              - artifacts
+              - commit_message
+            format: text
+        pr_title:
+          parts:
+          - value:
+              op: get
+              value:
+                op: evidence
+                name: work
+              keys:
+              - outcome
+              - artifacts
+              - pr_title
+            format: text
+        pr_body:
+          parts:
+          - value:
+              op: get
+              value:
+                op: evidence
+                name: work
+              keys:
+              - outcome
+              - artifacts
+              - pr_body
+            format: text
+      choices:
       - id: finish
         label: Finish without publishing
-        next: {complete: true, result: done-unpublished}
+        next:
+          complete: true
+          result: done-unpublished
       - id: request-changes
         label: Send it back with changes
         feedback_required: true
-        next: {step: work}
+        next:
+          step: work
       - id: commit-locally
         label: Make a local signed commit and stop
-        next: {step: commit-local}
-        authorize: {steps: [commit-local]}
+        next:
+          step: commit-local
+        authorize:
+          steps:
+          - commit-local
       - id: push-branch
         label: Sign and push the branch
-        next: {step: commit-for-push}
-        authorize: {steps: [commit-for-push, push-branch]}
+        next:
+          step: commit-for-push
+        authorize:
+          steps:
+          - commit-for-push
+          - push-branch
       - id: open-pr
         label: Sign, push, and open a pull request
-        next: {step: commit-for-pr}
-        authorize: {steps: [commit-for-pr, push-for-pr, open-pr]}
-
-  # 5. The three chains. They are separate steps rather than one chain the
-  #    operator truncates, because a grant names actions: "sign it" and "sign
-  #    it, push it, and open a pull request" are different permissions, and an
-  #    answer must not be able to grow into the next one.
+        next:
+          step: commit-for-pr
+        authorize:
+          steps:
+          - commit-for-pr
+          - push-for-pr
+          - open-pr
   - name: commit-local
-    kind: delivery
-    action: commit
-    mode: squash
-    approval: approve
-    next: {complete: true, result: committed-locally}
-
+    use: signed-commit
+    bindings:
+      commit_step: commit-local
+      approval_step: approve
+      result: committed-locally
   - name: commit-for-push
-    kind: delivery
-    action: commit
-    mode: squash
-    approval: approve
-    next: {step: push-branch}
-  - name: push-branch
-    kind: delivery
-    action: push
-    previous: commit-for-push
-    approval: approve
-    next: {complete: true, result: pushed}
-
+    use: signed-push
+    bindings:
+      commit_step: commit-for-push
+      approval_step: approve
+      result: pushed
+      push_step: push-branch
   - name: commit-for-pr
-    kind: delivery
-    action: commit
-    mode: squash
-    approval: approve
-    next: {step: push-for-pr}
-  - name: push-for-pr
-    kind: delivery
-    action: push
-    previous: commit-for-pr
-    approval: approve
-    next: {step: open-pr}
-  - name: open-pr
-    kind: delivery
-    action: pr
-    previous: push-for-pr
-    approval: approve
-    next: {complete: true, result: pull-request-opened}
-
+    use: signed-pr
+    bindings:
+      commit_step: commit-for-pr
+      approval_step: approve
+      result: pull-request-opened
+      push_step: push-for-pr
+      pr_step: open-pr
   # 6. The two exhaustion endings. Both are outside the loops they end, and
   #    neither offers publication: nothing here was approved.
   - name: correction-exhausted
@@ -281,27 +275,58 @@ steps:
         next: {complete: true, result: stopped-unpublished}
 
   - name: review-exhausted
-    kind: gate
-    evidence:
-      verdict: {steps: [review], required: false}
-    message:
-      separator: ""
-      parts:
-        - text: "Review did not approve this change. The last attempt ended as "
+    use: review-stop
+    bindings:
+      message:
+        separator: ''
+        parts:
+        - text: 'Review did not approve this change. The last attempt ended as '
         - value:
             op: coalesce
             values:
-              - op: get
-                value: {op: evidence, name: verdict}
-                keys: [outcome, result]
-              - {op: literal, value: "(no review was recorded)"}
+            - op: get
+              value:
+                op: evidence
+                name: verdict
+              keys:
+              - outcome
+              - result
+            - op: literal
+              value: (no review was recorded)
           format: text
         - text: |-
             .
 
             Review allows three attempts per run and no answer here refills them.
             Nothing was approved, so nothing can be published from this run.
-    choices:
-      - id: stop
-        label: Stop without publishing
-        next: {complete: true, result: stopped-unreviewed}
+      result: stopped-unreviewed
+
+stages:
+- name: work
+  label: Work
+  description: Carry out the task and address complete review comments within the correction budget.
+  steps:
+  - work
+  - correction-exhausted
+- name: review
+  label: Review
+  description: Independently review the candidate; complete comments return to work.
+  steps:
+  - review
+  - route-review
+  - review-exhausted
+- name: decide
+  label: Decide
+  description: Choose correction, no publication, a local commit, a push, or a pull request.
+  steps:
+  - approve
+- name: publish
+  label: Publish
+  description: Carry out only the signed delivery chain you authorized.
+  steps:
+  - commit-local
+  - commit-for-push
+  - push-branch
+  - commit-for-pr
+  - push-for-pr
+  - open-pr

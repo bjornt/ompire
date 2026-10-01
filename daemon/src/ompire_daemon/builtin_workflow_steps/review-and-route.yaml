@@ -1,0 +1,76 @@
+name: review-and-route
+label: Review
+description: Independent review; complete comments return to correction, and all other non-approval results stop
+  for a person.
+parameters:
+  review_name:
+    type: string
+    default: review
+  route_name:
+    type: string
+    default: route-review
+  max_visits:
+    type: integer
+    default: 3
+  exhausted_step:
+    type: string
+    default: review-exhausted
+  review_evidence:
+    type: object
+  route_evidence:
+    type: object
+  approved_cases:
+    type: array
+  correction_step:
+    type: string
+steps:
+- name:
+    param: review_name
+  kind: review
+  max_visits:
+    param: max_visits
+  on_exhausted:
+    step:
+      param: exhausted_step
+  evidence:
+    param: review_evidence
+- name:
+    param: route_name
+  kind: decision
+  evidence:
+    param: route_evidence
+  cases:
+  - spread: approved_cases
+  - when:
+      op: all
+      of:
+      - op: eq
+        left:
+          op: get
+          value:
+            op: evidence
+            name: verdict
+          keys:
+          - outcome
+          - result
+        right:
+          op: literal
+          value: comments
+      - op: eq
+        left:
+          op: get
+          value:
+            op: evidence
+            name: verdict
+          keys:
+          - outcome
+          - findings_state
+        right:
+          op: literal
+          value: complete
+    next:
+      step:
+        param: correction_step
+  otherwise:
+    step:
+      param: exhausted_step

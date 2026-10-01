@@ -100,8 +100,7 @@ def test_an_unknown_entry_is_a_404(client: TestClient, headers) -> None:
 def test_creating_without_a_source_opens_a_valid_starter(
     client: TestClient, headers
 ) -> None:
-    """The starter has to be a real format-4 definition, not a sketch: an
-    operator's first Validate must succeed."""
+    """The starter must be executable: an operator's first Validate succeeds."""
     detail = create(client, headers, name="starter").json()
     assert detail["entry"]["current_revision"] is None
     checked = client.post(
@@ -110,9 +109,7 @@ def test_creating_without_a_source_opens_a_valid_starter(
         json={"yaml": detail["draft_yaml"], "name": "starter"},
     )
     assert checked.status_code == 200
-    # The starter is format 4 and publishes nothing: review, an approval, and
-    # the actions it authorizes are all things an author adds deliberately.
-    assert checked.json()["format"] == 4
+    # It publishes nothing: authority is something an author adds deliberately.
     assert checked.json()["descriptor"]["actions"] == []
     assert [s["name"] for s in checked.json()["descriptor"]["steps"]] == [
         "work",
@@ -145,7 +142,6 @@ def test_duplicating_a_builtin_copies_the_procedure_under_a_new_name(
     assert "name: my-bugfix" in detail["draft_yaml"]
     saved = save_revision(client, headers, "my-bugfix", detail["draft_yaml"]).json()
     assert saved["entry"]["current_revision"] != bugfix["revision"]
-    assert saved["entry"]["current_format"] == 3
     assert saved["entry"]["available"] is True
 
 
@@ -721,3 +717,89 @@ def test_conversion_changes_no_library_state_and_authorizes_no_save(
         ]
         is None
     )
+
+
+COMPOSED_STOP = """
+format: 5
+name: custom
+sessions: [main]
+primary: main
+steps:
+  - name: check
+    kind: review
+  - name: finish-phase
+    use: review-stop
+    bindings:
+      gate_name: finish
+      review_name: check
+      result: stopped
+      message: {parts: [{text: Nothing is published.}]}
+"""
+
+
+def test_shared_catalog_is_authenticated_and_read_only(client: TestClient, headers):
+    assert client.get("/api/workflow-steps").status_code in (401, 403)
+    response = client.get("/api/workflow-steps", headers=headers)
+    assert response.status_code == 200
+    definitions = response.json()["definitions"]
+    assert definitions["review-stop"]["name"] == "review-stop"
+    assert definitions["review-stop"]["parameters"]["message"]["type"] == "object"
+    assert client.post("/api/workflow-steps", headers=headers, json={}).status_code == 405
+
+
+def test_visual_composition_validation_and_frozen_source_roundtrip(
+    client: TestClient, headers, monkeypatch
+):
+    from ompire_daemon import workflow_composition
+
+    authored = convert(client, headers, yaml=COMPOSED_STOP).json()
+    assert authored["validation"]["ok"] is True
+    assert authored["document"]["steps"][1]["use"] == "review-stop"
+    canonical = authored["validation"]["definition"]
+    assert [step["name"] for step in canonical["steps"]] == ["check", "finish"]
+
+    def unavailable():
+        raise AssertionError("canonical and portable authoring must not read the global catalog")
+
+    monkeypatch.setattr(workflow_composition, "shared_step_catalog", unavailable)
+    editable = convert(client, headers, document=canonical).json()
+    assert editable["validation"]["revision"] == authored["validation"]["revision"]
+    assert editable["document"]["steps"][1]["use"] == "review-stop"
+    assert "composition" not in editable["document"]
+    assert editable["document"]["definitions"]["review-stop"] == canonical["composition"]["definitions"]["review-stop"]
+    assert convert(client, headers, yaml=editable["yaml"]).json()["validation"]["revision"] == authored["validation"]["revision"]
+
+
+def test_an_invalid_invocation_stays_editable_with_a_located_failure(client: TestClient, headers):
+    broken = COMPOSED_STOP.replace("      result: stopped\n", "")
+    response = convert(client, headers, yaml=broken)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["document"]["steps"][1]["use"] == "review-stop"
+    assert body["validation"]["ok"] is False
+    assert body["validation"]["location"] == "steps[1].bindings.result"
+
+
+def test_saved_composition_reads_and_exports_without_the_packaged_catalog(
+    client: TestClient, headers, monkeypatch
+):
+    from ompire_daemon import workflow_composition
+    from ompire_daemon.registry.workflow_definitions import clear_cache
+    from ompire_daemon.workflow_definitions import load_definition
+
+    assert create(client, headers, name="custom", yaml=COMPOSED_STOP).status_code == 201
+    saved = save_revision(client, headers, "custom", COMPOSED_STOP)
+    assert saved.status_code == 200
+    pinned = saved.json()["entry"]["current_revision"]
+    clear_cache()
+
+    def unavailable():
+        raise AssertionError("retained reads must not require packaged templates")
+
+    monkeypatch.setattr(workflow_composition, "shared_step_catalog", unavailable)
+    retained = client.get(f"/api/workflows/revisions/{pinned}", headers=headers)
+    assert retained.status_code == 200
+    assert retained.json()["definition"]["composition"]["steps"][1]["use"] == "review-stop"
+    exported = client.get(f"/api/workflows/revisions/{pinned}/yaml", headers=headers)
+    assert exported.status_code == 200
+    assert load_definition(exported.json()["yaml"]).revision == pinned

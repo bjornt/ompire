@@ -179,6 +179,7 @@ from ompire_daemon.work.tasks import (
     get_task,
     purge_task,
 )
+from ompire_daemon.workflow_composition import shared_step_catalog
 from ompire_daemon.workflow_definitions import (
     GateStep,
     UnsupportedWorkflowFormatError,
@@ -188,6 +189,7 @@ from ompire_daemon.workflow_definitions import (
     definition_from_document,
     describe,
     emit_draft_yaml,
+    export_document,
     export_yaml,
     load_canonical_document,
     load_definition,
@@ -420,7 +422,7 @@ def export_workflow_revision_route(
 
 
 # The starter a new workflow opens on: the smallest thing that is a real
-# format-4 definition. One agent step that gets the operator's prompt, and an
+# format-5 definition. One agent step that gets the operator's prompt, and an
 # ending that says what finishing meant — because format 2 onwards does not
 # let a run stop by falling off the end of the list.
 #
@@ -436,7 +438,7 @@ STARTER_TEMPLATE = """\
 # This workflow publishes nothing. To publish, add a `review` step, a gate
 # whose `delivery` binds that review, and the `delivery` actions one of its
 # choices authorizes.
-format: 4
+format: 5
 name: {name}
 sessions: [main]
 primary: main
@@ -665,6 +667,15 @@ def _validated(text: str) -> WorkflowRevision:
         raise _document_error(exc) from exc
 
 
+@router.get("/workflow-steps")
+def list_workflow_steps_route() -> dict[str, Any]:
+    """Read-only packaged templates for prospective workflow authoring."""
+    try:
+        return {"definitions": shared_step_catalog()}
+    except WorkflowDocumentError as exc:
+        raise _document_error(exc) from exc
+
+
 @router.get("/workflow-library", response_model=list[WorkflowLibraryEntryOut])
 def list_workflow_library_route(
     engine: Engine = Depends(_engine),
@@ -804,13 +815,12 @@ class WorkflowDocumentInvalidOut(BaseModel):
 
 
 class WorkflowDocumentOut(BaseModel):
-    # The parsed draft, exactly as submitted — *not* a canonicalized
-    # definition. Unknown fields and incomplete values survive, so an editor
-    # reading this back cannot silently drop what it does not understand.
+    # The parsed draft, not a canonicalized execution graph. Unknown fields
+    # and incomplete values survive. Valid format-5 canonical input becomes
+    # self-contained editable source, preserving invocations and snapshots.
     document: dict[str, Any]
-    # The text form of that same draft. For YAML input it is the submitted
-    # text unchanged, so opening the visual editor and closing it again
-    # rewrites nothing.
+    # The text form of that same draft. Authored YAML input stays unchanged;
+    # canonical format-5 input is emitted as editable source instead.
     yaml: str
     validation: WorkflowDocumentValidOut | WorkflowDocumentInvalidOut
 
@@ -844,10 +854,10 @@ def convert_workflow_document_route(body: WorkflowDocumentIn) -> dict[str, Any]:
     """Translate one draft between text and data, and say what it means.
 
     YAML in goes through the production bounded parser — the same depth, node,
-    size, anchor, and scalar rules a save applies — and the submitted text
-    comes back untouched. Data in is bounded first, emitted through the
-    revision emitter, and then *parsed back*: what is returned as `document`
-    is what the loader would see, so the two representations cannot drift.
+    size, anchor, and scalar rules a save applies — and authored text comes
+    back untouched. Data in is bounded first, emitted through the revision
+    emitter, and parsed back. Valid retained composition becomes self-contained
+    source in either direction; executable expansion is never the editor's draft.
 
     Neither direction converts a format. An unsupported version is reported as
     an unsupported version; syntactically safe conversion is not semantic
@@ -874,11 +884,17 @@ def convert_workflow_document_route(body: WorkflowDocumentIn) -> dict[str, Any]:
             document = parse_yaml_document(text)
         except WorkflowDocumentError as exc:
             raise _document_error(exc) from exc
-    return {
-        "document": document,
-        "yaml": text,
-        "validation": _draft_validation(document, body.name),
-    }
+    validation = _draft_validation(document, body.name)
+    if document.get("format") == 5 and "composition" in document:
+        # The editor owns invocations, not a duplicate expanded execution graph.
+        try:
+            source = export_document(document)
+        except WorkflowDocumentError:
+            pass  # Keep malformed canonical data visible beside its refusal.
+        else:
+            document = source
+            text = emit_draft_yaml(document)
+    return {"document": document, "yaml": text, "validation": validation}
 
 
 @router.get("/workflow-library/{name}", response_model=WorkflowLibraryDetailOut)

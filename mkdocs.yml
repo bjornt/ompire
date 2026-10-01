@@ -154,3 +154,4 @@ nav:
           - 0037 Capture results before accepted handoffs: adr/0037-capture-workflow-results-before-accepted-handoffs.md
           - 0038 Own modules, compose local transactions: adr/0038-own-modules-and-compose-local-transactions.md
           - 0039 Workspace resources behind isolation: adr/0039-own-workspace-resources-behind-isolation.md
+          - 0040 Resolve shared workflow steps before retention: adr/0040-resolve-shared-workflow-steps-before-retention.md

@@ -115,6 +115,13 @@ only in comments would produce the same revision and the second save would
 silently overwrite the first. A stale submission is a `409` carrying the
 entry's actual version, and writes nothing. There is no force parameter.
 
+`GET /api/workflow-steps` reads the global packaged shared-step catalog as
+`{definitions: {name: snapshot}}`. It grants no authority and mutates no library
+entry. Format-5 validation and executable saves resolve missing source references
+through that catalog and freeze the used snapshots. Retained reads, task launch,
+recovery, and export use the saved composition only. See
+[Shared invocations and phases](workflow-definitions.md#shared-invocations-and-phases-format-5).
+
 `/api/workflow-library/document` is deliberately outside all of that. It
 translates a draft between text and structured data for an editing client and
 takes no reservation, because it writes nothing: no row, no revision, no event.

@@ -658,6 +658,11 @@ function PinnedProcedure({
 }) {
   const openAttempt = (seq: number) => {
     const card = document.getElementById(`attempt-${seq}`);
+    let ancestor = card?.parentElement;
+    while (ancestor != null) {
+      if (ancestor instanceof HTMLDetailsElement) ancestor.open = true;
+      ancestor = ancestor.parentElement;
+    }
     card?.scrollIntoView?.({ block: "nearest" });
     card?.focus();
   };
@@ -671,12 +676,14 @@ function PinnedProcedure({
       </p>
       <WorkflowRevision
         revision={revision}
+        defaultOpen
         current={workflow.step}
         summaryLabel="read the pinned procedure and what happened at each step"
         extras={(_index, name, step) => {
           const attempts = attemptsFor(workflow, name);
           const declaresEvidence = Object.keys(asObject(step.evidence) ?? {}).length > 0;
           return {
+            recordedAttempts: attempts.length,
             className: name === workflow.step ? "flowCard current" : undefined,
             badge:
               attempts.length === 0 ? (

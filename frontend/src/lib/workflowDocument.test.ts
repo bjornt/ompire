@@ -7,6 +7,8 @@ import {
   renameEvidenceAlias,
   renameSession,
   renameStep,
+  workflowSource,
+  sourceEngineNames,
   type DraftObject,
 } from "./workflowDocument";
 import {
@@ -15,6 +17,7 @@ import {
   readDeliveryAction,
   readDeliveryGate,
   readFlow,
+  readStages,
   unknownStepFields,
 } from "./workflowFlow";
 
@@ -400,5 +403,66 @@ describe("format 4 capture and result gates", () => {
       kind: "captured",
       to: { kind: "step", step: "decide" },
     });
+  });
+});
+
+describe("format 5 retained composition", () => {
+  it("uses pinned phases without changing primitive indexes or hiding authority", () => {
+    const definition = deliveringDraft();
+    definition.format = 5;
+    definition.composition = {
+      steps: [{ name: "shared-approval", use: "approval", bindings: {} }],
+      definitions: {},
+      stages: [
+        { name: "work", label: "Work", description: "Produce evidence", steps: ["work", "review"] },
+        { name: "publish", label: "Publish", description: "Only after approval", steps: ["approve", "commit", "push"] },
+      ],
+    };
+    const stages = readStages(definition);
+    expect(stages[1].steps.map((step) => [step.index, step.name])).toEqual([[2, "approve"], [3, "commit"], [4, "push"]]);
+    expect(stages[1].routes.some((edge) => edge.kind === "authorize")).toBe(true);
+    expect(stages[1].routes.some((edge) => edge.from === "commit" && edge.to.kind === "step" && edge.to.step === "push")).toBe(false);
+    expect(stages[1].routes.some((edge) => edge.to.kind === "complete" && edge.to.result === "published")).toBe(true);
+    const source = workflowSource(definition);
+    expect(source.steps).toEqual([{ name: "shared-approval", use: "approval", bindings: {} }]);
+    expect(source).not.toHaveProperty("composition");
+    expect(source.stages).toEqual((definition.composition as DraftObject).stages);
+  });
+
+  it("rewrites only template-declared references in bindings, including splices and defaults", () => {
+    const source = draft();
+    source.format = 5;
+    source.definitions = {
+      route: {
+        parameters: { correction: { type: "string", default: "reproduce" } },
+        steps: [{ name: { param: "engine_name" }, kind: "decision", cases: [{ spread: "routes" }], otherwise: { step: { param: "correction" } } }],
+      },
+    };
+    (source.steps as DraftObject[]).push({
+      name: "shared-routing", use: "route", bindings: {
+        engine_name: "route-shared",
+        prose: "reproduce",
+        routes: [{ when: { op: "eq", left: { op: "count", step: "reproduce" }, right: { op: "literal", value: { step: "reproduce" } } }, next: { step: "reproduce" } }],
+      },
+    });
+    source.stages = [{ name: "work", label: "reproduce", description: "reproduce", steps: ["reproduce", "route-shared"] }];
+    const renamed = renameStep(source, "reproduce", "repro").document;
+    const invocation = (renamed.steps as DraftObject[])[3];
+    const bindings = invocation.bindings as DraftObject;
+    expect(bindings.correction).toBe("repro");
+    expect(bindings.prose).toBe("reproduce");
+    const route = (bindings.routes as DraftObject[])[0];
+    expect(route.next).toEqual({ step: "repro" });
+    expect((route.when as DraftObject).left).toEqual({ op: "count", step: "repro" });
+    expect((route.when as DraftObject).right).toEqual({ op: "literal", value: { step: "reproduce" } });
+    expect(renamed.stages).toEqual([{ name: "work", label: "reproduce", description: "reproduce", steps: ["repro", "route-shared"] }]);
+    expect(renamed.definitions).toBe(source.definitions);
+    expect(referencesTo(source, "step", "reproduce").map((reference) => reference.location)).toContain("steps[3].bindings.routes[0].next.step");
+    expect(sourceEngineNames(renamed)).toContain("route-shared");
+    expect(renameStep(renamed, "shared-routing", "local-routing").document.stages).toEqual(renamed.stages);
+  });
+
+  it("does not invent execution routes for an unresolved invocation", () => {
+    expect(readFlow({ format: 5, steps: [{ name: "review", use: "missing", bindings: {} }] }).edges).toEqual([]);
   });
 });

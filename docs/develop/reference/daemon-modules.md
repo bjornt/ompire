@@ -105,7 +105,9 @@ owners have not moved yet — but never transport, commands, or projections.
 |---|---|
 | `db.py` | Engine, schema definition, WAL configuration. Note it does *not* enable `PRAGMA foreign_keys` — see [Database schema](database-schema.md#reference-safety-without-global-fk-enforcement). |
 | `model_config.py` | The vocabularies every model consumer agrees on: thinking levels, the four abstract roles, and the pure `RoleBinding` value with its validation. No persistence, no SQLAlchemy. |
-| `workflow_definitions.py` | The workflow document in both formats: immutable data model, strict format-aware YAML loader, canonicalization and content identity, verified YAML emission, the bounded three-valued evaluator, result contracts, and evidence selection. Imports nothing from the registry or the task model. See [Workflow definitions](workflow-definitions.md). |
+| `workflow_definitions.py` | The workflow document in formats 1–5: immutable data model, strict format-aware YAML loader, canonicalization and content identity, verified YAML emission, the bounded three-valued evaluator, result contracts, and evidence selection. Imports nothing from the registry or the task model. See [Workflow definitions](workflow-definitions.md). |
+| `workflow_composition.py` | Prospective shared-step catalog resolution, typed structural substitution, bounded expansion, phase validation, and frozen composition verification. Reuses ordinary graph/reference/authority checks; retained decoding never consults the global catalog. |
+| `builtin_workflow_steps/` | Read-only globally reusable YAML definitions for review, approval, and signed delivery, shipped as package resources. Both built-in and custom workflows reference them. |
 | `migrate.py` | Runs Alembic migrations at startup. |
 | `registry/sessions.py` | Session identity, `(task_id, name)` |
 | `registry/workflows.py` | Workflow runs, step records, and the atomic waiting, retry, and gate-decision transitions |

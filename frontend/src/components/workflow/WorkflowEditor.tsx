@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DELIVERY_ACTIONS,
   DELIVERY_METADATA_FIELDS,
@@ -12,15 +12,18 @@ import {
   documentFormat,
   evidenceAliases,
   fallThrough,
+  isInvocation,
   insertStep,
   moveStep,
   referencesTo,
   removeStep,
   renameEvidenceAlias,
   renameSession,
+  renameEngineReferences,
   renameStep,
   sessionNames,
   stepNames,
+  sourceEngineNames,
   stepObjects,
   updateStep,
   withKey,
@@ -29,6 +32,8 @@ import {
   type Reference,
   type StepKindName,
 } from "../../lib/workflowDocument";
+import { listWorkflowSteps } from "../../lib/api";
+import { numberToken, parseLossless, stringifyLossless } from "../../lib/losslessJson";
 import { isBounded, unknownStepFields } from "../../lib/workflowFlow";
 import {
   CheckField,
@@ -43,7 +48,7 @@ import {
 } from "./expressions";
 import { FieldProblem, ProblemProvider } from "./problem";
 import { useProblemWithin, useRowKeys } from "./problemContext";
-import type { WorkflowDraftValidation } from "../../types";
+import type { WorkflowDraftValidation, WorkflowStepCatalog } from "../../types";
 import "./workflow.css";
 
 /** The visual editor: the whole supported vocabulary, as forms.
@@ -136,6 +141,19 @@ export function WorkflowEditor({
   const [renameError, setRenameError] = useState<string | null>(null);
   const [announcement, setAnnouncement] = useState("");
   const cardRefs = useRef<Map<number, HTMLDetailsElement>>(new Map());
+  const [catalog, setCatalog] = useState<WorkflowStepCatalog["definitions"]>({});
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  const [sharedChoice, setSharedChoice] = useState("");
+  useEffect(() => {
+    if (format !== 5) return;
+    let active = true;
+    void listWorkflowSteps().then(
+      (answer) => { if (active) setCatalog(answer.definitions); },
+      (error: unknown) => { if (active) setCatalogError(error instanceof Error ? error.message : String(error)); },
+    );
+    return () => { active = false; };
+  }, [format]);
+  const engineNames = sourceEngineNames(document, catalog);
 
   const accepted = validation !== null && validation.ok === true ? validation : null;
   const refusal = validation !== null && validation.ok === false ? validation : null;
@@ -155,7 +173,7 @@ export function WorkflowEditor({
 
   const grammarFor = (index: number): GrammarContext => ({
     format,
-    steps: names,
+    steps: engineNames,
     aliases: evidenceAliases(steps[index] ?? {}),
   });
 
@@ -232,6 +250,7 @@ export function WorkflowEditor({
           readOnly={readOnly}
           onError={setRenameError}
         />
+        {format === 5 && <StagesEditor document={document} onChange={onChange} validation={accepted} />}
         {renameError !== null && (
           <p className="editorProblem" data-testid="editor-rename-error">
             {renameError}
@@ -242,6 +261,7 @@ export function WorkflowEditor({
           {steps.map((step, index) => {
             const name = asString(step.name);
             const kind = asString(step.kind) ?? "";
+            const invocation = isInvocation(step);
             const next = fallThrough(document, index);
             return (
               <li key={keys.at(index)}>
@@ -264,7 +284,7 @@ export function WorkflowEditor({
                   }
                 >
                   <summary>
-                    {index + 1}. {name ?? "unnamed step"} · {kind || "no kind"}
+                    {index + 1}. {name ?? "unnamed step"} · {invocation ? `shared ${asString(step.use)}` : kind || "no kind"}
                     {problemIndex === index && " · has a problem"}
                   </summary>
 
@@ -306,6 +326,7 @@ export function WorkflowEditor({
                       index={index}
                       name={name}
                       readOnly={readOnly}
+                      catalog={catalog}
                       onRemove={() => {
                         keys.removed(index);
                         onChange((current) => removeStep(current, index));
@@ -320,13 +341,24 @@ export function WorkflowEditor({
                     name={name}
                     index={index}
                     readOnly={readOnly}
+                    localInvocation={invocation}
                     onRename={(to) => {
-                      const result = renameStep(document, name ?? "", to);
+                      const result = renameStep(document, name ?? "", to, catalog);
                       setRenameError(result.error);
                       if (result.error === null) onChange(() => result.document);
                     }}
                   />
 
+                  {invocation ? (
+                    <InvocationEditor
+                      step={step}
+                      index={index}
+                      document={document}
+                      catalog={catalog}
+                      onEdit={(update) => editStep(index, update)}
+                      onChange={onChange}
+                    />
+                  ) : <>
                   <SelectField
                     label="Kind"
                     value={kind}
@@ -389,11 +421,12 @@ export function WorkflowEditor({
                     step={step}
                     index={index}
                     format={format}
-                    names={names}
+                    names={engineNames}
                     readOnly={readOnly}
                     onEdit={(update) => editStep(index, update)}
                     onDocument={onChange}
                   />
+                  </>}
 
                   <UnknownFields step={step} />
                 </details>
@@ -402,6 +435,27 @@ export function WorkflowEditor({
           })}
         </ol>
 
+        {format === 5 && <div className="editorSection">
+          <h3>Add a shared step</h3>
+          <p className="hint">References stay references. Definitions are frozen on executable save; loading this catalog never changes this draft.</p>
+          {catalogError !== null && <p className="editorProblem">Shared catalog unavailable: {catalogError}. Embedded definitions and YAML references are still retained.</p>}
+          <SelectField label="Shared definition" value={sharedChoice} options={Object.entries({ ...catalog, ...(asObject(document.definitions) ?? {}) }).map(([name, definition]) => ({ value: name, label: asString(asObject(definition)?.label) ?? name }))} onChange={setSharedChoice} testId="editor-shared-definition" />
+          <button type="button" className="ghostButton" disabled={readOnly || sharedChoice === ""} data-testid="editor-add-shared-step" onClick={() => {
+            const definition = asObject(asObject(document.definitions)?.[sharedChoice]) ?? catalog[sharedChoice];
+            if (definition === undefined || definition === null) return;
+            let name = sharedChoice;
+            let suffix = 2;
+            while (names.includes(name)) name = `${sharedChoice}-${suffix++}`;
+            const bindings: DraftObject = {};
+            for (const [key, value] of Object.entries(asObject(definition.parameters) ?? {})) {
+              const parameter = asObject(value);
+              if (parameter?.default !== undefined) bindings[key] = parameter.default;
+            }
+            keys.inserted(steps.length);
+            onChange((current) => insertStep(current, asArray(current.steps).length, { name, use: sharedChoice, bindings }));
+            setOpen(new Set([steps.length]));
+          }}>Add shared step</button>
+        </div>}
         <div className="editorActions">
           {STEP_KINDS.map((kind) => (
             <button
@@ -433,6 +487,144 @@ export function WorkflowEditor({
   );
 }
 
+function bindingJsonText(value: DraftValue | undefined): string {
+  return typeof value === "string" ? value : value === undefined ? "" : stringifyLossless(value);
+}
+
+function JsonBindingField({ value, type, location, label, onChange }: {
+  value: DraftValue | undefined;
+  type: "array" | "object";
+  location: string;
+  label: string;
+  onChange: (value: DraftValue) => void;
+}) {
+  const [text, setText] = useState(() => bindingJsonText(value));
+  const emitted = useRef(value);
+  useEffect(() => {
+    if (value !== emitted.current) setText(bindingJsonText(value));
+    emitted.current = value;
+  }, [value]);
+  const wrongType = value !== undefined && (type === "array" ? !Array.isArray(value) : asObject(value) === null);
+  const invalid = useProblemWithin(location);
+  return <div className="editorField" data-invalid={invalid || wrongType ? "true" : undefined}>
+    <label>{label} ({type}, JSON)
+      <textarea value={text} rows={5} data-testid={`field-${location}`} onChange={(event) => {
+        const raw = event.target.value;
+        setText(raw);
+        let next: DraftValue;
+        try { next = parseLossless(raw) as DraftValue; }
+        catch { next = raw; }
+        emitted.current = next;
+        onChange(next);
+      }} />
+    </label>
+    {wrongType && <p className="editorProblem">Not a JSON {type} yet. Your input is retained in the draft as written; repair it before saving an executable revision.</p>}
+    <FieldProblem location={location} />
+  </div>;
+}
+
+function InvocationEditor({ step, index, document, catalog, onEdit, onChange }: {
+  step: DraftObject;
+  index: number;
+  document: DraftObject;
+  catalog: WorkflowStepCatalog["definitions"];
+  onEdit: (update: (step: DraftObject) => DraftObject) => void;
+  onChange: (update: (document: DraftObject) => DraftObject) => void;
+}) {
+  const use = asString(step.use) ?? "";
+  const frozen = asObject(asObject(document.definitions)?.[use]);
+  const definition = frozen ?? catalog[use];
+  const bindings = asObject(step.bindings) ?? {};
+  const parameters = asObject(definition?.parameters) ?? {};
+  const editBinding = (name: string, value: DraftValue | undefined) => onEdit((current) => withKey(current, "bindings", withKey(asObject(current.bindings) ?? {}, name, value)));
+  const [bindingError, setBindingError] = useState<string | null>(null);
+  return <fieldset className="editorSection" data-testid={`editor-invocation-${index}`}>
+    <legend>Shared invocation</legend>
+    <p><code>{use}</code> — {asString(definition?.label) ?? "Definition unavailable"}</p>
+    {typeof definition?.description === "string" && <p className="hint">{definition.description}</p>}
+    <FieldProblem location={`steps[${index}].use`} />
+    {frozen !== null ? <>
+      <p data-testid={`editor-frozen-definition-${index}`}>Frozen definition: <code>{asString(frozen.revision) ?? "revision missing"}</code>. Every invocation of <code>{use}</code> in this draft uses these exact bytes.</p>
+      <button type="button" className="ghostButton" disabled={catalog[use] === undefined} data-testid={`editor-adopt-definition-${index}`} onClick={() => onChange((current) => withKey(current, "definitions", withKey(asObject(current.definitions) ?? {}, use, undefined)))}>Use current global definition for future saves</button>
+      <p className="hint">This explicitly removes the embedded snapshot for all invocations of this definition in this draft. Saved revisions and tasks remain unchanged.{catalog[use] === undefined ? " No current global definition is available." : ` Current global revision: ${catalog[use].revision}.`}</p>
+    </> : <p className="hint">Uses the global definition when a new executable revision is saved.{definition === undefined ? " The catalog could not resolve this reference; it is kept, not expanded or discarded." : ` Current catalog revision: ${asString(definition.revision) ?? "not supplied"}.`}</p>}
+    <FieldProblem location={`definitions.${use}`} />
+    {bindingError !== null && <p className="editorProblem">{bindingError}</p>}
+    {Object.entries(parameters).map(([name, parameter]) => {
+      const schema = asObject(parameter);
+      const type = asString(schema?.type);
+      const location = `steps[${index}].bindings.${name}`;
+      const value = bindings[name];
+      const label = `${name} (${type ?? "unknown type"})`;
+      const declaresIdentity = type === "string" && asArray(definition?.steps).some((entry) => asObject(asObject(entry)?.name)?.param === name);
+      const wrongScalarType = value !== undefined && ((type === "string" && typeof value !== "string") || (type === "boolean" && typeof value !== "boolean") || ((type === "integer" || type === "number") && numberToken(value) === null));
+      return <div key={name} className="editorRow">
+        {type === "array" || type === "object" ? <JsonBindingField value={value} type={type} label={name} location={location} onChange={(next) => editBinding(name, next)} />
+          : type === "boolean" ? <SelectField label={label} value={value === true ? "true" : value === false ? "false" : ""} options={[{ value: "true", label: "true" }, { value: "false", label: "false" }]} location={location} onChange={(next) => editBinding(name, next === "true")} />
+          : type === "integer" || type === "number" ? <NumberField label={label} value={value} allowEmpty location={location} onChange={(next) => editBinding(name, next)} />
+          : declaresIdentity ? <StepNameField name={asString(value === undefined ? schema?.default : value)} index={index} readOnly={false} location={location} label={label} testId={`field-${location}`} onRename={(to) => {
+            const from = asString(value === undefined ? schema?.default : value);
+            if (from !== null && sourceEngineNames(document, catalog).filter((identity) => identity === from).length > 1) {
+              setBindingError(`Engine identity “${from}” is ambiguous. Repair duplicate declarations in YAML before renaming it.`);
+              return;
+            }
+            setBindingError(null);
+            onChange((current) => updateStep(from === null ? current : renameEngineReferences(current, from, to, catalog), index, (existing) => withKey(existing, "bindings", withKey(asObject(existing.bindings) ?? {}, name, to))));
+          }} />
+          : <TextField label={label} value={asString(value) ?? ""} location={location} onChange={(next) => editBinding(name, next)} />}
+        {wrongScalarType && <p className="editorProblem">Existing binding has a different JSON type: <code>{stringifyLossless(value)}</code>. It is kept until you edit or omit it.</p>}
+        {value === undefined && <p className="hint">{schema?.default === undefined ? "Required binding is not supplied." : `Omitted: uses the definition's frozen default ${stringifyLossless(schema.default)}.`}</p>}
+        {value !== undefined && <button type="button" className="ghostButton" onClick={() => editBinding(name, undefined)}>Omit {name}{schema?.default === undefined ? "" : " and use its default"}</button>}
+      </div>;
+    })}
+    {Object.keys(bindings).filter((name) => !(name in parameters)).map((name) => <div key={name}>
+      <p className="editorProblem">Unknown binding <code>{name}</code>: <code>{stringifyLossless(bindings[name])}</code>. Kept as written; remove it explicitly or edit it in YAML.</p>
+      <FieldProblem location={`steps[${index}].bindings.${name}`} />
+      <button type="button" className="ghostButton" onClick={() => editBinding(name, undefined)}>Remove binding {name}</button>
+    </div>)}
+    <FieldProblem location={`steps[${index}].bindings`} />
+  </fieldset>;
+}
+
+function StagesEditor({ document, onChange, validation }: {
+  document: DraftObject;
+  onChange: (update: (document: DraftObject) => DraftObject) => void;
+  validation: ({ ok: true } & import("../../types").WorkflowValidation) | null;
+}) {
+  const stages = asArray(document.stages);
+  const keys = useRowKeys();
+  const edit = (index: number, update: (stage: DraftObject) => DraftObject) => onChange((current) => withKey(current, "stages", asArray(current.stages).map((entry, at) => at === index ? update(asObject(entry) ?? {}) : entry)));
+  return <fieldset className="editorSection" data-testid="editor-stages">
+    <legend>Phases</legend>
+    <p className="hint">Phases group engine step IDs, not invocation names. Labels, descriptions and membership are retained with the procedure. With no explicit phases, saving derives one per source declaration.</p>
+    {validation !== null && <p className="hint">Engine steps in the last valid check: {stepNames(validation.definition).join(", ")}</p>}
+    {stages.map((entry, index) => {
+      const stage = asObject(entry);
+      if (stage === null) return <p className="editorProblem" key={keys.at(index)}>Phase {index + 1} is not an object; kept as written, repair it in YAML.</p>;
+      return <fieldset className="editorSection" key={keys.at(index)}>
+        <legend>Phase {index + 1}</legend>
+        {(["name", "label", "description"] as const).map((field) => <TextField key={field} label={`Phase ${field}`} value={asString(stage[field]) ?? ""} location={`stages[${index}].${field}`} onChange={(next) => edit(index, (current) => withKey(current, field, next))} />)}
+        <JsonBindingField value={stage.steps} type="array" label="Engine step membership" location={`stages[${index}].steps`} onChange={(next) => edit(index, (current) => withKey(current, "steps", next))} />
+        <div className="editorActions">
+          {[-1, 1].map((direction) => <button type="button" key={direction} className="ghostButton" disabled={index + direction < 0 || index + direction >= stages.length} onClick={() => {
+            keys.moved(index, index + direction);
+            onChange((current) => {
+              const next = [...asArray(current.stages)];
+              const [moved] = next.splice(index, 1);
+              next.splice(index + direction, 0, moved);
+              return withKey(current, "stages", next);
+            });
+          }}>Move phase {direction < 0 ? "up" : "down"}</button>)}
+          <button type="button" className="ghostButton" onClick={() => { keys.removed(index); onChange((current) => withKey(current, "stages", asArray(current.stages).filter((_, at) => at !== index))); }}>Remove phase</button>
+        </div>
+      </fieldset>;
+    })}
+    <button type="button" className="ghostButton" onClick={() => { keys.inserted(stages.length); onChange((current) => withKey(current, "stages", [...asArray(current.stages), { name: "", label: "", description: "", steps: [] }])); }}>Add phase</button>
+    {document.stages !== undefined && <button type="button" className="ghostButton" onClick={() => onChange((current) => withKey(current, "stages", undefined))}>Derive phases from source steps on save</button>}
+    <FieldProblem location="stages" />
+  </fieldset>;
+}
+
 /** A rename is committed, not typed.
  *
  * Every keystroke rewriting every reference would churn the document and make
@@ -443,11 +635,19 @@ function StepNameField({
   index,
   readOnly,
   onRename,
+  location = `steps[${index}].name`,
+  label = "Name",
+  testId = `editor-name-${index}`,
+  localInvocation = false,
 }: {
   name: string | null;
   index: number;
   readOnly: boolean;
   onRename: (to: string) => void;
+  location?: string;
+  label?: string;
+  testId?: string;
+  localInvocation?: boolean;
 }) {
   const [typed, setTyped] = useState<string | null>(null);
   const value = typed ?? name ?? "";
@@ -461,13 +661,13 @@ function StepNameField({
   };
   return (
     <div className="editorField">
-      <label htmlFor={`step-name-${index}`}>Name</label>
+      <label htmlFor={`step-name-${location}`}>{label}</label>
       <input
-        id={`step-name-${index}`}
+        id={`step-name-${location}`}
         type="text"
         value={value}
         readOnly={readOnly}
-        data-testid={`editor-name-${index}`}
+        data-testid={testId}
         onChange={(event) => setTyped(event.target.value)}
         onBlur={commit}
         onKeyDown={(event) => {
@@ -478,11 +678,9 @@ function StepNameField({
         }}
       />
       <p className="hint">
-        Renaming moves every route, selector, and visit count that names this
-        step. It never rewrites an instruction that happens to contain the same
-        words.
+        {localInvocation ? "This is the invocation's local identity. Engine step IDs remain the explicitly bound names below." : "Renaming moves every route, selector, visit count and phase membership that names this engine step. Prose and literal data are never rewritten."}
       </p>
-      <FieldProblem location={`steps[${index}].name`} />
+      <FieldProblem location={location} />
     </div>
   );
 }
@@ -504,18 +702,24 @@ function RemoveStepButton({
   index,
   name,
   readOnly,
+  catalog,
   onRemove,
 }: {
   document: DraftObject;
   index: number;
   name: string | null;
   readOnly: boolean;
+  catalog: WorkflowStepCatalog["definitions"];
   onRemove: () => void;
 }) {
   const [confirming, setConfirming] = useState(false);
   const references = useMemo(
-    () => (name === null ? [] : referencesTo(document, "step", name).filter((r) => r.stepIndex !== index)),
-    [document, name, index],
+    () => {
+      const step = stepObjects(document)[index];
+      const identities = new Set([...(name === null ? [] : [name]), ...(step === undefined || !isInvocation(step) ? [] : sourceEngineNames({ ...document, steps: [step] }, catalog))]);
+      return [...identities].flatMap((identity) => referencesTo(document, "step", identity, catalog)).filter((reference) => reference.stepIndex !== index);
+    },
+    [document, name, index, catalog],
   );
   if (!confirming) {
     return (

@@ -74,6 +74,51 @@ export interface Flow {
   edges: FlowEdge[];
 }
 
+export interface FlowStage {
+  name: string | null;
+  label: string;
+  description: string | null;
+  steps: FlowStep[];
+  /** Only declared exits and authority grants, never predicted branches. */
+  routes: FlowEdge[];
+  missing: string[];
+}
+
+export function readStages(document: DraftObject, flow = readFlow(document)): FlowStage[] {
+  const declarations = documentFormat(document) === 5 ? asArray(asObject(document.composition)?.stages) : [];
+  if (declarations.length === 0) {
+    return flow.steps.map((step) => ({
+      name: step.name,
+      label: step.name ?? `Step ${step.index + 1}`,
+      description: step.kind,
+      steps: [step],
+      routes: edgesFrom(flow, step.index),
+      missing: [],
+    }));
+  }
+  const stages = declarations.map((entry, index): FlowStage => {
+    const stage = asObject(entry);
+    const names = asArray(stage?.steps).map(asString);
+    const steps = names.flatMap((name) => flow.steps.filter((step) => name !== null && step.name === name));
+    const indexes = new Set(steps.map((step) => step.index));
+    return {
+      name: asString(stage?.name),
+      label: asString(stage?.label) ?? asString(stage?.name) ?? `Phase ${index + 1}`,
+      description: asString(stage?.description),
+      steps,
+      routes: flow.edges.filter((edge) => indexes.has(edge.fromIndex) &&
+        (edge.kind === "authorize" || edge.to.kind !== "step" || edge.to.index === null || !indexes.has(edge.to.index))),
+      missing: names.filter((name): name is string => name !== null && !steps.some((step) => step.name === name)),
+    };
+  });
+  // Invalid drafts must not hide primitive declarations outside their stages.
+  const included = new Set(stages.flatMap((stage) => stage.steps.map((step) => step.index)));
+  for (const step of flow.steps) {
+    if (!included.has(step.index)) stages.push({ name: step.name, label: step.name ?? `Step ${step.index + 1}`, description: "Not assigned to a phase", steps: [step], routes: edgesFrom(flow, step.index), missing: [] });
+  }
+  return stages;
+}
+
 /** True when a step really declares a visit bound.
  *
  * Both halves are declared together, so either one being present and non-null
@@ -142,6 +187,8 @@ export function readFlow(document: DraftObject): Flow {
     const from = name ?? `step ${index + 1}`;
     const push = (edge: Omit<FlowEdge, "fromIndex" | "from">) =>
       edges.push({ ...edge, fromIndex: index, from });
+    // An uncompiled source reference cannot declare expanded routes here.
+    if (typeof step.use === "string") continue;
 
     if (kind === "decision") {
       asArray(step.cases).forEach((entry, caseIndex) => {
@@ -467,11 +514,14 @@ const KNOWN_STEP_FIELDS: Record<string, readonly string[]> = {
 };
 
 export function unknownStepFields(step: DraftObject): string[] {
-  const known = KNOWN_STEP_FIELDS[asString(step.kind) ?? ""] ?? ["name", "kind"];
+  const known = typeof step.use === "string"
+    ? ["name", "use", "bindings"]
+    : KNOWN_STEP_FIELDS[asString(step.kind) ?? ""] ?? ["name", "kind"];
   return Object.keys(step).filter((key) => !known.includes(key));
 }
 
 export function unknownDocumentFields(document: DraftObject): string[] {
   const known = ["format", "name", "sessions", "primary", "steps"];
+  if (documentFormat(document) === 5) known.push("definitions", "stages", "composition");
   return Object.keys(document).filter((key) => !known.includes(key));
 }

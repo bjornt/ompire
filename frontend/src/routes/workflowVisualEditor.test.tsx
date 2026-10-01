@@ -1,6 +1,10 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useState } from "react";
+import { WorkflowEditor } from "../components/workflow/WorkflowEditor";
+import { parseLossless, stringifyLossless } from "../lib/losslessJson";
+import type { DraftObject } from "../lib/workflowDocument";
 import { App } from "../App";
 import type { WorkflowDescriptor, WorkflowLibraryEntry } from "../types";
 
@@ -223,16 +227,6 @@ describe("switching between the two views of one draft", () => {
     expect(calls.some((call) => call.url.endsWith("/draft"))).toBe(false);
   });
 
-  it("warns that a visual edit normalizes the document before it happens", async () => {
-    await openEditor({
-      "POST /api/workflow-library/document": () => ({ json: conversion(DOCUMENT, YAML) }),
-    });
-    const user = userEvent.setup();
-    await user.click(screen.getByTestId("workflow-mode-visual"));
-    expect((await screen.findByTestId("workflow-visual-warning")).textContent).toContain(
-      "drops YAML comments",
-    );
-  });
 
   it("keeps unparseable text in the YAML editor with a located reason", async () => {
     await openEditor({
@@ -315,16 +309,6 @@ describe("an unfinished draft", () => {
     );
   });
 
-  it("keeps a broken route visible rather than dropping the edge", async () => {
-    await openEditor({
-      "POST /api/workflow-library/document": () => ({ json: conversion(DOCUMENT, YAML) }),
-    });
-    const user = userEvent.setup();
-    await user.click(screen.getByTestId("workflow-validate"));
-    // The shared flow renders the same definition the check answered about.
-    const flow = await screen.findByTestId("workflow-check-flow");
-    expect(flow.textContent).toContain("What this procedure declares may happen");
-  });
 });
 
 describe("answers that outlived their question", () => {
@@ -523,5 +507,76 @@ describe("an archived entry", () => {
 
     // Reading it is still the point: the flow is all there.
     expect(editor.textContent).toContain("do it");
+  });
+});
+
+describe("shared invocation authoring", () => {
+  const shared = {
+    name: "shared-review", label: "Shared review", description: "Review retained evidence",
+    revision: "sha256:frozen",
+    parameters: {
+      engine_name: { type: "string", default: "review-engine" },
+      evidence: { type: "object" },
+      routes: { type: "array", default: [] },
+    },
+    steps: [{ name: { param: "engine_name" }, kind: "review", evidence: { param: "evidence" } }],
+  };
+
+  it("preserves references and exact JSON data, and adopts a catalog revision only explicitly", async () => {
+    stubFetch({ "GET /api/workflow-steps": () => ({ json: { definitions: { "shared-review": { ...shared, revision: "sha256:current" } } } }) });
+    let draft: DraftObject = {
+      format: 5, name: "custom", sessions: ["main"], primary: "main",
+      steps: [{ name: "review-local", use: "shared-review", bindings: { evidence: { work: { steps: ["work"], required: true } } } }],
+      definitions: { "shared-review": shared, unrelated: { revision: "sha256:unrelated" } },
+      stages: [{ name: "review", label: "Review", description: "Keep this phase", steps: ["review-engine"] }],
+    };
+    function Harness() {
+      const [document, setDocument] = useState(draft);
+      return <WorkflowEditor document={document} validation={null} onChange={(update) => setDocument((current) => { draft = update(current); return draft; })} />;
+    }
+    render(<Harness />);
+    const user = userEvent.setup();
+    const adopt = await screen.findByTestId("editor-adopt-definition-0");
+    await waitFor(() => expect((adopt as HTMLButtonElement).disabled).toBe(false));
+    expect((draft.definitions as DraftObject)["shared-review"]).toBe(shared);
+    const identity = screen.getByTestId("field-steps[0].bindings.engine_name");
+    await user.clear(identity);
+    await user.type(identity, "review-new");
+    await user.tab();
+    expect((draft.stages as DraftObject[])[0]).toEqual({ name: "review", label: "Review", description: "Keep this phase", steps: ["review-new"] });
+    const evidence = screen.getByTestId("field-steps[0].bindings.evidence");
+    const text = '{"work":{"steps":["work"],"required":true},"opaque":{"op":"literal","value":90071992547409911}}';
+    await user.clear(evidence);
+    await user.paste(text);
+    expect(stringifyLossless(((draft.steps as DraftObject[])[0].bindings as DraftObject).evidence)).toBe(text);
+    await user.click(adopt);
+    expect((draft.definitions as DraftObject)["shared-review"]).toBeUndefined();
+    expect((draft.definitions as DraftObject).unrelated).toEqual({ revision: "sha256:unrelated" });
+    expect((draft.steps as DraftObject[])[0]).toMatchObject({ name: "review-local", use: "shared-review", bindings: { engine_name: "review-new" } });
+    expect(shared.revision).toBe("sha256:frozen");
+  });
+
+  it("adds an unexpanded catalog reference and retains incomplete structured binding edits", async () => {
+    stubFetch({ "GET /api/workflow-steps": () => ({ json: { definitions: { "shared-review": shared } } }) });
+    let draft: DraftObject = { format: 5, name: "custom", sessions: ["main"], primary: "main", steps: [] };
+    function Harness() {
+      const [document, setDocument] = useState(draft);
+      return <WorkflowEditor document={document} validation={null} onChange={(update) => setDocument((current) => { draft = update(current); return draft; })} />;
+    }
+    render(<Harness />);
+    const user = userEvent.setup();
+    await screen.findByRole("option", { name: "Shared review" });
+    await user.selectOptions(screen.getByTestId("editor-shared-definition"), "shared-review");
+    await user.click(screen.getByTestId("editor-add-shared-step"));
+    expect(draft.steps).toEqual([{ name: "shared-review", use: "shared-review", bindings: { engine_name: "review-engine", routes: [] } }]);
+    expect(draft.definitions).toBeUndefined();
+    const evidence = await screen.findByTestId("field-steps[0].bindings.evidence");
+    await user.click(evidence);
+    await user.paste("{");
+    expect(((draft.steps as DraftObject[])[0].bindings as DraftObject).evidence).toBe("{");
+    await user.clear(evidence);
+    await user.paste('{"work":{"steps":["work"]}}');
+    expect(((draft.steps as DraftObject[])[0].bindings as DraftObject).evidence).toEqual(parseLossless('{"work":{"steps":["work"]}}'));
+    expect((draft.steps as DraftObject[])[0].use).toBe("shared-review");
   });
 });

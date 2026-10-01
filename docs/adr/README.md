@@ -57,6 +57,7 @@ relying on it.
 | [0037](0037-capture-workflow-results-before-accepted-handoffs.md) | Capture workflow results before accepted handoffs | Accepted |
 | [0038](0038-own-modules-and-compose-local-transactions.md) | Own modules and compose local transactions | Accepted |
 | [0039](0039-own-workspace-resources-behind-isolation.md) | Own workspace resources behind isolation | Accepted |
+| [0040](0040-resolve-shared-workflow-steps-before-retention.md) | Resolve shared workflow steps before retention | Accepted |
 
 ## Template
 

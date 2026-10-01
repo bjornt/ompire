@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -431,8 +431,6 @@ def test_workflow_catalog_describes_every_declared_step(
     # pin, and the semantics version it is read under (ADR-0028). Both
     # packaged workflows are complete procedures now, and say so.
     assert bugfix["revision"].startswith("sha256:")
-    assert bugfix["format"] == 3
-    assert catalog["single-step"]["format"] == 3
     assert catalog["single-step"]["actions"] == ["commit", "push", "pr"]
     # Nothing describes a model consumer outside the declared steps.
     assert "judge_session" not in bugfix
@@ -1112,7 +1110,7 @@ def test_reference_write_failure_rolls_back_task_and_schedules_nothing(
     assert not client.app.state.spawn_scheduler.jobs
 
 
-async def test_direct_acceptance_enforces_the_same_admission_as_http(
+def test_direct_acceptance_enforces_the_same_admission_as_http(
     client: TestClient,
     auth_headers: dict,
     demo_project: dict,
@@ -1133,6 +1131,10 @@ async def test_direct_acceptance_enforces_the_same_admission_as_http(
     engine = client.app.state.engine
     install_plain_workflow(engine)
     service: LaunchService = client.app.state.launch_service
+    # Use the live application's loop for its owned scheduler and workflows.
+    # A separate pytest loop would strand those jobs during fixture teardown.
+    assert client.portal is not None
+    portal = client.portal
 
     def request(**overrides) -> LaunchRequest:
         base: dict = {
@@ -1151,43 +1153,31 @@ async def test_direct_acceptance_enforces_the_same_admission_as_http(
 
     # An unknown workflow is refused before anything is created.
     with pytest.raises(LaunchInputError):
-        await service.preview(request(workflow_name="missing"))
+        portal.call(service.preview, request(workflow_name="missing"))
     assert list_tasks(engine) == []
 
     # An empty profile name is refused for direct callers too, with the same
     # field-level error the wire adapter produces.
     with pytest.raises(LaunchInputError) as caught:
-        await service.preview(
-            request(step_overrides={"work": ConsumerOverride(model_profile="", role=None)})
+        portal.call(
+            service.preview,
+            request(step_overrides={"work": ConsumerOverride(model_profile="", role=None)}),
         )
     assert caught.value.field == "step_overrides.work.model_profile"
 
     # A reviewed preview accepted through the typed command records the same
     # decision the HTTP path would, and schedules its preparation.
-    resolved = await service.preview(request())
-    task = await service.accept(request(), preview_token=resolved.fingerprint)
+    resolved = portal.call(service.preview, request())
+    task = portal.call(partial(service.accept, request(), preview_token=resolved.fingerprint))
     assert task.branch == "ompire/direct-call"
     assert task.execution_inputs is not None
     assert task.execution_inputs.workflow_binding is not None
     assert task.execution_inputs.workflow_binding.revision == resolved.revision.revision
 
-    # Let the scheduled preparation finish on this test's loop before the
-    # client fixture's lifespan shutdown gathers the scheduler.
-    deadline = time.monotonic() + 20.0
-    while client.app.state.spawn_scheduler.jobs:
-        assert time.monotonic() < deadline, "scheduled preparation did not finish"
-        await asyncio.sleep(0.05)
-    settled = client.get(f"/api/tasks/{task.id}", headers=auth_headers).json()
+    settled = _wait_settled(client, auth_headers, task.id)
     assert settled["spawn_completed_at"] is not None or settled["state"] == "failed"
-
-    # The typed accept scheduled its preparation job on this test's loop, so
-    # the agent handle and its futures live here — the app's own loop (the
-    # test client's portal) cannot await them across loops. Stop the child
-    # from the loop that owns it; the fixture's shutdown then finds nothing
-    # left to reap.
-    await client.app.state.agents.shutdown()
 
     # A stale token is refused, not retried under today's resolution.
     with pytest.raises(PreviewChangedError):
-        await service.accept(request(slug="direct-stale"), preview_token="stale")
+        portal.call(partial(service.accept, request(slug="direct-stale"), preview_token="stale"))
     assert [t.slug for t in list_tasks(engine)] == ["direct-call"]

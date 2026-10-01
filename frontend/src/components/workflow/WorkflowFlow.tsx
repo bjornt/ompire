@@ -18,6 +18,7 @@ import {
   readEvidence,
   readFlow,
   readResults,
+  readStages,
   readText,
   unknownDocumentFields,
   unknownStepFields,
@@ -141,9 +142,11 @@ function TextPieceView({ piece }: { piece: TextPiece }) {
 function EdgeList({
   edges,
   onGoTo,
+  showSource = false,
 }: {
   edges: FlowEdge[];
   onGoTo: (index: number) => void;
+  showSource?: boolean;
 }) {
   if (edges.length === 0) {
     return <p className="flowMuted">No route is declared from here.</p>;
@@ -153,6 +156,7 @@ function EdgeList({
       {edges.map((edge, index) => (
         <li key={index} data-edge-kind={edge.kind}>
           <span className="flowChip">{EDGE_WORDS[edge.kind]}</span>
+          {showSource && <code className="mono">{edge.from}</code>}
           <span className="flowEdgeLabel">{edge.label}</span>
           <span aria-hidden="true"> → </span>
           {edge.to.kind === "step" && edge.to.index !== null ? (
@@ -261,6 +265,8 @@ export interface FlowStepExtras {
   /** Rendered in the card header. */
   badge?: ReactNode;
   className?: string;
+  /** Actual retained visits only, supplied by the task reader. */
+  recordedAttempts?: number;
 }
 
 export function WorkflowFlow({
@@ -278,12 +284,18 @@ export function WorkflowFlow({
 }) {
   const flow = useMemo(() => readFlow(definition), [definition]);
   const format = documentFormat(definition);
+  const stages = useMemo(() => readStages(definition, flow), [definition, flow]);
   const domId = useId();
   const cards = useRef<Map<number, HTMLLIElement>>(new Map());
 
   const goTo = useCallback((index: number) => {
     const card = cards.current.get(index);
     if (card === undefined) return;
+    let ancestor = card.parentElement;
+    while (ancestor !== null) {
+      if (ancestor instanceof HTMLDetailsElement) ancestor.open = true;
+      ancestor = ancestor.parentElement;
+    }
     card.scrollIntoView?.({ block: "nearest" });
     card.focus();
   }, []);
@@ -318,17 +330,50 @@ export function WorkflowFlow({
           removed in YAML.
         </p>
       )}
-      <div className="flowLayout">
-        <div className="flowOverview">
-          <FlowDiagram
-            names={flow.steps.map((step) => step.name)}
-            edges={flow.edges}
-            onGoTo={goTo}
-            current={currentIndex === -1 ? null : currentIndex}
-          />
-        </div>
-        <ol className="flowCards">
-          {flow.steps.map(({ index, name, kind, step }) => {
+      <details className="flowRouting">
+        <summary>Exact declared routing diagram</summary>
+        <FlowDiagram
+          names={flow.steps.map((step) => step.name)}
+          edges={flow.edges}
+          onGoTo={goTo}
+          current={currentIndex === -1 ? null : currentIndex}
+        />
+      </details>
+      <ol className="flowPhases">
+        {stages.map((stage, stageIndex) => {
+          const isCurrent = current != null && stage.steps.some((step) => step.name === current);
+          const recorded = stage.steps.reduce((total, step) => total + (extras?.(step.index, step.name, step.step).recordedAttempts ?? 0), 0);
+          const effects = stage.steps.filter((step) => step.kind === "delivery");
+          const destinations = [...new Set(stage.routes.map((edge) => {
+            if (edge.to.kind !== "step") return describeTarget(edge.to);
+            const target = edge.to;
+            const targetStage = stages.find((candidate) => candidate.steps.some((step) => step.index === target.index));
+            return targetStage !== undefined && targetStage !== stage ? targetStage.label : describeTarget(target);
+          }))];
+          const grants = [...new Set(stage.steps.flatMap(({ step }) => asArray(step.choices).flatMap((choice) =>
+            asArray(asObject(asObject(choice)?.authorize)?.steps).flatMap((name) => typeof name === "string" ? [name] : []),
+          )))];
+          return (
+            <li key={stageIndex} className={`flowPhase${isCurrent ? " current" : ""}`} data-testid={`flow-phase-${stage.name ?? stageIndex}`} aria-current={isCurrent ? "step" : undefined}>
+              <div className="flowHead">
+                <span className="flowIndex">{stageIndex + 1}</span>
+                <strong className="flowName">{stage.label}</strong>
+                {isCurrent && <strong className="flowCurrent">Current phase · <code>{current}</code></strong>}
+              </div>
+              {stage.description !== null && <p className="flowPhaseDescription">{stage.description}</p>}
+              {effects.length > 0 && <p className="hint">Declared publication: {effects.map((step) => `${asString(step.step.action) ?? "unspecified action"} (only with ${asString(step.step.approval) ?? "unspecified approval"})`).join(", ")}</p>}
+              <p className="hint flowPhaseRoutes">Possible destinations: {destinations.join(" · ") || "no expanded routes declared"}</p>
+              {grants.length > 0 && <p className="hint">Approval can authorize: {grants.join(", ")}</p>}
+              <details className="flowRouteDetails">
+                <summary>Possible declared routes (conditions and choices)</summary>
+                <EdgeList edges={stage.routes} onGoTo={goTo} showSource />
+              </details>
+              {extras !== undefined && <p className="flowRecorded" data-testid="flow-phase-attempts">Recorded history: <span className="flowChip">{recorded} attempt{recorded === 1 ? "" : "s"}</span></p>}
+              {stage.missing.length > 0 && <p className="flowBroken">Missing declared steps: {stage.missing.join(", ")}</p>}
+              <details className="flowInternals">
+                <summary>Exact steps and recorded attempts ({stage.steps.length} step{stage.steps.length === 1 ? "" : "s"})</summary>
+                <ol className="flowCards">
+          {stage.steps.map(({ index, name, kind, step }) => {
             const extra = extras?.(index, name, step) ?? {};
             const evidence = readEvidence(step);
             const results = readResults(step);
@@ -544,8 +589,12 @@ export function WorkflowFlow({
               </li>
             );
           })}
-        </ol>
-      </div>
+                </ol>
+              </details>
+            </li>
+          );
+        })}
+      </ol>
     </div>
   );
 }

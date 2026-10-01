@@ -19,6 +19,7 @@ import type {
   WorkflowReadinessReason,
   WorkflowRevisionDetail,
   WorkflowStepDescriptor,
+  WorkflowStepCatalog,
   WorkflowValidation,
   ReviewState,
   ShipEnding,
@@ -40,7 +41,7 @@ import type {
   WorkshopAdditionsSource,
 } from "../types";
 import { envelopeNumber, parseLossless, stringifyLossless } from "./losslessJson";
-import { asObject, asString, type DraftObject } from "./workflowDocument";
+import { asObject, asString, workflowSource, type DraftObject } from "./workflowDocument";
 import { getDaemonToken } from "./token";
 
 /** Minimal authenticated REST client. Commands go over REST, events come back
@@ -335,6 +336,12 @@ export function spawnTask(input: LaunchInput & { preview_token: string }): Promi
  * this is the reload path for a view mounted before the socket connects. */
 export function listWorkflows(): Promise<WorkflowDescriptor[]> {
   return request<WorkflowDescriptor[]>("GET", "/api/workflows");
+}
+
+/** Packaged reusable definitions, never a mutable execution dependency. */
+export async function listWorkflowSteps(): Promise<WorkflowStepCatalog> {
+  const body = asObject(await requestLossless("GET", "/api/workflow-steps"));
+  return { definitions: (asObject(body?.definitions) ?? {}) as WorkflowStepCatalog["definitions"] };
 }
 
 export function cleanupTask(id: number): Promise<Task> {
@@ -750,11 +757,14 @@ export async function convertWorkflowDocument(input: {
   name?: string;
 }): Promise<WorkflowDocumentConversion> {
   const body = asObject(
-    await requestLossless("POST", "/api/workflow-library/document", input),
+    await requestLossless("POST", "/api/workflow-library/document", {
+      ...input,
+      ...(input.document === undefined ? {} : { document: workflowSource(input.document) }),
+    }),
   );
   const validation = asObject(body?.validation) ?? {};
   return {
-    document: asObject(body?.document) ?? {},
+    document: workflowSource(asObject(body?.document) ?? {}),
     yaml: asString(body?.yaml) ?? "",
     validation:
       validation.ok === true

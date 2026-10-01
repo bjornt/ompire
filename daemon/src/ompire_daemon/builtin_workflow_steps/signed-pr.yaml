@@ -1,0 +1,57 @@
+name: signed-pr
+label: Open pull request
+description: Trusted publication effects linked to one exact approving answer. No effect is permitted without its
+  declared grant.
+parameters:
+  approval_step:
+    type: string
+    default: approve
+  mode:
+    type: string
+    default: squash
+  result:
+    type: string
+  commit_step:
+    type: string
+    default: commit
+  push_step:
+    type: string
+    default: push
+  pr_step:
+    type: string
+    default: open-pr
+steps:
+- name:
+    param: commit_step
+  kind: delivery
+  action: commit
+  mode:
+    param: mode
+  approval:
+    param: approval_step
+  next:
+    step:
+      param: push_step
+- name:
+    param: push_step
+  kind: delivery
+  action: push
+  previous:
+    param: commit_step
+  approval:
+    param: approval_step
+  next:
+    step:
+      param: pr_step
+- name:
+    param: pr_step
+  kind: delivery
+  action: pr
+  previous:
+    param: push_step
+  approval:
+    param: approval_step
+  next:
+    complete: true
+    result:
+      param: result

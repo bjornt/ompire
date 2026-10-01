@@ -45,12 +45,14 @@ parts:
       UV_VERSION="0.12.5"
       INSTALL_DIR="${CRAFT_PART_INSTALL}/opt/ompire/venv"
 
-      # Install the standalone uv binary.
-      mkdir -p /tmp/uv
+      # Install the standalone uv binary. Toolchains live next to the part's
+      # build dir rather than in /tmp, which is a small tmpfs (half of RAM) in
+      # the build instance and is also needed by snapcraft's patchelf step.
+      TOOLS_DIR="${CRAFT_PART_BUILD}/../tools/uv"
+      mkdir -p "$TOOLS_DIR"
       curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" \
-        -o /tmp/uv/uv.tgz
-      tar -xzf /tmp/uv/uv.tgz -C /tmp/uv --strip-components=1
-      UV=/tmp/uv/uv
+        | tar -xz -C "$TOOLS_DIR" --strip-components=1
+      UV="$TOOLS_DIR/uv"
 
       # Create a relocatable venv using the base system Python (classic snap).
       # The absolute path keeps uv from selecting a managed Python whose
@@ -91,18 +93,18 @@ parts:
       NODE_VERSION="24.19.0"
       PNPM_VERSION="11.22.0"
 
-      # Fetch Node.js.
-      mkdir -p /tmp/node
+      # Fetch Node.js. Kept out of /tmp, which is a small tmpfs in the build
+      # instance (see the ompire-daemon part).
+      TOOLS_DIR="${CRAFT_PART_BUILD}/../tools/node"
+      rm -rf "$TOOLS_DIR"
+      mkdir -p "$TOOLS_DIR/bin"
       curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
-        -o /tmp/node/node.tar.xz
-      tar -xf /tmp/node/node.tar.xz -C /tmp/node --strip-components=1
-      export PATH="/tmp/node/bin:${PATH}"
+        | tar -xJ -C "$TOOLS_DIR" --strip-components=1
+      export PATH="${TOOLS_DIR}/bin:${PATH}"
 
       # Fetch the standalone pnpm bundle matching package.json#packageManager.
-      mkdir -p /tmp/node/bin
       curl -fsSL "https://github.com/pnpm/pnpm/releases/download/v${PNPM_VERSION}/pnpm-linux-x64.tar.gz" \
-        -o /tmp/node/pnpm.tgz
-      tar -xzf /tmp/node/pnpm.tgz -C /tmp/node/bin
+        | tar -xz -C "$TOOLS_DIR/bin"
 
       # Remove any node_modules left over from a prior/interrupted build in
       # this reused build dir. Without this, pnpm detects a stale/mismatched
