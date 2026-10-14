@@ -33,6 +33,13 @@ Two rules follow, and the scripts enforce neither for you:
   credentials on disk. Treat it as disposable, and never give it anything the
   bot does not need.
 
+A read-only [forge broker](../reference/forge-broker.md) lets an observing task
+clone and read the bot's sandbox repository without receiving its PAT. Its
+reference documents the standalone process and Workshop tunnel contract; the
+dogfood-environment integration owns setup and tunnel wiring. The procedure
+below remains the existing QA loop, with publishing credentials on the trusted
+side rather than in the observing task.
+
 Why the identity is a bot at all, and why signing and publishing stay outside
 the agent sandbox:
 [ADR-0017](../../adr/0017-use-dedicated-bot-as-default-publishing-identity.md)

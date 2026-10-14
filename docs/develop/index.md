@@ -47,6 +47,7 @@ Daemon internals:
   [Workshop lifecycle](reference/workshop-lifecycle.md)
 - [Crash recovery](reference/crash-recovery.md) ·
   [Local testing harness](reference/local-testing.md)
+- [Forge broker](reference/forge-broker.md)
 
 Behavior an operator sees is documented in the [operator
 reference](../use/index.md#reference), not here.

@@ -106,6 +106,7 @@ nav:
           - WebSocket protocol: develop/reference/websocket-protocol.md
           - Agent integration: develop/reference/agent-rpc.md
           - Workshop lifecycle: develop/reference/workshop-lifecycle.md
+          - Forge broker: develop/reference/forge-broker.md
           - Crash recovery: develop/reference/crash-recovery.md
           - Local testing harness: develop/reference/local-testing.md
       - Explanation:
@@ -155,3 +156,4 @@ nav:
           - 0038 Own modules, compose local transactions: adr/0038-own-modules-and-compose-local-transactions.md
           - 0039 Workspace resources behind isolation: adr/0039-own-workspace-resources-behind-isolation.md
           - 0040 Resolve shared workflow steps before retention: adr/0040-resolve-shared-workflow-steps-before-retention.md
+          - 0041 Read-only forge broker: adr/0041-broker-forge-access-behind-read-only-proxy.md

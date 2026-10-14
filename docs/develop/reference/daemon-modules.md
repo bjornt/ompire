@@ -45,6 +45,7 @@ submodules — and the checker rejects anything else.
 | `config.py` | `config.toml` loading, validation, and defaults. Fails startup on an unknown or invalid key. |
 | `auth.py` | Bearer token generation, the REST dependency, and the WebSocket check. |
 | `static.py` | Serving the built frontend, including SPA deep-link fallback. |
+| `forge_broker.py` | Standalone stdlib-only trusted-side [forge broker](forge-broker.md): read-only repository REST and git clone/fetch behind a loopback Workshop tunnel; no daemon state or product imports. |
 | `platform/transactions.py` | `reserved_write`: the one SQLite write reservation (`BEGIN IMMEDIATE`, commit or roll back) that every check-then-write mutation in the daemon admits through. Platform code — the standard library and SQLAlchemy only. |
 | `platform/processes.py` | The checked host-subprocess step runner: literal argv, deadline, captured streams, and a typed failure whose diagnosis is the command's own output (stderr first, stdout fallback, bare exit status last). Neutral step/error values; command selection and interpretation stay with the calling owner. |
 | `platform/git.py` | `safe_git`/`run_git`/`git_out`: hardened host-side Git invocation with hooks disabled, a deadline, and a neutral `GitCommandError`. Callers own command selection, authorization, and failure classification. |
