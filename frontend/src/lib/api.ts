@@ -3,6 +3,7 @@ import type {
   AgentStatsData,
   DaemonInfo,
   DaemonSettings,
+  EnvironmentInfo,
   GitHubStatus,
   CheckoutInspection,
   ConsumerBinding,
@@ -943,6 +944,11 @@ export function shipReconcile(
 /** Force a fresh gpg-agent cache probe (ship capability). */
 export function recheckGpg(): Promise<GpgStatus> {
   return request<GpgStatus>("POST", "/api/gpg/recheck");
+}
+
+/** Re-probe one declared environment; observation arrives through the WebSocket. */
+export function recheckEnvironment(name: string): Promise<EnvironmentInfo> {
+  return request<EnvironmentInfo>("POST", `/api/environments/${encodeURIComponent(name)}/recheck`);
 }
 
 /** Current daemon-owned GitHub CLI and repository eligibility observation. */

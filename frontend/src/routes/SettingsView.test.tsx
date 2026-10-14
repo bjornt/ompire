@@ -1,9 +1,9 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DaemonProvider } from "../lib/daemonSocket";
 import { SettingsView } from "./SettingsView";
-import type { DaemonInfo, DaemonSettings, GitHubStatus, GpgStatus } from "../types";
+import type { DaemonInfo, DaemonSettings, EnvironmentInfo, GitHubStatus, GpgStatus } from "../types";
 
 type Provenance = Record<string, "default" | "config" | "override">;
 
@@ -33,6 +33,7 @@ class MockWebSocket {
     settings?: DaemonSettings;
     gh?: GitHubStatus;
     gpg?: GpgStatus;
+    environments?: EnvironmentInfo[];
   }) {
     this.onopen?.();
     this.emit("snapshot", payload);
@@ -116,6 +117,7 @@ function renderSettings(
   snapshotSettings: DaemonSettings = {},
   githubStatus?: GitHubStatus,
   gpgStatus?: GpgStatus,
+  environments: EnvironmentInfo[] = [],
 ) {
   render(
     <DaemonProvider>
@@ -130,6 +132,7 @@ function renderSettings(
       settings: snapshotSettings,
       gh: githubStatus,
       gpg: gpgStatus,
+      environments,
     });
   });
 }
@@ -572,4 +575,220 @@ describe("SettingsView checkout-root panel (ADR-0023)", () => {
     );
   });
 
+});
+
+describe("SettingsView environments panel", () => {
+  const dogfood: EnvironmentInfo = {
+    name: "dogfood",
+    host: "vm",
+    capabilities: { model: "auth-gateway", forge: "forge-broker", browser: "chrome" },
+    provision: ["/qa/setup env.sh", "--label", "operator's vm", "$HOME"],
+    check: ["/qa/check.sh", "--probe"],
+    status: { state: "ready", blockers: [], checked_at: "2026-10-14T12:00:00Z" },
+  };
+  const browser: EnvironmentInfo = {
+    ...dogfood,
+    name: "browser",
+    host: "container",
+    capabilities: {},
+    provision: ["setup-browser"],
+    status: { state: "unknown", blockers: [], checked_at: null },
+  };
+
+  beforeEach(() => {
+    MockWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    window.localStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    window.localStorage.clear();
+    MockWebSocket.instances = [];
+  });
+
+  it("hides optional infrastructure when no environment is declared, including after a replacement snapshot", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(buildFetchHandler()));
+    renderSettings();
+    await screen.findByTestId("daemon-info-version");
+    expect(screen.queryByTestId("environments-panel")).not.toBeInTheDocument();
+
+    act(() => socket().emit("environment_status", { environment: dogfood }));
+    expect(screen.getByRole("heading", { name: "Environments" })).toBeInTheDocument();
+    act(() => socket().emitSnapshot({ projects: [], tasks: [], environments: [] }));
+    expect(screen.queryByTestId("environments-panel")).not.toBeInTheDocument();
+  });
+
+  it("renders each environment's host, capability providers, unambiguous provision argv and check time", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(buildFetchHandler()));
+    renderSettings({}, undefined, undefined, [browser, dogfood]);
+
+    const panel = await screen.findByTestId("environments-panel");
+    expect(within(panel).getAllByRole("button")).toHaveLength(2);
+    const dogfoodRow = within(screen.getByTestId("environment-dogfood"));
+    expect(dogfoodRow.getByRole("heading", { name: "dogfood" })).toBeInTheDocument();
+    expect(dogfoodRow.getByText("vm")).toBeInTheDocument();
+    for (const [capability, provider] of Object.entries(dogfood.capabilities)) {
+      expect(dogfoodRow.getByText(capability).parentElement).toHaveTextContent(`${capability}: ${provider}`);
+    }
+    expect(dogfoodRow.getByTestId("environment-dogfood-provision").textContent).toBe(
+      `'/qa/setup env.sh' --label 'operator'"'"'s vm' '$HOME'`,
+    );
+    expect(dogfoodRow.getByText("2026-10-14T12:00:00Z")).toBeInTheDocument();
+    expect(dogfoodRow.getByTestId("environment-dogfood-state")).toHaveTextContent("ready");
+    expect(dogfoodRow.getByText(/daemon never provisions environments/)).toBeInTheDocument();
+
+    const browserRow = within(screen.getByTestId("environment-browser"));
+    expect(browserRow.getByText("container")).toBeInTheDocument();
+    expect(browserRow.getByText("None declared")).toBeInTheDocument();
+    expect(browserRow.getByText("Not checked yet")).toBeInTheDocument();
+    expect(browserRow.getByTestId("environment-browser-state")).toHaveTextContent("unknown");
+    expect(browserRow.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("follows live degraded, missing and error observations, displays every blocker, then clears them on recovery", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(buildFetchHandler()));
+    renderSettings({}, undefined, undefined, [dogfood]);
+    const row = within(await screen.findByTestId("environment-dogfood"));
+    const blockers = [
+      { code: "check-failed", message: "auth gateway not answering on localhost:4000" },
+      { code: "check-timed-out", message: "readiness deadline exceeded" },
+    ];
+    act(() => socket().emit("environment_status", {
+      environment: {
+        ...dogfood,
+        status: { state: "degraded", blockers, checked_at: "t1" },
+      },
+    }));
+    expect(row.getByTestId("environment-dogfood-state")).toHaveTextContent("degraded");
+    for (const blocker of blockers) {
+      expect(row.getByText(blocker.code).closest("li")).toHaveTextContent(`${blocker.code}: ${blocker.message}`);
+    }
+    expect(row.getByText("t1")).toBeInTheDocument();
+
+    act(() => socket().emit("environment_status", {
+      environment: {
+        ...dogfood,
+        status: {
+          state: "missing",
+          blockers: [{ code: "check-program-missing", message: "/qa/check.sh does not exist" }],
+          checked_at: "t2",
+        },
+      },
+    }));
+    expect(row.getByTestId("environment-dogfood-state")).toHaveTextContent("missing");
+    expect(row.getByRole("alert")).toHaveTextContent("check-program-missing: /qa/check.sh does not exist");
+    expect(row.queryByText("check-failed")).not.toBeInTheDocument();
+
+    act(() => socket().emit("environment_status", {
+      environment: {
+        ...dogfood,
+        status: {
+          state: "error", blockers: [{ code: "check-error", message: "Permission denied" }], checked_at: "t3",
+        },
+      },
+    }));
+    expect(row.getByTestId("environment-dogfood-state")).toHaveTextContent("error");
+    expect(row.getByRole("alert")).toHaveTextContent("check-error: Permission denied");
+
+    act(() => socket().emit("environment_status", { environment: dogfood }));
+    expect(row.getByTestId("environment-dogfood-state")).toHaveTextContent("ready");
+    expect(row.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("guards each pending recheck independently and never replaces authoritative events with REST status", async () => {
+    const user = userEvent.setup();
+    let releaseDogfood!: () => void;
+    let releaseBrowser!: () => void;
+    const dogfoodGate = new Promise<void>((resolve) => { releaseDogfood = resolve; });
+    const browserGate = new Promise<void>((resolve) => { releaseBrowser = resolve; });
+    const base = buildFetchHandler();
+    const fetchMock = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/environments/dogfood/recheck") {
+        await dogfoodGate;
+        return jsonResponse(dogfood);
+      }
+      if (url === "/api/environments/browser/recheck") {
+        await browserGate;
+        return jsonResponse({ ...browser, status: dogfood.status });
+      }
+      return base(url, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderSettings({}, undefined, undefined, [browser, dogfood]);
+
+    const dogfoodButton = await screen.findByRole("button", { name: "Re-check dogfood" });
+    const browserButton = screen.getByRole("button", { name: "Re-check browser" });
+    await user.dblClick(dogfoodButton);
+    expect(dogfoodButton).toBeDisabled();
+    expect(dogfoodButton).toHaveTextContent("Checking…");
+    expect(browserButton).not.toBeDisabled();
+    await user.dblClick(browserButton);
+    expect(browserButton).toBeDisabled();
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/environments/dogfood/recheck")).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([url]) => url === "/api/environments/browser/recheck")).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/environments/browser/recheck", expect.objectContaining({ method: "POST", body: undefined }),
+    );
+
+    act(() => socket().emit("environment_status", {
+      environment: {
+        ...dogfood,
+        status: {
+          state: "degraded", blockers: [{ code: "check-failed", message: "newer probe failed" }], checked_at: "t2",
+        },
+      },
+    }));
+    await act(async () => { releaseDogfood(); await dogfoodGate; });
+    await waitFor(() => expect(dogfoodButton).not.toBeDisabled());
+    expect(browserButton).toBeDisabled();
+    expect(screen.getByTestId("environment-dogfood-state")).toHaveTextContent("degraded");
+    expect(screen.getByText("newer probe failed", { exact: false })).toBeInTheDocument();
+
+    await act(async () => { releaseBrowser(); await browserGate; });
+    await waitFor(() => expect(browserButton).not.toBeDisabled());
+    expect(screen.getByTestId("environment-browser-state")).toHaveTextContent("unknown");
+    act(() => socket().emit("environment_status", {
+      environment: { ...browser, status: dogfood.status },
+    }));
+    expect(screen.getByTestId("environment-browser-state")).toHaveTextContent("ready");
+  });
+
+  it("shows a failed recheck only on its row, preserves probe blockers, and clears the error when retried", async () => {
+    const user = userEvent.setup();
+    const base = buildFetchHandler();
+    let attempts = 0;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/environments/dogfood/recheck") {
+        attempts += 1;
+        return attempts === 1
+          ? jsonResponse({ detail: "Environment probe request unavailable" }, 503)
+          : jsonResponse(dogfood);
+      }
+      return base(url, init);
+    }));
+    renderSettings({}, undefined, undefined, [browser, {
+      ...dogfood,
+      status: {
+        state: "missing",
+        blockers: [{ code: "provision-script-missing", message: "/qa/setup env.sh does not exist" }],
+        checked_at: "t0",
+      },
+    }]);
+
+    const dogfoodButton = await screen.findByRole("button", { name: "Re-check dogfood" });
+    await user.click(dogfoodButton);
+    expect(await screen.findByTestId("environment-dogfood-error")).toHaveTextContent("Environment probe request unavailable");
+    expect(screen.queryByTestId("environment-browser-error")).not.toBeInTheDocument();
+    expect(dogfoodButton).not.toBeDisabled();
+    expect(screen.getByTestId("environment-dogfood-state")).toHaveTextContent("missing");
+    expect(screen.getByText("provision-script-missing").closest("li")).toHaveTextContent("/qa/setup env.sh does not exist");
+
+    await user.click(dogfoodButton);
+    await waitFor(() => expect(dogfoodButton).not.toBeDisabled());
+    expect(screen.queryByTestId("environment-dogfood-error")).not.toBeInTheDocument();
+    expect(screen.getByTestId("environment-dogfood-state")).toHaveTextContent("missing");
+    expect(attempts).toBe(2);
+  });
 });

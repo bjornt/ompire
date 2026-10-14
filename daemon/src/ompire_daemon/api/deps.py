@@ -15,6 +15,7 @@ from ompire_daemon.agent import AgentSupervisor
 from ompire_daemon.application.cleanup import CleanupService
 from ompire_daemon.application.launch import LaunchService
 from ompire_daemon.config import Config
+from ompire_daemon.environments import EnvironmentRegistry
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import GpgProbe
@@ -75,6 +76,10 @@ def _gpg(request: Request) -> GpgProbe:
 
 def _gh(request: Request) -> GitHubProbe:
     return request.app.state.gh
+
+
+def _environments(request: Request) -> EnvironmentRegistry:
+    return request.app.state.environments
 
 
 def _project_setup(request: Request) -> ProjectSetupManager:

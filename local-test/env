@@ -43,6 +43,8 @@
 # gh_command at the fake gh and gpg_signing_key at the ephemeral key.
 # Port: 4173 (daemon default) or $LOCAL_TEST_PORT — a second concurrent
 # environment is a second LOCAL_TEST_STATE + LOCAL_TEST_PORT.
+# Set LOCAL_TEST_ENVIRONMENTS=0 on `up` to omit the fixture declaration and
+# verify that Settings stays quiet when environments are not configured.
 
 set -euo pipefail
 
@@ -262,6 +264,7 @@ cmd_up() {
 	resolve_real_tool my-workshop "$mw" "$mw_src"
 	resolve_real_tool llmvet "$lv" ""
 
+	"$REPO_ROOT/local-test/environmentctl" init
 	# ---- 5. gitconfig + daemon config ---------------------------------------
 	log "config: regenerating $GITCONFIG (identity + signing key)"
 	"$FORGE" gitconfig --signingkey "$fpr"
@@ -272,6 +275,18 @@ gh_command = ["$FAKES/gh"]
 gpg_signing_key = "$fpr"
 port = $DAEMON_PORT
 EOF
+	if [ "${LOCAL_TEST_ENVIRONMENTS:-1}" != "0" ]; then
+		cat >>"$CONFIG" <<EOF
+
+[environments.fixture]
+host = "host"
+provision = ["$REPO_ROOT/local-test/environmentctl", "ready"]
+check = ["$BIN/environment-check"]
+
+[environments.fixture.capabilities]
+browser = "fixture-browser"
+EOF
+	fi
 	log "config: $CONFIG (fake gh, gpg $fpr, port $DAEMON_PORT)"
 
 	# ---- 6. checkout from the forge -----------------------------------------
@@ -464,7 +479,8 @@ EOF
 	    restart:  $DAEMON_WRAPPER
 	    state:    $STATE_ROOT
 	    steer:    ghctl (GitHub identity, access, PRs) | wsctl (workshops) |
-	              ompctl (scenarios) | gpgctl (ship gate) — local-test controls
+	              ompctl (scenarios) | gpgctl (ship gate) |
+	              environmentctl (readiness) — local-test controls
 	$([ $rc -eq 0 ] || printf '\n    NOTE: one or more smoke checks failed — see above.\n')
 	EOF
 	[ "$rc" -eq 0 ] || exit 1

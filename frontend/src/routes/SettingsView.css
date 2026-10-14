@@ -208,6 +208,38 @@
   overflow-wrap: anywhere;
 }
 
+.environmentRow {
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+}
+
+.environmentRow + .environmentRow {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.environmentCapabilities,
+.environmentCommand {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.environmentCommand {
+  white-space: pre-wrap;
+}
+
+.environmentBlockers {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .tokenRow {
   display: flex;
   align-items: center;

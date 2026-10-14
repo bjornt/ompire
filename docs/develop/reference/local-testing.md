@@ -135,6 +135,35 @@ classifies it `ready`. The selfcheck pins both halves of that — never cached,
 still ready — against a real control key, so the distinction cannot regress
 back into "locked forever".
 
+### Declared QA environment
+
+The harness declares a `fixture` [environment](../../use/reference/environments.md)
+with host requirement `host` and capability `browser = "fixture-browser"`.
+Its read-only check is a real executable copied into the isolated state's
+`bin/`; its outcome comes from a control file, not daemon test-mode behavior.
+The provision command is an operator-run `local-test/environmentctl ready`.
+
+Use the same `LOCAL_TEST_STATE` as the running harness:
+
+```sh
+local-test/environmentctl status
+local-test/environmentctl degraded # check exits 1 with a provider diagnostic
+local-test/environmentctl missing  # remove only the state-root check copy
+local-test/environmentctl ready    # restore the check and passing condition
+```
+
+Each flip changes external readiness, not the cached daemon observation.
+Click that environment's **Re-check** in Settings to see `degraded` with
+`check-failed`, `missing` with `check-program-missing`, or recovery to `ready`.
+`environmentctl init` initializes a new fixture without resetting an existing
+condition; `env up` invokes it automatically.
+
+For the no-declaration browser check, bring up a fresh isolated harness with
+`LOCAL_TEST_ENVIRONMENTS=0 local-test/env up`. Its Settings has no Environments
+panel. Run `env up` again without that switch to regenerate the config with
+the fixture and restart the daemon. No real QA credentials or providers are
+involved in these checks.
+
 ## States and behavior
 
 ### Environment

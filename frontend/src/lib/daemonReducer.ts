@@ -8,6 +8,8 @@ import type {
   ConnectionState,
   DaemonSettings,
   Envelope,
+  EnvironmentInfo,
+  EnvironmentStatusPayload,
   GpgStatus,
   GpgStatusPayload,
   GitHubStatus,
@@ -121,6 +123,8 @@ export interface DaemonState {
   gpg: GpgStatus | null;
   /** Current GitHub CLI/target observation, replaced by snapshot and gh_status. */
   gh: GitHubStatus | null;
+  /** Declared environments, replaced by snapshots and upserted by full probe events. */
+  environments: EnvironmentInfo[];
   /** Effective daemon settings (daemon-settings capability): loaded from the
    * snapshot, replaced by `settings_changed` events. */
   settings: DaemonSettings;
@@ -147,6 +151,7 @@ export const initialDaemonState: DaemonState = {
   retainedResults: {},
   gpg: null,
   gh: null,
+  environments: [],
   settings: {},
 };
 
@@ -319,6 +324,7 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
         retainedResults,
         gpg: payload.gpg ?? null,
         gh: normalizeGitHubStatus(payload.gh),
+        environments: payload.environments ?? [],
         settings: payload.settings ?? {},
       };
     }
@@ -743,6 +749,18 @@ export function applyEnvelope(state: DaemonState, envelope: Envelope): DaemonSta
     case "gh_status": {
       const { gh } = envelope.payload as GitHubStatusPayload;
       return { ...state, gh: normalizeGitHubStatus(gh) };
+    }
+    case "environment_status": {
+      const { environment } = envelope.payload as EnvironmentStatusPayload;
+      const index = state.environments.findIndex((item) => item.name === environment.name);
+      const environments = [...state.environments];
+      if (index === -1) {
+        environments.push(environment);
+        environments.sort((a, b) => a.name.localeCompare(b.name));
+      } else {
+        environments[index] = environment;
+      }
+      return { ...state, environments };
     }
     default:
       return state;

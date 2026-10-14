@@ -31,6 +31,7 @@ from ompire_daemon.auth import load_or_create_token
 from ompire_daemon.config import DEFAULT_CONFIG_PATH, Config
 from ompire_daemon.datadir import carry_forward_snap_state
 from ompire_daemon.db import db_path_for, ensure_db_dir, make_engine
+from ompire_daemon.environments import EnvironmentRegistry
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import GpgProbe
@@ -72,6 +73,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     prwatch: PrWatcher = app.state.prwatch
     gpg: GpgProbe = app.state.gpg
     gh: GitHubProbe = app.state.gh
+    environments: EnvironmentRegistry = app.state.environments
     project_setup: ProjectSetupManager = app.state.project_setup
     # Synchronous REST routes publish from FastAPI's threadpool; the hub needs
     # this loop to hand fan-out back to it (see events.py).
@@ -87,6 +89,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # GitHub observation is bounded and fail-closed, but it must not prevent
     # the daemon from serving unrelated work when the forge is unavailable.
     await gh.probe()
+    # Environment checks are bounded observations, never provisioning or gates.
+    await environments.probe_all()
     # Slow (real container-side omp startups): runs in the background so it
     # never blocks serving (crash-recovery capability, design D-4/7.3). The
     # fast, must-finish-before-the-first-snapshot classification already ran
@@ -322,6 +326,7 @@ def create_app(
     )
     app.state.gpg = GpgProbe(config, app.state.events, app.state.settings_store)
     app.state.gh = GitHubProbe(config, app.state.events)
+    app.state.environments = EnvironmentRegistry(config, app.state.events)
     app.state.project_setup = ProjectSetupManager(
         config, app.state.engine, app.state.events
     )

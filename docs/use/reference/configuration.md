@@ -70,6 +70,37 @@ Correct an environment token in the daemon's launch environment and restart;
 use `gh auth login` or `gh auth switch` only when GitHub CLI configuration is
 the selected source.
 
+## Environments
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `environments` | table of named tables | empty | TOML-only infrastructure; observed at startup and on Re-check, never provisioned by the daemon |
+| `environments.<name>.host` | string | required | `container`, `vm`, or `host` |
+| `environments.<name>.provision` | list of strings | required | Non-empty argv; operator runs it |
+| `environments.<name>.check` | list of strings | required | Non-empty argv; daemon runs it with a 60-second deadline |
+| `environments.<name>.capabilities` | string map | empty | Capability names mapped to providers; neither may be empty |
+
+Environment names match `^[a-z0-9][a-z0-9-]*$`. Unknown keys inside a
+definition are errors. Commands use literal argv, not a shell; `~` in the
+program path expands and plain program names resolve on the daemon's `PATH`.
+Use absolute script paths. Commands and diagnostics must contain no secrets.
+
+```toml
+[environments.dogfood]
+host = "host"
+provision = ["/home/qa/ompire/scripts/setup-qa-env.sh"]
+check = ["/home/qa/ompire/scripts/setup-qa-env.sh", "--probe"]
+
+[environments.dogfood.capabilities]
+model = "auth-gateway"
+forge = "forge-broker"
+browser = "chrome"
+```
+
+This declares infrastructure; it neither installs providers nor grants task
+access. See [Environments](environments.md) for the check contract, trust
+boundary, states, and recovery.
+
 ## Lifecycle
 
 | Key | Type | Default | Notes |

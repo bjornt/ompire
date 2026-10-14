@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getGitHubStatus, recheckGitHub } from "./api";
+import { DaemonError, getGitHubStatus, recheckEnvironment, recheckGitHub } from "./api";
 import { setDaemonToken } from "./token";
 
 afterEach(() => {
@@ -69,5 +69,54 @@ describe("GitHub status API", () => {
         body: JSON.stringify({ task_id: 42 }),
       }),
     );
+  });
+});
+
+describe("Environment recheck API", () => {
+  it("posts a bodyless authenticated recheck for the named environment and returns its observation", async () => {
+    setDaemonToken("environment-token");
+    const environment = {
+      name: "dogfood",
+      host: "vm",
+      capabilities: { model: "auth-gateway" },
+      provision: ["/qa/setup.sh"],
+      check: ["/qa/setup.sh", "--probe"],
+      status: { state: "ready", blockers: [], checked_at: "t1" },
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => environment,
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(recheckEnvironment("dogfood")).resolves.toEqual(environment);
+    expect(fetchMock).toHaveBeenCalledWith("/api/environments/dogfood/recheck", {
+      method: "POST",
+      headers: { Authorization: "Bearer environment-token" },
+      body: undefined,
+    });
+  });
+
+  it("preserves the daemon's unknown-environment refusal and 404 status", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: async () => ({ detail: "Unknown environment: absent" }),
+    }));
+
+    const error = await recheckEnvironment("absent").catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(DaemonError);
+    expect(error).toMatchObject({ message: "Unknown environment: absent", status: 404 });
+  });
+
+  it("retains the response status when a failed recheck has no JSON diagnostic", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => { throw new Error("not JSON"); },
+    }));
+
+    await expect(recheckEnvironment("dogfood")).rejects.toMatchObject({ message: "503", status: 503 });
   });
 });

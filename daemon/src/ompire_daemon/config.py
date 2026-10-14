@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ompire_daemon.environments import EnvironmentDefinition, parse_environments
+
 DEFAULT_CONFIG_PATH = Path("~/.config/ompire/config.toml").expanduser()
 
 DEFAULT_PORT = 4173
@@ -122,6 +124,7 @@ _KNOWN_KEYS = {
     "gpg_signing_key",
     "gh_command",
     "pr_poll_interval",
+    "environments",
     *RETIRED_KEYS,
 }
 
@@ -162,6 +165,7 @@ class Config:
     gpg_signing_key: str | None = DEFAULT_GPG_SIGNING_KEY
     gh_command: tuple[str, ...] = DEFAULT_GH_COMMAND
     pr_poll_interval: float = DEFAULT_PR_POLL_INTERVAL
+    environments: tuple[EnvironmentDefinition, ...] = ()
     # Values found under a retired key, verbatim. Present so the retirement
     # can be surfaced and acknowledged; never consumed by execution.
     retired: dict[str, Any] = field(default_factory=dict, compare=False)
@@ -433,6 +437,8 @@ def load_config(path: Path | None = None) -> Config:
             f"got {pr_poll_interval!r}"
         )
 
+    environments = parse_environments(data.get("environments", {}))
+
     config_source: dict[str, Any] = {}
     if "checkout_root" in data:
         # Stored expanded, as a string: the settings store layers JSON scalars,
@@ -473,6 +479,7 @@ def load_config(path: Path | None = None) -> Config:
         gpg_signing_key=gpg_signing_key,
         gh_command=gh_command,
         pr_poll_interval=float(pr_poll_interval),
+        environments=environments,
         retired=retired,
     )
 

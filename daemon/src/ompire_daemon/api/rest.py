@@ -33,6 +33,7 @@ from ompire_daemon.api.deps import (
     _cleanup_service,
     _config,
     _engine,
+    _environments,
     _events,
     _exports,
     _gh,
@@ -55,6 +56,7 @@ from ompire_daemon.application.cleanup import (
 from ompire_daemon.auth import require_bearer_token
 from ompire_daemon.config import Config
 from ompire_daemon.datadir import audit_log_path_for
+from ompire_daemon.environments import EnvironmentRegistry
 from ompire_daemon.events import EventHub
 from ompire_daemon.gh import GitHubProbe
 from ompire_daemon.gpg import (
@@ -2585,6 +2587,24 @@ async def reconcile_ship_route(
         raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
     except ShipError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, {"message": str(exc)}) from exc
+
+
+@router.get("/environments")
+async def get_environments_route(
+    environments: EnvironmentRegistry = Depends(_environments),
+) -> list[dict[str, Any]]:
+    return environments.current()
+
+
+@router.post("/environments/{name}/recheck")
+async def recheck_environment_route(
+    name: str,
+    environments: EnvironmentRegistry = Depends(_environments),
+) -> dict[str, Any]:
+    try:
+        return await environments.probe(name)
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown environment: {name}") from exc
 
 
 @router.get("/gpg")

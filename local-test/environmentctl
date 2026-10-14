@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Control the fixture, never the daemon's cached observation. Re-check in Settings
+# after changing state. `missing` removes only the state-root copy of the probe.
+set -euo pipefail
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+STATE_ROOT=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
+CONTROL=$STATE_ROOT/environment/state
+CHECK=$STATE_ROOT/bin/environment-check
+
+usage() {
+	printf 'Usage: local-test/environmentctl init|ready|degraded|missing|status\n'
+}
+install_check() {
+	mkdir -p "$STATE_ROOT/bin"
+	cp "$REPO_ROOT/local-test/fakes/environment-check" "$CHECK"
+	chmod +x "$CHECK"
+}
+set_state() {
+	mkdir -p "$STATE_ROOT/environment"
+	local tmp
+	tmp=$(mktemp "$CONTROL.XXXXXX")
+	printf '%s\n' "$1" >"$tmp"
+	mv "$tmp" "$CONTROL"
+}
+[ "$#" -le 1 ] || { usage >&2; exit 2; }
+case "${1:-help}" in
+init)
+	if [ ! -f "$CONTROL" ]; then
+		set_state ready
+		install_check
+	fi
+	;;
+ready|degraded)
+	set_state "$1"
+	install_check
+	;;
+missing)
+	[ -f "$CONTROL" ] || { printf 'run env up first\n' >&2; exit 2; }
+	rm -f "$CHECK"
+	;;
+status)
+	if [ ! -f "$CONTROL" ]; then
+		printf 'not initialized\n'
+	elif [ ! -f "$CHECK" ]; then
+		printf 'missing\n'
+	else
+		cat "$CONTROL"
+	fi
+	;;
+help|--help|-h) usage ;;
+*) usage >&2; exit 2 ;;
+esac

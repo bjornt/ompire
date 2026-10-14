@@ -1134,6 +1134,28 @@ export interface GpgStatusPayload {
   status: GpgStatus;
 }
 
+export type EnvironmentState = "unknown" | "ready" | "degraded" | "missing" | "error";
+
+export interface EnvironmentStatus {
+  state: EnvironmentState;
+  blockers: { code: string; message: string }[];
+  checked_at: string | null;
+}
+
+/** Operator-declared infrastructure and its latest daemon-owned observation. */
+export interface EnvironmentInfo {
+  name: string;
+  host: "container" | "vm" | "host";
+  capabilities: Record<string, string>;
+  provision: string[];
+  check: string[];
+  status: EnvironmentStatus;
+}
+
+export interface EnvironmentStatusPayload {
+  environment: EnvironmentInfo;
+}
+
 export type GitHubIdentityState = "unknown" | "missing" | "unauthenticated" | "ready" | "error";
 export type GitHubTargetState = "unchecked" | "allowed" | "denied" | "error";
 
@@ -1494,6 +1516,8 @@ export interface SnapshotPayload {
   /** Current daemon-owned GitHub CLI and target eligibility observation; absent
    * from snapshots emitted before the GitHub preflight capability. */
   gh?: GitHubStatus;
+  /** All declared environments; an older snapshot without this field clears it. */
+  environments?: EnvironmentInfo[];
   /** Effective daemon settings (daemon-settings capability). */
   settings?: DaemonSettings;
 }

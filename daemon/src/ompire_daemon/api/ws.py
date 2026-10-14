@@ -229,6 +229,7 @@ async def _deliver_snapshot(
             "retained_results": retained_results_payload,
             "gpg": gpg_payload,
             "gh": gh_payload,
+            "environments": websocket.app.state.environments.current(),
             "settings": settings,
         },
     )

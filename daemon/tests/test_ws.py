@@ -42,6 +42,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
             "retained_results",
             "gpg",
             "gh",
+            "environments",
             "settings",
         }
         assert payload["projects"] == []
@@ -67,6 +68,7 @@ def test_connect_receives_snapshot_first(client: TestClient, auth_token: str) ->
         assert payload["attention"] == {}
         assert payload["reviews"] == {}
         assert payload["ships"] == {}
+        assert payload["environments"] == []
         assert payload["gpg"]["state"] in (
             "ready",
             "locked",

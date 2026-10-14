@@ -56,7 +56,7 @@ Precise detail, looked up rather than read through.
 Cross-cutting:
 
 - [Configuration](reference/configuration.md) — every `config.toml` key
-- [States](reference/states.md) — task, session, attention, GPG, and PR states
+- [States](reference/states.md) — task, session, attention, GPG, GitHub, environment, and PR states
 - [HTTP and WebSocket API](reference/api.md)
 
 Projects and tasks:
@@ -87,6 +87,7 @@ Review and publishing:
 Settings:
 
 - [Daemon settings](reference/daemon-settings.md)
+- [Environments](reference/environments.md) — declared QA infrastructure and readiness probes
 
 ## Explanation
 

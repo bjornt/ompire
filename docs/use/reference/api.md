@@ -549,6 +549,8 @@ credential, exclusivity, and replay check happens inside the delivery service.
 | `POST` | `/api/gpg/recheck` | Re-probe and broadcast |
 | `GET` | `/api/gh` | Latest safe in-memory GitHub CLI identity and target eligibility status |
 | `POST` | `/api/gh/recheck` | Re-probe global identity with no body; `{"task_id": id}` additionally checks that task's registered upstream. A completed observation remains `200`; only an unknown task is `404`. |
+| `GET` | `/api/environments` | All declared environments with cached status; does not probe |
+| `POST` | `/api/environments/{name}/recheck` | Probe one environment and return its full definition with fresh status. Failed observations remain `200`; unknown name is `404` |
 | `GET` | `/api/settings` | Effective settings |
 | `PUT` | `/api/settings` | Set runtime overrides |
 | `DELETE` | `/api/settings/{key}` | Clear one override |
@@ -578,6 +580,14 @@ The snapshot's optional `gh` key contains `{identity, targets}`. Every
 completed GitHub probe emits `gh_status` with the same full safe status object,
 so reconnecting clients need no event replay. See [States](states.md) for the
 identity and target vocabularies.
+
+The snapshot's `environments` key is a list of full entries: `name`, `host`,
+`capabilities`, `provision`, `check`, and nested `status` with `state`,
+`blockers` (`{code, message}`), and `checked_at` (null before the first probe).
+Every completed probe emits `environment_status` with `{"environment": <entry>}`;
+the GET and Re-check responses use the same entry shape. There are no definition
+mutation routes. See [Environments](environments.md) for the command contract
+and blocker vocabulary.
 
 The protocol is documented in full in [WebSocket
 protocol](../../develop/reference/websocket-protocol.md).

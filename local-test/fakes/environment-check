@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Read-only readiness probe; environmentctl owns the disposable control file.
+set -euo pipefail
+[ "$#" -eq 0 ] || { printf 'unsupported environment-check arguments\n' >&2; exit 2; }
+: "${LOCAL_TEST_STATE:?LOCAL_TEST_STATE is required}"
+control="$LOCAL_TEST_STATE/environment/state"
+[ -f "$control" ] || { printf 'fixture environment has not been initialized\n' >&2; exit 2; }
+IFS= read -r state <"$control"
+case "$state" in
+ready) exit 0 ;;
+degraded) printf 'fixture browser provider is not answering\n' >&2; exit 1 ;;
+*) printf 'unsupported fixture environment state: %s\n' "$state" >&2; exit 2 ;;
+esac

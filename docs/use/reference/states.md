@@ -145,6 +145,33 @@ This check is GitHub **API** identity and repository eligibility. It is not
 proof of the SSH key or HTTPS credential `git push` uses, and Ompire records
 that transport identity as explicitly unattributed rather than inventing one.
 
+## Environment states
+
+Environment readiness is an in-memory observation, not a launch or ship gate.
+Restarting re-probes the TOML definitions; Re-check replaces the named
+environment's status and blockers. No history is retained.
+
+| State | Meaning |
+|---|---|
+| `unknown` | No probe has completed; `checked_at` is null |
+| `ready` | Check exited 0 and required programs/scripts are present |
+| `degraded` | Nonzero check exit or deadline exceeded |
+| `missing` | Declared provision or check program/script is absent |
+| `error` | Check could not execute or another probe error occurred |
+
+Blockers use `{code, message}`; messages contain bounded diagnostics.
+
+| Code | Meaning |
+|---|---|
+| `provision-script-missing` | Provision program/script absent; takes precedence over the check outcome |
+| `check-program-missing` | Check program/script absent |
+| `check-failed` | Check exited nonzero |
+| `check-timed-out` | Check exceeded the fixed deadline |
+| `check-error` | Execution or probe error, including permissions or executable format |
+
+Fix the reported condition or run the provision command yourself, then
+Re-check. The daemon never provisions. See [Environments](environments.md).
+
 ## Where a run stands with publication
 
 Four things are distinct, and Ompire reports them separately rather than

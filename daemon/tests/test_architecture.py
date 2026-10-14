@@ -73,6 +73,7 @@ OWNER_BY_PREFIX: dict[str, str] = {
     f"{MODULE}.isolation": "isolation",
     f"{MODULE}.forge_broker": "isolation",
     f"{MODULE}.events": "core",
+    f"{MODULE}.environments": "core",
     f"{MODULE}.notifications": "oversight-flat",
     f"{MODULE}.advisories": "oversight-flat",
     f"{MODULE}.app": "core",

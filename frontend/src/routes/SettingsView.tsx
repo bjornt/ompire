@@ -4,6 +4,7 @@ import {
   getDaemonInfo,
   getSettings,
   getToken,
+  recheckEnvironment,
   recheckGitHub,
   recheckGpg,
   rotateToken,
@@ -11,10 +12,11 @@ import {
 } from "../lib/api";
 import { setDaemonToken } from "../lib/token";
 import { useDaemonState } from "../lib/useDaemonState";
+import { environmentPresentation, formatEnvironmentCommand } from "../lib/environmentPresentation";
 import { githubIdentityPresentation, safeGitHubDetail } from "../lib/githubPresentation";
 import { gpgPresentation, selectionSourceLabel } from "../lib/gpgPresentation";
 import { ModelProfilesPanel } from "./ModelProfilesPanel";
-import type { AttentionTier, DaemonInfo, DaemonSettings } from "../types";
+import type { AttentionTier, DaemonInfo, DaemonSettings, EnvironmentInfo } from "../types";
 import "./SettingsView.css";
 
 function errorText(error: unknown): string {
@@ -393,6 +395,108 @@ function CommitSigningPanel() {
   );
 }
 
+function EnvironmentRow({ environment }: { environment: EnvironmentInfo }) {
+  const [rechecking, setRechecking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const busy = useRef(false);
+  const presentation = environmentPresentation(environment.status.state);
+  const capabilities = Object.entries(environment.capabilities);
+
+  async function recheck() {
+    if (busy.current) return;
+    busy.current = true;
+    setRechecking(true);
+    setError(null);
+    try {
+      // The broadcast is authoritative; do not overwrite a newer event with
+      // this request's response if another probe has already completed.
+      await recheckEnvironment(environment.name);
+    } catch (err: unknown) {
+      setError(errorText(err));
+    } finally {
+      busy.current = false;
+      setRechecking(false);
+    }
+  }
+
+  return (
+    <div className="environmentRow" data-testid={`environment-${environment.name}`}>
+      <h3 className="daemonGithubTitle">{environment.name}</h3>
+      <div
+        className="daemonGithubStatus"
+        role="status"
+        aria-live="polite"
+        aria-label={presentation.description}
+        data-testid={`environment-${environment.name}-state`}
+      >
+        <span className="dot" style={{ background: presentation.dot }} />
+        {presentation.label}
+      </div>
+      <p className="fieldHint">{presentation.description}</p>
+      <div className="daemonInfoGrid">
+        <div className="daemonInfoRow">
+          <span>Host requirement</span>
+          <code>{environment.host}</code>
+        </div>
+        <div className="daemonInfoRow">
+          <span>Capabilities / providers</span>
+          <div className="environmentCapabilities">
+            {capabilities.length === 0 ? "None declared" : capabilities.map(([capability, provider]) => (
+              <div key={capability}><code>{capability}</code>: <code>{provider}</code></div>
+            ))}
+          </div>
+        </div>
+        <div className="daemonInfoRow">
+          <span>Provision command</span>
+          <code className="environmentCommand" data-testid={`environment-${environment.name}-provision`}>
+            {formatEnvironmentCommand(environment.provision)}
+          </code>
+        </div>
+        <div className="daemonInfoRow">
+          <span>Last checked</span>
+          <code>{environment.status.checked_at ?? "Not checked yet"}</code>
+        </div>
+      </div>
+      <p className="fieldHint">Run the provision command yourself when needed; the daemon never provisions environments.</p>
+      {environment.status.blockers.length > 0 && (
+        <ul className="environmentBlockers" role="alert">
+          {environment.status.blockers.map((blocker, index) => (
+            <li key={`${blocker.code}-${index}`}>
+              <code>{blocker.code}</code>: {blocker.message}
+            </li>
+          ))}
+        </ul>
+      )}
+      {error && (
+        <p className="daemonGithubDetail" role="alert" data-testid={`environment-${environment.name}-error`}>
+          {error}
+        </p>
+      )}
+      <button
+        type="button"
+        className="ghostButton"
+        disabled={rechecking}
+        aria-label={`Re-check ${environment.name}`}
+        onClick={() => void recheck()}
+        data-testid={`recheck-environment-${environment.name}`}
+      >
+        {rechecking ? "Checking…" : "Re-check"}
+      </button>
+    </div>
+  );
+}
+
+function EnvironmentsPanel() {
+  const { environments } = useDaemonState();
+  if (environments.length === 0) return null;
+  return (
+    <section className="panel" data-testid="environments-panel">
+      <h2 className="panelTitle">Environments</h2>
+      {environments.map((environment) => <EnvironmentRow key={environment.name} environment={environment} />)}
+    </section>
+  );
+}
+
 
 function DaemonPanel() {
   const { gh } = useDaemonState();
@@ -683,6 +787,8 @@ export function SettingsView() {
             <h2 className="panelTitle">Daemon</h2>
             <DaemonPanel />
           </section>
+
+          <EnvironmentsPanel />
         </div>
       </div>
     </div>

@@ -80,6 +80,7 @@ nav:
           - GPG signing: use/reference/gpg-signing.md
           - Merge polling: use/reference/merge-poll.md
           - Daemon settings: use/reference/daemon-settings.md
+          - Environments: use/reference/environments.md
       - Explanation:
           - What Ompire is: use/explanation/what-ompire-is.md
           - The trust boundary: use/explanation/trust-boundary.md

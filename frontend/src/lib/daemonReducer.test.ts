@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { applyEnvelope, initialDaemonState } from "./daemonReducer";
-import type { Envelope, ModelProfile, Project, WorkflowDescriptor } from "../types";
+import type { Envelope, EnvironmentInfo, ModelProfile, Project, WorkflowDescriptor } from "../types";
 
 const project: Project = {
   name: "maas",
@@ -1579,5 +1579,88 @@ describe("the workflow library projection", () => {
       payload: { projects: [], tasks: [] },
     });
     expect(next.workflowLibrary).toEqual([]);
+  });
+});
+
+describe("applyEnvelope environment registry", () => {
+  const dogfood: EnvironmentInfo = {
+    name: "dogfood",
+    host: "vm",
+    capabilities: { model: "auth-gateway" },
+    provision: ["/qa/provision.sh"],
+    check: ["/qa/check.sh"],
+    status: { state: "unknown", blockers: [], checked_at: null },
+  };
+  const browser: EnvironmentInfo = { ...dogfood, name: "browser", host: "container" };
+
+  it("loads unknown observations from the snapshot and replaces the full named definition on each probe", () => {
+    const start = applyEnvelope(initialDaemonState, {
+      seq: 0, ts: "", type: "snapshot",
+      payload: { projects: [], tasks: [], environments: [browser, dogfood] },
+    });
+    expect(start.environments).toEqual([browser, dogfood]);
+    const degraded: EnvironmentInfo = {
+      ...dogfood,
+      host: "host",
+      capabilities: { forge: "forge-broker" },
+      provision: ["/qa/new-setup.sh"],
+      check: ["/qa/new-check.sh", "--probe"],
+      status: {
+        state: "degraded",
+        blockers: [{ code: "check-failed", message: "gateway not answering" }],
+        checked_at: "t1",
+      },
+    };
+    const event: Envelope = {
+      seq: 1, ts: "", type: "environment_status", payload: { environment: degraded },
+    };
+    const failed = applyEnvelope(start, event);
+    expect(failed.environments).toEqual([browser, degraded]);
+    expect(start.environments).toEqual([browser, dogfood]);
+    expect(applyEnvelope(failed, event).environments).toEqual([browser, degraded]);
+
+    const ready: EnvironmentInfo = {
+      ...degraded, status: { state: "ready", blockers: [], checked_at: "t2" },
+    };
+    const recovered = applyEnvelope(failed, {
+      seq: 2, ts: "", type: "environment_status", payload: { environment: ready },
+    });
+    expect(recovered.environments).toEqual([browser, ready]);
+  });
+
+  it("adds a previously unseen environment once, preserving the name order and other rows", () => {
+    const event: Envelope = {
+      seq: 1, ts: "", type: "environment_status", payload: { environment: dogfood },
+    };
+    const one = applyEnvelope(initialDaemonState, event);
+    const two = applyEnvelope(one, {
+      seq: 2, ts: "", type: "environment_status", payload: { environment: browser },
+    });
+    expect(two.environments).toEqual([browser, dogfood]);
+    expect(applyEnvelope(two, event).environments).toEqual([browser, dogfood]);
+    expect(initialDaemonState.environments).toEqual([]);
+  });
+
+  it("treats a reconnect snapshot as authoritative, dropping stale definitions and probe blockers", () => {
+    const failed: EnvironmentInfo = {
+      ...dogfood,
+      status: {
+        state: "missing",
+        blockers: [{ code: "check-program-missing", message: "/qa/check.sh is absent" }],
+        checked_at: "t1",
+      },
+    };
+    const stale = { ...initialDaemonState, environments: [browser, failed] };
+    const reset = applyEnvelope(stale, {
+      seq: 0, ts: "", type: "snapshot",
+      payload: { projects: [], tasks: [], environments: [dogfood] },
+    });
+    expect(reset.environments).toEqual([dogfood]);
+    for (const payload of [
+      { projects: [], tasks: [], environments: [] },
+      { projects: [], tasks: [] },
+    ]) {
+      expect(applyEnvelope(reset, { seq: 0, ts: "", type: "snapshot", payload }).environments).toEqual([]);
+    }
   });
 });

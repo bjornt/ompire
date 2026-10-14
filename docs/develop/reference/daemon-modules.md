@@ -43,6 +43,7 @@ submodules — and the checker rejects anything else.
 | `__main__.py` | `ompire-daemon` entry point. Loads config, builds the app, runs uvicorn. |
 | `app.py` | Application construction and lifespan. Owns the shared state every route depends on, and constructs the `LaunchService`, `SpawnScheduler`, `CleanupService`, and `WorkflowRunner` (with its command-execution adapter) using explicit collaborators. |
 | `config.py` | `config.toml` loading, validation, and defaults. Fails startup on an unknown or invalid key. |
+| `environments.py` | Frozen operator definitions, strict TOML parsing, bounded read-only readiness checks, fixed states/blockers, and the process-local registry. Publishes full `environment_status` observations; never provisions or gates work. See [Environments](../../use/reference/environments.md). |
 | `auth.py` | Bearer token generation, the REST dependency, and the WebSocket check. |
 | `static.py` | Serving the built frontend, including SPA deep-link fallback. |
 | `forge_broker.py` | Standalone stdlib-only trusted-side [forge broker](forge-broker.md): read-only repository REST and git clone/fetch behind a loopback Workshop tunnel; no daemon state or product imports. |
