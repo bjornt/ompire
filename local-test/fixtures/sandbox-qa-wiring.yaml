@@ -1,0 +1,16 @@
+# Non-secret Workshop tunnel contract, consumed by the real my-workshop.
+sdks:
+  - name: omp
+    plugs:
+      qa-browser:
+        interface: tunnel
+        endpoint: localhost:4181
+  - name: system
+    slots:
+      qa-browser:
+        interface: tunnel
+        endpoint: localhost:4182
+provision:
+  connect:
+    - plug: omp:qa-browser
+      slot: system:qa-browser

@@ -264,6 +264,7 @@ ISOLATION_PUBLIC_SURFACE = frozenset(
     {
         "ExcludeUpdateError",
         "GIT_EXCLUDE_OMPIRE_ENTRY",
+        "LOCAL_ADDITIONS_FILENAME",
         "PhaseProgress",
         "SandboxCommandError",
         "SandboxCommandResult",
@@ -278,6 +279,7 @@ ISOLATION_PUBLIC_SURFACE = frozenset(
         "destroy_workspace",
         "ensure_git_excludes",
         "exclude_pattern_for",
+        "global_additions_path",
         "launch_workshop",
         "prepare_clone",
         "recover_pending",

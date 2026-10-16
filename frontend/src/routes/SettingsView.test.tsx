@@ -584,6 +584,8 @@ describe("SettingsView environments panel", () => {
     capabilities: { model: "auth-gateway", forge: "forge-broker", browser: "chrome" },
     provision: ["/qa/setup env.sh", "--label", "operator's vm", "$HOME"],
     check: ["/qa/check.sh", "--probe"],
+    wiring: null,
+    grantable: false,
     status: { state: "ready", blockers: [], checked_at: "2026-10-14T12:00:00Z" },
   };
   const browser: EnvironmentInfo = {

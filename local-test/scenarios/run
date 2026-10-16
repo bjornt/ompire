@@ -37,6 +37,7 @@ MATRIX=(
 	merge-poll
 	advisories-stalls
 	durable-results
+	environment-grants
 	crash-recovery
 	cleanup
 )

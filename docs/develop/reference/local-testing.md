@@ -46,11 +46,30 @@ against behavior nobody implemented.
 ### Workshop
 
 `exec` runs commands as local host processes. `launch` writes the project lock
-and registers the workshop. `info` answers `present`, `absent`, and `unknown`.
-`remove` is idempotent on an already-gone workshop.
+and registers the workshop, capturing the exact additions and the merged
+Workshop declaration that the **real `my-workshop`** handed it. `info` answers
+`present`, `absent`, and `unknown`. `remove` deletes the container's connections;
+an already-gone workshop returns the marker the daemon treats as successful
+idempotent cleanup. Each in-place `exec` records its
+container and Linux process identity (PID, start ticks, and boot ID). Removal
+terminates only those exact live children and waits for their pipes to close;
+it opens a pidfd and revalidates identity before signalling, so stale records
+cannot kill a reused PID or another container's child. Exec keeps the command's
+PID, stdio, signal behavior, and exit status; no extra process supervisor stands
+between the daemon and its agent. The harness requires Linux pidfd support.
+
+`connect` checks the captured SDK plug/slot declarations and their interfaces.
+`wsctl probe <clone> <endpoint>` runs an observer through `workshop exec` and
+resolves only connected tunnel endpoints in that container's logical namespace;
+an undeclared, unconnected, or removed endpoint fails. This models Workshop's
+declared tunnel contract without pretending that host processes have isolated
+TCP namespaces. It proves launcher consumption, declaration, connection, and
+container-scoped presence/absence, **not** real LXD networking or provider
+availability.
 
 Launch failure injection covers both spawn error paths — non-zero exit, and
-zero exit with a missing lock file.
+zero exit with a missing lock file. A launch gate can hold the external process
+while additions staging is live, then abort it to exercise startup restoration.
 
 ### Agent
 
@@ -135,13 +154,23 @@ classifies it `ready`. The selfcheck pins both halves of that — never cached,
 still ready — against a real control key, so the distinction cannot regress
 back into "locked forever".
 
-### Declared QA environment
+### Declared QA environments
 
-The harness declares a `fixture` [environment](../../use/reference/environments.md)
-with host requirement `host` and capability `browser = "fixture-browser"`.
-Its read-only check is a real executable copied into the isolated state's
-`bin/`; its outcome comes from a control file, not daemon test-mode behavior.
-The provision command is an operator-run `local-test/environmentctl ready`.
+The harness declares two [environments](../../use/reference/environments.md),
+both with host requirement `host` and capability `browser = "fixture-browser"`:
+
+- `fixture` is observation-only, for the registry and Settings checks.
+- `sandbox-qa` is grantable, with a non-secret wiring fragment in
+  `local-test/fixtures/sandbox-qa-wiring.yaml`. Its `omp:qa-browser` tunnel plug
+  at `localhost:4181` connects to `system:qa-browser` at `localhost:4182`.
+
+Read-only checks are real executables copied into the isolated state's `bin/`;
+their outcomes come from control files, not daemon test-mode behavior. The
+provision command is an operator-run `local-test/environmentctl ready`, with
+the optional environment name selecting `sandbox-qa`. `env up` also saves a
+real workflow-library revision named `qa-work` declaring
+`environment: sandbox-qa`. `work-only` remains the scenario workflow with no
+environment requirement.
 
 Use the same `LOCAL_TEST_STATE` as the running harness:
 
@@ -152,16 +181,21 @@ local-test/environmentctl missing  # remove only the state-root check copy
 local-test/environmentctl ready    # restore the check and passing condition
 ```
 
+For the grant fixture, append its name: `local-test/environmentctl ready sandbox-qa`,
+`degraded sandbox-qa`, `missing sandbox-qa`, or `status sandbox-qa`.
+Controls preserve the other environment's condition. Re-check in Spawn or
+Settings after changing an external condition; acceptance always probes again.
+
 Each flip changes external readiness, not the cached daemon observation.
 Click that environment's **Re-check** in Settings to see `degraded` with
 `check-failed`, `missing` with `check-program-missing`, or recovery to `ready`.
 `environmentctl init` initializes a new fixture without resetting an existing
-condition; `env up` invokes it automatically.
+condition; `env up` initializes both fixtures automatically.
 
 For the no-declaration browser check, bring up a fresh isolated harness with
 `LOCAL_TEST_ENVIRONMENTS=0 local-test/env up`. Its Settings has no Environments
 panel. Run `env up` again without that switch to regenerate the config with
-the fixture and restart the daemon. No real QA credentials or providers are
+both fixtures and restart the daemon. No real QA credentials or providers are
 involved in these checks.
 
 ## States and behavior
@@ -265,9 +299,10 @@ Steering happens through published surfaces only:
 | Tool | Steers |
 |---|---|
 | `ghctl` | GitHub fake identity/authentication, repository policy/permission, credential-shaped output, pull-request lifecycle, one-shot create/view failures, and one-shot *lost replies* (`lose-next`) where the write lands and the caller is told nothing |
-| `wsctl` | Workshop registry and launch injection |
+| `wsctl` | Workshop registry, exact consumed launch snapshots (`inspect`), logical connected endpoint probes (`probe`), launch failure injection, and the `gate launch on/off/abort/status` staging-interruption control |
 | `ompctl` | One-shot agent scenarios by task, clone, session, or global key; lists sessions and transcripts |
 | `gpgctl` | The ship-gate signing state |
+| `environmentctl` | Independent `fixture` / `sandbox-qa` external check conditions (`ready`, `degraded`, `missing`, `status`); omit the name to select `fixture` |
 | `forge` | The local Git forge: one-shot push rejection, a receive counter that proves a push was not repeated, and a gate that holds a receive open so a runbook can catch the daemon inside the write window |
 
 All share the state root.
@@ -292,6 +327,7 @@ to assertions.
 | `ship-interrupted` | Lost replies: an already-landed push adopted through the run's own continuation rather than repeated, a pull request found by its correlation marker, and an unsearchable forge left explicitly unresolved |
 | `merge-poll` | The poll observes merging |
 | `crash-recovery` | Daemon `kill -9` recovery |
+| `environment-grants` | Missing and unasked grants refused without effects; acceptance re-probes named blockers; exact grant pinning; real launcher's exact additions consumption and emitted tunnel stanzas/connections; granted/ordinary fake-namespace endpoint presence/absence; grant and container survival across restart; interrupted staging restored; cleanup revokes the route |
 | `cleanup` | Task teardown |
 | `durable-results` | The no-commit journey: planning files captured, reviewed, accepted, downloaded, superseded; a refused capture; the same bytes after a daemon restart and after cleanup deletes the clone; task purge refused while results are retained, then explicit result purge, tombstone, and task purge |
 | `advisories-stalls` | Stall and advisory surfaces |

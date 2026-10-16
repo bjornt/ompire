@@ -32,6 +32,7 @@ Both calls accept:
 | `workspace_overrides` | no | Task-local overrides of the project's workspace defaults |
 | `step_overrides` | no | Per-agent-step profile and role choices, keyed by declared step name |
 | `auxiliary_overrides` | no | Retired with the engine's judge. Any entry is `422` rather than dropped. |
+| `grant_environment` | no | Affirmative whole-environment grant, default `false`; required when the workflow declares an environment and refused when it does not |
 | `preview_token` | on `POST /api/tasks` | The token from the preview that was reviewed |
 
 `workspace_overrides` may carry `base_branch`, `branch_pattern`,
@@ -223,6 +224,51 @@ Leaving the form to create a model profile in Settings — or to save a workflow
 in Workflows — keeps the draft: coming back restores the workflow, project,
 slug, prompt, and every override, including the per-row choices. Arriving from a
 workflow's **Launch in Spawn** selects that workflow and keeps the rest.
+
+## Environment access
+
+A workflow's optional `environment: <name>` requirement appears in the preview
+with the configured capability → provider pairs, whether wiring is available
+(`grantable`), and a freshly probed status with named blockers. **Re-check**
+runs another probe; completed checks update the section over WebSocket. A
+not-ready environment does not prevent reviewing the preview. An undeclared
+environment does: the refusal names it on `workflow_name`.
+
+The grant control starts off. Granting access changes the launch request and
+triggers a new preview; its token covers the grant and the environment's exact
+capabilities and wiring, not probe timestamps. Changing workflow or executable
+revision clears the grant. A saved form draft may restore it only for the same
+workflow revision.
+
+Acceptance enforces all of these before creating any task, workspace, or job:
+
+| Condition | Refusal |
+|---|---|
+| Required environment, no grant | `422` on `grant_environment`, naming the environment |
+| Grant with no workflow environment requirement | `422` on `grant_environment` |
+| Environment not ready after a fresh acceptance probe | `422` detail `{environment, blockers}` with the current named blockers |
+| Granted wiring plus non-empty selected Workshop additions | `422` naming the additions/wiring conflict |
+
+Fix the blocker and re-check, or change the additions selection and review
+again. The conflict check reads the selected global additions file, or the
+project's `workshop.my.yaml` on the accepted base tree, not dirty checkout
+bytes. A project-source wired launch pins that inspected commit, so later
+branch movement cannot substitute uninspected additions. An absent or
+zero-byte source does not conflict. The daemon never merges two overlays.
+
+Acceptance records `execution_inputs.environment_grant`: `name`,
+`capabilities`, exact `wiring` (or null for observation-only infrastructure),
+`granted_at` in UTC, and `actor: "operator"`. Recording the grant and task is
+one transaction. Restart and later configuration edits do not rederive the
+grant. An environment without wiring adds no capability endpoint; workflows
+without an environment retain their ordinary launch behavior.
+
+The granted fragment is staged through [Workshop additions](#workshop-additions)
+for this container only. Cleanup removes its tunnels with the container.
+Keep broker endpoints out of static repository Workshop declarations: those
+are ambient access outside daemon grant-gating. See
+[Environments](environments.md#task-access) for this deployment boundary.
+
 
 ## Handoff inputs
 
@@ -427,9 +473,9 @@ Spawn completion is recorded only after the last workspace step succeeds.
 
 The pipeline resolves nothing. Acceptance already reviewed and pinned every
 value it needs — the checkout path, the fetch remote, the base branch, the
-rendered branch, and the Workshop additions source — in the same transaction
-that created the task row. Editing the project between the `202` and the
-pipeline cannot repoint the fetch or move the branch point.
+rendered branch, Workshop additions source, and any environment grant — in the
+same transaction that created the task row. Editing the project between the
+`202` and the pipeline cannot repoint the fetch or move the branch point.
 
 The same is true of the workflow definition and of model policy: the task
 carries the pinned revision and one complete binding per declared model
@@ -458,6 +504,13 @@ but cannot be read fails workspace setup rather than launching with nothing
 applied. The staged file is gone before any agent starts in the clone, the
 registered checkout is never touched, and a crash mid-staging is undone at the
 next startup before recovery resumes anything.
+
+For a granted environment with wiring, the pinned fragment replaces the
+selected additions content for the launcher call; acceptance has already
+refused a non-empty selected source. The `workshop_additions` disclosure names
+the environment. Restoration, interrupted-staging recovery, and container
+cleanup use the same paths as ordinary additions; there is no grant-specific
+cleanup or credential rotation.
 
 ### After the pipeline
 

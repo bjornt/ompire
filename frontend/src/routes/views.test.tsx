@@ -2,7 +2,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
-import type { ModelProfile, Task, TaskExecutionInputs, WorkflowDescriptor } from "../types";
+import type { EnvironmentInfo, ModelProfile, Task, TaskExecutionInputs, WorkflowDescriptor } from "../types";
 type DeferredPromise<T> = {
   promise: Promise<T>;
   resolve: (value: T | PromiseLike<T>) => void;
@@ -44,6 +44,7 @@ class MockWebSocket {
     gpg?: unknown;
     gh?: unknown;
     settings?: unknown;
+    environments?: EnvironmentInfo[];
   }) {
     this.onopen?.();
     this.emit("snapshot", payload);
@@ -302,6 +303,7 @@ async function renderAt(
     gpg?: unknown;
     gh?: unknown;
     settings?: unknown;
+    environments?: EnvironmentInfo[];
   },
 ) {
   window.history.pushState({}, "", path);
@@ -334,7 +336,7 @@ function stubLaunchFetch(options: {
   acceptStatus?: number;
   acceptDetail?: unknown;
 } = {}) {
-  const fetchMock = vi.fn((url: string, init?: { method?: string }) => {
+  const fetchMock = vi.fn((url: string, init?: RequestInit) => {
     if (typeof url === "string" && url.endsWith("/api/tasks/preview")) {
       const status = options.previewStatus ?? 200;
       return Promise.resolve({
@@ -416,6 +418,233 @@ async function fillDraft(user: ReturnType<typeof userEvent.setup>, slug = "fix-b
   await user.type(screen.getByLabelText("Task slug"), slug);
   await screen.findByTestId("step-preview");
 }
+
+describe("SpawnView environment grants", () => {
+  const environment: EnvironmentInfo = {
+    name: "sandbox-qa", host: "container",
+    capabilities: { forge: "forge-broker", model: "auth-gateway" },
+    provision: ["/qa/provision"], check: ["/qa/check"],
+    wiring: "plugs:\n  forge:\n    interface: tunnel\n", grantable: true,
+    status: { state: "ready", blockers: [], checked_at: "t0" },
+  };
+  const grantLabel = "Grant this task access to sandbox-qa";
+
+  function requestBody(init?: RequestInit) {
+    if (typeof init?.body !== "string") throw new Error("Expected a JSON request body");
+    return JSON.parse(init.body);
+  }
+
+  function previewBodies(fetchMock: ReturnType<typeof stubLaunchFetch>) {
+    return fetchMock.mock.calls.filter(([url]) => url === "/api/tasks/preview")
+      .map(([, init]) => requestBody(init));
+  }
+
+  it("leaves ordinary workflows unchanged with no environment control or request flag", async () => {
+    const fetchMock = stubLaunchFetch();
+    await renderAt("/spawn", { ...launchSnapshot, environments: [environment] });
+    await fillDraft(userEvent.setup());
+    expect(screen.queryByTestId("spawn-environment")).not.toBeInTheDocument();
+    expect(previewBodies(fetchMock).every((body) => !("grant_environment" in body))).toBe(true);
+  });
+
+  it("shows capabilities and re-previews an affirmative grant before submitting its new token", async () => {
+    const options = { preview: previewResponse({ environment }) };
+    const fetchMock = stubLaunchFetch(options);
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+    const section = screen.getByTestId("spawn-environment");
+    expect(section).toHaveTextContent("sandbox-qa");
+    expect(section).toHaveTextContent("forge → forge-broker");
+    expect(section).toHaveTextContent("model → auth-gateway");
+    expect(section).toHaveTextContent("Grantable");
+    expect(screen.getByLabelText(grantLabel)).not.toBeChecked();
+    expect(previewBodies(fetchMock).at(-1)).not.toHaveProperty("grant_environment");
+
+    options.preview = previewResponse({ environment, preview_token: "tok-granted", branch: "granted-preview" });
+    await user.click(screen.getByLabelText(grantLabel));
+    await waitFor(() => expect(screen.getByTestId("branch-preview")).toHaveTextContent("granted-preview"));
+    expect(previewBodies(fetchMock).at(-1)).toHaveProperty("grant_environment", true);
+    options.preview = previewResponse({ environment, preview_token: "tok-ungranted", branch: "ungranted-preview" });
+    await user.click(screen.getByLabelText(grantLabel));
+    await waitFor(() => expect(screen.getByTestId("branch-preview")).toHaveTextContent("ungranted-preview"));
+    expect(previewBodies(fetchMock).at(-1)).not.toHaveProperty("grant_environment");
+    options.preview = previewResponse({ environment, preview_token: "tok-granted", branch: "granted-preview" });
+    await user.click(screen.getByLabelText(grantLabel));
+    await waitFor(() => expect(screen.getByTestId("branch-preview")).toHaveTextContent("granted-preview"));
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+    const accept = fetchMock.mock.calls.find(([url, init]) => url === "/api/tasks" && init?.method === "POST")!;
+    expect(requestBody(accept[1])).toMatchObject({
+      grant_environment: true, preview_token: "tok-granted",
+    });
+  });
+
+  it("distinguishes an observation-only requirement without hiding its explicit grant", async () => {
+    stubLaunchFetch({ preview: previewResponse({
+      environment: { ...environment, grantable: false, status: { state: "unknown", blockers: [], checked_at: null } },
+    }) });
+    await renderAt("/spawn", launchSnapshot);
+    await fillDraft(userEvent.setup());
+    expect(screen.getByTestId("spawn-environment")).toHaveTextContent("Observation-only");
+    expect(screen.getByTestId("spawn-environment")).toHaveTextContent("no sandbox wiring");
+    expect(screen.getByTestId("spawn-environment-state")).toHaveTextContent("unknown");
+    expect(screen.getByLabelText(grantLabel)).not.toBeChecked();
+  });
+
+  it("renders live probe states and blockers and re-checks through the existing API", async () => {
+    const fetchMock = stubLaunchFetch({ preview: previewResponse({ environment }) });
+    await renderAt("/spawn", { ...launchSnapshot, environments: [{
+      ...environment, status: { state: "unknown", blockers: [], checked_at: null },
+    }] });
+    const user = userEvent.setup();
+    await fillDraft(user);
+    // An initial unprobed snapshot never overwrites the fresh preview.
+    expect(screen.getByTestId("spawn-environment-state")).toHaveTextContent("ready");
+    const states = ["degraded", "missing", "error", "ready"] as const;
+    for (const [index, state] of states.entries()) {
+      act(() => socket().emit("environment_status", { environment: {
+        ...environment, status: {
+          state, checked_at: `t${index + 1}`,
+          blockers: state === "ready" ? [] : [{ code: `${state}_broker`, message: "Restore the forge broker" }],
+        },
+      } }));
+      expect(screen.getByTestId("spawn-environment-state")).toHaveTextContent(state);
+      if (state !== "ready") expect(screen.getByTestId("spawn-environment")).toHaveTextContent(`${state}_broker`);
+    }
+    expect(within(screen.getByTestId("spawn-environment")).queryByRole("alert")).not.toBeInTheDocument();
+    const before = previewBodies(fetchMock).length;
+    const pending = nativePromiseWithResolvers.withResolvers<{
+      ok: boolean; status: number; json: () => Promise<EnvironmentInfo>;
+    }>();
+    fetchMock.mockReturnValueOnce(pending.promise);
+    await user.click(screen.getByRole("button", { name: "Re-check sandbox-qa" }));
+    expect(screen.getByRole("button", { name: "Re-check sandbox-qa" })).toBeDisabled();
+    expect(fetchMock).toHaveBeenCalledWith("/api/environments/sandbox-qa/recheck", expect.objectContaining({ method: "POST", body: undefined }));
+    expect(previewBodies(fetchMock)).toHaveLength(before);
+    // A REST response is not a replacement for the latest WS observation.
+    await act(async () => pending.resolve({
+      ok: true, status: 200, json: async () => ({
+        ...environment, status: { state: "degraded", blockers: [{ code: "stale", message: "Older probe" }], checked_at: "t2" },
+      }),
+    }));
+    expect(screen.getByRole("button", { name: "Re-check sandbox-qa" })).toBeEnabled();
+    expect(screen.queryByText("Older probe")).not.toBeInTheDocument();
+    expect(screen.getByTestId("spawn-environment-state")).toHaveTextContent("ready");
+  });
+
+  it("keeps a failed re-check actionable without changing the grant or observed status", async () => {
+    const fetchMock = stubLaunchFetch({ preview: previewResponse({ environment }) });
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({ detail: "Probe unavailable" }) });
+    await user.click(screen.getByRole("button", { name: "Re-check sandbox-qa" }));
+    expect(await screen.findByText("Probe unavailable")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Re-check sandbox-qa" })).toBeEnabled();
+    expect(screen.getByLabelText(grantLabel)).not.toBeChecked();
+    expect(screen.getByTestId("spawn-environment-state")).toHaveTextContent("ready");
+  });
+
+  it("clears an affirmative grant when changing workflows, even with matching revisions", async () => {
+    const options = { preview: previewResponse({ environment }) };
+    const fetchMock = stubLaunchFetch(options);
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+    await user.click(screen.getByLabelText(grantLabel));
+    await waitFor(() => expect(previewBodies(fetchMock).at(-1)).toHaveProperty("grant_environment", true));
+    options.preview = previewResponse({ environment, workflow_name: "bugfix" });
+    await user.selectOptions(screen.getByLabelText("Workflow"), "bugfix");
+    await waitFor(() => expect(screen.getByLabelText(grantLabel)).not.toBeChecked());
+    expect(previewBodies(fetchMock).at(-1)).not.toHaveProperty("grant_environment");
+    expect(screen.getByTestId("spawn-grant-cleared")).toHaveTextContent("cleared the environment grant");
+    options.preview = previewResponse({ environment });
+    await user.selectOptions(screen.getByLabelText("Workflow"), "single-step");
+    await waitFor(() => expect(screen.getByLabelText(grantLabel)).not.toBeChecked());
+    expect(previewBodies(fetchMock).at(-1)).not.toHaveProperty("grant_environment");
+  });
+
+  it("clears a grant on a new executable revision but not a draft-only edit", async () => {
+    const options = { preview: previewResponse({ environment }) };
+    const fetchMock = stubLaunchFetch(options);
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+    await user.click(screen.getByLabelText(grantLabel));
+    await waitFor(() => expect(previewBodies(fetchMock).at(-1)).toHaveProperty("grant_environment", true));
+    act(() => socket().emit("workflow_library_updated", { ...libraryEntry("single-step", "sha256:abc"), version: 4 }));
+    expect(screen.getByLabelText(grantLabel)).toBeChecked();
+    options.preview = previewResponse({ environment, workflow_revision: "sha256:new" });
+    act(() => socket().emit("workflow_library_updated", { ...libraryEntry("single-step", "sha256:new"), version: 5 }));
+    await waitFor(() => expect(screen.getByLabelText(grantLabel)).not.toBeChecked());
+    expect(previewBodies(fetchMock).at(-1)).not.toHaveProperty("grant_environment");
+    expect(screen.getByTestId("spawn-grant-cleared")).toBeInTheDocument();
+  });
+
+  it.each(["sha256:abc", "sha256:old"])("restores draft grant only for the unchanged selected revision (%s)", async (grantRevision) => {
+    window.sessionStorage.setItem("ompire.spawnDraft", JSON.stringify({
+      ...emptyDraft, workflow: "single-step", project: "maas", slug: "restored",
+      grantEnvironment: true, grantRevision,
+    }));
+    const fetchMock = stubLaunchFetch({ preview: previewResponse({ environment }) });
+    await renderAt("/spawn", launchSnapshot);
+    await screen.findByTestId("spawn-environment");
+    await waitFor(() => {
+      if (grantRevision === "sha256:abc") expect(screen.getByLabelText(grantLabel)).toBeChecked();
+      else expect(screen.getByLabelText(grantLabel)).not.toBeChecked();
+    });
+    expect(previewBodies(fetchMock).at(-1)?.grant_environment).toBe(grantRevision === "sha256:abc" ? true : undefined);
+    expect(screen.getByLabelText("Task slug")).toHaveValue("restored");
+  });
+
+  it("keeps a grant through a same-workflow handoff and route round trip", async () => {
+    window.sessionStorage.setItem("ompire.spawnDraft", JSON.stringify({
+      ...emptyDraft, workflow: "single-step", project: "maas", slug: "restored",
+      grantEnvironment: true, grantRevision: "sha256:abc",
+    }));
+    stubLaunchFetch({ preview: previewResponse({ environment }) });
+    window.history.pushState({ usr: { workflow: "single-step" } }, "", "/spawn");
+    render(<App />);
+    act(() => socket().emitSnapshot(launchSnapshot));
+    expect(await screen.findByLabelText(grantLabel)).toBeChecked();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("link", { name: "Settings" }));
+    await user.click(screen.getByRole("link", { name: "Spawn task" }));
+    expect(await screen.findByLabelText(grantLabel)).toBeChecked();
+    expect(screen.getByLabelText("Workflow")).toHaveValue("single-step");
+  });
+
+  it("shows the grant field refusal and leaves the form editable", async () => {
+    stubLaunchFetch({ preview: previewResponse({ environment }), acceptStatus: 422,
+      acceptDetail: "grant_environment: Grant access to sandbox-qa before launching" });
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+    expect(await screen.findByText(/grant_environment: Grant access/)).toBeInTheDocument();
+    expect(screen.getByText(/Grant access to sandbox-qa before launching/)).toBeInTheDocument();
+    expect(screen.getByLabelText(grantLabel)).toBeEnabled();
+    expect(screen.getByLabelText("Task slug")).toHaveValue("fix-bug");
+  });
+
+  it("renders acceptance-time blocker details even when the earlier preview was ready", async () => {
+    const fetchMock = stubLaunchFetch({ preview: previewResponse({ environment }), acceptStatus: 422,
+      acceptDetail: { environment: "sandbox-qa", blockers: [{ code: "forge_down", message: "Start the forge broker" }] } });
+    await renderAt("/spawn", launchSnapshot);
+    const user = userEvent.setup();
+    await fillDraft(user);
+    await user.click(screen.getByLabelText(grantLabel));
+    await waitFor(() => expect(previewBodies(fetchMock).at(-1)).toHaveProperty("grant_environment", true));
+    await user.click(screen.getByRole("button", { name: "Spawn task" }));
+    const refusal = await screen.findByTestId("spawn-environment-refusal");
+    expect(refusal).toHaveTextContent("forge_down");
+    expect(refusal).toHaveTextContent("Start the forge broker");
+    expect(screen.getByText("Environment sandbox-qa is not ready.")).toBeInTheDocument();
+    expect(screen.getByLabelText(grantLabel)).toBeChecked();
+    expect(screen.getByRole("button", { name: "Spawn task" })).toBeEnabled();
+    expect(fetchMock.mock.calls.filter(([url, init]) => url === "/api/tasks" && init?.method === "POST")).toHaveLength(1);
+  });
+});
 
 describe("SpawnView", () => {
   it("offers every registered workflow against every project, with no template step", async () => {

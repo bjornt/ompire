@@ -43,7 +43,7 @@
 # gh_command at the fake gh and gpg_signing_key at the ephemeral key.
 # Port: 4173 (daemon default) or $LOCAL_TEST_PORT — a second concurrent
 # environment is a second LOCAL_TEST_STATE + LOCAL_TEST_PORT.
-# Set LOCAL_TEST_ENVIRONMENTS=0 on `up` to omit the fixture declaration and
+# Set LOCAL_TEST_ENVIRONMENTS=0 on `up` to omit both fixture declarations and
 # verify that Settings stays quiet when environments are not configured.
 
 set -euo pipefail
@@ -265,6 +265,7 @@ cmd_up() {
 	resolve_real_tool llmvet "$lv" ""
 
 	"$REPO_ROOT/local-test/environmentctl" init
+	"$REPO_ROOT/local-test/environmentctl" init sandbox-qa
 	# ---- 5. gitconfig + daemon config ---------------------------------------
 	log "config: regenerating $GITCONFIG (identity + signing key)"
 	"$FORGE" gitconfig --signingkey "$fpr"
@@ -284,6 +285,19 @@ provision = ["$REPO_ROOT/local-test/environmentctl", "ready"]
 check = ["$BIN/environment-check"]
 
 [environments.fixture.capabilities]
+browser = "fixture-browser"
+EOF
+		cat >>"$CONFIG" <<EOF
+
+[environments.sandbox-qa]
+host = "host"
+provision = ["$REPO_ROOT/local-test/environmentctl", "ready", "sandbox-qa"]
+check = ["$BIN/sandbox-qa-check"]
+wiring = '''
+$(cat "$REPO_ROOT/local-test/fixtures/sandbox-qa-wiring.yaml")
+'''
+
+[environments.sandbox-qa.capabilities]
 browser = "fixture-browser"
 EOF
 	fi
@@ -393,6 +407,20 @@ EOF
 		log "project: '$NAME' already registered"
 	else
 		log "project: registered '$NAME' ($SSH_URL)"
+	fi
+	# A real library revision, available to both runbooks and browser checks.
+	if [ "${LOCAL_TEST_ENVIRONMENTS:-1}" != "0" ]; then
+		local workflow_entry workflow_version
+		if workflow_entry=$(api_daemon POST /api/workflow-library '{"name":"qa-work"}' 2>/dev/null); then
+			workflow_version=$(jq -r '.entry.version' <<<"$workflow_entry")
+		else
+			workflow_entry=$(api_daemon GET /api/workflow-library/qa-work)
+			workflow_version=$(jq -r '.entry.version' <<<"$workflow_entry")
+		fi
+		payload=$(jq -n --rawfile y "$REPO_ROOT/local-test/scenarios/qa-work.yaml" \
+			--argjson v "$workflow_version" '{yaml: $y, expected_version: $v}')
+		api_daemon POST /api/workflow-library/qa-work/revisions "$payload" >/dev/null
+		log "workflow: registered 'qa-work' (requires sandbox-qa)"
 	fi
 
 

@@ -96,6 +96,41 @@ def test_source_invocations_have_the_same_ordinary_execution_semantics():
     }]
 
 
+def test_environment_requirement_survives_composition_retention_and_portable_authoring(monkeypatch):
+    document = source_document()
+    ordinary = revision(document)
+    required = revision({**document, "environment": "sandbox-qa"})
+    assert ordinary.definition.environment is None
+    assert "environment" not in ordinary.document
+    assert "environment" not in export_document(ordinary.document)
+    assert required.definition.environment == "sandbox-qa"
+    assert required.document == {**ordinary.document, "environment": "sandbox-qa"}
+    assert required.revision != ordinary.revision
+    monkeypatch.setattr(composition, "shared_step_catalog", no_catalog)
+    assert make_revision(load_canonical_document(required.document)).revision == required.revision
+    portable = export_document(required.document)
+    assert portable["environment"] == "sandbox-qa"
+    assert revision(portable).revision == required.revision
+    assert load_definition(export_yaml(required)).revision == required.revision
+    assert revision({**portable, "environment": "other-qa"}).revision != required.revision
+
+
+@pytest.mark.parametrize("canonical", [False, True])
+@pytest.mark.parametrize("value", [None, False, 1, [], {}, "", "Qa", "qa_env", "-qa", "qa\n"])
+def test_malformed_environment_is_located_in_both_composition_shapes(canonical, value):
+    document = revision(source_document()).document if canonical else source_document()
+    with pytest.raises(WorkflowDocumentError) as error:
+        revision({**document, "environment": value})
+    assert error.value.location == "environment"
+
+
+@pytest.mark.parametrize("canonical", [False, True])
+def test_environment_does_not_admit_unknown_composition_root_keys(canonical):
+    document = revision(source_document()).document if canonical else source_document()
+    with pytest.raises(WorkflowDocumentError, match="unknown field 'environments'"):
+        revision({**document, "environment": "sandbox-qa", "environments": []})
+
+
 @pytest.mark.parametrize("bindings", [{}, {"engine_name": 3}, {"engine_name": "finish", "unknown": True}])
 def test_missing_wrong_and_unknown_parameters_are_located(bindings):
     with pytest.raises(WorkflowDocumentError) as error:
@@ -286,10 +321,13 @@ def test_stages_may_group_later_exception_steps_without_reordering_execution():
 
 
 @pytest.mark.parametrize("version", [1, 2, 3, 4])
-def test_old_formats_keep_their_exact_canonical_identity(version):
+@pytest.mark.parametrize("environment", [None, "sandbox-qa"])
+def test_old_formats_keep_their_exact_canonical_identity(version, environment):
     ending = {"complete": True} if version == 1 else {"complete": True, "result": "done"}
     step = {"name": "finish", "kind": "decision", "cases": [{"when": True, "next": ending}], "otherwise": ending}
     source = {"format": version, "name": "custom", "sessions": ["main"], "primary": "main", "steps": [step]}
+    if environment is not None:
+        source["environment"] = environment
     expected_step = {**step, "max_visits": None, "on_exhausted": None}
     if version >= 2:
         expected_step["evidence"] = {}

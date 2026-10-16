@@ -1589,6 +1589,8 @@ describe("applyEnvelope environment registry", () => {
     capabilities: { model: "auth-gateway" },
     provision: ["/qa/provision.sh"],
     check: ["/qa/check.sh"],
+    wiring: null,
+    grantable: false,
     status: { state: "unknown", blockers: [], checked_at: null },
   };
   const browser: EnvironmentInfo = { ...dogfood, name: "browser", host: "container" };

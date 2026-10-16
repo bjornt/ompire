@@ -43,7 +43,7 @@ submodules — and the checker rejects anything else.
 | `__main__.py` | `ompire-daemon` entry point. Loads config, builds the app, runs uvicorn. |
 | `app.py` | Application construction and lifespan. Owns the shared state every route depends on, and constructs the `LaunchService`, `SpawnScheduler`, `CleanupService`, and `WorkflowRunner` (with its command-execution adapter) using explicit collaborators. |
 | `config.py` | `config.toml` loading, validation, and defaults. Fails startup on an unknown or invalid key. |
-| `environments.py` | Frozen operator definitions, strict TOML parsing, bounded read-only readiness checks, fixed states/blockers, and the process-local registry. Publishes full `environment_status` observations; never provisions or gates work. See [Environments](../../use/reference/environments.md). |
+| `environments.py` | Frozen operator definitions including optional wiring, strict TOML parsing, bounded read-only readiness checks, fixed states/blockers, and the process-local registry. Publishes full `environment_status` observations; never provisions. LaunchService consumes its probes to enforce environment grants. See [Environments](../../use/reference/environments.md). |
 | `auth.py` | Bearer token generation, the REST dependency, and the WebSocket check. |
 | `static.py` | Serving the built frontend, including SPA deep-link fallback. |
 | `forge_broker.py` | Standalone stdlib-only trusted-side [forge broker](forge-broker.md): read-only repository REST and git clone/fetch behind a loopback Workshop tunnel; no daemon state or product imports. |
@@ -77,14 +77,14 @@ acceptance algorithm itself never sees a request.
 
 | Module | Responsibility |
 |---|---|
-| `application/launch.py` | `LaunchService.preview/accept` and `SpawnScheduler` (strong job references, completion removal, lifespan cancellation — shared by preparation jobs and delivery jobs). |
+| `application/launch.py` | `LaunchService.preview/accept`: fresh required-environment probes, grant and additions-conflict enforcement, atomic accepted grant recording; and `SpawnScheduler` (strong job references, completion removal, lifespan cancellation — shared by preparation jobs and delivery jobs). |
 | `application/spawn.py` | The accepted-task preparation coordinator: projects accepted inputs onto a `WorkspaceSpec`, translates live resource progress into task events, installs retained handoff inputs between clone and container, records lifecycle observations through the work owner, and starts the pinned workflow only after preparation succeeds. `read_attachment_bytes` lives here — it reads result records under a connection. |
 | `application/cleanup.py` | `CleanupService`: admission (active delivery, run-position refusal), the shared cleanup hold, guarded resource teardown through isolation, and the existing owner finalization, archival, and projection. Destroys resources, never retained results or journals. |
 | `application/execution.py` | The workflow command-execution adapter: implements the engine's consumer-owned `CommandExecutor` contract over isolation's sandbox execution, translating resource failures into the engine's one execution error. |
 | `application/work.py` | Project registration/update/removal with checkout admission, setup retry, profile commands, and reconciliation confirmation — each with its committed-change event. |
 | `application/tasks.py` | Task list/detail composition (workshop status, attempt history) and the guarded explicit Continue. |
 | `work/launch.py` | Launch resolution: one set of rules shared by preview, acceptance, and legacy confirmation. Pure with respect to the world outside the database, so it can run inside a write reservation. |
-| `work/inputs.py` | The typed launch decision pinned to a task — including its workflow revision — its JSON codec, and `ModelPolicy`, the complete native role map one omp process runs under. |
+| `work/inputs.py` | The typed launch decision pinned to a task — including its workflow revision and optional immutable environment grant — its JSON codec, and `ModelPolicy`, the complete native role map one omp process runs under. |
 | `work/projects.py` | Project records: CRUD against the `projects` table, the guarded default-model-profile reference, setup-state transitions, and the launch-reconciliation state. |
 | `work/profiles.py` | Model-profile records: names, CRUD, and reference-guarded deletion. The role *values* live in `model_config.py`. |
 | `work/tasks.py` | Task records: the pinned-input guards, lifecycle classification, atomic purge (with its cross-owner result/delivery guards, held intact until the artifacts extraction), and startup reconciliation. |

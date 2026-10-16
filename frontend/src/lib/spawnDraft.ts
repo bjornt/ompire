@@ -69,6 +69,9 @@ export interface SpawnDraft {
    * selection changes, because an acknowledgement is about a specific set of
    * files and a specific target. */
   acknowledgeBaseDifference: boolean;
+  /** Affirmative access is scoped to this workflow's exact reviewed revision. */
+  grantEnvironment: boolean;
+  grantRevision: string | null;
 }
 
 /** Drop rows that override nothing, so an opened-and-reset selector leaves
@@ -96,6 +99,8 @@ export const emptySpawnDraft: SpawnDraft = {
   stepOverrides: {},
   attachments: [],
   acknowledgeBaseDifference: false,
+  grantEnvironment: false,
+  grantRevision: null,
 };
 
 /** Restore the draft a Settings or Workflows round trip interrupted.
@@ -130,6 +135,9 @@ export function loadSpawnDraft(preselectedProject?: string): SpawnDraft {
         acknowledgeBaseDifference:
           (parsed.attachments ?? []).length > 0 &&
           (parsed.acknowledgeBaseDifference ?? false),
+        grantEnvironment:
+          parsed.grantEnvironment === true && typeof parsed.grantRevision === "string",
+        grantRevision: typeof parsed.grantRevision === "string" ? parsed.grantRevision : null,
       };
     }
   } catch {

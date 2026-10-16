@@ -311,6 +311,15 @@ export interface WorkflowBinding {
   interrupted_legacy_seq: number | null;
 }
 
+/** The operator's immutable spawn-time authority, not a live registry lookup. */
+export interface EnvironmentGrant {
+  name: string;
+  capabilities: Readonly<Record<string, string>>;
+  wiring: string | null;
+  granted_at: string;
+  actor: string;
+}
+
 export interface TaskExecutionInputs {
   version: number;
   provenance: "accepted" | "legacy-confirmed";
@@ -350,6 +359,8 @@ export interface TaskExecutionInputs {
   source_commit: string | null;
   base_comparisons: PinnedBaseComparison[];
   acknowledged_base_difference: boolean;
+  /** Absent on tasks accepted before environment grants existed. */
+  environment_grant?: EnvironmentGrant | null;
 }
 
 /** One bundle this task was launched with, exactly as accepted. The files are
@@ -1149,6 +1160,8 @@ export interface EnvironmentInfo {
   capabilities: Record<string, string>;
   provision: string[];
   check: string[];
+  wiring: string | null;
+  grantable: boolean;
   status: EnvironmentStatus;
 }
 

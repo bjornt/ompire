@@ -405,6 +405,7 @@ def create_app(
         app.state.engine,
         config,
         events=app.state.events,
+        environments=app.state.environments,
         scheduler=app.state.spawn_scheduler,
         workflow_runner=app.state.workflow_runner,
         result_notifier=app.state.results.publish,

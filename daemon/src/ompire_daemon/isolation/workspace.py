@@ -87,6 +87,8 @@ class WorkspaceSpec:
     launcher_argv: tuple[str, ...]
     git_timeout: int
     workshop_timeout: int
+    environment_wiring: str | None = None
+    environment_name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,9 +127,9 @@ def _git_steps(spec: WorkspaceSpec) -> list[ProcessStep]:
     The base checkout's own fetch remote, which is not necessarily `origin`
     (ADR-0022), is fetched first; the local source path then gives the task
     clone a near-instant hardlink clone whose `origin` points at that
-    checkout. An attached launch branches from the pinned source commit, not
-    from wherever the base branch points by the time the clone lands
-    (ADR-0035).
+    checkout. A launch with an inspected source commit branches from that
+    commit, not from wherever the base branch points by the time the clone
+    lands (ADR-0035, ADR-0042).
     """
     timeout = spec.git_timeout
     return [
@@ -286,7 +288,9 @@ async def launch_workshop(
             spec.data_dir,
             spec.owner_id,
             spec.clone_path,
-            spec.additions_source,
+            "environment" if spec.environment_wiring is not None else spec.additions_source,
+            content=spec.environment_wiring,
+            note=f"environment {spec.environment_name!r} wiring applied",
         )
     except additions.WorkshopAdditionsError as exc:
         raise WorkspaceOperationError("workshop", str(exc)) from exc

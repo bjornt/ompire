@@ -36,6 +36,7 @@ from sqlalchemy import Connection
 from ompire_daemon.db import model_profiles as model_profiles_table
 from ompire_daemon.db import projects as projects_table
 from ompire_daemon.db import tasks as tasks_table
+from ompire_daemon.environments import EnvironmentDefinition
 from ompire_daemon.handoff import HandoffError, plan_destinations
 from ompire_daemon.model_config import MODEL_ROLES, RoleBinding, validate_model_role
 from ompire_daemon.registry.results import (
@@ -167,6 +168,7 @@ class LaunchRequest:
     # *this* attachment set and target commit by the fingerprint, so it cannot
     # be carried over to a different selection.
     acknowledge_result_base_difference: bool = False
+    grant_environment: bool = False
 
 
 @dataclass(frozen=True)
@@ -255,6 +257,9 @@ class ResolvedLaunch:
     # Whether this launch still needs the operator to acknowledge an
     # unvalidated base. False both when nothing needs it and when it was given.
     needs_base_acknowledgement: bool = False
+    environment: EnvironmentDefinition | None = None
+    # Fresh observation is presentation only and never fingerprint material.
+    environment_status: Mapping[str, Any] | None = None
 
 
 def _now_iso() -> str:
@@ -621,6 +626,7 @@ def launch_fingerprint(
     inputs: TaskExecutionInputs,
     revision: WorkflowRevision,
     rows: tuple[PreviewRow, ...],
+    environment: EnvironmentDefinition | None = None,
 ) -> str:
     """A deterministic value over the submitted selections, everything they
     resolved to, and the workflow descriptor they were resolved against.
@@ -686,6 +692,11 @@ def launch_fingerprint(
                     "acknowledge_result_base_difference": (
                         request.acknowledge_result_base_difference
                     ),
+                    **(
+                        {"grant_environment": request.grant_environment}
+                        if environment is not None or request.grant_environment
+                        else {}
+                    ),
                 },
                 "resolved": {
                     "profile": inputs.model_profile_name,
@@ -733,6 +744,17 @@ def launch_fingerprint(
                     "acknowledged_base_difference": (
                         inputs.acknowledged_base_difference
                     ),
+                    **(
+                        {
+                            "environment": {
+                                "name": environment.name,
+                                "capabilities": dict(environment.capabilities),
+                                "wiring": environment.wiring,
+                            }
+                        }
+                        if environment is not None
+                        else {}
+                    ),
                 },
                 "workflow": {
                     "name": revision.name,
@@ -761,6 +783,7 @@ def resolve_launch(
     request: LaunchRequest,
     *,
     evidence: TargetEvidence | None = None,
+    environments: tuple[EnvironmentDefinition, ...] = (),
 ) -> ResolvedLaunch:
     """Resolve one launch, or refuse it. Reads only; the caller decides
     whether that read sits in a reservation.
@@ -796,6 +819,23 @@ def resolve_launch(
         revision = resolve_current(conn, request.workflow_name)
     except (UnknownWorkflowNameError, WorkflowNotLaunchableError) as exc:
         raise LaunchInputError("workflow_name", str(exc)) from exc
+
+    environment = None
+    if revision.definition.environment is not None:
+        environment = next(
+            (
+                declaration
+                for declaration in environments
+                if declaration.name == revision.definition.environment
+            ),
+            None,
+        )
+        if environment is None:
+            raise LaunchInputError(
+                "workflow_name",
+                f"workflow {revision.name!r} requires environment "
+                f"{revision.definition.environment!r}, which this daemon does not declare",
+            )
 
     reader = _ProfileReader(conn)
     # The task-wide decision is still mandatory, and still resolved first:
@@ -856,10 +896,22 @@ def resolve_launch(
         upstream_url=project_row.upstream_url,
         fork_url=project_row.fork_url,
         result_attachments=attachments,
-        # Pinned only for an attachment launch. An ordinary launch keeps its
-        # branch-based behavior and records no commit observation, so nothing
-        # about it changes.
-        source_commit=evidence.commit if attachments and evidence else None,
+        # A wiring grant with project additions also pins the immutable base
+        # whose additions were checked, never the operator's dirty checkout.
+        source_commit=(
+            evidence.commit
+            if evidence is not None
+            and (
+                attachments
+                or (
+                    environment is not None
+                    and environment.wiring
+                    and request.grant_environment
+                    and workspace.workshop_additions == "project"
+                )
+            )
+            else None
+        ),
         base_comparisons=comparisons,
         acknowledged_base_difference=(
             needs_acknowledgement and request.acknowledge_result_base_difference
@@ -869,7 +921,7 @@ def resolve_launch(
         inputs=inputs,
         revision=revision,
         rows=rows,
-        fingerprint=launch_fingerprint(request, inputs, revision, rows),
+        fingerprint=launch_fingerprint(request, inputs, revision, rows, environment),
         profile_source=profile_source,
         project_default_profile=project_row.default_model_profile,
         inherited_workspace=WorkspaceInputs(
@@ -880,6 +932,7 @@ def resolve_launch(
         ),
         task_roles=roles,
         needs_base_acknowledgement=needs_acknowledgement,
+        environment=environment,
     )
 
 

@@ -13,6 +13,13 @@
 # Commands:
 #   list                        every launched workshop: path, id, name,
 #                               launch time, connections
+#   inspect <clone>             JSON launch snapshot (merged declaration and
+#                               exact additions), connections, id, timestamps
+#   probe <clone> <endpoint>    inspect a connected container-local tunnel via
+#                               workshop exec (logical namespace, not host TCP)
+#   gate launch on|off|abort|status
+#                               hold at the external launch boundary; abort
+#                               refuses the held launch before any container
 #   remove <clone>              deregister (like `workshop remove`,
 #                               .workshop.lock stays on disk)
 #   fail-next launch [fail|no-lock|off]
@@ -33,6 +40,11 @@ STATE_ROOT=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
 WS_JSON=$STATE_ROOT/workshops.json
 WS=$REPO_ROOT/local-test/fakes/workshop
 SELF_BIN=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+CONTRACT=$REPO_ROOT/local-test/fakes/workshop-contract.py
+PYTHON=$REPO_ROOT/daemon/.venv/bin/python
+LAUNCH_GATE=$STATE_ROOT/workshop-launch-gate
+LAUNCH_HELD=$STATE_ROOT/workshop-launch-held
+LAUNCH_ABORT=$STATE_ROOT/workshop-launch-abort
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
 
@@ -76,6 +88,45 @@ cmd_list() {
 		"$WS_JSON"
 }
 
+cmd_inspect() {
+	[ $# -eq 1 ] || die "usage: $0 inspect <clone>"
+	require_state
+	jq -e --arg p "$(realpath -m "$1")" '.workshops[$p] // null' "$WS_JSON"
+}
+
+cmd_probe() {
+	[ $# -eq 2 ] || die "usage: $0 probe <clone> <endpoint>"
+	export LOCAL_TEST_STATE=$STATE_ROOT
+	"$WS" exec -p "$1" -- "$PYTHON" "$CONTRACT" probe "$2"
+}
+
+cmd_gate() {
+	[ $# -eq 2 ] && [ "$1" = launch ] || die "usage: $0 gate launch on|off|abort|status"
+	case "$2" in
+	on)
+		[ ! -f "$LAUNCH_HELD" ] || die "a launch is already held"
+		mkdir -p "$STATE_ROOT"
+		rm -f "$LAUNCH_ABORT"
+		touch "$LAUNCH_GATE"
+		;;
+	off) rm -f "$LAUNCH_GATE" ;;
+	abort)
+		[ -f "$LAUNCH_HELD" ] || die "no launch is held"
+		touch "$LAUNCH_ABORT"
+		rm -f "$LAUNCH_GATE"
+		;;
+	status)
+		local armed=false held=null
+		[ ! -f "$LAUNCH_GATE" ] || armed=true
+		if [ -f "$LAUNCH_HELD" ]; then
+			held=$(cat "$LAUNCH_HELD" 2>/dev/null) || held=null
+		fi
+		jq -n --argjson armed "$armed" --argjson held "$held" '{armed: $armed, held: $held}'
+		;;
+	*) die "usage: $0 gate launch on|off|abort|status" ;;
+	esac
+}
+
 # --- remove -----------------------------------------------------------------------
 
 cmd_remove() {
@@ -89,7 +140,7 @@ cmd_remove() {
 	if [ -z "$entry" ]; then
 		die "no launched workshop registered for $key (known: $(known_paths))"
 	fi
-	mutate --arg p "$key" 'del(.workshops[$p])'
+	LOCAL_TEST_STATE="$STATE_ROOT" "$WS" remove -p "$key"
 	printf 'deregistered %s (.workshop.lock left on disk)\n' "$key"
 }
 
@@ -182,6 +233,20 @@ cmd_selfcheck() {
 		fail "list shows the id and name" "$out"
 	grep -q 'since:' <<<"$out" || fail "list shows the launch time" "$out"
 	ok "list: empty → launched, with id/name/since"
+	out=$(ctl_run inspect "$proj") || fail "inspect launched workshop" "$out"
+	jq -e '.launch.additions == null and .launch.plugs == {} and
+		.launch.definition == "name: selfcheck-ws\nbase: ubuntu@24.04\n"' \
+		<<<"$out" >/dev/null || fail "inspect captures the consumed declaration" "$out"
+	rc=0
+	ctl_run probe "$proj" localhost:4181 >/dev/null 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "ordinary workshop has no tunnel endpoint"
+	ctl_run gate launch on
+	ctl_run gate launch status | jq -e '.armed and .held == null' >/dev/null ||
+		fail "launch gate arms without inventing a held launch"
+	ctl_run gate launch off
+	ctl_run gate launch status | jq -e '(.armed | not) and .held == null' >/dev/null ||
+		fail "launch gate disarms"
+	ok "inspect, ungranted probe, and launch gate controls"
 
 	# ---- 2/6 remove mirrors workshop remove (lock preserved, info gone)
 	log "2/6 remove mirrors workshop remove"
@@ -263,6 +328,9 @@ cmd_selfcheck() {
 command=${1:-help}
 case "$command" in
 list) shift; cmd_list "$@" ;;
+inspect) shift; cmd_inspect "$@" ;;
+probe) shift; cmd_probe "$@" ;;
+gate) shift; cmd_gate "$@" ;;
 remove) shift; cmd_remove "$@" ;;
 fail-next) shift; cmd_fail_next "$@" ;;
 selfcheck) shift; cmd_selfcheck "$@" ;;

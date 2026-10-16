@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { WorkflowRevision } from "../components/WorkflowRevision";
-import { previewTask, spawnTask } from "../lib/api";
+import { DaemonError, previewTask, recheckEnvironment, spawnTask } from "../lib/api";
 import type {
   BaseComparison,
   ConsumerOverrideInput,
   LaunchInput,
+  LaunchEnvironment,
   LaunchPreview,
   WorkspaceOverridesInput,
 } from "../lib/api";
 import { PromptMentions } from "./PromptMentions";
 import { useDaemonState } from "../lib/useDaemonState";
+import { environmentPresentation } from "../lib/environmentPresentation";
 import {
   WORKSPACE_FIELDS,
   loadSpawnDraft,
@@ -327,6 +329,108 @@ function BaseComparisonNote({ comparison }: { comparison: BaseComparison }) {
   );
 }
 
+function LaunchError({ error }: { error: unknown }) {
+  const message = error instanceof Error ? error.message : String(error);
+  const detail = error instanceof DaemonError ? error.detail : null;
+  const blockers = Array.isArray(detail?.blockers)
+    ? detail.blockers.filter(
+        (blocker): blocker is { code: string; message: string } =>
+          typeof blocker === "object" && blocker !== null &&
+          typeof blocker.code === "string" && typeof blocker.message === "string",
+      )
+    : [];
+  return (
+    <>
+      {typeof detail?.field === "string" && <><code>{detail.field}</code>: </>}
+      {message}
+      {typeof detail?.environment === "string" && blockers.length > 0 && (
+        <ul data-testid="spawn-environment-refusal">
+          {blockers.map((blocker, index) => (
+            <li key={`${blocker.code}-${index}`}><code>{blocker.code}</code>: {blocker.message}</li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
+function EnvironmentRequirement({
+  environment, granted, onGrant, disabled,
+}: {
+  environment: LaunchEnvironment;
+  granted: boolean;
+  onGrant: (value: boolean) => void;
+  disabled: boolean;
+}) {
+  const { environments } = useDaemonState();
+  const [rechecking, setRechecking] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const busy = useRef(false);
+  const live = environments.find((entry) => entry.name === environment.name)?.status;
+  // A reconnect's unprobed snapshot must not hide the fresh preview probe.
+  const status = live?.checked_at &&
+    (!environment.status.checked_at || live.checked_at >= environment.status.checked_at)
+    ? live : environment.status;
+  const presentation = environmentPresentation(status.state);
+
+  async function recheck() {
+    if (busy.current) return;
+    busy.current = true;
+    setRechecking(true);
+    setError(null);
+    try {
+      // The existing environment_status stream owns the observation.
+      await recheckEnvironment(environment.name);
+    } catch (err: unknown) {
+      setError(err);
+    } finally {
+      busy.current = false;
+      setRechecking(false);
+    }
+  }
+
+  return (
+    <section className="spawnEnvironment" aria-label="Required environment" data-testid="spawn-environment">
+      <h3>Required environment: <code>{environment.name}</code></h3>
+      <div role="status" aria-live="polite" data-testid="spawn-environment-state">
+        <span className="dot" style={{ background: presentation.dot }} /> {presentation.label}
+      </div>
+      <p className="hint">{presentation.description}</p>
+      <p className="hint">Capabilities → providers</p>
+      <ul className="spawnEnvironmentCapabilities">
+        {Object.entries(environment.capabilities).map(([capability, provider]) => (
+          <li key={capability}><code>{capability}</code> → <code>{provider}</code></li>
+        ))}
+      </ul>
+      {Object.keys(environment.capabilities).length === 0 && <p className="hint">None declared.</p>}
+      <p className="hint">
+        {environment.grantable
+          ? "Grantable — granting wires these capabilities into this task's sandbox. Broker credentials stay outside the sandbox."
+          : "Observation-only — granting records approval of this requirement, but this environment has no sandbox wiring."}
+      </p>
+      <p className="hint">Last checked: <code>{status.checked_at ?? "Not checked yet"}</code></p>
+      {status.blockers.length > 0 && (
+        <ul className="spawnEnvironmentBlockers" role="alert">
+          {status.blockers.map((blocker, index) => (
+            <li key={`${blocker.code}-${index}`}><code>{blocker.code}</code>: {blocker.message}</li>
+          ))}
+        </ul>
+      )}
+      {error !== null && <div className="submitError" role="alert"><LaunchError error={error} /></div>}
+      <button type="button" className="ghostButton" disabled={disabled || rechecking}
+        aria-label={`Re-check ${environment.name}`} onClick={() => void recheck()}>
+        {rechecking ? "Checking…" : "Re-check"}
+      </button>
+      <label className="spawnEnvironmentGrant">
+        <input type="checkbox" name="grant_environment" checked={granted} disabled={disabled}
+          onChange={(event) => onGrant(event.target.checked)} />{" "}
+        Grant this task access to {environment.name}
+      </label>
+      <p className="hint">Readiness is checked again on submission. A grant applies only to this workflow revision.</p>
+    </section>
+  );
+}
+
 export function SpawnView() {
   const {
     snapshotReady,
@@ -349,10 +453,11 @@ export function SpawnView() {
     loadSpawnDraft((location.state as { project?: string } | null)?.project),
   );
   const [phase, setPhase] = useState<SpawnPhase>({ kind: "idle" });
-  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<unknown>(null);
   const [preview, setPreview] = useState<LaunchPreview | null>(null);
-  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<unknown>(null);
   const [staleReview, setStaleReview] = useState(false);
+  const [grantCleared, setGrantCleared] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   // Set when a workflow change — or a new executable revision of the selected
   // one — discarded row overrides, so the operator is told rather than
@@ -369,6 +474,16 @@ export function SpawnView() {
   useEffect(() => saveSpawnDraft(draft), [draft]);
 
   const project = projects.find((p) => p.name === draft.project) ?? null;
+  const workflow = workflowCatalog.find((w) => w.name === draft.workflow) ?? null;
+  const selectedRevision = workflow?.revision ?? null;
+  const environmentGranted = draft.grantEnvironment &&
+    selectedRevision !== null && draft.grantRevision === selectedRevision;
+
+  useEffect(() => {
+    if (!snapshotReady || !draft.grantEnvironment || draft.grantRevision === selectedRevision) return;
+    setDraft((current) => ({ ...current, grantEnvironment: false, grantRevision: null }));
+    setGrantCleared(true);
+  }, [snapshotReady, draft.grantEnvironment, draft.grantRevision, selectedRevision]);
 
   const update = useCallback((patch: Partial<SpawnDraft>) => {
     setDraft((current) => ({ ...current, ...patch }));
@@ -389,7 +504,8 @@ export function SpawnView() {
         setClearedRows(
           cleared.length > 0 ? { rows: cleared.sort(), reason: "workflow" } : null,
         );
-        return { ...current, workflow, stepOverrides: {} };
+        if (current.grantEnvironment) setGrantCleared(true);
+        return { ...current, workflow, stepOverrides: {}, grantEnvironment: false, grantRevision: null };
       });
     },
     [],
@@ -506,6 +622,7 @@ export function SpawnView() {
       ...(draft.profile ? { model_profile: draft.profile } : {}),
       ...(Object.keys(overrides).length > 0 ? { workspace_overrides: overrides } : {}),
       ...(Object.keys(stepOverrides).length > 0 ? { step_overrides: stepOverrides } : {}),
+      ...(environmentGranted ? { grant_environment: true } : {}),
       // Omitted entirely when nothing is attached, so an ordinary launch sends
       // exactly the request it always did.
       ...(draft.attachments.length > 0
@@ -515,7 +632,7 @@ export function SpawnView() {
           }
         : {}),
     };
-  }, [draft]);
+  }, [draft, environmentGranted]);
 
   /** Every accepted, still-readable revision this project can offer.
    *
@@ -541,8 +658,6 @@ export function SpawnView() {
     return offered.sort((a, b) => b.captured_at.localeCompare(a.captured_at));
   }, [draft.project, tasks, taskResults]);
 
-  const workflow = workflowCatalog.find((w) => w.name === draft.workflow) ?? null;
-
   /** The library entry behind the selection, whether or not it can launch.
    *
    * Kept separate from the catalog lookup so a selection that has just been
@@ -566,7 +681,6 @@ export function SpawnView() {
    * re-resolved. Editing only the entry's draft does not move this value, so
    * it deliberately does not refetch — and does not reset the row overrides,
    * which are still about these same steps. */
-  const selectedRevision = workflow?.revision ?? null;
   const lastRevisionRef = useRef<string | null>(selectedRevision);
 
   useEffect(() => {
@@ -657,7 +771,7 @@ export function SpawnView() {
       .catch((error: unknown) => {
         if (cancelled || generation !== previewGenerationRef.current) return;
         setPreview(null);
-        setPreviewError(error instanceof Error ? error.message : String(error));
+        setPreviewError(error);
       });
     return () => {
       cancelled = true;
@@ -712,7 +826,7 @@ export function SpawnView() {
       submitLockRef.current = false;
       setPhase({ kind: "idle" });
       const message = error instanceof Error ? error.message : String(error);
-      setSubmitError(message);
+      setSubmitError(error);
       if (message.includes("changed since it was previewed")) {
         setStaleReview(true);
         previewGenerationRef.current += 1;
@@ -895,6 +1009,21 @@ export function SpawnView() {
             </div>
           </div>
 
+          {grantCleared && (
+            <p className="hint" role="status" data-testid="spawn-grant-cleared">
+              Changing the workflow or its selected revision cleared the environment grant. Review the requirement and grant access again.
+            </p>
+          )}
+          {preview?.environment && preview.workflow_name === draft.workflow &&
+            preview.workflow_revision === selectedRevision && (
+            <EnvironmentRequirement key={`${draft.workflow}-${selectedRevision}`}
+              environment={preview.environment} granted={environmentGranted} disabled={locked}
+              onGrant={(value) => {
+                update({ grantEnvironment: value, grantRevision: value ? selectedRevision : null });
+                setGrantCleared(false);
+              }} />
+          )}
+
           <HandoffInputs
             projectName={draft.project}
             selected={draft.attachments}
@@ -1010,14 +1139,14 @@ export function SpawnView() {
               template upgrade. <Link to="/projects">Resolve it in Projects</Link>
             </div>
           )}
-          {previewError && (
+          {previewError !== null && (
             <div className="submitError" role="alert" data-testid="preview-error">
-              {previewError}
+              <LaunchError error={previewError} />
             </div>
           )}
-          {submitError && (
+          {submitError !== null && (
             <div className="submitError" role="alert">
-              {submitError}
+              <LaunchError error={submitError} />
             </div>
           )}
         </form>

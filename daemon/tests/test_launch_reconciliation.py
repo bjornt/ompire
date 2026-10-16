@@ -546,6 +546,71 @@ def test_a_legacy_task_states_what_is_unknown_and_blocks_until_confirmed(
         assert again.status_code == 409
 
 
+def test_environment_candidate_cannot_grant_access_by_legacy_continuation(
+    daemon_config: Config, git_checkout: Path
+) -> None:
+    from ompire_daemon.registry.workflow_definitions import insert_revision
+    from ompire_daemon.work.profiles import create_model_profile
+    from ompire_daemon.workflow_definitions import load_definition
+    from tests.conftest import PLAIN_WORKFLOW_YAML
+
+    _land_at_0012(daemon_config)
+    _seed(daemon_config, git_checkout, [{"name": "t"}])
+    task_id = _seed_legacy_task(daemon_config, git_checkout)
+    app = create_app(daemon_config, frontend_dist=daemon_config.data_dir / "no-dist")
+    create_model_profile(app.state.engine, name="chosen", roles=TEST_ROLES)
+    required = load_definition(
+        PLAIN_WORKFLOW_YAML.replace("name: plain", "name: single-step")
+        + "environment: sandbox-qa\n"
+    )
+    with app.state.engine.begin() as conn:
+        insert_revision(conn, required)
+        conn.execute(
+            text("UPDATE workflow_library SET current_revision = :revision WHERE name = 'single-step'"),
+            {"revision": required.revision},
+        )
+    with TestClient(app) as client:
+        headers = {"Authorization": f"Bearer {app.state.auth_token}"}
+        before = client.get(f"/api/tasks/{task_id}", headers=headers).json()
+        candidate = client.get(
+            f"/api/tasks/{task_id}/configuration", headers=headers
+        ).json()["workflow_candidate"]
+        assert candidate["available"] is True
+        assert candidate["compatible"] is False
+        problems = "; ".join(candidate["problems"])
+        assert "environment 'sandbox-qa'" in problems
+        assert "cannot wire an environment" in problems
+        assert "spawn a new task" in problems
+        assert "environment grant" in problems
+        continuation = {
+            "model_profile": "chosen",
+            "base_branch": "main",
+            "workshop_additions": "project",
+            "preamble": "",
+        }
+        preview = client.post(
+            f"/api/tasks/{task_id}/configuration/preview", headers=headers, json=continuation
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["workflow"]["compatible"] is False
+        refused = client.post(
+            f"/api/tasks/{task_id}/configuration/confirm",
+            headers=headers,
+            json={
+                **continuation,
+                "preview_token": preview.json()["preview_token"],
+                "acknowledge_unknown": True,
+                "acknowledge_workflow": True,
+            },
+        )
+        assert refused.status_code == 422, refused.text
+        assert "workflow_candidate" in refused.json()["detail"]
+        assert "sandbox-qa" in refused.json()["detail"]
+        assert "spawn a new task" in refused.json()["detail"]
+        after = client.get(f"/api/tasks/{task_id}", headers=headers).json()
+        assert after == before
+
+
 def test_a_stale_continuation_preview_changes_nothing(
     daemon_config: Config, git_checkout: Path
 ) -> None:

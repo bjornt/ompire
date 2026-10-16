@@ -158,3 +158,4 @@ nav:
           - 0039 Workspace resources behind isolation: adr/0039-own-workspace-resources-behind-isolation.md
           - 0040 Resolve shared workflow steps before retention: adr/0040-resolve-shared-workflow-steps-before-retention.md
           - 0041 Read-only forge broker: adr/0041-broker-forge-access-behind-read-only-proxy.md
+          - 0042 Environment grants at acceptance: adr/0042-pin-environment-grants-at-task-acceptance.md

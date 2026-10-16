@@ -37,6 +37,12 @@ That profile is harness data, not a production fallback. The daemon never
 creates one; the harness does, in the same way it creates the sandbox
 repository.
 
+With declarations enabled (the default), bring-up also registers `qa-work`,
+whose requirement is `sandbox-qa`. Its ready/degraded/missing condition is
+controlled independently with `local-test/environmentctl ready sandbox-qa`
+(replace `ready` as needed), always using the running harness's
+`LOCAL_TEST_STATE`. The existing `fixture` environment remains observation-only.
+
 Scenarios launch through the real contract: `spawn_task` in
 `local-test/scenarios/lib.sh` previews first and submits the reviewed token,
 because that is what `POST /api/tasks` requires.
@@ -73,6 +79,7 @@ the daemon, and `cleanup` runs last.
 | `merge-poll` | Pull-request state polling to a terminal state |
 | `advisories-stalls` | Stall detection and context advisories |
 | `crash-recovery` | Killing the daemon mid-work and recovering, including inside a delivery's push window |
+| `environment-grants` | Grant refusals, live readiness at acceptance, pinned grant, exact wiring consumed by the real launcher, connected/absent endpoints in the fake Workshop namespace, restart survival, interrupted staging restoration, and cleanup revocation |
 | `durable-results` | Capturing planning files with no commit, reviewing and accepting one revision, downloading it, a successor and its comparison, a refused capture, identical bytes after a daemon restart and after cleanup, guarded purge, and a create-only export into a disposable checkout with its conflict, identical-destination, and purge-blocker behavior |
 | `planning-handoff` | Packaged planning capture, exact-result acceptance prerequisite, and no-publication completion |
 | `cleanup` | Workshop removal, clone deletion, archival |
@@ -96,6 +103,17 @@ uv run --project daemon --quiet python local-test/scenarios/ws-watch \
 
 Each scenario is also directly executable — it sources `lib.sh` itself. The
 `run` driver adds preflight checks and the clean-machine matrix run.
+
+For a focused grant check, run `local-test/scenarios/run environment-grants`.
+For its browser counterpart, select `qa-work` in Spawn, inspect the requirement
+and blockers, toggle the affirmative grant, re-check after
+`local-test/environmentctl degraded sandbox-qa` and `ready sandbox-qa`, then
+submit a granted launch. `work-only` (saved by the runbook) has no requirement;
+the packaged `single-step` workflow is also ordinary. The runbook's
+`wsctl inspect` assertions prove the **real `my-workshop`** consumed the exact
+fragment and emitted the tunnel declaration and connection calls. Its endpoint
+probe models Workshop's container-local namespace, not real LXD networking;
+see the [harness reference](../reference/local-testing.md#workshop).
 
 ## Drive the UI in a browser
 

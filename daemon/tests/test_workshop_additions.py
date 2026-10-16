@@ -23,6 +23,7 @@ from ompire_daemon.isolation.additions import (
     LOCAL_ADDITIONS_FILENAME,
     WorkshopAdditionsError,
 )
+from ompire_daemon.work.inputs import EnvironmentGrant
 from ompire_daemon.work.projects import create_project
 from ompire_daemon.work.tasks import clone_path_for, create_task, get_task
 from tests.conftest import make_execution_inputs
@@ -43,6 +44,7 @@ class _RecordingRunner:
 
 LOCAL_MARKER = "additions:\n  - source: project-local\n"
 GLOBAL_MARKER = "additions:\n  - source: operator-global\n"
+ENVIRONMENT_WIRING = "plugs:\n  forge:\n    interface: tunnel\n    port: 8791\n"
 
 
 @pytest.fixture
@@ -184,8 +186,33 @@ def test_interrupted_staging_is_undone_before_agents_start(
     assert workshopadditions.recover_pending(data_dir) == []
 
 
+@pytest.mark.parametrize("original", [None, LOCAL_MARKER])
+def test_interrupted_environment_staging_restores_original_state(
+    tmp_path: Path, original: str | None
+) -> None:
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    local = clone / LOCAL_ADDITIONS_FILENAME
+    if original is not None:
+        local.write_text(original)
+    data_dir = tmp_path / "data"
+
+    workshopadditions.stage(
+        data_dir, 1, str(clone), "environment", content=ENVIRONMENT_WIRING,
+        note="environment 'sandbox-qa' wiring applied",
+    )
+    assert local.read_text() == ENVIRONMENT_WIRING
+    assert workshopadditions.recover_pending(data_dir) == [1]
+    if original is None:
+        assert not local.exists()
+    else:
+        assert local.read_text() == original
+    assert workshopadditions.recover_pending(data_dir) == []
+
+
+@pytest.mark.parametrize("granted", [False, True])
 async def test_launcher_sees_the_selected_source_and_the_clone_is_restored(
-    app, git_checkout: Path, tmp_path: Path, global_additions: Path
+    app, git_checkout: Path, tmp_path: Path, global_additions: Path, granted: bool
 ) -> None:
     """End to end through the pipeline, against an executable fake launcher
     that records the additions file it found. The clone an agent later starts
@@ -219,11 +246,22 @@ async def test_launcher_sees_the_selected_source_and_the_clone_is_restored(
         branch="ompire/additions",
         clone_path=str(clone_path),
         prompt="",
-        execution_inputs=make_execution_inputs(
-            engine=engine,
-            checkout_path=str(git_checkout),
-            branch="ompire/additions",
-            workshop_additions="global",
+        execution_inputs=replace(
+            make_execution_inputs(
+                engine=engine,
+                checkout_path=str(git_checkout),
+                branch="ompire/additions",
+                workshop_additions="global",
+            ),
+            environment_grant=(
+                EnvironmentGrant(
+                    name="sandbox-qa",
+                    capabilities={"forge": "forge-broker"},
+                    wiring=ENVIRONMENT_WIRING,
+                    granted_at="2026-10-16T00:00:00+00:00",
+                    actor="operator",
+                ) if granted else None
+            ),
         ),
     )
 
@@ -235,7 +273,7 @@ async def test_launcher_sees_the_selected_source_and_the_clone_is_restored(
     assert get_task(engine, task.id).spawn_completed_at is not None
     assert runner.started == [task.id]
     # The launcher ran with the operator's global additions in place …
-    assert seen.read_text() == GLOBAL_MARKER
+    assert seen.read_text() == (ENVIRONMENT_WIRING if granted else GLOBAL_MARKER)
     # … and the clone it left behind carries none of them.
     assert not (clone_path / LOCAL_ADDITIONS_FILENAME).exists()
 
@@ -244,7 +282,9 @@ async def test_launcher_sees_the_selected_source_and_the_clone_is_restored(
         event = queue.get_nowait()
         if event.type == "workshop_additions":
             disclosures.append(event.payload)
-    assert disclosures[0]["source"] == "global"
+    assert disclosures[0]["source"] == ("environment" if granted else "global")
+    if granted:
+        assert "sandbox-qa" in disclosures[0]["detail"]
 
 
 async def test_a_failed_launch_still_restores_the_clone(

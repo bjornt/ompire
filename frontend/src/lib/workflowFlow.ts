@@ -521,7 +521,7 @@ export function unknownStepFields(step: DraftObject): string[] {
 }
 
 export function unknownDocumentFields(document: DraftObject): string[] {
-  const known = ["format", "name", "sessions", "primary", "steps"];
+  const known = ["format", "name", "sessions", "primary", "steps", "environment"];
   if (documentFormat(document) === 5) known.push("definitions", "stages", "composition");
   return Object.keys(document).filter((key) => !known.includes(key));
 }

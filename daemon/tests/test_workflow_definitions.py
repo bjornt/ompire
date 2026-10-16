@@ -35,6 +35,7 @@ from ompire_daemon.workflow_definitions import (
     bindings_document,
     bindings_from_document,
     canonical_bytes,
+    canonical_document,
     check_draft_data,
     definition_from_document,
     describe,
@@ -42,8 +43,11 @@ from ompire_daemon.workflow_definitions import (
     evaluate_predicate,
     evaluate_value,
     evidence_views,
+    export_document,
     export_yaml,
+    load_canonical_document,
     load_definition,
+    make_revision,
     parse_yaml_document,
     record_view,
     render_text,
@@ -95,6 +99,41 @@ def test_minimal_document_loads_with_defaults_made_explicit() -> None:
     assert (step.role, step.expects_outcome, step.max_visits) == ("default", False, None)
     assert revision.document["steps"][0]["role"] == "default"
     assert revision.revision.startswith("sha256:")
+
+
+@pytest.mark.parametrize("name", ["sandbox-qa", "2", "qa--env-"])
+def test_environment_requirement_is_retained_and_exported_without_daemon_lookup(name: str) -> None:
+    original = load(MINIMAL)
+    required = load(MINIMAL + f"environment: {json.dumps(name)}\n")
+    assert original.definition.environment is None
+    assert "environment" not in original.document
+    assert "environment" not in export_document(original.document)
+    assert required.definition.environment == name
+    assert required.document["environment"] == name
+    assert required.revision != original.revision
+    assert make_revision(load_canonical_document(required.document)).revision == required.revision
+    assert load(export_yaml(required)).revision == required.revision
+    assert export_document(required.document)["environment"] == name
+    expected = {**original.document, "environment": name}
+    assert canonical_document(required.definition) == expected
+    changed = load(MINIMAL + "environment: another-env\n")
+    assert changed.revision != required.revision
+
+
+@pytest.mark.parametrize("value", [None, False, 1, [], {}, "", " ", "Qa", "qa_env", "-qa", "qa/host", "qa\n"])
+def test_malformed_environment_requirement_names_its_root_location(value) -> None:
+    document = {**parse_yaml_document(MINIMAL), "environment": value}
+    with pytest.raises(WorkflowDocumentError) as error:
+        definition_from_document(document)
+    assert error.value.location == "environment"
+    expected = "string" if not isinstance(value, str) else "environment name"
+    assert expected in error.value.reason
+
+
+def test_environment_support_does_not_admit_other_root_keys() -> None:
+    document = {**parse_yaml_document(MINIMAL), "environment": "sandbox-qa", "environments": []}
+    with pytest.raises(WorkflowDocumentError, match="unknown field 'environments'"):
+        definition_from_document(document)
 
 
 @pytest.mark.parametrize(

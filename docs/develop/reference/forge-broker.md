@@ -119,6 +119,12 @@ is connected. If the broker runs on another trusted machine, arranging a
 protected forward to the slot host is an operator responsibility; exposing the
 listener publicly is not a substitute.
 
+For daemon-granted environments, supply the tunnel stanzas and their
+connections through the environment's
+[wiring fragment](../../use/reference/environments.md#task-access), not a
+static repository declaration. Static plugs give every task ambient access
+and are outside daemon grant-gating.
+
 This component does not modify this repository's current `workshop.yaml`, start
 a broker from `setup-qa-env.sh`, install a service unit, or implement environment
 grants. The dogfood-environment integration owns that provisioning and tunnel

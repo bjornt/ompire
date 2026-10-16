@@ -41,6 +41,10 @@ latest_result() { # latest_result TASK_ID — newest revision id
 
 results_version() { results_doc "$1" | jq -r '.version'; }
 
+planning_session_resumed() {
+	[ "$(api_code GET "/api/tasks/$1/sessions/main/agent/state")" = 200 ]
+}
+
 capture() { # capture TASK_ID REQUEST_ID PATH… — returns the new revision id
 	local task=$1 request=$2
 	shift 2
@@ -198,6 +202,9 @@ rm -rf "$clone/$PLAN_DIR/nested"
 
 daemon_stop
 daemon_start
+# Serving metadata does not mean background session recovery has completed.
+# Finish the restart leg before destroying the container in the next leg.
+wait_for "planning session resumes after restart" 90 planning_session_resumed "$tid"
 [ "$(result_field "$tid" "$first" .accepted_at)" = "$accepted_at" ] &&
 	ok "acceptance survives a daemon restart" || fail "acceptance after restart" "lost"
 zip_after=$WORKDIR/after-restart.zip
@@ -273,7 +280,7 @@ gone_code=$(api_code GET "/api/tasks/$tid/results/$first/download")
 
 api_json DELETE "/api/tasks/$tid" >/dev/null
 [ "$API_CODE" = 200 ] && ok "task purge succeeds once results are purged" ||
-	fail "task purge" "code $API_CODE"
+	fail "task purge" "code $API_CODE: $API_BODY"
 [ "$(api_code GET "/api/tasks/$tid")" = 404 ] && ok "task is gone" ||
 	fail "task purged" "still present"
 

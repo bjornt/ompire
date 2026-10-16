@@ -79,11 +79,14 @@ the selected source.
 | `environments.<name>.provision` | list of strings | required | Non-empty argv; operator runs it |
 | `environments.<name>.check` | list of strings | required | Non-empty argv; daemon runs it with a 60-second deadline |
 | `environments.<name>.capabilities` | string map | empty | Capability names mapped to providers; neither may be empty |
+| `environments.<name>.wiring` | string | absent | Non-empty YAML mapping encoded as a string; task-scoped Workshop additions applied only after an explicit launch grant |
 
 Environment names match `^[a-z0-9][a-z0-9-]*$`. Unknown keys inside a
 definition are errors. Commands use literal argv, not a shell; `~` in the
 program path expands and plain program names resolve on the daemon's `PATH`.
-Use absolute script paths. Commands and diagnostics must contain no secrets.
+Use absolute script paths. Commands, diagnostics, and wiring must contain no
+secrets. Invalid wiring (including a scalar or sequence YAML document) fails
+startup with `environments.<name>.wiring` named.
 
 ```toml
 [environments.dogfood]
@@ -98,8 +101,9 @@ browser = "chrome"
 ```
 
 This declares infrastructure; it neither installs providers nor grants task
-access. See [Environments](environments.md) for the check contract, trust
-boundary, states, and recovery.
+access by itself. Wiring makes the environment grantable; without it the
+environment is observation-only. See [Environments](environments.md) for
+wiring, the check contract, trust boundary, states, and recovery.
 
 ## Lifecycle
 

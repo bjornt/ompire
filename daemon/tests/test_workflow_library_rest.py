@@ -747,6 +747,36 @@ def test_shared_catalog_is_authenticated_and_read_only(client: TestClient, heade
     assert client.post("/api/workflow-steps", headers=headers, json={}).status_code == 405
 
 
+@pytest.mark.parametrize("composed", [False, True])
+def test_environment_survives_visual_conversion_retention_and_export(
+    client: TestClient, headers, composed: bool
+) -> None:
+    from ompire_daemon.workflow_definitions import load_definition
+
+    source = (COMPOSED_STOP if composed else minimal()) + "environment: sandbox-qa\n"
+    authored = convert(client, headers, yaml=source)
+    assert authored.status_code == 200, authored.text
+    body = authored.json()
+    assert body["validation"]["ok"] is True
+    assert body["document"]["environment"] == "sandbox-qa"
+    canonical = body["validation"]["definition"]
+    editable = convert(client, headers, document=canonical).json()
+    assert editable["document"]["environment"] == "sandbox-qa"
+    assert editable["validation"]["revision"] == body["validation"]["revision"]
+    assert load_definition(editable["yaml"]).revision == body["validation"]["revision"]
+    assert create(client, headers, name="custom").status_code == 201
+    saved = save_revision(client, headers, "custom", editable["yaml"])
+    assert saved.status_code == 200, saved.text
+    pinned = saved.json()["entry"]["current_revision"]
+    assert pinned == body["validation"]["revision"]
+    retained = client.get(f"/api/workflows/revisions/{pinned}", headers=headers).json()
+    assert retained["definition"]["environment"] == "sandbox-qa"
+    exported = client.get(f"/api/workflows/revisions/{pinned}/yaml", headers=headers).json()
+    reloaded = load_definition(exported["yaml"])
+    assert reloaded.definition.environment == "sandbox-qa"
+    assert reloaded.revision == pinned
+
+
 def test_visual_composition_validation_and_frozen_source_roundtrip(
     client: TestClient, headers, monkeypatch
 ):

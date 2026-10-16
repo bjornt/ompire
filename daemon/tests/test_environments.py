@@ -71,6 +71,53 @@ def test_valid_declaration_preserves_commands_and_optional_capabilities(host: st
     assert parse_environments({}) == ()
 
 
+@pytest.mark.parametrize("wiring", ["{}", "plugs:\n  forge:\n    interface: tunnel\n    port: 8090\n"])
+def test_wiring_is_validated_as_a_mapping_but_retained_as_exact_immutable_text(wiring: str) -> None:
+    definition = parse_environments({"qa": declaration(wiring=wiring)})[0]
+    assert definition.wiring == wiring
+    with pytest.raises(FrozenInstanceError):
+        definition.wiring = "{}"  # type: ignore[misc]
+    registry = EnvironmentRegistry(Config(environments=(definition,)), EventHub())
+    info = registry.current()[0]
+    assert info["wiring"] == wiring
+    assert info["grantable"] is True
+    assert info["status"]["state"] == "unknown"
+
+
+def test_observation_only_environment_explicitly_exposes_no_grantable_wiring() -> None:
+    definitions = parse_environments({"qa": declaration()})
+    assert definitions[0].wiring is None
+    registry = EnvironmentRegistry(Config(environments=definitions), EventHub())
+    assert registry.current()[0]["wiring"] is None
+    assert registry.current()[0]["grantable"] is False
+
+
+@pytest.mark.parametrize(
+    ("wiring", "reason"),
+    [
+        (None, "non-empty string"),
+        (False, "non-empty string"),
+        (1, "non-empty string"),
+        ({}, "non-empty string"),
+        ([], "non-empty string"),
+        ("", "non-empty string"),
+        (" \n", "non-empty string"),
+        ("# comment only", "YAML mapping"),
+        ("null", "YAML mapping"),
+        ("tunnel", "YAML mapping"),
+        ("[]", "YAML mapping"),
+        ("plugs: [", "valid YAML"),
+        ("{}\n---\n{}", "valid YAML"),
+        ("!!python/object/apply:os.system ['id']", "valid YAML"),
+    ],
+)
+def test_invalid_wiring_names_the_precise_dotted_configuration_key(wiring: Any, reason: str) -> None:
+    with pytest.raises(ConfigError) as error:
+        parse_environments({"sandbox-qa": declaration(wiring=wiring)})
+    assert "config key 'environments.sandbox-qa.wiring'" in str(error.value)
+    assert reason in str(error.value)
+
+
 @pytest.mark.parametrize(
     ("value", "key"),
     [
@@ -152,6 +199,7 @@ def test_load_config_accepts_complete_environment_table(tmp_path: Path) -> None:
     path.write_text(
         '[environments.qa-env]\nhost = "container"\n'
         'provision = ["qa-setup"]\ncheck = ["qa-setup", "--probe"]\n'
+        'wiring = "plugs: {}"\n'
         '[environments.qa-env.capabilities]\nmodel = "auth-gateway"\n'
         'forge = "forge-broker"\n',
         encoding="utf-8",
@@ -164,6 +212,7 @@ def test_load_config_accepts_complete_environment_table(tmp_path: Path) -> None:
                 provision=["qa-setup"],
                 check=["qa-setup", "--probe"],
                 capabilities={"model": "auth-gateway", "forge": "forge-broker"},
+                wiring="plugs: {}",
             )
         }
     )

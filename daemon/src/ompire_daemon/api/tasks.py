@@ -30,6 +30,7 @@ from ompire_daemon.api.work_models import (
 )
 from ompire_daemon.application import tasks as task_commands
 from ompire_daemon.application.launch import (
+    EnvironmentNotReadyError,
     LaunchMentionsRejectedError,
     LaunchService,
 )
@@ -112,6 +113,7 @@ def _launch_request(body: TaskCreate) -> LaunchRequest:
             for entry in body.result_attachments
         ),
         acknowledge_result_base_difference=body.acknowledge_result_base_difference,
+        grant_environment=body.grant_environment,
         step_overrides=_consumer_overrides(body.step_overrides, "step_overrides"),
         # Not normalized: an empty override for a consumer that no longer
         # exists is still a caller believing it configures something, and it
@@ -211,6 +213,11 @@ async def spawn_task_route(
         )
     except (LaunchInputError, ProjectNotLaunchableError) as exc:
         raise launch_error(exc) from exc
+    except EnvironmentNotReadyError as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            {"environment": exc.environment, "blockers": list(exc.blockers)},
+        ) from exc
     except HandoffError as exc:
         raise attachment_observation_error(exc) from exc
     except PreviewChangedError as exc:

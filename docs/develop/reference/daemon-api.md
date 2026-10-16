@@ -100,6 +100,35 @@ retrying under settings they never saw. What this pins is configuration and
 the procedure, not the future contents of a Git branch, model output, or tool
 versions.
 
+**Environment grants at launch.**
+
+Both launch bodies accept `grant_environment: boolean` (default false). For a
+workflow declaring an environment, the preview adds `environment`:
+`{name, capabilities, grantable, status: {state, blockers, checked_at}}`.
+`capabilities` maps names to providers; blockers are `{code, message}`. A fresh
+registry probe supplies the status even when it is not ready. Without a
+requirement the section is omitted and the ordinary fingerprint is unchanged.
+An undeclared requirement is a `workflow_name` input error.
+
+The token covers the requirement's capability/wiring snapshot and the grant
+selection, but never live status or timestamps. Acceptance probes again and
+checks selected additions content outside the write reservation. A wired
+project-source launch also resolves and pins the inspected source commit;
+Git reads use that tree, never the dirty checkout. The final resolution and
+task-plus-grant insertion remain inside the same reservation, with no awaited
+IO or publication before commit (ADR-0042).
+
+Missing required and unasked grants return the existing `422` field shape:
+`{"detail": "grant_environment: <message>"}`.
+Not-ready acceptance returns `422` with
+`{"detail": {"environment": "<name>", "blockers": [{"code": "...", "message": "..."}]}}`.
+An additions conflict is a `422` input error naming the selected source and
+environment wiring. Every refusal creates nothing. The task's
+`execution_inputs.environment_grant` records `name`, `capabilities`, nullable
+`wiring`, `granted_at`, and `actor: "operator"`; old task documents decode the
+absent record as no grant. See [Environment access](../../use/reference/task-spawn.md#environment-access).
+
+
 Workflow authoring is the fourth. `/api/workflow-library` routes separate three
 operations that a single "save" would conflate: a draft save persists inert
 text, a validate parses text and persists nothing, and an executable save
@@ -145,6 +174,10 @@ whose format reads results differently from the ones already on record cannot
 explain that history, so it is reported incompatible with the reasons named
 rather than offered and silently reinterpreting them. There is no automatic
 format upgrade.
+
+A candidate declaring an environment is also incompatible: continuation does
+not rebuild a container and cannot install its wiring. The named refusal
+directs the operator to spawn a new task with an environment grant.
 
 Trusted delivery is the fifth, and it is the one where the boundary is
 deliberately *not* in this layer at all

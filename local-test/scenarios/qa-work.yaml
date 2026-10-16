@@ -1,0 +1,22 @@
+# A grant-requiring work-only workflow: no review, signing, or publication.
+format: 3
+name: qa-work
+environment: sandbox-qa
+sessions: [main]
+primary: main
+steps:
+  - name: work
+    kind: agent
+    session: main
+    role: default
+    outcome: null
+    prompt:
+      parts:
+        - value: {op: input, name: task.prompt}
+          format: text
+  - name: finish
+    kind: decision
+    cases:
+      - when: true
+        next: {complete: true, result: done}
+    otherwise: {complete: true, result: done}

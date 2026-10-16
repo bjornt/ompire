@@ -454,3 +454,32 @@ button.primary:disabled {
   margin-top: 0.8rem;
   font-size: 0.95em;
 }
+
+.spawnEnvironment {
+  margin: 1rem 0;
+  padding: 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.spawnEnvironment h3 {
+  margin: 0 0 0.6rem;
+  font-size: 1rem;
+}
+
+.spawnEnvironmentCapabilities,
+.spawnEnvironmentBlockers {
+  margin: 0.5rem 0;
+  padding-left: 1.4rem;
+  overflow-wrap: anywhere;
+}
+
+.spawnEnvironmentBlockers {
+  color: var(--red);
+}
+
+.spawnEnvironmentGrant {
+  display: block;
+  margin-top: 0.9rem;
+  font-weight: 600;
+}

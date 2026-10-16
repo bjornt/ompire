@@ -6,9 +6,10 @@ names each capability and the provider behind it. These are declarations,
 not per-capability verification or remote host orchestration. One read-only
 check command determines the environment's readiness.
 
-Environments are observation only. Declaring one changes no task launch,
-workflow, or ship decision and grants no sandbox access. The daemon never
-runs the provision command. Bring up the infrastructure yourself.
+Declaring an environment alone grants no sandbox access. A workflow may name
+it with `environment: <name>`; launch then requires an explicit operator grant
+and a fresh ready check. The daemon never runs the provision command. Bring
+up the infrastructure yourself.
 
 ## Declaration
 
@@ -21,6 +22,23 @@ definitions cannot be edited through the UI or REST API.
 host = "host"
 provision = ["/home/qa/ompire/scripts/setup-qa-env.sh"]
 check = ["/home/qa/ompire/scripts/setup-qa-env.sh", "--probe"]
+wiring = '''
+sdks:
+  - name: omp
+    plugs:
+      forge:
+        interface: tunnel
+        endpoint: localhost:4100
+  - name: system
+    slots:
+      forge:
+        interface: tunnel
+        endpoint: localhost:4100
+provision:
+  connect:
+    - plug: omp:forge
+      slot: system:forge
+'''
 
 [environments.dogfood.capabilities]
 model = "auth-gateway"
@@ -28,8 +46,9 @@ forge = "forge-broker"
 browser = "chrome"
 ```
 
-This is a declaration example, not an automatically installed environment.
-The operator must supply commands that satisfy the contract below.
+This illustrates a forge tunnel to a broker on trusted-host loopback; it is
+not an installed environment. Supply working commands and matching wiring
+for every capability you declare; add separate model/browser wiring as needed.
 
 | Field | Contract |
 |---|---|
@@ -38,11 +57,48 @@ The operator must supply commands that satisfy the contract below.
 | `provision` | Required non-empty argv list of non-empty strings; operator-run only |
 | `check` | Required non-empty argv list of non-empty strings; daemon-run |
 | `capabilities` | Optional map of non-empty capability names to non-empty provider strings; defaults to an empty map |
+| `wiring` | Optional non-empty string containing a YAML mapping; the exact Workshop additions fragment to apply only to granted tasks |
 
 Unknown environment fields, wrong value types, an invalid name or host, and
-empty commands fail startup with the offending configuration key. With no
-`environments` table, there are no environments and Settings hides the panel.
+empty commands or malformed wiring fail startup with the offending dotted
+configuration key. With no `environments` table, there are no environments
+and Settings hides the panel.
 See [Configuration](configuration.md).
+
+## Task access
+
+A definition with `wiring` is **grantable**: its declared capability/provider
+pairs describe the access the grant wires into the task. Without wiring it is
+observation-only: a requiring workflow still asks for a recorded readiness
+grant, but no tunnel or endpoint is added. There are no per-capability grants.
+
+Put only non-secret Workshop tunnel declarations and their connections in the
+fragment. The daemon validates that it is a YAML mapping, not the Workshop
+schema or that each named provider is reachable. The launcher owns those
+semantics. Credentials stay behind trusted-side brokers, never in the fragment.
+
+In **Spawn**, review the environment, capability/provider pairs, readiness,
+and named blockers, then explicitly grant the selected workflow access.
+**Re-check** runs the check again; completed probes update open clients live.
+An unready preview is readable, but acceptance probes again and refuses unless
+the environment is ready. A workflow naming an undeclared environment can be
+saved in the library but cannot be previewed or launched on this daemon.
+See [Task spawn](task-spawn.md#environment-access) for request and refusal rules.
+
+The grant is pinned to the task with its name, capability map, exact wiring,
+UTC grant time, and actor `operator`. Changes to configuration do not alter
+accepted tasks. Wiring is staged only around that task's container launch;
+the existing restoration and startup recovery remove the staged file. A
+surviving container keeps its tunnels across a daemon restart. Cleaning up
+the task removes the container and therefore its tunnels; no credential
+dirty-marking or rotation is needed merely because a brokered task ran.
+
+**Grant-gating covers daemon-applied wiring only.** A repository's static
+`workshop.yaml` can grant ambient access independently. Keep environment-backed
+broker endpoints out of repository Workshop declarations; otherwise every task
+using that declaration can receive those tunnels without an environment grant.
+The daemon deliberately does not parse or police repository Workshop schemas.
+
 
 ## Command contract and trust
 
@@ -81,7 +137,8 @@ Each definition carries a nested `status` with `state`, `blockers` (a list of
 `{code, message}`), and `checked_at` (UTC timestamp, or null before probing).
 Definitions are durable in TOML; status is process-local. Restarting the
 daemon re-probes every definition and retains no probe history. Checks run
-at startup and on demand, not on a periodic polling loop.
+at startup, on demand, and during preview and acceptance of requiring workflows,
+not on a periodic polling loop.
 
 | State | Meaning |
 |---|---|
@@ -116,8 +173,8 @@ Both routes use the daemon's bearer-token authentication:
 | `POST` | `/api/environments/{name}/recheck` | Fresh full definition and status; unknown name is `404` |
 
 A full entry contains `name`, `host`, `capabilities`, `provision`, `check`,
-and nested `status`. The WebSocket snapshot's `environments` list contains
-these same entries. Every completed probe publishes `environment_status`
+nullable `wiring`, `grantable`, and nested `status`. The WebSocket snapshot's
+`environments` list contains these same entries. Every completed probe publishes `environment_status`
 with `{"environment": <full entry>}`, including failed probes. A reconnect
 replaces the client's environment list from the new snapshot.
 See [HTTP and WebSocket API](api.md).

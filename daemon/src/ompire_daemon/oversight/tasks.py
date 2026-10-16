@@ -16,7 +16,7 @@ ADR-0026, ADR-0028.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import fields
 from typing import Any
 
 from sqlalchemy import Engine
@@ -54,7 +54,13 @@ def task_payload(task: Task, *, engine: Engine) -> dict:
     damaged or unsupported still serializes — it reports why, and stays
     readable, stoppable, and cleanable.
     """
-    payload = asdict(task)
+    # Execution inputs have their own serializer; immutable grant snapshots
+    # deliberately cannot be deep-copied by dataclasses.asdict.
+    payload = {
+        field.name: getattr(task, field.name)
+        for field in fields(task)
+        if field.name != "execution_inputs"
+    }
     payload["execution_inputs"] = (
         execution_inputs_payload(task.execution_inputs)
         if task.execution_inputs is not None
@@ -97,6 +103,21 @@ def resolution_payload(resolved: ResolvedLaunch) -> dict[str, Any]:
     inputs = resolved.inputs
     return {
         "preview_token": resolved.fingerprint,
+        **(
+            {
+                "environment": {
+                    "name": resolved.environment.name,
+                    "capabilities": dict(resolved.environment.capabilities),
+                    "grantable": bool(resolved.environment.wiring),
+                    "status": dict(
+                        resolved.environment_status
+                        or {"state": "unknown", "blockers": [], "checked_at": None}
+                    ),
+                }
+            }
+            if resolved.environment is not None
+            else {}
+        ),
         "project_name": inputs.project_name,
         "workflow_name": inputs.workflow_name,
         # The exact procedure being accepted, not just its name. The UI shows

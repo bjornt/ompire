@@ -136,7 +136,15 @@ def _read_selected_source(source: str, clone_path: str) -> tuple[str | None, str
     raise WorkshopAdditionsError(f"unknown Workshop additions source {source!r}")
 
 
-def stage(data_dir: Path, task_id: int, clone_path: str, source: str) -> StagedAdditions:
+def stage(
+    data_dir: Path,
+    task_id: int,
+    clone_path: str,
+    source: str,
+    *,
+    content: str | None = None,
+    note: str | None = None,
+) -> StagedAdditions:
     """Put the selected source's additions in place for one launch.
 
     Always writes the local file — with the selected content, or with an
@@ -144,7 +152,10 @@ def stage(data_dir: Path, task_id: int, clone_path: str, source: str) -> StagedA
     only see the chosen source.
     """
     local = _local_path(clone_path)
-    content, note = _read_selected_source(source, clone_path)
+    if content is None:
+        content, selected_note = _read_selected_source(source, clone_path)
+    else:
+        selected_note = note or "explicit additions applied"
 
     staging_dir = _staging_dir(data_dir)
     backup_path: Path | None = None
@@ -164,7 +175,7 @@ def stage(data_dir: Path, task_id: int, clone_path: str, source: str) -> StagedA
         source=source,
         had_original=had_original,
         backup_path=str(backup_path) if backup_path is not None else None,
-        note=note,
+        note=selected_note,
     )
     # The record goes down *before* the clone is touched: a crash between the
     # two must leave something that says a restore is owed.

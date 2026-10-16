@@ -148,6 +148,7 @@ MAX_CAPTURE_ALLOWLISTS = 128
 REQUIRED_TYPES = ("boolean", "integer", "number", "string", "array", "object")
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_ENVIRONMENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # JSON's own number grammar. YAML 1.1 octals, sexagesimals, `.inf`, and `.nan`
 # are deliberately not here.
 _INT_RE = re.compile(r"^-?(0|[1-9][0-9]*)$")
@@ -834,6 +835,7 @@ class WorkflowDefinition:
     steps: tuple[Step, ...]
     # Immutable normalized source metadata; runtime steps remain ordinary steps.
     composition: str | None = None
+    environment: str | None = None
 
     def step_named(self, name: str) -> Step | None:
         for step in self.steps:
@@ -942,6 +944,19 @@ def _require_slug(data: Mapping[str, Any], key: str, location: str) -> str:
     if not _SLUG_RE.match(value):
         raise WorkflowDocumentError(
             f"{location}.{key}", f"{value!r} is not slug-format (a-z, 0-9, hyphens)"
+        )
+    return value
+
+
+def _parse_environment(document: Mapping[str, Any]) -> str | None:
+    if "environment" not in document:
+        return None
+    value = document["environment"]
+    if not isinstance(value, str):
+        raise WorkflowDocumentError("environment", "must be a string")
+    if not _ENVIRONMENT_NAME_RE.fullmatch(value):
+        raise WorkflowDocumentError(
+            "environment", f"{value!r} is not a valid environment name (a-z, 0-9, hyphens; must start with a-z or 0-9)"
         )
     return value
 
@@ -1826,13 +1841,14 @@ def definition_from_document(
 
 def _primitive_definition_from_document(document: Mapping[str, Any]) -> WorkflowDefinition:
     """The unchanged ordinary step grammar and reference/authority validation."""
-    _reject_unknown(document, ("format", "name", "sessions", "primary", "steps"), "")
+    _reject_unknown(document, ("format", "name", "sessions", "primary", "steps", "environment"), "")
     if "format" not in document:
         raise WorkflowDocumentError("format", "missing required field 'format'")
     version = document["format"]
     if version not in SUPPORTED_FORMATS:
         raise UnsupportedWorkflowFormatError(version)
     name = _require_slug(document, "name", "")
+    environment = _parse_environment(document)
     raw_sessions = document.get("sessions")
     if not isinstance(raw_sessions, list) or not raw_sessions:
         raise WorkflowDocumentError("sessions", "must be a nonempty list of names")
@@ -1878,6 +1894,7 @@ def _primitive_definition_from_document(document: Mapping[str, Any]) -> Workflow
         sessions=tuple(sessions),
         primary=primary,
         steps=tuple(steps),
+        environment=environment,
     )
     _validate_references(definition)
     _validate_graph(definition)
@@ -2704,6 +2721,8 @@ def canonical_document(definition: WorkflowDefinition) -> dict[str, Any]:
             _step_document(step, definition.format) for step in definition.steps
         ],
     }
+    if definition.environment is not None:
+        document["environment"] = definition.environment
     if definition.format == 5 and definition.composition is not None:
         document["composition"] = json.loads(definition.composition)
     return document
@@ -3013,7 +3032,7 @@ def export_document(document: Mapping[str, Any]) -> dict[str, Any]:
         # Verify first: conversion/export must not disguise corrupted retained bytes.
         verified = canonical_document(load_canonical_document(document))
         composition = verified["composition"]
-        return {
+        source = {
             "format": version,
             "name": verified["name"],
             "sessions": verified["sessions"],
@@ -3022,13 +3041,19 @@ def export_document(document: Mapping[str, Any]) -> dict[str, Any]:
             "definitions": composition["definitions"],
             "stages": composition["stages"],
         }
-    return {
+        if "environment" in verified:
+            source["environment"] = verified["environment"]
+        return source
+    source = {
         "format": version,
         "name": document["name"],
         "sessions": list(document["sessions"]),
         "primary": document["primary"],
         "steps": [_export_step(step, version) for step in document["steps"]],
     }
+    if "environment" in document:
+        source["environment"] = document["environment"]
+    return source
 
 
 def export_yaml(revision: WorkflowRevision) -> str:

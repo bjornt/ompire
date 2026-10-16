@@ -530,6 +530,13 @@ def _compatibility_problems(
     """
     definition = revision.definition
     problems: list[str] = []
+    if definition.environment is not None:
+        problems.append(
+            f"the current {revision.name!r} definition requires environment "
+            f"{definition.environment!r}; continuation does not rebuild the workspace "
+            "and cannot wire an environment; spawn a new task with an explicit "
+            "environment grant instead"
+        )
     records = list_step_records(engine, task.id)
     if definition.format >= 2:
         # A format-2 definition reads results by declared name; this history

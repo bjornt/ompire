@@ -16,7 +16,9 @@
 #
 # `exec` replaces this process with the command, run on the host with cwd =
 # the project directory — agent children become ordinary local processes
-# with real stdio/signal/exit-code semantics. Launched workshops live in
+# with real stdio/signal/exit-code semantics. Each exec records its exact
+# process identity; container removal kills only matching tracked children.
+# Launched workshops live in
 # <state>/workshops.json keyed by realpath; `launch` writes the .workshop.lock
 # (8-hex project id — the real CLI's own format, not my-workshop's) that the
 # daemon's spawn pipeline reads. One-shot failure injection lives in the
@@ -34,7 +36,7 @@
 #   exec [-p <path>] [--] <argv…>   run argv on the host, cwd = project path
 #   launch [-p <path>] [name…]      write .workshop.lock, register, exit 0
 #   info [-p <path>] [name]         present ⇒ YAML on stdout; else gone error
-#   remove [-p <path>] [name…]      deregister; already gone ⇒ gone error
+#   remove [-p <path>] [name…]      terminate tracked execs, deregister
 #   connect <plug> <slot>           record the connection, exit 0
 #   selfcheck                       prove the whole contract offline in a
 #                                   temp root; never touches $STATE
@@ -42,9 +44,14 @@
 
 set -euo pipefail
 
-REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+REPO_ROOT=$(cd "$(dirname "$(realpath "$0")")/../.." && pwd)
 STATE_ROOT=${LOCAL_TEST_STATE:-$REPO_ROOT/local-test/.state}
 WS_JSON=$STATE_ROOT/workshops.json
+CONTRACT=$REPO_ROOT/local-test/fakes/workshop-contract.py
+PYTHON=$REPO_ROOT/daemon/.venv/bin/python
+LAUNCH_GATE=$STATE_ROOT/workshop-launch-gate
+LAUNCH_HELD=$STATE_ROOT/workshop-launch-held
+LAUNCH_ABORT=$STATE_ROOT/workshop-launch-abort
 
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,/^set -euo/p' "$0" | sed 's/^# \{0,1\}//; /^set -euo/d' | sed '$d'; }
@@ -71,7 +78,7 @@ state_write() { # state_write <tmp-path>
 }
 
 registry_get() { # registry_get <realpath>: print the entry JSON, nothing when absent
-	# Read-only: never creates the state file (the exec hot path must not).
+	# Read-only: process admission writes its own separately locked registry.
 	# A corrupt file makes jq exit non-zero with its parse error on stderr —
 	# exit explicitly: bash does not apply set -e inside command-substitution
 	# subshells, so a silent fallthrough would read corrupt state as
@@ -169,7 +176,7 @@ cmd_exec() {
 	local cmd=("$@")
 	[ ${#cmd[@]} -gt 0 ] || unsupported "exec (no command given)"
 
-	# No state writes on this path — resolve, validate, replace ourselves.
+	# Register the exact host process as a container child, then exec in place.
 	resolve_project "$path"
 	require_project "$PROJ_REAL"
 	local entry
@@ -180,7 +187,8 @@ cmd_exec() {
 		exit 1
 	fi
 	cd "$PROJ_REAL" || die "exec: cannot cd to $PROJ_REAL"
-	exec "${cmd[@]}"
+	export LOCAL_TEST_STATE=$STATE_ROOT
+	exec "$PYTHON" "$CONTRACT" execute "$PROJ_REAL" "$(jq -r .id <<<"$entry")" "${cmd[@]}"
 }
 
 # --- launch ----------------------------------------------------------------------
@@ -222,6 +230,23 @@ cmd_launch() {
 		esac
 	fi
 
+	# Observe at the Workshop boundary, after the real my-workshop has merged
+	# the staged additions. Neither this capture nor connect knows about grants.
+	local launch
+	launch=$("$PYTHON" "$CONTRACT" capture "$PROJ_REAL")
+	if [ -f "$LAUNCH_GATE" ]; then
+		local held_tmp
+		held_tmp=$(mktemp "$LAUNCH_HELD.XXXXXX")
+		jq -n --arg path "$PROJ_REAL" --argjson launch "$launch" \
+			'{path: $path, launch: $launch}' >"$held_tmp"
+		mv "$held_tmp" "$LAUNCH_HELD"
+		while [ -f "$LAUNCH_GATE" ]; do sleep 0.1; done
+		rm -f "$LAUNCH_HELD"
+		if [ -f "$LAUNCH_ABORT" ]; then
+			rm -f "$LAUNCH_ABORT"
+			die "held launch aborted by workshop control"
+		fi
+	fi
 	local name id now tmp
 	name=$(workshop_name "$PROJ_REAL")
 	id=$(jq -r --arg p "$PROJ_REAL" '.workshops[$p].id // empty' "$WS_JSON")
@@ -237,11 +262,13 @@ cmd_launch() {
 			printf '/.workshop.lock\n' >>"$PROJ_REAL/.git/info/exclude"
 	fi
 	tmp=$(mktemp "$WS_JSON.XXXXXX")
-	jq --arg p "$PROJ_REAL" --arg name "$name" --arg id "$id" --arg now "$now" '
+	jq --arg p "$PROJ_REAL" --arg name "$name" --arg id "$id" --arg now "$now" \
+		--argjson launch "$launch" '
 		.workshops[$p] = {
 			name: $name,
 			id: $id,
 			launched_at: $now,
+			launch: $launch,
 			connects: ((.workshops[$p].connects) // [])
 		}' "$WS_JSON" >"$tmp"
 	state_write "$tmp"
@@ -305,6 +332,8 @@ cmd_remove() {
 	local entry
 	entry=$(registry_get "$PROJ_REAL")
 	if [ -n "$entry" ]; then
+		LOCAL_TEST_STATE=$STATE_ROOT "$PYTHON" "$CONTRACT" remove-processes \
+			"$PROJ_REAL" "$(jq -r .id <<<"$entry")"
 		state_init
 		local tmp
 		tmp=$(mktemp "$WS_JSON.XXXXXX")
@@ -333,6 +362,9 @@ cmd_connect() {
 			"$plug" "$slot" >&2
 		exit 1
 	fi
+	# Workshop can connect only declared, interface-compatible endpoints. Use
+	# the launch snapshot, never a file the agent may have edited afterward.
+	"$PYTHON" "$CONTRACT" connect "$entry" "$plug" "$slot" >/dev/null
 	state_init
 	local tmp
 	tmp=$(mktemp "$WS_JSON.XXXXXX")
@@ -432,6 +464,11 @@ cmd_selfcheck() {
 		fail "exec cat exits 0" "$(cat "$err")"
 	[ "$out" = "piped-line" ] || fail "exec pipes stdin to the command" "got: $out"
 	ok "exec: stdin pipes through (tar-copy shape)"
+	LOCAL_TEST_STATE=$root "$PYTHON" "$CONTRACT" process-selfcheck "$self_bin" "$proj" \
+		>"$SELF_TMP/process-check" 2>"$err" ||
+		fail "remove terminates only exact tracked container children" "$(cat "$err")"
+	ok "remove: tracked child dies, stale PID and other container survive; exec signals pass through"
+	in_proj launch >/dev/null 2>"$err" || fail "relaunch after process teardown" "$(cat "$err")"
 
 	# ---- 5/10 remove → gone; info absent via the exact marker
 	log "5/10 remove, then info absent"
@@ -514,12 +551,38 @@ cmd_selfcheck() {
 
 	# ---- 9/10 connect recording + unsupported rejection
 	log "9/10 connect recording, unsupported rejection"
-	in_proj connect selfcheck-ws/plug selfcheck-ws/slot >/dev/null 2>"$err" ||
+	cat >"$proj/workshop.yaml" <<'EOF'
+name: selfcheck-ws
+base: ubuntu@24.04
+sdks:
+  - name: agent
+    plugs:
+      probe:
+        interface: tunnel
+        endpoint: localhost:4181
+  - name: system
+    slots:
+      probe:
+        interface: tunnel
+        endpoint: localhost:4182
+EOF
+	in_proj launch >/dev/null 2>"$err" || fail "launch tunnel declaration" "$(cat "$err")"
+	in_proj connect selfcheck-ws/agent:probe selfcheck-ws/system:probe >/dev/null 2>"$err" ||
 		fail "connect exits 0 on a launched workshop" "$(cat "$err")"
 	jq -e --arg p "$proj" \
-		'.workshops[$p].connects == [["selfcheck-ws/plug", "selfcheck-ws/slot"]]' \
+		'.workshops[$p].connects == [["selfcheck-ws/agent:probe", "selfcheck-ws/system:probe"]]' \
 		"$root/workshops.json" >/dev/null ||
 		fail "connect records the plug/slot pair"
+	in_proj exec -- "$PYTHON" "$CONTRACT" probe localhost:4181 >"$SELF_TMP/probe" 2>"$err" ||
+		fail "connected endpoint is reachable in fake namespace" "$(cat "$err")"
+	jq -e '.reachable and .upstream == "localhost:4182"' "$SELF_TMP/probe" >/dev/null ||
+		fail "probe resolves the declared tunnel endpoints"
+	rc=0
+	in_proj exec -- "$PYTHON" "$CONTRACT" probe localhost:4999 >/dev/null 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "an undeclared endpoint is absent"
+	rc=0
+	in_proj connect selfcheck-ws/agent:unknown selfcheck-ws/system:probe >/dev/null 2>"$err" || rc=$?
+	[ "$rc" -ne 0 ] || fail "undeclared connect is refused"
 	rc=0
 	ws_run refresh >/dev/null 2>"$err" || rc=$?
 	[ "$rc" -ne 0 ] || fail "unsupported subcommand exits non-zero"
@@ -546,6 +609,7 @@ cmd_selfcheck() {
 		git -C "$mwclone" init -q
 		git -C "$mwclone" -c user.name=t -c user.email=t@t commit -q \
 			--allow-empty -m init
+		cp "$REPO_ROOT/local-test/fixtures/sandbox-qa-wiring.yaml" "$mwclone/workshop.my.yaml"
 		local mwroot=$SELF_TMP/mwstate rc2=0
 		(cd "$mwclone" &&
 			LOCAL_TEST_STATE=$mwroot PATH="$(dirname "$self_bin"):$PATH" \
@@ -558,6 +622,13 @@ cmd_selfcheck() {
 			fail "my-workshop hid workshop.yaml from git"
 		[ -s "$mwclone/.workshop.lock" ] ||
 			fail "the fake left a non-empty .workshop.lock for my-workshop"
+		jq -e --arg p "$mwclone" --rawfile wiring "$mwclone/workshop.my.yaml" '
+			.workshops[$p] | .launch.additions == $wiring and
+			.launch.plugs[.name + "/omp:qa-browser"].endpoint == "localhost:4181" and
+			.launch.slots[.name + "/system:qa-browser"].endpoint == "localhost:4182" and
+			.connects == [[.name + "/omp:qa-browser", .name + "/system:qa-browser"]]' \
+			"$mwroot/workshops.json" >/dev/null ||
+			fail "real launcher consumes exact additions, merges stanzas, and connects the tunnel"
 		ok "real my-workshop: exit 0, hidden workshop.yaml, non-empty lock"
 	else
 		printf '  skip  11/11 real my-workshop: no binary on PATH (set MY_WORKSHOP_BIN)\n'

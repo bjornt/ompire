@@ -4,6 +4,7 @@ import type {
   DaemonInfo,
   DaemonSettings,
   EnvironmentInfo,
+  EnvironmentStatus,
   GitHubStatus,
   CheckoutInspection,
   ConsumerBinding,
@@ -69,14 +70,12 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     try {
       const data = (await response.json()) as { detail?: unknown };
       if (typeof data.detail === "string") detail = data.detail;
-      else if (
-        typeof data.detail === "object" &&
-        data.detail !== null &&
-        "message" in data.detail &&
-        typeof data.detail.message === "string"
-      ) {
-        detail = data.detail.message;
+      else if (typeof data.detail === "object" && data.detail !== null) {
         structured = data.detail as Record<string, unknown>;
+        if (typeof structured.message === "string") detail = structured.message;
+        else if (typeof structured.environment === "string") {
+          detail = `Environment ${structured.environment} is not ready.`;
+        }
       }
     } catch {
       /* non-JSON error body; keep the status code */
@@ -206,6 +205,8 @@ export interface LaunchInput {
    * unknown base has not been validated against this target. Bound by the
    * preview token to this exact selection and target commit. */
   acknowledge_result_base_difference?: boolean;
+  /** Explicit whole-environment authority. Omitted means no grant. */
+  grant_environment?: boolean;
 }
 
 /** One selected revision. All three fields together: the manifest id is what
@@ -236,6 +237,13 @@ export interface LaunchPreviewStep {
   role: ModelRole | null;
   model: string | null;
   thinking: ThinkingLevel | null;
+}
+
+export interface LaunchEnvironment {
+  name: string;
+  capabilities: Record<string, string>;
+  grantable: boolean;
+  status: EnvironmentStatus;
 }
 
 /** The daemon's resolution of one launch. `preview_token` names exactly what
@@ -282,6 +290,8 @@ export interface LaunchPreview {
   acknowledged_base_difference: boolean;
   result_attachments: LaunchAttachment[];
   base_comparisons: BaseComparison[];
+  /** Omitted entirely for workflows without an environment requirement. */
+  environment?: LaunchEnvironment;
 }
 
 /** One pinned bundle, as the preview and the accepted task both describe it. */

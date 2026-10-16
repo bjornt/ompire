@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from ompire_daemon.model_config import MODEL_ROLES, RoleBinding
@@ -289,6 +290,20 @@ class WorkflowBinding:
 
 
 @dataclass(frozen=True)
+class EnvironmentGrant:
+    """The operator's pinned access snapshot, never re-derived (ADR-0042)."""
+
+    name: str
+    capabilities: Mapping[str, str]
+    wiring: str | None
+    granted_at: str
+    actor: str = "operator"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "capabilities", MappingProxyType(dict(self.capabilities)))
+
+
+@dataclass(frozen=True)
 class TaskExecutionInputs:
     """One task's pinned launch decision.
 
@@ -328,10 +343,9 @@ class TaskExecutionInputs:
     # The accepted result revisions this task materializes before its first
     # step runs (ADR-0035). Empty is the ordinary case and is not an error.
     result_attachments: tuple[ResultAttachment, ...] = ()
-    # The exact commit an attachment launch was reviewed against. `None` for a
-    # launch with no attachments, which pins a branch exactly as before — and
-    # for every task written before version 4, where no observation was made
-    # and none is invented.
+    # The exact commit an attachment launch or a project-wiring grant was
+    # reviewed against. None for ordinary branch-based launches and historical
+    # tasks for which no immutable-base observation was made.
     source_commit: str | None = None
     # One comparison per attachment, in attachment order. Empty for a launch
     # with none.
@@ -339,6 +353,8 @@ class TaskExecutionInputs:
     # Whether the operator acknowledged that the plan was not validated against
     # this target. Meaningful only when the comparison asked for it.
     acknowledged_base_difference: bool = False
+    # Absent for ordinary launches and tasks accepted before environment grants.
+    environment_grant: EnvironmentGrant | None = None
 
     @property
     def preamble(self) -> str:
@@ -522,6 +538,26 @@ def decode_base_comparison(document: Mapping[str, Any]) -> BaseComparison:
     )
 
 
+def encode_environment_grant(grant: EnvironmentGrant) -> dict[str, Any]:
+    return {
+        "name": grant.name,
+        "capabilities": dict(grant.capabilities),
+        "wiring": grant.wiring,
+        "granted_at": grant.granted_at,
+        "actor": grant.actor,
+    }
+
+
+def decode_environment_grant(document: Mapping[str, Any]) -> EnvironmentGrant:
+    return EnvironmentGrant(
+        name=document["name"],
+        capabilities=document["capabilities"],
+        wiring=document.get("wiring"),
+        granted_at=document["granted_at"],
+        actor=document.get("actor", "operator"),
+    )
+
+
 def execution_inputs_document(inputs: TaskExecutionInputs) -> dict[str, Any]:
     return {
         "version": EXECUTION_INPUTS_VERSION,
@@ -559,6 +595,11 @@ def execution_inputs_document(inputs: TaskExecutionInputs) -> dict[str, Any]:
             for comparison in inputs.base_comparisons
         ],
         "acknowledged_base_difference": inputs.acknowledged_base_difference,
+        **(
+            {"environment_grant": encode_environment_grant(inputs.environment_grant)}
+            if inputs.environment_grant is not None
+            else {}
+        ),
     }
 
 
@@ -612,6 +653,11 @@ def decode_execution_inputs(raw: str) -> TaskExecutionInputs:
         ),
         acknowledged_base_difference=bool(
             document.get("acknowledged_base_difference", False)
+        ),
+        environment_grant=(
+            decode_environment_grant(document["environment_grant"])
+            if document.get("environment_grant") is not None
+            else None
         ),
     )
 

@@ -19,6 +19,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+import yaml
+
 if TYPE_CHECKING:
     from ompire_daemon.config import Config
     from ompire_daemon.events import EventHub
@@ -40,7 +42,7 @@ CHECK_ERROR = "check-error"
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _HOSTS = frozenset({"container", "vm", "host"})
-_KEYS = frozenset({"host", "capabilities", "provision", "check"})
+_KEYS = frozenset({"host", "capabilities", "provision", "check", "wiring"})
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,7 @@ class EnvironmentDefinition:
     provision: tuple[str, ...]
     check: tuple[str, ...]
     capabilities: Mapping[str, str] = field(default_factory=dict)
+    wiring: str | None = None
 
     def __post_init__(self) -> None:
         # A frozen dataclass alone would still expose mutable nested values.
@@ -113,6 +116,17 @@ def parse_environments(value: Any) -> tuple[EnvironmentDefinition, ...]:
                 raise ConfigError(f"config key '{cap_key}' must have a non-empty capability name")
             if not isinstance(provider, str) or not provider.strip():
                 raise ConfigError(f"config key '{cap_key}' must be a non-empty provider string")
+        wiring = None
+        if "wiring" in table:
+            wiring = table["wiring"]
+            if not isinstance(wiring, str) or not wiring.strip():
+                raise ConfigError(f"config key '{key}.wiring' must be a non-empty string")
+            try:
+                fragment = yaml.safe_load(wiring)
+            except yaml.YAMLError as exc:
+                raise ConfigError(f"config key '{key}.wiring' must be valid YAML: {exc}") from exc
+            if not isinstance(fragment, dict):
+                raise ConfigError(f"config key '{key}.wiring' must be a YAML mapping")
         definitions.append(
             EnvironmentDefinition(
                 name=name,
@@ -120,6 +134,7 @@ def parse_environments(value: Any) -> tuple[EnvironmentDefinition, ...]:
                 capabilities=capabilities,
                 provision=commands["provision"],
                 check=commands["check"],
+                wiring=wiring,
             )
         )
     return tuple(definitions)
@@ -240,6 +255,8 @@ class EnvironmentRegistry:
             "name": name,
             "host": definition.host,
             "capabilities": dict(definition.capabilities),
+            "wiring": definition.wiring,
+            "grantable": bool(definition.wiring),
             "provision": list(definition.provision),
             "check": list(definition.check),
             "status": {

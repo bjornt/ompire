@@ -787,7 +787,13 @@ config_set() { # config_set KEY VALUE
 		prev=$(sed -n "s/^${key}[[:space:]]*=[[:space:]]*//p" "$CONFIG" | tail -1)
 	fi
 	if [ -z "$prev" ]; then
-		printf '%s = %s\n' "$key" "$value" >>"$CONFIG"
+		# Environment tables can end the document; appending would place a
+		# daemon setting inside the last table instead of at the TOML root.
+		local updated
+		updated=$(mktemp "${CONFIG}.XXXXXX")
+		printf '%s = %s\n' "$key" "$value" >"$updated"
+		cat "$CONFIG" >>"$updated"
+		mv "$updated" "$CONFIG"
 	else
 		sed -i "s|^${key}[[:space:]]*=.*|${key} = ${value}|" "$CONFIG"
 	fi

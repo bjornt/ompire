@@ -63,11 +63,22 @@ steps:
 | `sessions` | yes | Nonempty, unique, slug-format. `judge` is reserved. |
 | `primary` | yes | Must be a declared session. Explicit — never defaulted. |
 | `steps` | yes | Nonempty, ordered, uniquely named; format 5 also accepts shared invocations. `judge` is reserved. |
+| `environment` | no | Environment name matching `^[a-z0-9][a-z0-9-]*$`; accepted by primitives and both format-5 composition shapes |
 
 Unknown fields are refused, not ignored, everywhere in the document. So are
 duplicate step names, undeclared session references, and routes to steps that
 do not exist. Every refusal carries a location like
 `steps[2].prompt.parts[0].value` and a reason.
+
+An environment requirement is retained in the workflow's canonical content:
+changing it changes the revision identity. Omitting it preserves the ordinary
+document and revision. Explicit null, a non-string, or a malformed name is a
+located `environment` error. Definitions remain machine-independent: saving
+and inspecting one does not require a matching daemon environment. Launch
+resolution does, and preview refuses an undeclared name on `workflow_name`.
+See [Environment access](../../use/reference/task-spawn.md#environment-access).
+Legacy continuation cannot install wiring and refuses a requiring candidate;
+spawn a new task with a grant instead.
 
 ### The five formats
 

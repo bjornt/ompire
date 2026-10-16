@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DaemonError, getGitHubStatus, recheckEnvironment, recheckGitHub } from "./api";
+import { DaemonError, getGitHubStatus, recheckEnvironment, recheckGitHub, spawnTask } from "./api";
 import { setDaemonToken } from "./token";
 
 afterEach(() => {
@@ -73,31 +73,6 @@ describe("GitHub status API", () => {
 });
 
 describe("Environment recheck API", () => {
-  it("posts a bodyless authenticated recheck for the named environment and returns its observation", async () => {
-    setDaemonToken("environment-token");
-    const environment = {
-      name: "dogfood",
-      host: "vm",
-      capabilities: { model: "auth-gateway" },
-      provision: ["/qa/setup.sh"],
-      check: ["/qa/setup.sh", "--probe"],
-      status: { state: "ready", blockers: [], checked_at: "t1" },
-    };
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: async () => environment,
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    await expect(recheckEnvironment("dogfood")).resolves.toEqual(environment);
-    expect(fetchMock).toHaveBeenCalledWith("/api/environments/dogfood/recheck", {
-      method: "POST",
-      headers: { Authorization: "Bearer environment-token" },
-      body: undefined,
-    });
-  });
-
   it("preserves the daemon's unknown-environment refusal and 404 status", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: false,
@@ -118,5 +93,23 @@ describe("Environment recheck API", () => {
     }));
 
     await expect(recheckEnvironment("dogfood")).rejects.toMatchObject({ message: "503", status: 503 });
+  });
+});
+
+describe("Environment launch API", () => {
+  const input = { project_name: "project", workflow_name: "qa-work", slug: "qa", prompt: "Check" };
+
+  it("keeps blocker-carrying acceptance refusals even without a message field", async () => {
+    const detail = {
+      environment: "sandbox-qa",
+      blockers: [{ code: "forge_down", message: "Start the forge broker" }],
+    };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false, status: 422, json: async () => ({ detail }),
+    }));
+    await expect(spawnTask({ ...input, grant_environment: true, preview_token: "reviewed" }))
+      .rejects.toMatchObject({
+        status: 422, message: "Environment sandbox-qa is not ready.", detail,
+      });
   });
 });

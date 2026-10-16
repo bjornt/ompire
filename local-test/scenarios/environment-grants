@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# Grant enforcement, real-launcher additions consumption, and container-scoped
+# tunnel lifetime. Workshop's logical namespace is fake; the daemon, launcher,
+# workflow revisions, acceptance, staging, and restart reconciliation are real.
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+ENVIRONMENTCTL=$CTL/environmentctl
+WIRING=$CTL/fixtures/sandbox-qa-wiring.yaml
+ENDPOINT=localhost:4181
+slug=$(unique_slug grants)
+original_condition=$($ENVIRONMENTCTL status sandbox-qa)
+
+_restore_fixture() {
+	if [ "$($WSCTL gate launch status | jq -r '.held != null')" = true ]; then
+		$WSCTL gate launch abort >/dev/null
+	else
+		$WSCTL gate launch off >/dev/null
+	fi
+	if ! daemon_wait_ready 2; then daemon_start; fi
+	case "$original_condition" in
+	ready|degraded) $ENVIRONMENTCTL "$original_condition" sandbox-qa ;;
+	missing) $ENVIRONMENTCTL ready sandbox-qa; $ENVIRONMENTCTL missing sandbox-qa ;;
+	esac
+}
+register_cleanup _restore_fixture
+
+request() { # WORKFLOW GRANT SUFFIX
+	jq -n --arg project "$PROJECT" --arg workflow "$1" --argjson grant "$2" \
+		--arg slug "$slug-$3" \
+		'{project_name: $project, workflow_name: $workflow, slug: $slug,
+		  prompt: "Exercise the environment grant contract.", grant_environment: $grant}'
+}
+preview() { # BODY — retains the exact submitted selections
+	_api_run POST /api/tasks/preview "$1"
+	[ "$API_CODE" = 200 ] || die "preview failed ($API_CODE): $API_BODY"
+	PREVIEW=$API_BODY
+	ACCEPT_BODY=$(jq --arg token "$(jq -r .preview_token <<<"$PREVIEW")" \
+		'. + {preview_token: $token}' <<<"$1")
+}
+refused_without_effects() { # EXPECTED DETAIL JQ FILTER
+	[ "$API_CODE" = 422 ] && jq -e "$1" <<<"$API_BODY" >/dev/null &&
+		ok "acceptance refuses with the named grant reason" ||
+		fail "named acceptance refusal" "$API_CODE $API_BODY"
+	local after
+	after=$(api_json GET /api/tasks | jq -c 'map(.id) | sort')
+	[ "$after" = "$before_tasks" ] && ok "refusal creates no task" ||
+		fail "refusal created a task" "$after"
+	[ "$($WSCTL list)" = "$before_workshops" ] && ok "refusal creates no container" ||
+		fail "refusal created a container"
+	if find "$HOME_DIR" -type d -name "*$slug*" -print -quit | grep -q .; then
+		fail "refusal created a workspace"
+	else
+		ok "refusal creates no workspace"
+	fi
+}
+launch_held() {
+	$WSCTL gate launch status | jq -e '.held != null'
+}
+launch_released() {
+	$WSCTL gate launch status | jq -e '.held == null'
+}
+cleanup_task() {
+	_api_run POST "/api/tasks/$1/cleanup"
+	[ "$API_CODE" = 200 ] || die "cleanup failed ($API_CODE): $API_BODY"
+	[ "$(task_field "$1" state)" = archived ] && ok "task $1 archived" ||
+		fail "task $1 not archived"
+}
+
+save_workflow qa-work "$(cat "$CTL/scenarios/qa-work.yaml")" >/dev/null
+save_workflow work-only "$(cat "$CTL/scenarios/work-only.yaml")" >/dev/null
+$ENVIRONMENTCTL ready sandbox-qa
+before_tasks=$(api_json GET /api/tasks | jq -c 'map(.id) | sort')
+before_workshops=$($WSCTL list)
+
+# --- missing grant and unasked authority: no accepted row, job, or workspace ---
+preview "$(request qa-work false missing)"
+jq -e '.environment | .name == "sandbox-qa" and .grantable and
+	.capabilities == {browser: "fixture-browser"} and .status.state == "ready" and
+	.status.blockers == [] and (.status.checked_at | type == "string")' \
+	<<<"$PREVIEW" >/dev/null && ok "preview surfaces the fresh requirement and capabilities" ||
+	fail "requirement preview" "$PREVIEW"
+_api_run POST /api/tasks "$ACCEPT_BODY"
+refused_without_effects '.detail | contains("grant_environment") and contains("sandbox-qa")'
+
+preview "$(request work-only true unasked)"
+jq -e 'has("environment") | not' <<<"$PREVIEW" >/dev/null &&
+	ok "ordinary preview omits the environment section" || fail "ordinary preview widened"
+_api_run POST /api/tasks "$ACCEPT_BODY"
+refused_without_effects '.detail | contains("grant_environment")'
+ordinary_body=$(request work-only false stable)
+preview "$ordinary_body"
+explicit_false_preview=$PREVIEW
+preview "$(jq 'del(.grant_environment)' <<<"$ordinary_body")"
+[ "$PREVIEW" = "$explicit_false_preview" ] &&
+	ok "ordinary omitted and false grant retain identical previews and fingerprints" ||
+	fail "ordinary grant default changed preview fields or fingerprint"
+
+# The acceptance probe, not the earlier ready preview, is authoritative.
+body=$(request qa-work true granted)
+preview "$body"
+$ENVIRONMENTCTL degraded sandbox-qa
+_api_run POST /api/tasks "$ACCEPT_BODY"
+refused_without_effects '.detail.environment == "sandbox-qa" and
+	any(.detail.blockers[]; .code == "check-failed" and
+	(.message | contains("sandbox-qa browser provider is not answering")))'
+preview "$body"
+jq -e '.environment.status.state == "degraded" and
+	any(.environment.status.blockers[]; .code == "check-failed")' <<<"$PREVIEW" >/dev/null &&
+	ok "not-ready preview succeeds and exposes named blockers" ||
+	fail "not-ready preview" "$PREVIEW"
+$ENVIRONMENTCTL ready sandbox-qa
+_api_run POST /api/tasks "$ACCEPT_BODY"
+[ "$API_CODE" = 202 ] || die "grant after provider recovery failed ($API_CODE): $API_BODY"
+tid=$(jq -r .id <<<"$API_BODY")
+wait_for "granted work completes" 180 workflow_complete "$tid"
+clone=$(task_field "$tid" clone_path)
+grant=$(task_get "$tid" | jq -cS '.execution_inputs.environment_grant')
+jq -e --rawfile wiring "$WIRING" '.name == "sandbox-qa" and
+	.capabilities == {browser: "fixture-browser"} and .wiring == $wiring and
+	.actor == "operator" and (.granted_at | type == "string" and length > 0)' \
+	<<<"$grant" >/dev/null && ok "acceptance pins the exact complete grant" ||
+	fail "pinned grant" "$grant"
+
+# The source fragment alone is not evidence: inspect the actual external launch
+# invocation after real my-workshop has consumed it, including its merged YAML.
+launch=$($WSCTL inspect "$clone")
+jq -e --rawfile wiring "$WIRING" '.launch.additions == $wiring and
+	.launch.plugs[.name + "/omp:qa-browser"] ==
+		{interface: "tunnel", endpoint: "localhost:4181"} and
+	.launch.slots[.name + "/system:qa-browser"] ==
+		{interface: "tunnel", endpoint: "localhost:4182"} and
+	.connects == [[.name + "/omp:qa-browser", .name + "/system:qa-browser"]]' \
+	<<<"$launch" >/dev/null && ok "real my-workshop consumed exact wiring and connected declared stanzas" ||
+	fail "consumed launcher additions and declarations" "$launch"
+assert "granted container exposes its declared endpoint" "$WSCTL" probe "$clone" "$ENDPOINT"
+[ ! -e "$clone/workshop.my.yaml" ] && ok "successful staging restores absent local additions" ||
+	fail "staged wiring left in clone"
+
+# An ordinary launch gets no grant, stanza, connection, or logical endpoint.
+ordinary=$(spawn_task "$slug-ordinary" "Ordinary work has no QA authority." work-only)
+wait_for "ordinary work completes" 180 workflow_complete "$ordinary"
+ordinary_clone=$(task_field "$ordinary" clone_path)
+task_get "$ordinary" | jq -e '.execution_inputs.environment_grant == null' >/dev/null &&
+	ok "ordinary inputs carry no environment grant" || fail "ordinary task widened"
+$WSCTL inspect "$ordinary_clone" | jq -e '
+	.launch.additions == "# no additions: selected source is absent\n" and
+	.launch.plugs == {} and .launch.slots == {} and .connects == []' >/dev/null &&
+	ok "ordinary launcher receives no environment wiring" || fail "ordinary launcher widened"
+if $WSCTL probe "$ordinary_clone" "$ENDPOINT" >/dev/null 2>&1; then
+	fail "ordinary container exposes an ungranted endpoint"
+else
+	ok "ungranted endpoint is absent at the sandbox contract"
+fi
+
+# Readiness may change after acceptance. A restart must not re-derive the grant
+# or recreate a surviving container; compare the full external launch record.
+$ENVIRONMENTCTL degraded sandbox-qa
+daemon_kill9
+daemon_start
+[ "$(task_get "$tid" | jq -cS '.execution_inputs.environment_grant')" = "$grant" ] &&
+	ok "grant survives daemon restart byte-for-byte while provider is degraded" ||
+	fail "restart changed the pinned grant"
+[ "$($WSCTL inspect "$clone" | jq -cS .)" = "$(jq -cS . <<<"$launch")" ] &&
+	ok "same container and tunnel connections survive restart without relaunch" ||
+	fail "restart replaced the granted container"
+assert "surviving container retains its tunnel" "$WSCTL" probe "$clone" "$ENDPOINT"
+assert "granted task does not fail after restart" task_not_failed "$tid"
+$ENVIRONMENTCTL ready sandbox-qa
+
+# Hold the real launcher at its external boundary while daemon staging is live.
+# Kill the daemon, explicitly abort the orphaned fake launch via its control,
+# then let normal startup restore the pending additions record.
+$WSCTL gate launch on
+preview "$(request qa-work true interrupted)"
+_api_run POST /api/tasks "$ACCEPT_BODY"
+[ "$API_CODE" = 202 ] || die "interrupted grant failed ($API_CODE): $API_BODY"
+interrupted=$(jq -r .id <<<"$API_BODY")
+wait_for "external launcher holds with staged wiring" 90 launch_held >/dev/null
+held=$($WSCTL gate launch status)
+interrupted_clone=$(jq -r .held.path <<<"$held")
+jq -e --rawfile wiring "$WIRING" '.held.launch.additions == $wiring' <<<"$held" >/dev/null &&
+	ok "interrupted launch had consumed the exact staged wiring" ||
+	fail "held launch content" "$held"
+[ -f "$HOME_DIR/.local/share/ompire/workshop-staging/$interrupted.json" ] &&
+	ok "interrupted staging is journaled before the launcher proceeds" ||
+	fail "no pending staging journal"
+daemon_kill9
+$WSCTL gate launch abort
+wait_for "orphaned launcher exits without a container" 30 launch_released >/dev/null
+daemon_start
+[ ! -e "$interrupted_clone/workshop.my.yaml" ] &&
+	ok "startup restores absent additions after interrupted granted staging" ||
+	fail "startup left staged grant wiring"
+[ ! -e "$HOME_DIR/.local/share/ompire/workshop-staging/$interrupted.json" ] &&
+	ok "startup consumes the interrupted staging journal" || fail "staging journal retained"
+[ "$(task_field "$interrupted" state)" = failed ] &&
+	ok "interrupted spawn fails without silently retrying authority" ||
+	fail "interrupted task classification" "$(task_get "$interrupted")"
+if $WSCTL inspect "$interrupted_clone" >/dev/null 2>&1; then
+	fail "interrupted launch created a container"
+else
+	ok "interrupted launch leaves no container or tunnel"
+fi
+
+# Cleanup removes the capability by removing its container. The pinned record
+# remains an audit fact, but cannot expose an endpoint after clone removal.
+cleanup_task "$tid"
+[ ! -d "$clone" ] && ok "granted clone removed" || fail "granted clone retained"
+if $WSCTL inspect "$clone" >/dev/null 2>&1 || $WSCTL probe "$clone" "$ENDPOINT" >/dev/null 2>&1; then
+	fail "cleanup left granted container or endpoint"
+else
+	ok "cleanup revokes the granted tunnel with the container"
+fi
+[ "$(task_get "$tid" | jq -cS '.execution_inputs.environment_grant')" = "$grant" ] &&
+	ok "cleanup preserves the immutable grant audit record" || fail "cleanup changed grant"
+cleanup_task "$ordinary"
+cleanup_task "$interrupted"
+[ ! -d "$interrupted_clone" ] && ok "interrupted clone removed by ordinary cleanup" ||
+	fail "interrupted clone retained"

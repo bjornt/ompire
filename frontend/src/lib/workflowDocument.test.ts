@@ -18,6 +18,7 @@ import {
   readDeliveryGate,
   readFlow,
   readStages,
+  unknownDocumentFields,
   unknownStepFields,
 } from "./workflowFlow";
 
@@ -410,6 +411,7 @@ describe("format 5 retained composition", () => {
   it("uses pinned phases without changing primitive indexes or hiding authority", () => {
     const definition = deliveringDraft();
     definition.format = 5;
+    definition.environment = "sandbox-qa";
     definition.composition = {
       steps: [{ name: "shared-approval", use: "approval", bindings: {} }],
       definitions: {},
@@ -427,6 +429,9 @@ describe("format 5 retained composition", () => {
     expect(source.steps).toEqual([{ name: "shared-approval", use: "approval", bindings: {} }]);
     expect(source).not.toHaveProperty("composition");
     expect(source.stages).toEqual((definition.composition as DraftObject).stages);
+    expect(source.environment).toBe("sandbox-qa");
+    expect(renameSession(source, "main", "worker").document.environment).toBe("sandbox-qa");
+    expect(unknownDocumentFields({ ...definition, environments: [] })).toEqual(["environments"]);
   });
 
   it("rewrites only template-declared references in bindings, including splices and defaults", () => {

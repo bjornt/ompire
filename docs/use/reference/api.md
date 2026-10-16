@@ -229,7 +229,7 @@ For a launch with attachments, both calls also return:
 
 | Field | Meaning |
 |---|---|
-| `source_commit` | The exact commit the clone will be built from. `null` for a launch with no attachments |
+| `source_commit` | The exact commit the clone will be built from; also pinned for project-source environment wiring. Otherwise `null` without attachments |
 | `result_attachments` | Each pinned revision with its `manifest_id`, `destinations`, file list with checksums, producer provenance, `classification: "handoff-input"`, and `publishable: false` |
 | `base_comparisons` | Per attachment: `state` (`match`/`different`/`unknown`), `target_commit`, `producer_observation`, a bounded `changed_paths` list, `truncated`, and a `detail` naming any gap |
 | `needs_base_acknowledgement` | Whether an acknowledgement is still required |
@@ -256,6 +256,21 @@ while an edit to an unrelated profile or workflow does not. Unknown top-level
 fields — including the retired `template_name` and the old scalar
 `model`/`thinking` overrides — are refused, not ignored. See
 [Task spawn](task-spawn.md).
+
+`grant_environment` is an affirmative boolean, default false. A requiring
+workflow's preview includes `environment` with `name`, `capabilities`,
+`grantable`, and fresh `status` (`state`, `{code, message}` blockers,
+`checked_at`). Without a requirement this section is absent. The token covers
+the grant selection and access snapshot, not readiness timestamps. Acceptance
+probes again: a missing/unasked grant is `422` with
+`detail: "grant_environment: ..."`; not ready is `422` with
+`detail: {environment, blockers}`. Selected additions with content conflict
+with granted wiring and are refused rather than merged. See
+[Environment access](task-spawn.md#environment-access).
+
+A task's optional `execution_inputs.environment_grant` records `name`,
+`capabilities`, nullable `wiring`, `granted_at`, and `actor: "operator"` in the
+same transaction as acceptance. Pre-existing tasks have no grant.
 
 A preview's step rows carry `declared_role` and a `binding` object — the source
 profile, its source, the effective role, its source, and the full role map —
@@ -582,8 +597,9 @@ so reconnecting clients need no event replay. See [States](states.md) for the
 identity and target vocabularies.
 
 The snapshot's `environments` key is a list of full entries: `name`, `host`,
-`capabilities`, `provision`, `check`, and nested `status` with `state`,
-`blockers` (`{code, message}`), and `checked_at` (null before the first probe).
+`capabilities`, `provision`, `check`, nullable `wiring`, `grantable`, and nested
+`status` with `state`, `blockers` (`{code, message}`), and `checked_at` (null
+before the first probe).
 Every completed probe emits `environment_status` with `{"environment": <entry>}`;
 the GET and Re-check responses use the same entry shape. There are no definition
 mutation routes. See [Environments](environments.md) for the command contract

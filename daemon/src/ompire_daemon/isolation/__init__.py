@@ -17,7 +17,11 @@ or classified failures; an owner identity is an opaque integer that needs no
 task row.
 """
 
-from ompire_daemon.isolation.additions import recover_pending
+from ompire_daemon.isolation.additions import (
+    LOCAL_ADDITIONS_FILENAME,
+    global_additions_path,
+    recover_pending,
+)
 from ompire_daemon.isolation.excludes import (
     GIT_EXCLUDE_OMPIRE_ENTRY,
     ExcludeUpdateError,
@@ -52,6 +56,7 @@ from ompire_daemon.isolation.workspace import (
 
 __all__ = [
     "GIT_EXCLUDE_OMPIRE_ENTRY",
+    "LOCAL_ADDITIONS_FILENAME",
     "ExcludeUpdateError",
     "PhaseProgress",
     "SandboxCommandError",
@@ -67,6 +72,7 @@ __all__ = [
     "destroy_workspace",
     "ensure_git_excludes",
     "exclude_pattern_for",
+    "global_additions_path",
     "launch_workshop",
     "prepare_clone",
     "recover_pending",

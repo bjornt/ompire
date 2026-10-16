@@ -59,6 +59,7 @@ relying on it.
 | [0039](0039-own-workspace-resources-behind-isolation.md) | Own workspace resources behind isolation | Accepted |
 | [0040](0040-resolve-shared-workflow-steps-before-retention.md) | Resolve shared workflow steps before retention | Accepted |
 | [0041](0041-broker-forge-access-behind-read-only-proxy.md) | Broker forge access behind a read-only proxy | Accepted |
+| [0042](0042-pin-environment-grants-at-task-acceptance.md) | Pin environment grants at task acceptance | Accepted |
 
 ## Template
 

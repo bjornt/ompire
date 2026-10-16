@@ -105,6 +105,12 @@ def _workspace_spec(config: Config, task: Task, inputs: TaskExecutionInputs) -> 
         launcher_argv=config.my_workshop_command,
         git_timeout=config.spawn_step_timeout,
         workshop_timeout=config.workshop_step_timeout,
+        environment_wiring=(
+            inputs.environment_grant.wiring if inputs.environment_grant else None
+        ),
+        environment_name=(
+            inputs.environment_grant.name if inputs.environment_grant else None
+        ),
     )
 
 

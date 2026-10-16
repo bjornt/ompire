@@ -35,14 +35,22 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Coroutine
+from dataclasses import replace
 from typing import Any
 
 from sqlalchemy import Connection, Engine
 
 from ompire_daemon.application.spawn import run_spawn_pipeline
 from ompire_daemon.config import Config
+from ompire_daemon.environments import STATE_READY, EnvironmentRegistry
 from ompire_daemon.events import EventHub
-from ompire_daemon.handoff import observe_base_difference, observe_target
+from ompire_daemon.handoff import (
+    HandoffError,
+    observe_base_difference,
+    observe_target,
+    resolve_target_commit,
+)
+from ompire_daemon.isolation import LOCAL_ADDITIONS_FILENAME, global_additions_path
 from ompire_daemon.oversight.tasks import task_payload
 from ompire_daemon.platform.transactions import reserved_write
 from ompire_daemon.registry.results import (
@@ -51,6 +59,7 @@ from ompire_daemon.registry.results import (
     read_result_on,
 )
 from ompire_daemon.work.files import validate_mentions
+from ompire_daemon.work.inputs import EnvironmentGrant
 from ompire_daemon.work.launch import (
     LaunchInputError,
     LaunchRequest,
@@ -73,6 +82,15 @@ class LaunchMentionsRejectedError(ValueError):
     def __init__(self, detail: str) -> None:
         super().__init__(f"prompt file mention rejected — {detail}")
         self.detail = detail
+
+
+class EnvironmentNotReadyError(ValueError):
+    """The freshly checked required environment is not ready for acceptance."""
+
+    def __init__(self, environment: str, blockers: list[dict[str, str]]) -> None:
+        super().__init__(f"environment {environment!r} is not ready")
+        self.environment = environment
+        self.blockers = tuple(dict(blocker) for blocker in blockers)
 
 
 class SpawnScheduler:
@@ -117,6 +135,7 @@ class LaunchService:
         config: Config,
         *,
         events: EventHub,
+        environments: EnvironmentRegistry,
         scheduler: SpawnScheduler,
         workflow_runner: Any,
         result_notifier: Callable[[int], None],
@@ -124,6 +143,7 @@ class LaunchService:
         self._engine = engine
         self._config = config
         self._events = events
+        self._environments = environments
         self._scheduler = scheduler
         self._workflow_runner = workflow_runner
         # Republishing a producer's result projection after a consumer's
@@ -140,7 +160,11 @@ class LaunchService:
         """
         evidence = await self._target_evidence(request)
         with self._engine.connect() as conn:
-            return self._resolve(conn, request, evidence)
+            resolved = self._resolve(conn, request, evidence)
+        if resolved.environment is not None:
+            observed = await self._environments.probe(resolved.environment.name)
+            resolved = replace(resolved, environment_status=observed["status"])
+        return resolved
 
     async def accept(self, request: LaunchRequest, *, preview_token: str) -> Task:
         """Accept one reviewed launch: record the task and its pinned inputs,
@@ -159,6 +183,28 @@ class LaunchService:
             resolved = self._resolve(conn, request, evidence)
         if resolved.fingerprint != preview_token:
             raise PreviewChangedError(resolved)
+
+        environment = resolved.environment
+        if environment is None:
+            if request.grant_environment:
+                raise LaunchInputError(
+                    "grant_environment",
+                    "this workflow requires no environment; do not grant unrequested access",
+                )
+        else:
+            if not request.grant_environment:
+                raise LaunchInputError(
+                    "grant_environment",
+                    f"workflow {resolved.revision.name!r} requires environment "
+                    f"{environment.name!r}; explicitly grant access before launching",
+                )
+            observed = await self._environments.probe(environment.name)
+            if observed["status"]["state"] != STATE_READY:
+                raise EnvironmentNotReadyError(
+                    environment.name, observed["status"]["blockers"]
+                )
+            if environment.wiring:
+                await self._refuse_additions_conflict(resolved)
 
         # Mentions are validated before anything is created: Omp drops one it
         # cannot resolve without a word, so a mention that will not survive
@@ -191,6 +237,19 @@ class LaunchService:
             final = self._resolve(conn, request, evidence)
             if final.fingerprint != preview_token:
                 raise PreviewChangedError(final)
+            # Only acceptance stamps authority, after re-resolution has matched
+            # the reviewed capability/wiring snapshot under the reservation.
+            accepted_inputs = final.inputs
+            if final.environment is not None:
+                accepted_inputs = replace(
+                    accepted_inputs,
+                    environment_grant=EnvironmentGrant(
+                        name=final.environment.name,
+                        capabilities=final.environment.capabilities,
+                        wiring=final.environment.wiring,
+                        granted_at=accepted_inputs.accepted_at,
+                    ),
+                )
             task = create_task(
                 self._engine,
                 project_name=final.inputs.project_name,
@@ -198,7 +257,7 @@ class LaunchService:
                 branch=final.inputs.branch,
                 clone_path=str(clone_path),
                 prompt=request.prompt,
-                execution_inputs=final.inputs,
+                execution_inputs=accepted_inputs,
                 workflow_name=final.inputs.workflow_name,
                 conn=conn,
             )
@@ -249,7 +308,9 @@ class LaunchService:
         selection, profile, or workflow checks the HTTP path runs.
         """
         self._refuse_empty_profile_overrides(request)
-        return resolve_launch(conn, request, evidence=evidence)
+        return resolve_launch(
+            conn, request, evidence=evidence, environments=self._config.environments
+        )
 
     @staticmethod
     def _refuse_empty_profile_overrides(request: LaunchRequest) -> None:
@@ -271,18 +332,38 @@ class LaunchService:
     async def _target_evidence(
         self, request: LaunchRequest
     ) -> TargetEvidence | None:
-        """Read the target base for an attachment launch, outside any lock.
+        """Read a guarded target base outside any lock.
 
-        Returns None when nothing is attached, which is what keeps an ordinary
-        launch on exactly its previous path: no commit is resolved, no tree is
-        read, and nothing new can refuse it.
+        Attachments and a project-wiring grant need an immutable base. Ordinary
+        launches keep their existing path: no commit or tree reading.
 
         A revision that cannot be read here contributes no destinations. It is
         not refused *here* — resolution owns that refusal, and it has to be the
         same refusal in the preview and in the acceptance.
         """
         if not request.result_attachments:
-            return None
+            if not request.grant_environment:
+                return None
+            with self._engine.connect() as conn:
+                resolved = self._resolve(conn, request, None)
+            if (
+                resolved.environment is None
+                or not resolved.environment.wiring
+                or resolved.inputs.workspace.workshop_additions != "project"
+            ):
+                return None
+            try:
+                commit = await resolve_target_commit(
+                    resolved.inputs.checkout_path,
+                    resolved.inputs.workspace.base_branch,
+                    self._config.spawn_step_timeout,
+                )
+            except HandoffError as exc:
+                raise LaunchInputError(
+                    "grant_environment",
+                    f"cannot inspect project Workshop additions: {exc.detail}",
+                ) from exc
+            return TargetEvidence(commit=commit)
         with self._engine.connect() as conn:
             checkout_path, base_branch = resolve_target_context(conn, request)
             observations: dict[str, str | None] = {}
@@ -326,3 +407,68 @@ class LaunchService:
             ),
             comparisons=comparisons,
         )
+
+    async def _refuse_additions_conflict(self, resolved: ResolvedLaunch) -> None:
+        """Check only the selected source's bytes, outside the write lock.
+
+        Project additions come from the immutable accepted base tree, not the
+        operator's working copy. cat-file reports just type and size: a huge
+        blob never enters daemon memory merely to decide whether it is empty.
+        """
+        source = resolved.inputs.workspace.workshop_additions
+        field = "grant_environment"
+        if source == "global":
+            path = global_additions_path()
+
+            def has_content() -> bool:
+                try:
+                    with path.open("rb") as stream:
+                        return bool(stream.read(1))
+                except FileNotFoundError:
+                    return False
+
+            try:
+                nonempty = await asyncio.to_thread(has_content)
+            except OSError as exc:
+                raise LaunchInputError(field, f"cannot read global Workshop additions: {exc}") from exc
+        else:
+            commit = resolved.inputs.source_commit
+            if commit is None:
+                raise LaunchInputError(field, "the project additions base was not observed; preview again")
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    "git", "--no-replace-objects", "-C", resolved.inputs.checkout_path,
+                    "cat-file", "--batch-check=%(objecttype) %(objectsize)",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                try:
+                    out, _ = await asyncio.wait_for(
+                        process.communicate(f"{commit}:{LOCAL_ADDITIONS_FILENAME}\n".encode()),
+                        timeout=self._config.spawn_step_timeout,
+                    )
+                except BaseException:
+                    if process.returncode is None:
+                        process.kill()
+                    await process.wait()
+                    raise
+            except (OSError, TimeoutError) as exc:
+                raise LaunchInputError(field, f"cannot inspect project Workshop additions: {exc}") from exc
+            if process.returncode != 0:
+                raise LaunchInputError(field, "cannot inspect project Workshop additions in the accepted base")
+            reading = out.decode("ascii", errors="replace").strip()
+            if reading.endswith(" missing"):
+                nonempty = False
+            else:
+                kind, _, size = reading.partition(" ")
+                if kind != "blob" or not size.isdigit():
+                    raise LaunchInputError(field, "project Workshop additions in the accepted base are not a file")
+                nonempty = int(size) > 0
+        if nonempty:
+            assert resolved.environment is not None
+            raise LaunchInputError(
+                field,
+                f"environment {resolved.environment.name!r} wiring conflicts with non-empty "
+                f"selected {source} Workshop additions; composing them is not supported",
+            )

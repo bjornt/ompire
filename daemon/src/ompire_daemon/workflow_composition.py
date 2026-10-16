@@ -223,7 +223,7 @@ def composition_definition(document: Mapping[str, Any], *, resolve_catalog: bool
     if len(_json(dict(document)).encode("utf-8")) > MAX_DOCUMENT_BYTES:
         raise WorkflowDocumentError("", "composition exceeds the document byte bound")
     canonical = "composition" in document
-    _reject_unknown(document, ("format", "name", "sessions", "primary", "steps", *(("composition",) if canonical else ("definitions", "stages"))), "")
+    _reject_unknown(document, ("format", "name", "sessions", "primary", "steps", "environment", *(("composition",) if canonical else ("definitions", "stages"))), "")
     source_location = "composition.steps" if canonical else "steps"
     definitions_location = "composition.definitions" if canonical else "definitions"
     if canonical:
@@ -307,6 +307,8 @@ def composition_definition(document: Mapping[str, Any], *, resolve_catalog: bool
             raise WorkflowDocumentError(location, "expanded steps exceed the step bound")
         defaults.append({"name": name, "label": label, "description": description, "steps": [step.get("name") for step in added]})
     primitive_document = {key: document.get(key) for key in ("format", "name", "sessions", "primary")}
+    if "environment" in document:
+        primitive_document["environment"] = document["environment"]
     primitive_document["steps"] = expanded
     try:
         definition = _primitive_definition_from_document(primitive_document)

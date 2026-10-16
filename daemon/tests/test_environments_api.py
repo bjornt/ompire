@@ -65,6 +65,8 @@ def test_get_is_cached_and_post_returns_fresh_full_environment(
         "name": "qa-env",
         "host": "container",
         "capabilities": {"model": "auth-gateway", "browser": "chrome"},
+        "wiring": None,
+        "grantable": False,
         "provision": ["/bin/true"],
         "check": [str(check)],
         "status": {

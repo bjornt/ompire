@@ -274,6 +274,8 @@ class TaskCreate(BaseModel):
     # target commit: an acknowledgement cannot be carried over to a different
     # selection or a base that moved.
     acknowledge_result_base_difference: bool = False
+    # Whole-environment access is an explicit operator decision, off by default.
+    grant_environment: bool = False
 
     @field_validator("slug")
     @classmethod
