@@ -20,24 +20,24 @@ definitions cannot be edited through the UI or REST API.
 ```toml
 [environments.dogfood]
 host = "host"
-provision = ["/home/qa/ompire/scripts/setup-qa-env.sh"]
+provision = ["/home/qa/ompire/scripts/setup-qa-env.sh", "--dir", "/home/qa/ompire/.qa-agent", "--repo", "ompire-test/sandbox"]
 check = ["/home/qa/ompire/scripts/setup-qa-env.sh", "--probe"]
 wiring = '''
 sdks:
   - name: omp
     plugs:
-      forge:
+      github:
         interface: tunnel
         endpoint: localhost:4100
   - name: system
     slots:
-      forge:
+      github:
         interface: tunnel
         endpoint: localhost:4100
 provision:
   connect:
-    - plug: omp:forge
-      slot: system:forge
+    - plug: omp:github
+      slot: system:github
 '''
 
 [environments.dogfood.capabilities]
@@ -46,9 +46,32 @@ forge = "forge-broker"
 browser = "chrome"
 ```
 
-This illustrates a forge tunnel to a broker on trusted-host loopback; it is
-not an installed environment. Supply working commands and matching wiring
-for every capability you declare; add separate model/browser wiring as needed.
+This is the shape installed by `scripts/setup-qa-env.sh` for the `dogfood`
+environment; paths and sandbox repository are resolved on the trusted QA host.
+The forge capability's provider is `forge-broker`, while its Workshop tunnel
+plug/slot is named `github`. The existing `pi-auth-gateway` model tunnel and
+browser SDK stay in Ompire's repository Workshop declaration; only the forge
+route arrives through this grant-scoped fragment. Do not add `github` to the
+static declaration, which would give tasks ambient access without a grant.
+
+Setup starts `~/.config/ompire/qa-forge-broker.sh` with the one sandbox
+allowlisted and keeps pid/log files at
+`~/.local/share/ompire/forge-broker.{pid,log}`. It registers the local `ompire`
+project with `fetch_remote: qa-self` and installs the non-publishing `dogfood`
+driver workflow when absent. The daemon does not do any of that provisioning.
+See the [QA-loop guide](../../develop/how-to/run-the-qa-loop.md) for the
+operator/agent split and real-service evidence procedure.
+
+The installed check's `--probe` option is mutually exclusive with other CLI
+options. It uses `QA_AGENT_DIR` inherited from the trusted daemon wrapper
+(which sources the identity's `env.sh`), or the checkout's `.qa-agent/` by
+default. For a direct check with a custom identity, run
+`QA_AGENT_DIR=/absolute/identity /absolute/ompire/scripts/setup-qa-env.sh --probe`
+on the trusted host, not `--probe --dir ...`. Only the non-secret identity
+path is supplied; the probe does not source `env.sh` or print secret material.
+It checks identity presence/modes, local broker health, gateway reachability,
+browser availability and container tooling; a ready probe is not evidence of
+upstream GitHub authentication.
 
 | Field | Contract |
 |---|---|

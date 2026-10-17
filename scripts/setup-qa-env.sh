@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # Set up everything needed to dogfood-QA ompire with the AI agent identity
-# provisioned by setup-qa-agent.sh. Run this in the QA environment (the
-# machine/container the QA agent works in) AFTER the identity directory has
-# been created and placed at .qa-agent/ in this repo.
+# provisioned by setup-qa-agent.sh. Run this on the trusted QA host AFTER the
+# identity directory has been created and placed at .qa-agent/ in this repo.
+# Never run provisioning inside a task sandbox.
 #
 # What it does, in order:
 #
@@ -12,9 +12,8 @@
 #                   operation from here on runs as the bot (@ompire-test)
 #   2. gitignore    add .qa-agent/ to .gitignore — it contains a live PAT,
 #                   an SSH private key, and a GPG private key
-#   3. gh           install the GitHub CLI (agent needs it for PRs; it picks
-#                   up GH_TOKEN from env.sh — no `gh auth login` here, the
-#                   management-plane auth stays on the operator's machine)
+#   3. gh           install the GitHub CLI for trusted daemon publishing
+#                   (GH_TOKEN from env.sh; no management-plane login here)
 #   3b. toolchain   node (NodeSource 24) + corepack pnpm (pinned in
 #                   frontend/package.json#packageManager), uv (astral installer)
 #   3c. workshop    workshop snap + LXD + my-workshop (built from
@@ -37,6 +36,7 @@
 #                   credential value is printed
 #
 # Options:
+#   --probe             read-only readiness check; exclusive with all options
 #   --repo OWNER/NAME   QA sandbox repo (default: auto-discover from the PAT)
 #   --skip-browser      skip the Chromium provisioning step
 #   --skip-workshop     skip the workshop/LXD/my-workshop provisioning step
@@ -55,11 +55,16 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-QA_DIR="$ROOT/.qa-agent"
+QA_DIR=${QA_AGENT_DIR:-"$ROOT/.qa-agent"}
+
+
 OMPIRE_CONFIG_DIR="$HOME/.config/ompire"
 OMPIRE_CONFIG="$OMPIRE_CONFIG_DIR/config.toml"
 OMPIRE_DATA="$HOME/.local/share/ompire"
 DAEMON_WRAPPER="$OMPIRE_CONFIG_DIR/qa-daemon.sh"
+BROKER_WRAPPER="$OMPIRE_CONFIG_DIR/qa-forge-broker.sh"
+BROKER_PIDFILE="$OMPIRE_DATA/forge-broker.pid"
+BROKER_LOG="$OMPIRE_DATA/forge-broker.log"
 DAEMON_URL="http://127.0.0.1:4173"
 CHECKOUT_ROOT="$HOME/proj"
 
@@ -75,13 +80,54 @@ usage() {
 log()  { printf '==> %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+probe() {
+	local failed=0 f expected actual tool
+	probe_fail() { printf 'dogfood: %s\n' "$*" >&2; failed=1; }
+	for f in . gnupg token .curlrc env.sh id_ed25519 gitconfig known_hosts state.json .gpg-passphrase; do
+		expected=600
+		case "$f" in . | gnupg) expected=700 ;; known_hosts) expected=644 ;; esac
+		if { [ "$expected" = 700 ] && [ ! -d "$QA_DIR/$f" ]; } ||
+			{ [ "$expected" != 700 ] && [ ! -f "$QA_DIR/$f" ]; }; then
+			probe_fail "identity $f missing — re-copy the identity with setup-qa-agent.sh on the management machine"
+			continue
+		fi
+		actual=$(stat -c %a "$QA_DIR/$f" 2>/dev/null) || actual=unknown
+		if [ "$actual" != "$expected" ] || [ ! -O "$QA_DIR/$f" ] || [ ! -r "$QA_DIR/$f" ]; then
+			probe_fail "identity $f needs owner access and mode $expected — fix ownership and chmod $expected on the trusted QA host"
+		fi
+	done
+	if ! curl -q -fsS --noproxy '*' --connect-timeout 1 --max-time 2 \
+		http://127.0.0.1:4100/healthz >/dev/null 2>&1; then
+		probe_fail "forge broker unavailable on localhost:4100 — restart $BROKER_WRAPPER"
+	fi
+	if ! timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/4000' >/dev/null 2>&1; then
+		probe_fail "auth gateway unavailable on localhost:4000 — start scripts/qa-auth-tunnel.sh from the gateway host"
+	fi
+	if ! timeout 10 "$ROOT/scripts/setup-browser.sh" --status >/dev/null 2>&1; then
+		probe_fail "browser unavailable — run scripts/setup-browser.sh on the trusted QA host"
+	fi
+	for tool in workshop my-workshop lxc; do
+		command -v "$tool" >/dev/null 2>&1 ||
+			probe_fail "container tooling $tool missing — re-run scripts/setup-qa-env.sh without --skip-workshop"
+	done
+	return "$failed"
+}
 
 # ---- options -------------------------------------------------------------
+# Do not source env.sh, read credentials, or provision anything on this path.
+for arg in "$@"; do
+	if [ "$arg" = --probe ]; then
+		[ "$#" -eq 1 ] || die "--probe is mutually exclusive with all other options"
+		probe
+		exit $?
+	fi
+done
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-	--repo) OPT_REPO=$2; shift 2 ;;
-	--dir) QA_DIR=$2; shift 2 ;;
+	--probe) die "--probe is mutually exclusive with all other options" ;;
+	--repo) [ $# -ge 2 ] || die "--repo needs OWNER/NAME"; OPT_REPO=$2; shift 2 ;;
+	--dir) [ $# -ge 2 ] || die "--dir needs PATH"; QA_DIR=$2; shift 2 ;;
 	--skip-browser) OPT_SKIP_BROWSER=1; shift ;;
 	--skip-workshop) OPT_SKIP_WORKSHOP=1; shift ;;
 	--check) OPT_CHECK=1; shift ;;
@@ -91,6 +137,9 @@ while [ $# -gt 0 ]; do
 done
 
 # ---- 1. preflight: the identity must already exist ------------------------
+command -v python3 >/dev/null && python3 -c 'import sys; sys.exit(sys.version_info < (3, 12))' ||
+	die "Python 3.12 or newer is required — install it on the trusted QA host"
+
 
 log "preflight: checking QA identity in $QA_DIR"
 for f in token .curlrc env.sh id_ed25519 gitconfig known_hosts state.json; do
@@ -102,6 +151,8 @@ BOT_LOGIN=$(jq -r '.login // empty' "$QA_DIR/state.json")
 BOT_FPR=$(jq -r '.gpg.fingerprint // empty' "$QA_DIR/state.json")
 [ -n "$BOT_LOGIN" ] || die "state.json has no login — re-run setup-qa-agent.sh setup"
 [ -n "$BOT_FPR" ] || die "state.json has no gpg fingerprint — re-run setup-qa-agent.sh setup"
+[ "$BOT_LOGIN" = ompire-test ] || die "QA requires @ompire-test — never provision with a personal identity"
+QA_DIR=$(cd "$QA_DIR" && pwd)
 
 # From here on, act as the bot: git/gh/gpg all pick up the identity.
 # shellcheck disable=SC1090
@@ -226,20 +277,9 @@ if [ "$OPT_CHECK" -eq 1 ]; then
 	(cd "$ROOT/frontend" && pnpm test)
 fi
 
-# ---- 6. daemon config -----------------------------------------------------
+# ---- 6. trusted-side directories ------------------------------------------
 
 mkdir -p "$OMPIRE_CONFIG_DIR" "$OMPIRE_DATA"
-toml_set() { # toml_set KEY VALUE(pre-quoted)
-	if [ -f "$OMPIRE_CONFIG" ] && grep -qE "^$1[[:space:]]*=" "$OMPIRE_CONFIG"; then
-		sed -i "s|^$1[[:space:]]*=.*|$1 = $2|" "$OMPIRE_CONFIG"
-	else
-		printf '%s = %s\n' "$1" "$2" >>"$OMPIRE_CONFIG"
-	fi
-}
-touch "$OMPIRE_CONFIG"
-toml_set gpg_signing_key "\"$BOT_FPR\""
-toml_set notifications_enabled false
-log "config: $OMPIRE_CONFIG (gpg_signing_key $BOT_FPR, notifications off)"
 
 # ---- 7. QA sandbox repo ---------------------------------------------------
 
@@ -258,6 +298,8 @@ $REPO_LIST" ;;
 	esac
 fi
 log "repo: $REPO"
+[[ "$REPO" =~ ^ompire-test/[A-Za-z0-9_.-]+$ ]] ||
+	die "QA repository must be owned by ompire-test — never target a real repository"
 
 repo_json=$(curl -fsS -K "$QA_DIR/.curlrc" "https://api.github.com/repos/$REPO") ||
 	die "cannot read repo $REPO with the agent PAT"
@@ -266,6 +308,7 @@ SSH_URL=$(jq -r '.ssh_url // empty' <<<"$repo_json")
 [ -n "$SSH_URL" ] || die "repo $REPO has no ssh_url"
 
 NAME=$(basename "$REPO" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-' | sed 's/--*/-/g; s/^-//; s/-$//')
+[ "$NAME" != ompire ] || die "sandbox project slug ompire is reserved for the dogfood checkout — rename the sandbox repository"
 [ -n "$NAME" ] || die "could not derive a project slug from $REPO"
 CHECKOUT="$CHECKOUT_ROOT/$NAME"
 
@@ -293,6 +336,116 @@ if ! git -C "$CHECKOUT" rev-parse --verify HEAD >/dev/null 2>&1; then
 		git push -q -u origin "$BASE_BRANCH"
 	)
 fi
+
+# ---- 7b. dogfood environment configuration --------------------------------
+
+python3 - "$OMPIRE_CONFIG" "$ROOT/scripts/setup-qa-env.sh" "$QA_DIR" "$REPO" "$BOT_FPR" <<'PY'
+import json
+import pathlib
+import re
+import sys
+import tomllib
+
+path = pathlib.Path(sys.argv[1])
+script, identity, repo, fingerprint = sys.argv[2:]
+text = path.read_text() if path.exists() else (
+    f'gpg_signing_key = {json.dumps(fingerprint)}\nnotifications_enabled = false\n'
+)
+original = tomllib.loads(text)
+headers = []
+for match in re.finditer(r'^[ \t]*\[.+?\][ \t]*(?:#[^\n]*)?$', text, re.MULTILINE):
+    try:
+        # A header-looking line inside a multiline string is not a table.
+        tomllib.loads(text[:match.start()])
+        table = tomllib.loads(match.group())
+    except tomllib.TOMLDecodeError:
+        continue
+    keys = []
+    while isinstance(table, dict) and len(table) == 1:
+        key, table = next(iter(table.items()))
+        keys.append(key)
+    headers.append((match.start(), keys[:2] == ['environments', 'dogfood']))
+if 'dogfood' in original.get('environments', {}) and not any(owned for _, owned in headers):
+    sys.exit('dogfood config must use [environments.dogfood] tables, not an inline declaration')
+headers.append((len(text), False))
+parts = []
+offset = 0
+for index, (start, owned) in enumerate(headers[:-1]):
+    if owned:
+        parts.append(text[offset:start])
+        offset = headers[index + 1][0]
+parts.append(text[offset:])
+preserved = ''.join(parts)
+block = f'''[environments.dogfood]
+host = "host"
+provision = {json.dumps([script, '--dir', identity, '--repo', repo])}
+check = {json.dumps([script, '--probe'])}
+wiring = ''' + "'''\n" + '''sdks:
+  - name: omp
+    plugs:
+      github:
+        interface: tunnel
+        endpoint: localhost:4100
+  - name: system
+    slots:
+      github:
+        interface: tunnel
+        endpoint: localhost:4100
+provision:
+  connect:
+    - plug: omp:github
+      slot: system:github
+''' + "'''\n" + '''
+[environments.dogfood.capabilities]
+model = "auth-gateway"
+forge = "forge-broker"
+browser = "chrome"
+'''
+updated = preserved + ('' if preserved.endswith('\n\n') else '\n' if preserved.endswith('\n') else '\n\n') + block
+tomllib.loads(updated)
+path.write_text(updated)
+PY
+log "config: $OMPIRE_CONFIG (replaced only dogfood; existing operator settings preserved)"
+
+# ---- 7c. forge broker wrapper + (re)start ----------------------------------
+
+{
+	printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+	# No env.sh sourcing: the broker reads its sole credential from the file.
+	printf 'unset OMPIRE_FORGE_TOKEN GH_TOKEN GITHUB_TOKEN\n'
+	printf 'exec %q %q --token-file %q --repo %q --port 4100\n' \
+		"$(command -v python3)" "$ROOT/daemon/src/ompire_daemon/forge_broker.py" "$QA_DIR/token" "$REPO"
+} >"$BROKER_WRAPPER"
+chmod 700 "$BROKER_WRAPPER"
+if [ -f "$BROKER_PIDFILE" ] && kill -0 "$(cat "$BROKER_PIDFILE")" 2>/dev/null; then
+	log "forge broker: restarting (pid $(cat "$BROKER_PIDFILE"))"
+	kill "$(cat "$BROKER_PIDFILE")"
+	for _ in $(seq 1 20); do
+		kill -0 "$(cat "$BROKER_PIDFILE")" 2>/dev/null || break
+		sleep 0.2
+	done
+	kill -0 "$(cat "$BROKER_PIDFILE")" 2>/dev/null &&
+		die "forge broker did not stop — inspect $BROKER_PIDFILE before restarting"
+fi
+# Readiness must belong to this start, not a previous log line.
+touch "$BROKER_LOG"
+chmod 600 "$BROKER_LOG"
+broker_start=$(wc -l <"$BROKER_LOG")
+nohup "$BROKER_WRAPPER" >>"$BROKER_LOG" 2>&1 &
+echo $! >"$BROKER_PIDFILE"
+ready=0
+for _ in $(seq 1 40); do
+	kill -0 "$(cat "$BROKER_PIDFILE")" 2>/dev/null ||
+		die "forge broker died during startup — see $BROKER_LOG; restart $BROKER_WRAPPER"
+	if tail -n "+$((broker_start + 1))" "$BROKER_LOG" | grep -qxF 'forge broker ready http://127.0.0.1:4100' &&
+		curl -q -fsS --noproxy '*' --max-time 2 http://127.0.0.1:4100/healthz >/dev/null 2>&1; then
+		ready=1
+		break
+	fi
+	sleep 0.2
+done
+[ "$ready" -eq 1 ] || die "forge broker not ready — see $BROKER_LOG; restart $BROKER_WRAPPER"
+log "forge broker: ready (pid $(cat "$BROKER_PIDFILE"), log $BROKER_LOG)"
 
 # ---- 8. daemon wrapper + (re)start ----------------------------------------
 
@@ -341,7 +494,7 @@ DAEMON_TOKEN=$(cat "$OMPIRE_DATA/token")
 
 api_daemon() { # api_daemon METHOD PATH [JSON]
 	local method=$1 path=$2 data=${3:-}
-	local -a args=(-fsS -X "$method" -H "Authorization: Bearer $DAEMON_TOKEN"
+	local -a args=(-q -fsS --connect-timeout 2 --max-time 60 -X "$method" -H "Authorization: Bearer $DAEMON_TOKEN"
 		-H "Content-Type: application/json")
 	[ -n "$data" ] && args+=(-d "$data")
 	curl "${args[@]}" "$DAEMON_URL$path"
@@ -386,12 +539,87 @@ if ! api_daemon POST /api/projects "$payload" >/dev/null 2>&1; then
 else
 	log "project: registered '$NAME' ($SSH_URL)"
 fi
+# Refresh only our local fetch remote; no real-upstream credentials are needed.
+if git -C "$ROOT" remote get-url qa-self >/dev/null 2>&1; then
+	git -C "$ROOT" remote set-url qa-self "$ROOT"
+else
+	git -C "$ROOT" remote add qa-self "$ROOT"
+fi
+OMPIRE_UPSTREAM=$(git -C "$ROOT" remote get-url origin) || die "ompire checkout needs an origin for project identity"
+OMPIRE_BASE=$(git -C "$ROOT" symbolic-ref --short HEAD) ||
+	die "ompire checkout must be on a named branch for the local qa-self fetch"
+if existing=$(api_daemon GET /api/projects/ompire 2>/dev/null); then
+	jq -e --arg c "$ROOT" --arg u "$OMPIRE_UPSTREAM" \
+		'.checkout_path == $c and .upstream_url == $u and .fetch_remote == "qa-self"' \
+		<<<"$existing" >/dev/null || die "project ompire has conflicting registration — fix its checkout/upstream/fetch_remote in Projects"
+	log "project: 'ompire' already registered"
+else
+	payload=$(jq -n --arg u "$OMPIRE_UPSTREAM" --arg c "$ROOT" --arg b "$OMPIRE_BASE" --arg p "$PROFILE" \
+		'{name: "ompire", title: "Ompire dogfood driver", upstream_url: $u,
+		  checkout_path: $c, fetch_remote: "qa-self", base_branch: $b, default_model_profile: $p}')
+	api_daemon POST /api/projects "$payload" >/dev/null || die "could not register the ompire project"
+	log "project: registered 'ompire' (local qa-self fetch, no publish workflow)"
+fi
+
+# The library belongs to the operator. Validate our tracked source every run,
+# but create an executable revision only when the name is not already owned.
+workflow_payload=$(jq -n --rawfile yaml "$ROOT/scripts/qa-dogfood-workflow.yaml" \
+	'{name: "dogfood", yaml: $yaml}')
+api_daemon POST /api/workflow-library/validate "$workflow_payload" >/dev/null ||
+	die "tracked dogfood workflow failed validation"
+if api_daemon GET /api/workflow-library/dogfood >/dev/null 2>&1; then
+	log "workflow: 'dogfood' already present (operator version preserved)"
+else
+	if created=$(api_daemon POST /api/workflow-library "$workflow_payload"); then
+		version=$(jq -er '.entry.version' <<<"$created")
+		revision_payload=$(jq --argjson v "$version" '{yaml: .yaml, expected_version: $v}' <<<"$workflow_payload")
+		api_daemon POST /api/workflow-library/dogfood/revisions "$revision_payload" >/dev/null ||
+			die "dogfood draft created but executable save failed — inspect it in Workflows"
+		log "workflow: installed executable 'dogfood'"
+	else
+		api_daemon GET /api/workflow-library/dogfood >/dev/null 2>&1 ||
+			die "could not install dogfood workflow"
+		log "workflow: 'dogfood' created concurrently (operator version preserved)"
+	fi
+fi
+
 
 # ---- 10. smoke ------------------------------------------------------------
 
 rc=0
 smoke_ok()   { printf '  ok    %s\n' "$1"; }
 smoke_fail() { printf '  FAIL  %s\n' "$1" >&2; rc=1; }
+if curl -q -fsS --noproxy '*' --max-time 2 http://127.0.0.1:4100/healthz >/dev/null 2>&1; then
+	smoke_ok "forge broker /healthz (local readiness only, not GitHub authentication)"
+else
+	smoke_fail "forge broker unavailable — restart $BROKER_WRAPPER"
+fi
+environments=$(api_daemon GET /api/environments) || environments='[]'
+environment=$(jq -c '.[] | select(.name == "dogfood")' <<<"$environments")
+[ -n "$environment" ] || environment='{}'
+state=$(jq -r '.status.state // "missing"' <<<"$environment")
+if [ "$state" = ready ]; then
+	smoke_ok "environment dogfood: ready"
+else
+	smoke_fail "environment dogfood: $state — fix blockers and Re-check in Settings"
+	jq -r '.status.blockers[]? | "  blocker: " + .message' <<<"$environment" >&2
+fi
+workflow=$(api_daemon GET /api/workflow-library/dogfood) || workflow='{}'
+revision=$(jq -r '.entry.current_revision // empty' <<<"$workflow")
+if jq -e '.entry.available == true and .entry.descriptor.actions == [] and .entry.descriptor.reviews == false' \
+	<<<"$workflow" >/dev/null && [ -n "$revision" ] &&
+	api_daemon GET "/api/workflows/revisions/$revision" | jq -e '.definition.environment == "dogfood"' >/dev/null; then
+	smoke_ok "workflow dogfood: executable, requires dogfood, no publish authority"
+else
+	smoke_fail "workflow dogfood unavailable, publishes, or no longer requires dogfood — inspect the operator library in Workflows"
+fi
+if api_daemon GET /api/projects/ompire | jq -e --arg c "$ROOT" \
+	'.checkout_path == $c and .fetch_remote == "qa-self" and .setup_state == "ready"' >/dev/null; then
+	smoke_ok "project ompire: ready with local qa-self fetch"
+else
+	smoke_fail "project ompire missing or not ready with local qa-self fetch"
+fi
+
 
 login=$(curl -fsS -K "$QA_DIR/.curlrc" https://api.github.com/user | jq -r '.login // empty' 2>/dev/null)
 [ "$login" = "$BOT_LOGIN" ] && smoke_ok "agent PAT authenticates as @$BOT_LOGIN" ||
@@ -489,7 +717,7 @@ fi
 
 # Task agents get LLM auth through the pi-auth-gateway tunnel (workshop.yaml):
 # it must be reachable on localhost:4000 (port-forwarded here if needed).
-gw_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:4000/ 2>/dev/null)
+gw_code=$(curl -q -sS -o /dev/null -w '%{http_code}' --max-time 5 http://localhost:4000/ 2>/dev/null) || gw_code=000
 if [ -n "$gw_code" ] && [ "$gw_code" != 000 ]; then
 	smoke_ok "auth gateway reachable on :4000 (HTTP $gw_code)"
 else
@@ -500,11 +728,13 @@ fi
 
 	cat <<-EOF
 
-	==> QA environment ready
+	==> QA environment setup complete
 	    daemon:   $DAEMON_URL  (pid $(cat "$PIDFILE"), log $OMPIRE_DATA/daemon.log)
-	    open UI:  $DAEMON_URL/?token=$DAEMON_TOKEN
-	              (the ?token= stashes itself in the browser's localStorage)
+	    open UI:  $DAEMON_URL/ (bootstrap from $OMPIRE_DATA/token on the trusted operator browser only)
+	    broker:   localhost:4100 (pid $(cat "$BROKER_PIDFILE"), log $BROKER_LOG)
+	    restart:  $BROKER_WRAPPER (foreground; setup manages its background pid)
 	    project:  $NAME -> $REPO (checkout $CHECKOUT, base $BASE_BRANCH)
+	    dogfood:  project ompire, workflow dogfood; grant environment access in Spawn
 	    restart:  $DAEMON_WRAPPER
 	    identity: . $QA_DIR/env.sh   (any shell that should act as @$BOT_LOGIN)
 	$([ $rc -eq 0 ] || printf '\n    NOTE: one or more smoke checks failed — see above.\n')

@@ -1,0 +1,79 @@
+# QA observer/driver only. Publishing and other authority acts stay with the operator.
+format: 5
+name: dogfood
+sessions: [main]
+primary: main
+environment: dogfood
+steps:
+  - name: drive-qa-loop
+    kind: agent
+    session: main
+    role: default
+    outcome:
+      results:
+        done:
+          required: {evidence: string}
+        blocked:
+          required: {reason: string}
+    prompt:
+      separator: ""
+      parts:
+        - text: |
+            Drive the real dogfooding QA loop using
+            docs/develop/how-to/run-the-qa-loop.md. Read the guide first and follow
+            its agent/operator split. You are the observing agent, not the daemon
+            or the operator. The operator's request is:
+
+        - value: {op: input, name: task.prompt}
+          format: text
+        - text: |
+
+            Keep these authority and credential boundaries regardless of the request:
+            - Ask the operator to perform trusted-host setup, spawning the sandbox
+              task under observation, answering gates, confirming ship, merging,
+              and cleanup in the UI or on the trusted host as the guide assigns.
+              Wait for their action; do not impersonate them or call the daemon API.
+            - Never request, locate, read, copy, source, or use the daemon token,
+              .qa-agent identity material, forge credentials, signing keys, or a
+              personal GitHub identity. Do not ask for credentials in chat.
+            - Use plain git and curl through http://localhost:4100 for the
+              allowlisted bot-owned sandbox repository only, with no PAT,
+              Authorization header, gh, credential helper, or direct-forge fallback.
+              Model access uses the existing auth gateway; never obtain its
+              upstream credential.
+            - Never push, create a PR, merge, or write to any upstream repository.
+              This workflow has no review, delivery, or publish authority. The
+              daemon under test publishes only to the disposable bot sandbox when
+              the operator authorizes it; you observe its result.
+
+            Collect the guide's actual evidence: brokered clone/fetch and repository
+            REST reads, commit.verification for the daemon-published commit, one
+            deliberately denied GET /api/user request, and sandbox inspection of
+            environment, argv, workspace files, and transcripts. Inspect without
+            printing secret values; if credential material is found, stop and tell
+            the operator its location, not its contents. Ask the operator for the
+            trusted-side broker-log correlation. Request a tunnel-revocation check
+            after this task is cleaned up; that later operator check is not
+            something this running session can claim to have observed.
+            Report real observations and blockers, never simulated acceptance.
+
+            Finish with done only when the guide's agent-run steps and observable
+            evidence are complete; summarize the evidence and any remaining
+            operator-owned checks in the declared artifact. If those agent steps
+            cannot be completed, finish with blocked and the concrete reason.
+            Requests for operator action do not grant you that authority.
+
+  - name: finish
+    kind: decision
+    evidence:
+      qa: {steps: [drive-qa-loop], with_outcome: true, required: true}
+    cases:
+      - when:
+          op: eq
+          left:
+            op: get
+            value: {op: evidence, name: qa}
+            keys: [outcome, result]
+          right: {op: literal, value: done}
+        next: {complete: true, result: qa-complete}
+    otherwise: {complete: true, result: qa-blocked}
