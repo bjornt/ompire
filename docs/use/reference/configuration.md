@@ -91,8 +91,25 @@ startup with `environments.<name>.wiring` named.
 ```toml
 [environments.dogfood]
 host = "host"
-provision = ["/home/qa/ompire/scripts/setup-qa-env.sh"]
+provision = ["/home/qa/ompire/scripts/setup-qa-env.sh", "--dir", "/home/qa/ompire/.qa-agent", "--repo", "ompire-test/sandbox"]
 check = ["/home/qa/ompire/scripts/setup-qa-env.sh", "--probe"]
+wiring = '''
+sdks:
+  - name: omp
+    plugs:
+      github:
+        interface: tunnel
+        endpoint: localhost:4100
+  - name: system
+    slots:
+      github:
+        interface: tunnel
+        endpoint: localhost:4100
+provision:
+  connect:
+    - plug: omp:github
+      slot: system:github
+'''
 
 [environments.dogfood.capabilities]
 model = "auth-gateway"
@@ -100,10 +117,23 @@ forge = "forge-broker"
 browser = "chrome"
 ```
 
-This declares infrastructure; it neither installs providers nor grants task
-access by itself. Wiring makes the environment grantable; without it the
-environment is observation-only. See [Environments](environments.md) for
-wiring, the check contract, trust boundary, states, and recovery.
+This is the `dogfood` shape installed by `scripts/setup-qa-env.sh`, with paths
+and the bot sandbox resolved on the trusted host. Setup starts the broker,
+registers the local `ompire` project (`fetch_remote: qa-self`), installs the
+non-publishing driver workflow when absent, and restarts the daemon. On a
+re-run it replaces only the `dogfood` environment tables; unrelated operator
+configuration stays intact. Declaring this TOML alone neither provisions
+providers nor grants a task access.
+
+The capability is `forge`, its provider is `forge-broker`, and the tunnel
+plug/slot is `github`. The model gateway/browser remain supplied by Ompire's
+existing Workshop declaration; keep the grant-backed `github` route out of
+that static declaration. The check's standalone `--probe` uses the trusted
+daemon's inherited `QA_AGENT_DIR` for a custom identity, never `--dir` alongside
+`--probe`; it reports local readiness, not upstream authentication.
+See [Environments](environments.md) for task access, check trust, states and
+recovery, and the [QA-loop guide](../../develop/how-to/run-the-qa-loop.md) for
+the operator-run define → probe → grant procedure.
 
 ## Lifecycle
 

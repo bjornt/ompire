@@ -89,35 +89,33 @@ read-only allowlist. Host-local processes are part of that trust boundary.
 to unrelated tasks and removed with the task environment, as required by
 [ADR-0015](../../adr/0015-keep-agent-credentials-behind-narrow-brokers.md).
 
-The consumption stanza below mirrors the existing `pi-auth-gateway` plug and
-slot in `workshop.yaml`, with `github` on port `4100`:
+The installed `dogfood` environment adds this fragment around a granted task's
+Workshop launch. It follows the existing `pi-auth-gateway` tunnel's shape, but
+the forge plug is named `github`, not the capability name `forge`:
 
 ```yaml
 sdks:
   - name: omp
     plugs:
-      pi-auth-gateway:
-        interface: tunnel
-        endpoint: localhost:4000
       github:
         interface: tunnel
         endpoint: localhost:4100
   - name: system
     slots:
-      pi-auth-gateway:
-        interface: tunnel
-        endpoint: localhost:4000
       github:
         interface: tunnel
         endpoint: localhost:4100
+provision:
+  connect:
+    - plug: omp:github
+      slot: system:github
 ```
 
-Merge these entries into the applicable Workshop declaration; this is not a
-complete replacement for its SDK list. The slot side must reach the running
-broker on that host. The sandbox uses `http://localhost:4100` after the tunnel
-is connected. If the broker runs on another trusted machine, arranging a
-protected forward to the slot host is an operator responsibility; exposing the
-listener publicly is not a substitute.
+This is a Workshop additions fragment, not a replacement SDK list. The slot
+side reaches the broker on the trusted QA host; the sandbox uses
+`http://localhost:4100` after connection. A broker on another trusted machine
+would require an operator-arranged protected forward to the slot host, not a
+public listener.
 
 For daemon-granted environments, supply the tunnel stanzas and their
 connections through the environment's
@@ -125,11 +123,24 @@ connections through the environment's
 static repository declaration. Static plugs give every task ambient access
 and are outside daemon grant-gating.
 
-This component does not modify this repository's current `workshop.yaml`, start
-a broker from `setup-qa-env.sh`, install a service unit, or implement environment
-grants. The dogfood-environment integration owns that provisioning and tunnel
-wiring. The [QA-loop guide](../how-to/run-the-qa-loop.md) continues to describe
-the existing loop, rather than claiming those integrations already exist.
+`scripts/setup-qa-env.sh` installs this integration: it resolves the sandbox
+repository, generates `~/.config/ompire/qa-forge-broker.sh` to execute the
+broker with that one repository and the trusted identity's token file, and
+backgrounds it with pid/log files at
+`~/.local/share/ompire/forge-broker.{pid,log}`. It writes the `dogfood`
+definition with the fragment above, capabilities `model: auth-gateway`,
+`forge: forge-broker`, `browser: chrome`, and a read-only `--probe` check.
+The existing model gateway tunnel remains in `workshop.yaml`; the forge
+tunnel does not. The script also registers the local `ompire` project with
+`fetch_remote: qa-self` and installs the non-publishing `dogfood` driver
+workflow when absent. Only an explicit environment grant adds its forge route.
+
+Every setup re-run restarts the broker and reloads its token/allowlist; the
+wrapper is not an automatic respawner or a service unit. The
+[QA-loop guide](../how-to/run-the-qa-loop.md) describes provisioning, browser
+readiness and grant decisions, operator-owned publication, brokered reads,
+denial auditing, sandbox inspection, recovery, and teardown. Those instructions
+are not evidence that a real-service run has passed.
 
 ## Endpoint policy
 
@@ -281,11 +292,13 @@ repository, never a personal identity or a production repository. The complete
 loop and its credential handling are described in the
 [QA-loop guide](../how-to/run-the-qa-loop.md).
 
-Start the broker on the trusted QA host with that sandbox allowlisted, using
-the invocation above. Run the following on the QA host's loopback endpoint, or
-inside a sandbox whose tunnel is explicitly connected. Do **not** source
-`.qa-agent/env.sh`, copy the identity directory into the sandbox, or configure
-forge authentication for these observing commands.
+For the installed integration, run `scripts/setup-qa-env.sh` on the trusted
+host and grant a driver task through the operator UI as described in the guide;
+the script starts the broker. The standalone invocation above remains useful
+outside that integration. Run these commands on the trusted host's loopback
+endpoint or inside the explicitly granted sandbox. Do **not** source
+`.qa-agent/env.sh`, copy the identity directory, configure forge credentials,
+or bring a daemon token into the observing sandbox.
 
 Choose an existing sandbox PR and a commit published by the daemon under test.
 Replace the values below; `outside` must be a different bot sandbox repository
@@ -297,22 +310,25 @@ repo='ompire-test/<sandbox>'
 outside='ompire-test/<other-sandbox>'
 pr='<existing-pr-number>'
 sha='<daemon-published-commit-sha>'
+label='dogfood-<driver-task-id>'
 checkout=$(mktemp -d)/sandbox
 
-curl -q --fail --show-error "$base/healthz"
+curl -q --fail --show-error -H "X-Ompire-Task: $label" "$base/healthz"
 git -c credential.helper= -c core.hooksPath=/dev/null \
-  ls-remote "$base/git/$repo.git"
+  -c "http.extraHeader=X-Ompire-Task: $label" ls-remote "$base/git/$repo.git"
 git -c credential.helper= -c core.hooksPath=/dev/null \
-  clone "$base/git/$repo.git" "$checkout"
+  -c "http.extraHeader=X-Ompire-Task: $label" clone "$base/git/$repo.git" "$checkout"
+git -C "$checkout" -c credential.helper= -c core.hooksPath=/dev/null \
+  -c "http.extraHeader=X-Ompire-Task: $label" fetch origin
 
 curl -q --fail --show-error -H 'Accept: application/vnd.github+json' \
-  -H 'X-Ompire-Task: qa-observer' "$base/api/repos/$repo"
+  -H "X-Ompire-Task: $label" "$base/api/repos/$repo"
 curl -q --fail --show-error -H 'Accept: application/vnd.github+json' \
-  "$base/api/repos/$repo/pulls/$pr"
+  -H "X-Ompire-Task: $label" "$base/api/repos/$repo/pulls/$pr"
 curl -q --fail --show-error -H 'Accept: application/vnd.github+json' \
-  "$base/api/repos/$repo/commits/$sha"
+  -H "X-Ompire-Task: $label" "$base/api/repos/$repo/commits/$sha"
 curl -q --fail --show-error -H 'Accept: application/vnd.github+json' \
-  "$base/api/repos/$repo/commits/$sha/check-runs"
+  -H "X-Ompire-Task: $label" "$base/api/repos/$repo/commits/$sha/check-runs"
 ```
 
 All reads should succeed with the bot's sandbox permissions. In the commit
@@ -326,13 +342,14 @@ Then exercise denials, still only through the broker:
 
 ```sh
 curl -q --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
-  "$base/api/user"
+  -H "X-Ompire-Task: $label" "$base/api/user"
 curl -q --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
-  "$base/api/repos/$outside"
+  -H "X-Ompire-Task: $label" "$base/api/repos/$outside"
 curl -q --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
-  --request POST "$base/api/repos/$repo"
+  -H "X-Ompire-Task: $label" --request POST "$base/api/repos/$repo"
 
 git -C "$checkout" -c credential.helper= -c core.hooksPath=/dev/null \
+  -c "http.extraHeader=X-Ompire-Task: $label" \
   push origin HEAD:refs/heads/forge-broker-denial-probe
 ```
 
@@ -343,3 +360,17 @@ requests, their rule names and task labels, and `upstream_status: null` for
 policy denials. These probes must not publish a branch or contact an outside
 repository upstream. Retain only non-secret evidence; never reproduce token
 material while inspecting logs or reporting results.
+
+For the installed combined log, the operator can select only this run's records
+without printing unrelated requests:
+
+```sh
+jq -R --arg label 'dogfood-<driver-task-id>' \
+  'fromjson? | select(.task == $label) | {timestamp, task, method, path, decision, rule, upstream_status, status}' \
+  ~/.local/share/ompire/forge-broker.log
+```
+
+`fromjson?` skips the plain readiness line. Inspect this log only on the trusted
+host; the driver does not need host log access or daemon authority. The guide
+also requires a no-grant control, restart recovery, credential-free inspection,
+and container removal as evidence of task-scoped tunnel revocation.
