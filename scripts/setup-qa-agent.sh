@@ -132,7 +132,10 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 cleanup() {
 	[ -z "$ADMIN_CURLRC" ] || rm -f "$ADMIN_CURLRC"
-	[ "$LOCKED" -eq 1 ] && rm -rf "$DIR/.lock"
+	# if-form, not `[ … ] && …`: the EXIT trap's status becomes the
+	# script's exit status, and `status` — the one command that never locks —
+	# must not exit 1 on all-green output.
+	if [ "$LOCKED" -eq 1 ]; then rm -rf "$DIR/.lock"; fi
 }
 
 # ---- state ---------------------------------------------------------------

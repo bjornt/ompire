@@ -107,6 +107,9 @@ breaks. It prints the agent login, repository reachability, the management
 login, local-vs-state-vs-remote key agreement for both key types, and a live
 SSH authentication attempt against `git@github.com`.
 
+Its exit code is truthful: 0 when every printed check is green, 1 when any
+of them failed — safe to use as a gate.
+
 ## 2. Move the identity to the QA host
 
 The identity directory is self-locating — `env.sh` resolves paths from its own
@@ -162,9 +165,11 @@ when the PAT can see more than one repository, `--skip-workshop` and
 outside the repository.
 
 `--check` aborts the run before the smoke block if either suite fails. The
-daemon suite exercises real subprocesses and is sensitive to a loaded host, so
-reproduce a failure with a plain `cd daemon && uv run pytest` on a quiet
-machine before treating it as a real one.
+suites run with the sourced identity environment scrubbed, so their result
+is what a plain clean shell on the same machine produces — a failure under
+`--check` is a real failure, not identity bleed. The daemon suite still
+exercises real subprocesses, so give a one-off failure on a loaded host a
+re-run before treating it as a product defect.
 
 The run ends with a smoke block. Every line must read `ok` — including the
 reviewer launch, the tracked Workshop wiring (`workshop.yaml` with no
@@ -347,6 +352,10 @@ lxc list --project workshop.ubuntu               # leftover task containers, nam
 rm -rf ~/tasks/<project> ~/proj/<name>           # task clones and the sandbox checkout
 rm -rf ~/.local/share/ompire ~/.config/ompire    # daemon state (including db/) and config
 ```
+
+`daemon.pid` is refreshed on every daemon start, including restarts through
+`~/.config/ompire/qa-daemon.sh`, so the `kill` above always names the
+running daemon.
 
 Prefer cleaning tasks through the UI first — it removes each Workshop container
 along with its clone, so `lxc list` should come back empty. `workshop list` is

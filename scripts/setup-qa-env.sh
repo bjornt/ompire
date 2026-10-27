@@ -50,6 +50,8 @@
 #   --skip-browser      skip the Chromium provisioning step
 #   --skip-workshop     skip the workshop/LXD/my-workshop provisioning step
 #   --check             additionally run the daemon + frontend test suites
+#                       (with the sourced identity env scrubbed around
+#                       them, so the result matches a plain clean shell)
 #   --dir PATH          identity directory (default: <repo>/.qa-agent)
 #
 # Notes:
@@ -264,9 +266,17 @@ log "build: frontend production bundle (daemon serves frontend/dist)"
 (cd "$ROOT/frontend" && pnpm build)
 
 if [ "$OPT_CHECK" -eq 1 ]; then
-	log "check: daemon + frontend test suites"
-	(cd "$ROOT/daemon" && uv run pytest -q)
-	(cd "$ROOT/frontend" && pnpm test)
+	log "check: daemon + frontend test suites (identity env scrubbed)"
+	# The suites must report what a plain clean shell reports: the sourced
+	# bot identity otherwise bleeds into them — GH_TOKEN/GITHUB_TOKEN into
+	# the gh probe and its test fake, GIT_CONFIG_GLOBAL/GNUPGHOME into
+	# every fixture git commit (the bot gitconfig signs them),
+	# GIT_SSH_COMMAND into ssh — and shows up as defects that are not.
+	# Keep this list in sync with write_env_sh in setup-qa-agent.sh.
+	SUITE_ENV=(env -u GH_TOKEN -u GITHUB_TOKEN -u GNUPGHOME \
+		-u GIT_CONFIG_GLOBAL -u GIT_SSH_COMMAND -u QA_AGENT_DIR)
+	(cd "$ROOT/daemon" && "${SUITE_ENV[@]}" uv run pytest -q)
+	(cd "$ROOT/frontend" && "${SUITE_ENV[@]}" pnpm test)
 fi
 
 # ---- 6. daemon config -----------------------------------------------------
@@ -471,6 +481,10 @@ fi
 		gpg --batch --yes --pinentry-mode loopback \
 			--passphrase-file "\$QA_AGENT_DIR/.gpg-passphrase" --clearsign <<<"warm" >/dev/null 2>&1 || true
 	export PATH="\$HOME/.local/bin:/snap/bin:\$PATH"
+	# Keep daemon.pid current on every start, including direct wrapper
+	# restarts — the guide's teardown kill reads it (\$\$ survives the exec).
+	mkdir -p "\$HOME/.local/share/ompire"
+	echo "\$\$" >"\$HOME/.local/share/ompire/daemon.pid"
 	exec uv run --project "$ROOT/daemon" ompire-daemon
 	EOF
 chmod +x "$DAEMON_WRAPPER"
