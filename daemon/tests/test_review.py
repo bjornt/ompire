@@ -694,6 +694,115 @@ class TestReviewManagerLifecycle:
         assert session.status == "idle"
 
     @pytest.mark.asyncio
+    async def test_failed_launch_records_error_and_releases_the_workspace(
+        self, review_app, tmp_path: Path, git_checkout: Path
+    ) -> None:
+        """A reviewer that never starts must not park the workspace: the
+        error iteration records, the guard admits the next writer with no
+        restart, and a retry of the review starts cleanly once the reviewer
+        is available again.
+        """
+        app = review_app
+        app.state.config = Config(
+            **{
+                **app.state.config.__dict__,
+                "llmvet_command": (str(tmp_path / "missing-llmvet"),),
+            }
+        )
+        reviews = app.state.reviews
+        reviews._config = app.state.config
+        reviews.start()
+
+        from ompire_daemon.work.tasks import get_task
+
+        engine = app.state.engine
+        seeded_inputs = encode_execution_inputs(
+            make_execution_inputs(
+                engine=engine,
+                checkout_path=str(git_checkout),
+                branch="ompire/task1",
+            )
+        )
+        # Seed project/task directly; review manager only needs the task row.
+        with engine.begin() as conn:
+            from ompire_daemon.db import projects, tasks
+
+            conn.execute(
+                projects.insert().values(
+                    name="demo",
+                    title="Demo",
+                    upstream_url="https://example.com/demo.git",
+                    fork_url=None,
+                    checkout_path=str(git_checkout),
+                    branch_pattern="ompire/<slug>",
+                )
+            )
+            now = _now_iso()
+            result = conn.execute(
+                tasks.insert().values(
+                    project_name="demo",
+                    execution_inputs_json=seeded_inputs,
+                    slug="task1",
+                    branch="ompire/task1",
+                    clone_path=str(git_checkout),
+                    state="created",
+                    prompt="hello",
+                    error=None,
+                    workshop_id=None,
+                    workflow_name="plain",
+                    workflow_status=None,
+                    workflow_step=None,
+                    spawn_completed_at=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            task_id = result.inserted_primary_key[0]
+        task = get_task(engine, task_id)
+        app.state.sessions.recovering(task_id, "main")
+        app.state.sessions.session_recovered(task_id, "main")
+
+        _add_change(git_checkout)
+
+        await reviews.start_review(task)
+        deadline = asyncio.get_event_loop().time() + 5
+        while reviews.get(task_id) and reviews.get(task_id).status == "open":
+            if asyncio.get_event_loop().time() > deadline:
+                raise RuntimeError("review did not finish")
+            await asyncio.sleep(0.01)
+
+        final = reviews.get(task_id)
+        assert final is not None
+        assert final.status == "error"
+        assert len(final.iterations) == 1
+        assert final.iterations[0].outcome == "error"
+        assert "failed to launch llmvet" in (final.iterations[0].stderr or "")
+        # The hold the failed launch took is gone: the workspace admits a
+        # new writer — no restart, no cancel.
+        assert app.state.workspace_guard.owner(task_id) is None
+
+        # A retry starts cleanly once the reviewer is available again, and
+        # appends to the same history.
+        fake_llmvet = _write_fake_llmvet(tmp_path, "", 0)
+        app.state.config = Config(
+            **{**app.state.config.__dict__, "llmvet_command": (str(fake_llmvet),)}
+        )
+        reviews._config = app.state.config
+        state = await reviews.start_review(task)
+        assert state.status == "open"
+        deadline = asyncio.get_event_loop().time() + 5
+        while reviews.get(task_id) and reviews.get(task_id).status == "open":
+            if asyncio.get_event_loop().time() > deadline:
+                raise RuntimeError("retry review did not finish")
+            await asyncio.sleep(0.01)
+
+        final = reviews.get(task_id)
+        assert final is not None
+        assert final.status == "approved"
+        assert [it.outcome for it in final.iterations] == ["error", "approved"]
+        assert app.state.workspace_guard.owner(task_id) is None
+
+    @pytest.mark.asyncio
     async def test_comments_iteration_errors_without_live_agent(
         self, review_app, tmp_path: Path, git_checkout: Path
     ) -> None:

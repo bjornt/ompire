@@ -205,6 +205,7 @@ is finished with it, and the turn is admitted on its own.
 | Cancel with no open review | `409` |
 | The task's launch configuration is not confirmed yet | Refused; confirm the task's configuration first (see [States](states.md)) |
 | Comments arrive but the primary session has no live agent | Review recorded `error` naming the missing agent; the session is left unchanged |
+| The reviewer process fails to launch (missing or broken `llmvet_command`) | Review recorded `error` naming the launch failure; no workspace hold remains, so the run routes on and the review can be retried once the reviewer is available |
 | Nothing to review — the task's content matches its base | `409` naming the empty delta |
 | Another writer owns the workspace, or an unresolved delivery effect blocks it | `409` naming the holder or the effect |
 | The clone configures content filters or a hooks path | `409` naming the settings Ompire refuses to capture under |

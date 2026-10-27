@@ -513,56 +513,73 @@ class ReviewManager:
         candidate: CandidateRecord,
         workflow_seq: int | None = None,
     ) -> None:
+        # The watcher owns the workspace hold `start_review` took, and is the
+        # one that gives it back — on every exit path: a normal exit, a
+        # launch failure (which finalizes an honest `error` iteration), and
+        # an exception while finalizing or interpreting. The release is
+        # last, so the durable iteration lands before a run woken by it can
+        # write.
         process: asyncio.subprocess.Process | None = None
+        launch_error: Exception | None = None
         try:
-            argv = [
-                *self._config.llmvet_command,
-                "-no-open",
-                "-host",
-                "127.0.0.1",
-                "-port",
-                str(port),
-            ]
-            # The reviewer runs in the isolated candidate view, never in the
-            # task clone: what it reads is the content the approval will name.
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=view_path,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            self._processes[task_id] = process
-            stdout_bytes, stderr_bytes = await process.communicate()
-        except Exception as exc:
-            logger.exception("llmvet spawn failed for task %d", task_id)
-            await self._finalize(
-                task_id,
-                task,
-                outcome="error",
-                candidate_id=candidate.candidate_id,
-                workflow_seq=workflow_seq,
-                stderr=f"failed to launch llmvet: {exc}",
-                close_session=True,
-            )
-            return
-        finally:
-            self._processes.pop(task_id, None)
-            # The process was observed exiting: drop its URL/port and clear
-            # the write-ahead marker, so a later startup does not read this
-            # review as interrupted. The isolated view goes with it — the
-            # candidate's own protected store keeps the reviewed objects.
-            self._runtime.pop(task_id, None)
-            self._views.pop(task_id, None)
-            clear_process_marker(self._engine, task_id)
-            await asyncio.to_thread(remove_review_view, view_path)
+            try:
+                argv = [
+                    *self._config.llmvet_command,
+                    "-no-open",
+                    "-host",
+                    "127.0.0.1",
+                    "-port",
+                    str(port),
+                ]
+                # The reviewer runs in the isolated candidate view, never in
+                # the task clone: what it reads is the content the approval
+                # will name.
+                process = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=view_path,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                self._processes[task_id] = process
+                stdout_bytes, stderr_bytes = await process.communicate()
+            except Exception as exc:
+                # Finalizing waits until the cleanup `finally` below has
+                # run: the wake-up inside `_finalize` must not open a window
+                # where the run resumes, takes its next step, and meets the
+                # hold this watcher has not given back yet. The normal exit
+                # path gets the same ordering for the same reason.
+                logger.exception("llmvet spawn failed for task %d", task_id)
+                launch_error = exc
+            finally:
+                self._processes.pop(task_id, None)
+                # The process was observed exiting: drop its URL/port and
+                # clear the write-ahead marker, so a later startup does not
+                # read this review as interrupted. The isolated view goes
+                # with it — the candidate's own protected store keeps the
+                # reviewed objects.
+                self._runtime.pop(task_id, None)
+                self._views.pop(task_id, None)
+                clear_process_marker(self._engine, task_id)
+                await asyncio.to_thread(remove_review_view, view_path)
 
-        assert process is not None
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
-        code = process.returncode
-        assert code is not None
-        try:
+            if launch_error is not None:
+                await self._finalize(
+                    task_id,
+                    task,
+                    outcome="error",
+                    candidate_id=candidate.candidate_id,
+                    workflow_seq=workflow_seq,
+                    stderr=f"failed to launch llmvet: {launch_error}",
+                    close_session=True,
+                )
+                return
+
+            assert process is not None
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+            code = process.returncode
+            assert code is not None
             await self._interpret_exit(
                 task_id,
                 task,
