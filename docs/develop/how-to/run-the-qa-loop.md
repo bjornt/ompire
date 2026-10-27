@@ -130,18 +130,31 @@ On the **QA host**, from the repository root:
 scripts/setup-qa-env.sh --check
 ```
 
-It verifies the identity directory, adds `.qa-agent/` to `.gitignore`, installs
-`gh`, the Node/pnpm/uv toolchain, and the Workshop/LXD stack, provisions a
-headless browser, builds the frontend, writes `~/.config/ompire/config.toml`
-with the bot's signing key, clones the sandbox repository to `~/proj/<name>`,
-registers it as a project, starts the daemon, and runs smoke checks. `--check`
-additionally runs both test suites.
+It verifies the identity directory, adds `.qa-agent/` to `.gitignore`, warms
+the VM's gpg-agent (the bot gitconfig signs every fixture commit and the
+wiring seed commit), installs `gh`, the Node/pnpm/uv toolchain, and the
+Workshop/LXD stack, fetches the pinned `llmvet` reviewer into
+`local-test/.tools/` and points `llmvet_command` at it by absolute path,
+provisions a headless browser, builds the frontend, writes
+`~/.config/ompire/config.toml` with the bot's signing key and that reviewer
+command, clones the sandbox repository to `~/proj/<name>`, seeds its Workshop
+wiring when it is untracked, registers it as a project, starts the daemon, and
+runs smoke checks. `--check` additionally runs both test suites.
 
 A launch needs a complete model profile, and the QA loop runs the real stack
 against real providers, so the script will not invent one. Either create a
 profile first and pass its name as `OMPIRE_QA_MODEL_PROFILE`, or set
 `OMPIRE_QA_MODEL` to a provider-qualified model id and let the script bind all
 four roles to it. Nothing is inherited from your own `omp` configuration.
+
+The wiring seed needs one more real input: the omp provider registry that
+`workshop.my.yaml` copies into every task container — the file holding the
+scoped auth-gateway token as a literal `apiKey`
+([ADR-0015](../../adr/0015-keep-agent-credentials-behind-narrow-brokers.md)).
+Nothing invents one. Put it at `~/.omp-agent/agent/models.yml`, or point
+`OMPIRE_QA_MODELS_REGISTRY` at it; a fresh empty sandbox repo without one
+makes the run refuse and print the exact wiring it would have seeded. An
+already-tracked wiring file is the operator's — the seed never overwrites it.
 
 It is idempotent — re-run it freely. Useful options: `--repo <owner>/<sandbox>`
 when the PAT can see more than one repository, `--skip-workshop` and
@@ -153,7 +166,9 @@ daemon suite exercises real subprocesses and is sensitive to a loaded host, so
 reproduce a failure with a plain `cd daemon && uv run pytest` on a quiet
 machine before treating it as a real one.
 
-The run ends with a smoke block. Every line must read `ok`; see
+The run ends with a smoke block. Every line must read `ok` — including the
+reviewer launch, the tracked Workshop wiring (`workshop.yaml` with no
+`provision:` key, `workshop.my.yaml`), and the provider-registry lines; see
 [Troubleshooting](#troubleshooting) for the ones that do not.
 
 On a host where LXD was just installed, your user was added to the `lxd` group

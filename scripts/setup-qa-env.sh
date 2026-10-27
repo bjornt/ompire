@@ -9,7 +9,10 @@
 #
 #   1. preflight    verify .qa-agent/ is complete (token, ssh key, gnupg,
 #                   env.sh, state.json) and source env.sh — every git/gh/gpg
-#                   operation from here on runs as the bot (@ompire-test)
+#                   operation from here on runs as the bot (@ompire-test) —
+#                   then warm gpg-agent: the bot gitconfig signs every
+#                   fixture commit and the wiring seed commit, and a cold
+#                   agent dies on pinentry without a tty
 #   2. gitignore    add .qa-agent/ to .gitignore — it contains a live PAT,
 #                   an SSH private key, and a GPG private key
 #   3. gh           install the GitHub CLI (agent needs it for PRs; it picks
@@ -20,20 +23,26 @@
 #   3c. workshop    workshop snap + LXD + my-workshop (built from
 #                   github.com/bjornt/my-workshop) — the daemon spawns task
 #                   agents through them. Skip with --skip-workshop.
+#   3d. reviewer    llmvet via local-test/tools (pinned, sha256-verified);
+#                   llmvet_command in config.toml points at it by absolute
+#                   path, so the review step never depends on the daemon's PATH
 #   4. browser      delegate to setup-browser.sh (UI dogfooding via the
 #                   omp browser tool); skip with --skip-browser
 #   5. build        pnpm install + production build (frontend; the daemon
 #                   serves frontend/dist), uv sync (daemon)
 #   6. config       ~/.config/ompire/config.toml: gpg_signing_key = the bot's
-#                   key, notifications_enabled = false (headless QA env)
+#                   key, notifications_enabled = false (headless QA env),
+#                   and llmvet_command = the fetched reviewer (absolute path)
 #   7. qa repo      resolve the QA sandbox repo (auto-discovered via the PAT —
 #                   a fine-grained PAT sees only its selected repos — or pass
-#                   --repo owner/name), clone it to ~/proj/<name> over SSH
+#                   --repo owner/name), clone it to ~/proj/<name> over SSH,
+#                   and seed its Workshop wiring when untracked (7b below)
 #   8. daemon       write ~/.config/ompire/qa-daemon.sh (sources env.sh, then
 #                   uv run ompire-daemon) and (re)start it; the daemon needs
 #                   the bot env for ship-flow git/gh/gpg operations
 #  10. smoke        verify: PAT and daemon GitHub identity, registered sandbox
-#                   target eligibility, ssh, GPG probe, and UI serving — no
+#                   target eligibility, ssh, GPG probe, reviewer, tracked
+#                   Workshop wiring, provider registry, and UI serving — no
 #                   credential value is printed
 #
 # Options:
@@ -46,7 +55,14 @@
 # Notes:
 #   - The daemon keeps running afterwards (nohup; logs + pid in
 #     ~/.local/share/ompire/). Restart later with ~/.config/ompire/qa-daemon.sh.
-#   - Re-running is safe: every step is idempotent.
+#   - Re-running is safe: every step is idempotent. Seeding commits the
+#     Workshop wiring exactly once; an untracked wiring file that already
+#     exists is never overwritten.
+#   - The wiring seed copies the omp provider registry into every task
+#     container, and that registry holds the scoped auth-gateway token as a
+#     literal apiKey (ADR-0015). Nothing here invents one: without a registry
+#     at ~/.omp-agent/agent/models.yml (override: OMPIRE_QA_MODELS_REGISTRY)
+#     the run refuses and prints the exact wiring it would have seeded.
 #   - The bot's GPG key is passphrase-protected and the daemon wrapper warms
 #     gpg-agent at startup, so the ship gate sees it as "ready". A cold key
 #     reports "locked" instead; the smoke step reports the daemon's own
@@ -110,6 +126,19 @@ BOT_FPR=$(jq -r '.gpg.fingerprint // empty' "$QA_DIR/state.json")
 [ -d "${GNUPGHOME:-/nonexistent}" ] || die "GNUPGHOME ($GNUPGHOME) does not exist — stale absolute paths? regenerate env.sh with setup-qa-agent.sh"
 [ -f "${GIT_CONFIG_GLOBAL:-/nonexistent}" ] || die "GIT_CONFIG_GLOBAL ($GIT_CONFIG_GLOBAL) does not exist"
 log "identity: @$BOT_LOGIN (gpg $BOT_FPR)"
+
+# Warm gpg-agent before anything signs. The bot gitconfig signs every
+# fixture commit in the --check suites and the Workshop wiring seed commit
+# (7b) — a cold agent dies on pinentry without a tty. Same warm the
+# generated daemon wrapper performs at startup.
+if [ -f "$QA_DIR/.gpg-passphrase" ]; then
+	gpg --batch --yes --pinentry-mode loopback \
+		--passphrase-file "$QA_DIR/.gpg-passphrase" --clearsign <<<warm \
+		>/dev/null 2>&1 ||
+		warn "gpg-agent warm failed — signing (wiring seed commit, --check fixtures) may fail"
+else
+	warn "$QA_DIR/.gpg-passphrase missing — skipping the gpg-agent warm"
+fi
 
 # ---- 2. gitignore: never commit the identity -----------------------------
 
@@ -199,6 +228,20 @@ else
 	log "workshop: $(workshop --version 2>/dev/null || echo present), my-workshop present"
 fi
 
+# ---- 3d. reviewer: llmvet for the review step -------------------------------
+
+# The review step launches the daemon's configured reviewer; a missing
+# binary is what cost task 8 of the 2026-10-26 loop. Fetch the pinned,
+# sha256-verified release into the gitignored local-test/.tools cache
+# (local-test/tools writes nothing outside it). A failed fetch does not
+# stop the run: llmvet_command is then left at its default and the smoke
+# block reports the gap.
+REVIEWER="$ROOT/local-test/.tools/llmvet"
+if ! "$ROOT/local-test/tools" fetch llmvet; then
+	warn "llmvet fetch failed — the review step will not launch until
+          '$ROOT/local-test/tools fetch llmvet' succeeds"
+fi
+
 # ---- 4. browser -----------------------------------------------------------
 
 if [ "$OPT_SKIP_BROWSER" -eq 1 ]; then
@@ -239,6 +282,14 @@ toml_set() { # toml_set KEY VALUE(pre-quoted)
 touch "$OMPIRE_CONFIG"
 toml_set gpg_signing_key "\"$BOT_FPR\""
 toml_set notifications_enabled false
+# Absolute reviewer path (3d): the review step must not depend on the
+# daemon's PATH. Left at the default when the fetch failed.
+if [ -x "$REVIEWER" ]; then
+	toml_set llmvet_command "[\"$REVIEWER\"]"
+	log "config: reviewer $REVIEWER ($("$REVIEWER" -version 2>&1 | head -1))"
+else
+	warn "no reviewer at $REVIEWER — llmvet_command left at its default; see the smoke block"
+fi
 log "config: $OMPIRE_CONFIG (gpg_signing_key $BOT_FPR, notifications off)"
 
 # ---- 7. QA sandbox repo ---------------------------------------------------
@@ -291,6 +342,120 @@ if ! git -C "$CHECKOUT" rev-parse --verify HEAD >/dev/null 2>&1; then
 		git add README.md
 		git commit -q -m "chore: initial commit (QA sandbox seed)"
 		git push -q -u origin "$BASE_BRANCH"
+	)
+fi
+
+# ---- 7b. Workshop wiring for task launches ---------------------------------
+
+# Task launches apply the sandbox repo's own Workshop additions: the
+# daemon's default additions source is "project", so a tracked
+# workshop.my.yaml in the clone is merged into the tracked workshop.yaml by
+# my-workshop, and its provision block — registry copy + tunnel connect —
+# is what gives every task container model auth (ADR-0015: the copied
+# registry holds the *scoped* auth-gateway token as a literal apiKey; the
+# credential itself stays behind the gateway). A fresh empty repo has
+# neither file, and the 2026-10-26 loop lost three tasks to wiring that was
+# never seeded (FINDINGS.md F1/F2/F3): no `provision:` key in the tracked
+# declaration (it breaks `workshop launch`), and no channel pin (the
+# default channel installs an omp that reads the current registry schema;
+# 17/edge does not). Seed both exactly once; an existing file is the
+# operator's and is never overwritten.
+MODELS_REGISTRY=${OMPIRE_QA_MODELS_REGISTRY:-$HOME/.omp-agent/agent/models.yml}
+
+emit_workshop_yaml() { # the tracked declaration my-workshop builds the container from
+	cat <<'EOF'
+# Wiring for ompire task-agent containers (dogfooding QA sandbox).
+# The daemon clones this repo per task; my-workshop augments this tracked
+# workshop.yaml with the additions source chosen at launch (workshop.my.yaml).
+name: qa-agent
+base: ubuntu@26.04
+sdks:
+  - name: omp
+    plugs:
+      pi-auth-gateway:
+        interface: tunnel
+        endpoint: localhost:4000
+  - name: system
+    slots:
+      pi-auth-gateway:
+        interface: tunnel
+        endpoint: localhost:4000
+EOF
+}
+
+emit_workshop_my_yaml() { # the additions applied at launch (default source: project)
+	# The copy source is the registry's omp home — the parent of agent/ —
+	# written back in ~ form when it lives under $HOME (the observed shape).
+	REGISTRY_HOME=$(dirname "$(dirname "$MODELS_REGISTRY")")
+	case "$REGISTRY_HOME" in
+	"$HOME"/*) REGISTRY_HOME="~${REGISTRY_HOME#"$HOME"}" ;;
+	esac
+	cat <<EOF
+# Additions staged by the ompire daemon when this project selects the
+# project additions source. my-workshop merges the sdks below into the
+# tracked workshop.yaml (existing named entries are kept), then copies
+# the omp provider registry into the container and connects the
+# auth-gateway tunnel plug to its slot. The copied registry holds the
+# scoped gateway token as a literal apiKey (ADR-0015); no credential is here.
+sdks:
+  - name: omp
+    plugs:
+      pi-auth-gateway:
+        interface: tunnel
+        endpoint: localhost:4000
+  - name: system
+    slots:
+      pi-auth-gateway:
+        interface: tunnel
+        endpoint: localhost:4000
+provision:
+  copy:
+    - source: $REGISTRY_HOME
+      target: omp:omp-home
+  connect:
+    - plug: omp:pi-auth-gateway
+      slot: system:pi-auth-gateway
+EOF
+}
+
+seed_wiring=()
+for f in workshop.yaml workshop.my.yaml; do
+	if git -C "$CHECKOUT" ls-files -- "$f" | grep -q .; then
+		log "wiring: $f is already tracked in the sandbox repo — leaving it alone"
+	elif [ -e "$CHECKOUT/$f" ]; then
+		die "untracked $f exists at $CHECKOUT — commit or remove it by hand; this script will not overwrite it"
+	else
+		seed_wiring+=("$f")
+	fi
+done
+
+if [ ${#seed_wiring[@]} -gt 0 ]; then
+	if [ ! -s "$MODELS_REGISTRY" ]; then
+		{
+			printf 'The additions file copies the omp provider registry into every task\n'
+			printf 'container, and that registry holds the scoped auth-gateway token as\n'
+			printf 'a literal apiKey (ADR-0015: the credential itself stays behind the\n'
+			printf 'gateway). Nothing here invents one. Put it at %s, or point\n' "$MODELS_REGISTRY"
+			printf 'OMPIRE_QA_MODELS_REGISTRY at it, then re-run. The exact wiring this\n'
+			printf 'run would seed:\n\n'
+			emit_workshop_yaml
+			printf '\n'
+			emit_workshop_my_yaml
+		} >&2
+		die "no provider registry at $MODELS_REGISTRY — refusing to seed the sandbox Workshop wiring"
+	fi
+	log "wiring: seeding ${seed_wiring[*]} as one signed commit on $BASE_BRANCH"
+	for f in "${seed_wiring[@]}"; do
+		case "$f" in
+		workshop.yaml) emit_workshop_yaml >"$CHECKOUT/$f" ;;
+		workshop.my.yaml) emit_workshop_my_yaml >"$CHECKOUT/$f" ;;
+		esac
+	done
+	(
+		cd "$CHECKOUT"
+		git add -- "${seed_wiring[@]}"
+		git commit -q -m "chore: seed Workshop wiring for QA task launches"
+		git push -q origin "$BASE_BRANCH"
 	)
 fi
 
@@ -465,6 +630,35 @@ if jq -e '
 	smoke_ok "sandbox target eligible for GitHub preflight: github.com/$REPO"
 else
 	smoke_fail "sandbox target is not eligible for GitHub preflight: github.com/$REPO"
+fi
+
+# The reviewer the daemon launches (3d). A missing binary is what killed
+# task 8 of the 2026-10-26 loop (F12); this line keeps that gap visible.
+if [ -x "$REVIEWER" ]; then
+	smoke_ok "reviewer launches: $REVIEWER ($("$REVIEWER" -version 2>&1 | head -1))"
+else
+	smoke_fail "reviewer $REVIEWER missing — run '$ROOT/local-test/tools fetch llmvet' and re-run"
+fi
+
+# The Workshop wiring every task launch applies (7b): tracked in the
+# sandbox repo, the tracked declaration carries no provision block (it
+# breaks `workshop launch`), and the registry the additions copies exists.
+for f in workshop.yaml workshop.my.yaml; do
+	if git -C "$CHECKOUT" ls-files -- "$f" | grep -q .; then
+		smoke_ok "sandbox Workshop wiring tracked: $f"
+	else
+		smoke_fail "sandbox Workshop wiring not tracked: $f — re-run scripts/setup-qa-env.sh"
+	fi
+done
+if grep -qE '^provision:' "$CHECKOUT/workshop.yaml" 2>/dev/null; then
+	smoke_fail "tracked workshop.yaml has a top-level provision: key — it breaks 'workshop launch'"
+else
+	smoke_ok "tracked workshop.yaml has no provision: key"
+fi
+if [ -s "$MODELS_REGISTRY" ]; then
+	smoke_ok "provider registry present: $MODELS_REGISTRY"
+else
+	smoke_fail "provider registry missing or empty: $MODELS_REGISTRY — set OMPIRE_QA_MODELS_REGISTRY"
 fi
 
 # Do the bot's commits show "Verified" on GitHub?
