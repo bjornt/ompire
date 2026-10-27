@@ -325,9 +325,42 @@ def _setup_signing_gpg(
 def _set_operator_signing_program(
     bin_dir: Path, program: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Point operator-owned Git config at `program`, never the clone's."""
+    """Point operator-owned Git config at `program`, never the clone's.
+
+    Redirects the global scope to a temp file so the suite cannot touch the
+    developer's real ~/.gitconfig — and gives that file the operator's own
+    user identity, which is where a delivered commit's author comes from
+    under the same rule.
+    """
     global_config = bin_dir / "gitconfig"
-    global_config.write_text(f"[gpg]\n\tprogram = {program}\n", encoding="utf-8")
+    global_config.write_text(
+        f"[gpg]\n\tprogram = {program}\n{_OPERATOR_IDENTITY_INI}",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+
+
+# The operator's git identity: who a delivered commit is stamped as,
+# resolved from the daemon's own operator-owned config. The value is fixed
+# so a workspace that claims to be somebody else is visibly wrong.
+_OPERATOR_NAME = "Ompire Operator"
+_OPERATOR_EMAIL = "operator@ompire.test"
+_OPERATOR_IDENTITY = {"name": _OPERATOR_NAME, "email": _OPERATOR_EMAIL}
+_OPERATOR_IDENTITY_INI = (
+    f"[user]\n\tname = {_OPERATOR_NAME}\n\temail = {_OPERATOR_EMAIL}\n"
+)
+
+
+def _set_operator_git_identity(bin_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give the daemon an operator identity in global Git config.
+
+    For previews that resolve a delivery without signing anything: the
+    author a delivered commit would carry resolves from the daemon's own
+    operator-owned config, so one must exist for the preview to be
+    deliverable.
+    """
+    global_config = bin_dir / "gitconfig"
+    global_config.write_text(_OPERATOR_IDENTITY_INI, encoding="utf-8")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
 
 
@@ -767,6 +800,7 @@ async def test_delivery_requires_an_approval_bound_to_the_current_content(
     tmp_root, engine, ships, config, monkeypatch
 ):
     _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _set_operator_git_identity(tmp_root / "bin", monkeypatch)
     _setup_git_clone(tmp_root / "review-origin.git", Path(task.clone_path))
     clone = Path(task.clone_path)
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe())
@@ -914,6 +948,7 @@ async def test_a_local_ending_needs_no_github_availability(
     procedure the task accepted — not a choice made at the confirmation.
     """
     project, task = _make_project_and_task(engine, tmp_root, ending=ending)
+    _set_operator_git_identity(tmp_root / "bin", monkeypatch)
     _setup_git_clone(tmp_root / "offline-origin.git", Path(task.clone_path))
     await _approve_current(config, engine, task)
     error = _blocked_preflight_error(project.upstream_url)
@@ -1108,6 +1143,9 @@ async def test_retain_preserves_messages_trees_and_count_under_new_signatures(
     # Retain publishes existing commits, so the pending edit is committed.
     _run_git(clone, "add", "file3.txt")
     _run_git(clone, "commit", "-m", "third task commit")
+    # The workspace claims an identity that must not survive the replay.
+    _run_git(clone, "config", "user.name", "omp agent")
+    _run_git(clone, "config", "user.email", "workshop@qa-agent-c573e117.wp")
     _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
     candidate = await _approve_current(config, engine, task)
@@ -1134,6 +1172,13 @@ async def test_retain_preserves_messages_trees_and_count_under_new_signatures(
     ).splitlines()
     assert all(line.split()[0] in ("G", "U") for line in signers)
     assert all(line.split()[1].upper() == fingerprint.upper() for line in signers)
+    # Every replayed commit is rewritten onto the operator identity — author
+    # and committer both, never the workspace's claim.
+    stamp = f"{_OPERATOR_NAME} <{_OPERATOR_EMAIL}>"
+    authors = _git_out(
+        clone, "log", "--format=%an <%ae> %cn <%ce>", f"{candidate.base_commit}..HEAD"
+    ).splitlines()
+    assert authors == [f"{stamp} {stamp}"] * 3
 
 
 async def test_retain_refuses_a_dirty_tree_and_an_empty_range(
@@ -1263,6 +1308,98 @@ async def test_clone_local_signing_config_cannot_redirect_the_commit(
     with pytest.raises(UnsafeCloneConfigError):
         await capture_candidate(config, engine, task, base_branch="main")
     assert not (tmp_root / "PWNED").exists()
+
+
+async def test_a_delivered_commit_is_stamped_by_the_operator_identity(
+    tmp_root, engine, ships, config, monkeypatch, runner
+):
+    """The clone is agent-writable, so it must not choose the author.
+
+    A hostile `user.name`/`user.email` in the task clone's local git config
+    changes nothing: a delivered commit's author and committer resolve from
+    the daemon's own operator-owned config, and the identity the preview
+    showed is the identity the commit carries (ADR-0011).
+    """
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "stamped-origin.git", Path(task.clone_path))
+    clone = Path(task.clone_path)
+    _run_git(clone, "config", "user.name", "omp agent")
+    _run_git(clone, "config", "user.email", "workshop@qa-agent-c573e117.wp")
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    preview = await ships.preview(
+        task,
+        **_gate(engine, task),
+        commit_message="ship: the work",
+        pr_title="",
+        pr_body="",
+        request_id="hostile-1",
+    )
+    assert preview.deliverable, [b.code for b in preview.blockers]
+    assert preview.identity["git"] == _OPERATOR_IDENTITY
+    delivery_id, _projection = await ships.confirm(task, preview, runner=runner)
+    await ships._run_prefix(task, delivery_id, "hostile-1")
+
+    # The authorization records the same identity the preview displayed, and
+    # the commit that lands in the clone is stamped by it — author and
+    # committer both, never by the workspace's claim.
+    record = get_delivery(engine, delivery_id)
+    assert record.identity["git"] == _OPERATOR_IDENTITY
+    assert _git_out(clone, "log", "-1", "--format=%an <%ae>") == (
+        f"{_OPERATOR_NAME} <{_OPERATOR_EMAIL}>"
+    )
+    assert _git_out(clone, "log", "-1", "--format=%cn <%ce>") == (
+        f"{_OPERATOR_NAME} <{_OPERATOR_EMAIL}>"
+    )
+
+
+async def test_a_delivery_without_an_operator_identity_is_refused(
+    tmp_root, engine, ships, config, monkeypatch, runner
+):
+    """Nothing resolves, so nothing is stamped.
+
+    A delivery whose author cannot be resolved from operator-owned config
+    is refused with a blocker naming what is missing. It never falls back
+    to the workspace's identity, and no authorization is recorded.
+    """
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "no-identity-origin.git", Path(task.clone_path))
+    clone = Path(task.clone_path)
+    # The workspace claims an identity — precisely what must not be used.
+    _run_git(clone, "config", "user.name", "omp agent")
+    _run_git(clone, "config", "user.email", "workshop@qa-agent-c573e117.wp")
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    # The operator's config carries no user identity: signing program only.
+    stripped = tmp_root / "bin" / "gitconfig-no-user"
+    stripped.write_text(f"[gpg]\n\tprogram = {_wrapper}\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(stripped))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    preview = await ships.preview(
+        task,
+        **_gate(engine, task),
+        commit_message="m",
+        pr_title="",
+        pr_body="",
+        request_id="r1",
+    )
+    codes = [b.code for b in preview.blockers]
+    assert "identity-unavailable" in codes
+    assert not preview.deliverable
+    assert any(
+        "user.name" in b.message and "user.email" in b.message
+        for b in preview.blockers
+    )
+    with pytest.raises(DeliveryBlockedError):
+        await ships.confirm(task, preview, runner=runner)
+    # The refusal left no authorization and no action behind.
+    refused = list_deliveries(engine, task.id)[-1]
+    assert refused.authorized_at is None
+    assert [a.kind for a in refused.actions] == []
 
 
 async def test_a_workspace_that_moved_on_blocks_installation_of_the_signed_result(
@@ -2091,6 +2228,7 @@ async def test_a_confirmation_cannot_smuggle_a_chain_the_choice_never_granted(
     from dataclasses import replace as dc_replace
 
     _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _set_operator_git_identity(tmp_root / "bin", monkeypatch)
     _setup_git_clone(tmp_root / "smuggle-origin.git", Path(task.clone_path))
     monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe())
     await _approve_current(config, engine, task)
@@ -2508,6 +2646,89 @@ async def test_an_interrupted_action_waits_for_an_explicit_continuation(
     assert {a.workflow_seq for a in attempts} == {
         next(r for r in list_step_records(engine, task.id) if r.step == "commit").seq
     }
+
+
+async def test_an_interrupted_delivery_keeps_its_staged_identity(
+    tmp_root, engine, ships, config, hub, sessions, monkeypatch
+):
+    """Staged before the restart, stamped after it — by the same identity.
+
+    A delivery authorized and interrupted before its commit exists is
+    confirmed again after a daemon restart. The commit that lands carries
+    the operator identity the preview displayed, byte-identical to the
+    normal path's, whatever the task clone claims in the meantime.
+    """
+    _project, task = _make_project_and_task(engine, tmp_root, ending="commit")
+    _setup_git_clone(tmp_root / "staged-identity-origin.git", Path(task.clone_path))
+    clone = Path(task.clone_path)
+    _run_git(clone, "config", "user.name", "omp agent")
+    _run_git(clone, "config", "user.email", "workshop@qa-agent-c573e117.wp")
+    _wrapper, fingerprint = _setup_signing_gpg(tmp_root / "bin", monkeypatch)
+    monkeypatch.setattr(ships._gpg, "probe", _ready_gpg_probe(fingerprint))
+    await _approve_current(config, engine, task)
+
+    live = _live_runner(engine, config, hub, sessions, ships)
+
+    async def die_before_signing(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(ships, "_sign", die_before_signing)
+    try:
+        preview = await ships.preview(
+            task,
+            **_gate(engine, task),
+            commit_message="ship: it",
+            pr_title="",
+            pr_body="",
+            request_id="r1",
+        )
+        assert preview.identity["git"] == _OPERATOR_IDENTITY
+        await ships.confirm(task, preview, runner=live)
+        await _wait_delivery_phase(engine, task.id, "executing")
+    finally:
+        await live.shutdown()
+
+    # The workspace claims yet another identity while the daemon is down.
+    _run_git(clone, "config", "user.name", "even worse")
+    _run_git(clone, "config", "user.email", "hostile@qa-agent.wp")
+
+    assert await ships.restore() == []
+    restarted = _live_runner(engine, config, hub, sessions, ships)
+    try:
+        restarted.recover_run(
+            get_task(engine, task.id),
+            resolve_task_definition(engine, get_task(engine, task.id)),
+        )
+        waiting = await _settle(engine, task.id, {"waiting", "complete", "failed"})
+        assert waiting.workflow_status == "waiting"
+
+        # The operator confirms the remaining work; the continuation signs
+        # with the identity the first preview resolved and recorded.
+        monkeypatch.setattr(ships, "_sign", _restored_sign(ships))
+        current = get_task(engine, task.id)
+        again = await ships.preview(
+            task,
+            commit_message="ship: it",
+            pr_title="",
+            pr_body="",
+            request_id="r2",
+        )
+        assert again.source == "workflow-action"
+        assert again.identity["git"] == _OPERATOR_IDENTITY
+        await ships.confirm(current, again, runner=restarted)
+        finished = await _settle(engine, task.id, {"complete", "failed"})
+    finally:
+        await restarted.shutdown()
+
+    assert finished.workflow_status == "complete"
+    record = get_latest_delivery(engine, task.id)
+    assert record.disposition == "completed"
+    # The recorded authorization and the delivered commit agree, and neither
+    # ever agreed with the workspace.
+    assert record.identity["git"] == _OPERATOR_IDENTITY
+    stamp = f"{_OPERATOR_NAME} <{_OPERATOR_EMAIL}>"
+    assert _git_out(clone, "log", "-1", "--format=%an <%ae>") == stamp
+    assert _git_out(clone, "log", "-1", "--format=%cn <%ce>") == stamp
 
 
 # --- the non-publishable handoff boundary (ADR-0035) -------------------------

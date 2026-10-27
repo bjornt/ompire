@@ -71,8 +71,9 @@ It returns:
 - the candidate being delivered — its identity, base branch, base commit, tree,
   and commit count — and whether the approval covers it;
 - the actions still to run and the ones already completed;
-- the accepted destination, the signing identity, and the GitHub account, where
-  each applies to the requested ending;
+- the accepted destination, the signing identity, the git identity the delivered
+  commits are stamped as, and the GitHub account, where each applies to the
+  requested ending;
 - the exact pull-request body Ompire will write, including the recovery
   correlation marker;
 - **every** reason the delivery is currently refused, not just the first;
@@ -105,6 +106,7 @@ content, the target, and the identities the authorization is about.
 | `empty-candidate` | There is nothing to deliver. Ompire refuses rather than manufacturing a commit. |
 | `candidate-unavailable` | The workspace could not be resolved into publishable content. |
 | `signing-unavailable` | The signing key is not ready; the message names the specific state. |
+| `identity-unavailable` | No git identity (`user.name`/`user.email`) resolves from the daemon's own global/system git config. A delivered commit is never stamped by the task workspace's identity, so there is nothing to fall back to: set the operator identity and deliver again. |
 | `github-unavailable` | GitHub identity or repository eligibility blocks a pushing ending. A local ending is unaffected. |
 | `retain-dirty` / `retain-empty` / `retain-merges` | Retain publishes existing commits; this range cannot be retained as it stands. |
 | `retain-protected-paths` | A commit this delivery would publish carries a [handoff input](#handoff-inputs). Names the paths and the commit. |
@@ -249,6 +251,16 @@ Both modes sign against the protected candidate — never a freshly staged live
 workspace — using the operator's own signing configuration, never the task
 clone's. Trees, commit count, parents, and the signing key are all verified
 before the result leaves its protected store.
+
+Both modes also stamp **who delivered**. The author and committer of every
+delivered commit — the squash tip and each replayed retain commit alike —
+resolve from the operator's own global/system git config, the one the
+daemon's environment points at, never from the task clone: what the agent
+writes into its workspace's git config changes nothing, and the identity the
+preview displayed is the identity the delivered commit carries — including a
+delivery staged before and confirmed after a daemon restart. If nothing
+resolves, the delivery is refused rather than stamped by whatever the
+workspace says.
 
 The signed result is then installed into the task clone under a compare-and-swap
 against the HEAD the candidate was captured at, and the index is synchronized to

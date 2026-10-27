@@ -1010,7 +1010,25 @@ class ShipManager:
                     await self._retain_protected_blockers(task, candidate)
                 )
         if candidate is not None:
-            identity["git"] = await self._git_identity(task.clone_path)
+            # Who a delivered commit is stamped as comes from the operator's
+            # own config, never the workspace's — and when nothing resolves
+            # there, the delivery is refused rather than silently stamped by
+            # whatever the agent's environment happens to say.
+            git_identity = await self._git_identity()
+            if "commit" in remaining and (
+                git_identity.get("name") is None or git_identity.get("email") is None
+            ):
+                blockers.append(
+                    Blocker(
+                        "identity-unavailable",
+                        "no operator git identity resolves from the daemon's "
+                        "global/system git config (user.name/user.email); set "
+                        "both there — a delivered commit never takes its "
+                        "author from the task workspace",
+                    )
+                )
+            else:
+                identity["git"] = git_identity
 
         # A local-only ending needs no forge availability at all. Anything that
         # pushes keeps the existing trusted-target and eligibility preflight —
@@ -1453,10 +1471,18 @@ class ShipManager:
             )
         return blockers
 
-    async def _git_identity(self, clone_path: str) -> dict[str, Any]:
+    async def _git_identity(self) -> dict[str, Any]:
+        """The operator's own git identity, never the task workspace's.
+
+        Resolved from operator-owned config only — the global and system
+        scopes the daemon's own environment points at, `GIT_CONFIG_GLOBAL`
+        and `GIT_CONFIG_SYSTEM` included — because the clone is
+        agent-writable and must not decide who a signed, published commit
+        claims to be (ADR-0011).
+        """
         return {
-            "name": await self._git_config(clone_path, "user.name"),
-            "email": await self._git_config(clone_path, "user.email"),
+            "name": await self._operator_git_config("user.name"),
+            "email": await self._operator_git_config("user.email"),
         }
 
     # --- delivery ----------------------------------------------------------
@@ -3376,17 +3402,6 @@ class ShipManager:
         return f"an interrupted {action.kind} action has an unknown outcome: {detail}"
 
     # --- git configuration helpers -----------------------------------------
-
-    async def _git_config(self, clone_path: str, key: str) -> str | None:
-        stdout, _stderr, code = await run_git(
-            safe_git(clone_path, "config", "--get", key),
-            cwd=clone_path,
-            timeout=10,
-            step=f"git-config-{key.replace('.', '-')}",
-            check=False,
-        )
-        value = stdout.strip()
-        return value if code == 0 and value else None
 
     async def _signing_config(self) -> list[str]:
         """Command-local signing settings taken from operator-owned config.
